@@ -12,6 +12,21 @@
 | 2026-05-26T11:53:38.5645338+02:00 | Increase pgzip read-ahead block size to 1 MiB | 5000000 | 3.9621918 | 1261927.80 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample5m-pgzip-1mb-2.tshd --max-rows 5000000` |
 | 2026-05-26T11:58:15.5413137+02:00 | Current sustained import throughput check | 20000000 | 13.4056739 | 1491905.60 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample20m-current.tshd --max-rows 20000000` |
 
+## Factorio chunk ingest benchmark
+
+Measured `serve` plus `tail-chunk-tsv` against the local `chunk-charted.tsv` Factorio mod output. Runs reset the local `factorio*` benchmark database directories first. Capped runs used `WaitForExit(...)` and killed the tail client and server after the timeout; rows are metadata-confirmed when possible, otherwise they are the tail client's last completed progress report.
+
+| Time | Change | Batch rows | Timeout sec | Rows accepted | Chunks/min | Command |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| 2026-05-26T20:45:00+02:00 | User-observed pre-optimization baseline | default | n/a | n/a | 1400.0 | `.\timeshadedb.exe serve --dev --db factorio` + `.\timeshadedb.exe tail-chunk-tsv --input .\chunk-charted.tsv --savefile speedrun --once` |
+| 2026-05-26T21:02:00+02:00 | Batched HTTP ingest and grouped chunk-file writes | 4096 | 60 | 69632 | 69610.1 | `.\timeshadedb.exe tail-chunk-tsv --input .\chunk-charted.tsv --savefile speedrun --base-url http://127.0.0.1:18082 --once --progress-interval 5s --batch-rows 4096` |
+| 2026-05-26T21:09:00+02:00 | Remove chunk hot-path fsync and cache datastore metadata writes | 4096 | 60 | 94208 | 94185.7 | same as above |
+| 2026-05-26T21:23:00+02:00 | Skip no-op repeat frames while persisting per-datastore ingest progress | 16384 | 60 | 114688 | 119566.3 | `.\timeshadedb.exe tail-chunk-tsv --input .\chunk-charted.tsv --savefile speedrun --base-url http://127.0.0.1:18082 --once --progress-interval 5s` |
+| 2026-05-26T21:32:00+02:00 | Tune default batch size and avoid client-side RGB565 decode on fresh sends | 10240 | 60 | 122880 | 122867.2 | same as above |
+| 2026-05-26T21:40:00+02:00 | Final exact consecutive-repeat shortcut check | 10240 | 60 | 122880 | 122847.4 | same as above |
+
+Best sustained 60-second result so far is 122,847 chunks/min, about 87.7x the 1,400 chunks/min baseline. Shorter 30-second tuning runs reached 131,042 chunks/min at 8,192-row batches and 143,307 chunks/min at 10,240-row batches, but the longer run slows on later sections of `chunk-charted.tsv`.
+
 ## Tile API benchmark
 
 Measured `serve` over the actual HTTP tile API against `full.tshd` with a 64 MiB decoded snapshot cache. The request generator sampled tile coordinates weighted by each tile's `changed_placements_stored` in `full.tshd/stats.json`, then sampled timestamps uniformly across the `/api/meta` dataset time range. Each run used 1,000 requests, concurrency 16, seed 12345, and read the full PNG response body.
