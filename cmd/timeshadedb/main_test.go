@@ -320,6 +320,66 @@ func TestTailChunkTSVOnceResumesFromServerMetadata(t *testing.T) {
 	}
 }
 
+func TestTailChunkTSVOnceWaitsForAllDatastoreResumeTargets(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db.tshd")
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, Format: timeshadedb.FormatChunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	handler := newWebServer(db, http.NotFoundHandler()).routes()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	saveID := "save-1"
+	aLatest := "10\tnauvis\t0,0\tplayer\t" + testRGB565Hex(0x1001)
+	bOld := "20\tvulcanus\t0,0\tplayer\t" + testRGB565Hex(0x2002)
+	bLatest := "21\tvulcanus\t0,0\tplayer\t" + testRGB565Hex(0x3003)
+	aNext := "22\tnauvis\t0,0\tplayer\t" + testRGB565Hex(0x4004)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest/chunk/"+saveID, strings.NewReader(aLatest+"\n"+bOld+"\n"+bLatest+"\n"))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("pre-ingest status = %d, body %s", resp.Code, resp.Body.String())
+	}
+
+	input := filepath.Join(dir, "chunk-charted.tsv")
+	if err := os.WriteFile(input, []byte(aLatest+"\n"+bOld+"\n"+bLatest+"\n"+aNext+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var progress bytes.Buffer
+	if err := tailChunkTSV(context.Background(), tailChunkTSVOptions{
+		InputPath:        input,
+		SavefileUUID:     saveID,
+		BaseURL:          server.URL,
+		BatchRows:        1,
+		PollInterval:     time.Second,
+		ProgressInterval: 10 * time.Second,
+		ProgressOutput:   &progress,
+		Once:             true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := progress.String(); !strings.Contains(got, "pushed 1 chunks total") {
+		t.Fatalf("progress output = %q", got)
+	}
+
+	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
+		Key:   timeshadedb.DatastoreKey{SavefileUUID: saveID, Surface: "vulcanus", Force: "player"},
+		Tick:  21,
+		Chunk: timeshadedb.ChunkCoord{X: 0, Y: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Pixels[0] != 0x3003 {
+		t.Fatalf("tail sender replayed pre-resume row for second datastore, pixel = %#04x", chunk.Pixels[0])
+	}
+}
+
 func TestSendAppendedChunkRowsDefersPartialTrailingLine(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db.tshd")

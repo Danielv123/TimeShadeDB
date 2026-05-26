@@ -78,11 +78,12 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 	defer f.Close()
 
 	targets := resumeTargets(meta)
-	var offset int64
-	var lastMatchedOffset int64
-	if len(targets) > 0 {
-		lastMatchedOffset = -1
+	pendingTargets := make(map[resumeTarget]struct{}, len(targets))
+	for target := range targets {
+		pendingTargets[target] = struct{}{}
 	}
+	resumeComplete := len(pendingTargets) == 0
+	var offset int64
 	var batch []string
 	reader := bufio.NewReader(f)
 	for lineNo := 1; ; lineNo++ {
@@ -97,19 +98,20 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 			break
 		}
 		nextOffset := offset + lineBytes
-		if len(targets) > 0 {
+		if !resumeComplete {
 			row, parseErr := timeshadedb.ParseChunkTSVRow(opts.SavefileUUID, line)
 			if parseErr != nil {
 				return 0, fmt.Errorf("%s:%d: %w", opts.InputPath, lineNo, parseErr)
 			}
-			if matchesResumeTarget(row, targets) {
-				lastMatchedOffset = nextOffset
-				batch = batch[:0]
+			if target, ok := matchingResumeTarget(row, pendingTargets); ok {
+				delete(pendingTargets, target)
 				offset = nextOffset
+				if len(pendingTargets) == 0 {
+					resumeComplete = true
+				}
 				continue
 			}
-		}
-		if len(targets) == 0 || lastMatchedOffset >= 0 {
+		} else {
 			batch = append(batch, line)
 			if len(batch) >= opts.BatchRows {
 				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter, opts.RetryInterval); err != nil {
@@ -119,6 +121,9 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 			}
 		}
 		offset = nextOffset
+	}
+	if len(pendingTargets) > 0 {
+		return 0, fmt.Errorf("resume target not found in TSV: %d datastore(s) remaining", len(pendingTargets))
 	}
 	if len(batch) > 0 {
 		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter, opts.RetryInterval); err != nil {
@@ -412,14 +417,15 @@ func resumeTargets(meta *timeshadedb.IngestMetadata) map[resumeTarget]struct{} {
 	return targets
 }
 
-func matchesResumeTarget(row timeshadedb.ParsedChunkRow, targets map[resumeTarget]struct{}) bool {
-	_, ok := targets[resumeTarget{
+func matchingResumeTarget(row timeshadedb.ParsedChunkRow, targets map[resumeTarget]struct{}) (resumeTarget, bool) {
+	target := resumeTarget{
 		tick:    row.Tick,
 		surface: row.Key.Surface,
 		chunk:   row.Chunk,
 		force:   row.Key.Force,
-	}]
-	return ok
+	}
+	_, ok := targets[target]
+	return target, ok
 }
 
 func normalizeBaseURL(raw string) (string, error) {
