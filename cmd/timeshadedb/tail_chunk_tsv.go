@@ -23,6 +23,7 @@ type tailChunkTSVOptions struct {
 	BatchRows        int
 	PollInterval     time.Duration
 	ProgressInterval time.Duration
+	RequestTimeout   time.Duration
 	ProgressOutput   io.Writer
 	Once             bool
 }
@@ -41,12 +42,15 @@ func tailChunkTSV(ctx context.Context, opts tailChunkTSVOptions) error {
 	if opts.PollInterval <= 0 {
 		return fmt.Errorf("poll-interval must be positive")
 	}
+	if opts.RequestTimeout <= 0 {
+		opts.RequestTimeout = 5 * time.Minute
+	}
 	reporter := newChunkProgressReporter(opts.ProgressOutput, opts.ProgressInterval)
 	baseURL, err := normalizeBaseURL(opts.BaseURL)
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: opts.RequestTimeout}
 	meta, err := fetchIngestMetadata(ctx, client, baseURL, opts.SavefileUUID)
 	if err != nil {
 		return err
@@ -82,14 +86,19 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 		line := scanner.Text()
 		lineBytes := int64(len(line)) + 1
 		nextOffset := offset + lineBytes
-		row, parseErr := timeshadedb.ParseChunkTSVRow(opts.SavefileUUID, line)
-		if parseErr != nil {
-			return 0, fmt.Errorf("%s:%d: %w", opts.InputPath, lineNo, parseErr)
+		if len(targets) > 0 {
+			row, parseErr := timeshadedb.ParseChunkTSVRow(opts.SavefileUUID, line)
+			if parseErr != nil {
+				return 0, fmt.Errorf("%s:%d: %w", opts.InputPath, lineNo, parseErr)
+			}
+			if matchesResumeTarget(row, targets) {
+				lastMatchedOffset = nextOffset
+				batch = batch[:0]
+				offset = nextOffset
+				continue
+			}
 		}
-		if len(targets) > 0 && matchesResumeTarget(row, targets) {
-			lastMatchedOffset = nextOffset
-			batch = batch[:0]
-		} else if len(targets) == 0 || lastMatchedOffset >= 0 {
+		if len(targets) == 0 || lastMatchedOffset >= 0 {
 			batch = append(batch, line)
 			if len(batch) >= opts.BatchRows {
 				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
@@ -161,9 +170,6 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		if line != "" {
 			trimmed := strings.TrimRight(line, "\r\n")
 			if strings.TrimSpace(trimmed) != "" {
-				if _, parseErr := timeshadedb.ParseChunkTSVRow(opts.SavefileUUID, trimmed); parseErr != nil {
-					return offset, parseErr
-				}
 				batch = append(batch, trimmed)
 				if len(batch) >= opts.BatchRows {
 					if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {

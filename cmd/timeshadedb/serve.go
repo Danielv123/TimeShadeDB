@@ -29,6 +29,11 @@ type webServer struct {
 	static http.Handler
 }
 
+const (
+	maxChunkIngestRows = 16384
+	maxChunkIngestBody = maxChunkIngestRows * 4608
+)
+
 type metadataResponse struct {
 	CanvasWidth  int    `json:"canvasWidth"`
 	CanvasHeight int    `json:"canvasHeight"`
@@ -271,7 +276,7 @@ func (s *webServer) handleChunkIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	r.Body = http.MaxBytesReader(w, r.Body, 4096*8192)
+	r.Body = http.MaxBytesReader(w, r.Body, maxChunkIngestBody)
 	scanner := bufio.NewScanner(r.Body)
 	scanner.Buffer(make([]byte, 0, 8192), 1024*1024)
 	rows, err := timeshadedb.ParseChunkTSV(savefileUUID, scanner)
@@ -283,7 +288,7 @@ func (s *webServer) handleChunkIngest(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "request body contains no rows")
 		return
 	}
-	if len(rows) > 4096 {
+	if len(rows) > maxChunkIngestRows {
 		writeAPIError(w, http.StatusRequestEntityTooLarge, "too many rows in request")
 		return
 	}
