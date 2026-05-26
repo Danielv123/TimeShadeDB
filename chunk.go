@@ -56,6 +56,7 @@ type factorioChunkState struct {
 	latestTick   uint64
 	latestRowSeq uint64
 	index        chunkIndex
+	tileBacked   bool
 }
 
 type chunkIndex struct {
@@ -968,9 +969,14 @@ func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 		chunk := write.chunk
 		var kind uint8
 		var raw []byte
-		if write.snapshot {
+		writeSnapshot := write.snapshot || !chunk.tileBacked
+		if writeSnapshot {
 			kind = frameKindSnapshot
-			raw = encodeChunkSnapshot(write.snapshotPixels)
+			snapshotPixels := write.snapshotPixels
+			if !write.snapshot {
+				snapshotPixels = chunk.pixels
+			}
+			raw = encodeChunkSnapshot(snapshotPixels)
 		} else {
 			kind = frameKindDelta
 			raw = encodeChunkDeltaPayload(entry.Tick, entry.Changes)
@@ -979,7 +985,10 @@ func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 		if err != nil {
 			return err
 		}
-		if write.snapshot {
+		if writeSnapshot {
+			if !chunk.tileBacked {
+				chunk.index = chunkIndex{}
+			}
 			chunk.index.snapshots = append(chunk.index.snapshots, chunkSnapshotRecord{
 				Tick:               entry.Tick,
 				FrameOffset:        offset,
@@ -990,6 +999,7 @@ func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 				EventSeq:           entry.Seq,
 				Checksum:           checksum,
 			})
+			chunk.tileBacked = true
 		} else {
 			chunk.index.deltas = append(chunk.index.deltas, chunkDeltaRecord{
 				MinTick:        entry.Tick,
@@ -1010,12 +1020,10 @@ func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 
 func (db *DB) ensureChunkDatastoreFilesLocked(ds *chunkDatastore) error {
 	dsDir := chunkDatastorePath(db.path, ds.key)
-	if !ds.dirsReady {
-		if err := os.MkdirAll(filepath.Join(dsDir, "tiles"), 0o755); err != nil {
-			return err
-		}
-		ds.dirsReady = true
+	if err := os.MkdirAll(filepath.Join(dsDir, "tiles"), 0o755); err != nil {
+		return err
 	}
+	ds.dirsReady = true
 	if !ds.metadataWritten {
 		if err := writeChunkMetadata(dsDir, ds.key); err != nil {
 			return err
@@ -1256,7 +1264,7 @@ func (db *DB) loadLegacyChunkIndexFilesLocked(ds *chunkDatastore, dsDir string) 
 			return false, err
 		}
 		dataPath := chunkDataPath(db.path, ds.key, coord)
-		if err := db.loadChunkFramesLocked(ds, coord, idx, dataPath, func(f *os.File) error {
+		if err := db.loadChunkFramesLocked(ds, coord, idx, false, dataPath, func(f *os.File) error {
 			return readChunkDataHeader(f, coord)
 		}); err != nil {
 			return false, err
@@ -1287,7 +1295,7 @@ func (db *DB) loadChunkTileIndexFilesLocked(ds *chunkDatastore, dsDir string) (b
 		}
 		dataPath := chunkTileDataPath(db.path, ds.key, tile)
 		for coord, idx := range indexes {
-			if err := db.loadChunkFramesLocked(ds, coord, idx, dataPath, func(f *os.File) error {
+			if err := db.loadChunkFramesLocked(ds, coord, idx, true, dataPath, func(f *os.File) error {
 				return readChunkTileDataHeader(f, tile)
 			}); err != nil {
 				return false, err
@@ -1298,7 +1306,7 @@ func (db *DB) loadChunkTileIndexFilesLocked(ds *chunkDatastore, dsDir string) (b
 	return loaded, nil
 }
 
-func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx chunkIndex, dataPath string, readHeader func(*os.File) error) error {
+func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx chunkIndex, tileBacked bool, dataPath string, readHeader func(*os.File) error) error {
 	f, err := os.Open(dataPath)
 	if err != nil {
 		return err
@@ -1309,6 +1317,7 @@ func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx ch
 	}
 	chunk := ds.chunkLocked(coord)
 	chunk.index = idx
+	chunk.tileBacked = tileBacked
 	type indexedFrame struct {
 		offset uint64
 		seq    uint64

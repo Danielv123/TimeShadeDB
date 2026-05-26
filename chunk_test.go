@@ -249,13 +249,61 @@ func TestLoadLegacyPerChunkFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
 	got, err := db.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 10, Chunk: coord})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Pixels[0] != 0x2462 || got.Pixels[ChunkPixelCount-1] != 0x2462 {
 		t.Fatalf("legacy chunk pixels were not loaded")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rw, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := make([]uint16, ChunkPixelCount)
+	for i := range updated {
+		updated[i] = 0x2462
+	}
+	updated[0] = 0xf800
+	if _, err := rw.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 11, Chunk: coord, Pixels: updated}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tile := chunkTileCoordForChunk(coord)
+	_, tileIndexes, err := readChunkTileIndex(chunkTileIndexPath(dbPath, key, tile))
+	if err != nil {
+		t.Fatalf("tile index after legacy migration unreadable: %v", err)
+	}
+	migrated := tileIndexes[coord]
+	if len(migrated.snapshots) != 1 || len(migrated.deltas) != 0 {
+		t.Fatalf("migrated tile index snapshots=%d deltas=%d, want one fresh tile snapshot", len(migrated.snapshots), len(migrated.deltas))
+	}
+
+	reopened, err := Open(OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	oldTick, err := reopened.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 10, Chunk: coord})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldTick.Pixels[0] != 0x2462 {
+		t.Fatalf("legacy history after migration = %#04x, want 0x2462", oldTick.Pixels[0])
+	}
+	newTick, err := reopened.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 11, Chunk: coord})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newTick.Pixels[0] != 0xf800 || newTick.Pixels[1] != 0x2462 {
+		t.Fatalf("migrated tile snapshot pixels = %#04x %#04x, want 0xf800 0x2462", newTick.Pixels[0], newTick.Pixels[1])
 	}
 }
 
