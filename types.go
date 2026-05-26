@@ -142,6 +142,33 @@ type IngestDatastoreMetadata struct {
 	LatestRowSeq uint64 `json:"latest_row_seq"`
 }
 
+type ChunkSaveCatalog struct {
+	Saves []ChunkSaveSummary `json:"saves"`
+}
+
+type ChunkSaveSummary struct {
+	SavefileUUID string                  `json:"savefile_uuid"`
+	Forces       []string                `json:"forces"`
+	Surfaces     []string                `json:"surfaces"`
+	Datastores   []ChunkDatastoreSummary `json:"datastores"`
+}
+
+type ChunkDatastoreSummary struct {
+	Surface      string `json:"surface"`
+	Force        string `json:"force"`
+	LatestTick   uint64 `json:"latest_tick"`
+	LatestRowSeq uint64 `json:"latest_row_seq"`
+	ChunkCount   int    `json:"chunk_count"`
+	MinChunkX    int32  `json:"min_chunk_x"`
+	MaxChunkX    int32  `json:"max_chunk_x"`
+	MinChunkY    int32  `json:"min_chunk_y"`
+	MaxChunkY    int32  `json:"max_chunk_y"`
+	MinTileX     int32  `json:"min_tile_x"`
+	MaxTileX     int32  `json:"max_tile_x"`
+	MinTileY     int32  `json:"min_tile_y"`
+	MaxTileY     int32  `json:"max_tile_y"`
+}
+
 func Open(opts OpenOptions) (*DB, error) {
 	return openDB(opts)
 }
@@ -168,6 +195,10 @@ func (db *DB) ChunkAt(ctx context.Context, opts ChunkAtOptions) (*ChunkResult, e
 
 func (db *DB) IngestMetadata(savefileUUID string) (*IngestMetadata, error) {
 	return db.ingestMetadata(savefileUUID)
+}
+
+func (db *DB) ChunkSaveCatalog() (*ChunkSaveCatalog, error) {
+	return db.chunkSaveCatalog()
 }
 
 func (db *DB) TimeRange() (uint32, uint32) {

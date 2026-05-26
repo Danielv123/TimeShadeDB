@@ -194,6 +194,9 @@ func (s *webServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/meta", s.handleMetadata)
 	mux.HandleFunc("/api/tiles/", s.handleTile)
+	mux.HandleFunc("/api/chunk/saves", s.handleChunkSaves)
+	mux.HandleFunc("/api/chunk/saves/", s.handleChunkSaves)
+	mux.HandleFunc("/api/chunk/tiles/", s.handleChunkTile)
 	mux.HandleFunc("/api/ingest/chunk/", s.handleChunkIngest)
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
@@ -244,6 +247,62 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	if err := encodeTilePNG(w, res, timeshadedb.TileSize, timeshadedb.TileSize, png.BestSpeed); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+func (s *webServer) handleChunkSaves(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	catalog, err := s.db.ChunkSaveCatalog()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	rel := strings.TrimPrefix(path.Clean(r.URL.Path), "/api/chunk/saves")
+	if rel == "" || rel == "." || rel == "/" {
+		writeAPIJSON(w, catalog)
+		return
+	}
+	savefileUUID, err := url.PathUnescape(strings.TrimPrefix(rel, "/"))
+	if err != nil || strings.TrimSpace(savefileUUID) == "" || strings.Contains(savefileUUID, "/") {
+		writeAPIError(w, http.StatusNotFound, "save not found")
+		return
+	}
+	for _, save := range catalog.Saves {
+		if save.SavefileUUID == savefileUUID {
+			writeAPIJSON(w, save)
+			return
+		}
+	}
+	writeAPIError(w, http.StatusNotFound, "save not found")
+}
+
+func (s *webServer) handleChunkTile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	key, z, x, y, err := parseChunkTilePath(r.URL.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if z > 0 {
+		writeAPIError(w, http.StatusNotFound, "tile out of bounds")
+		return
+	}
+	tick, err := parseGameTick(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	img := s.renderChunkTile(r.Context(), key, tick, int32(x), int32(y))
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if err := png.Encode(w, img); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 	}
 }
@@ -308,6 +367,37 @@ func (s *webServer) tileAtZoom(ctx context.Context, ts time.Time, z, x, y int) (
 		})
 	}
 	return s.downsampledTileAt(ctx, ts, z, x, y)
+}
+
+func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, tileX, tileY int32) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, timeshadedb.TileSize, timeshadedb.TileSize))
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = 0xff
+	}
+	chunksPerTile := timeshadedb.TileSize / timeshadedb.ChunkSize
+	baseChunkX := tileX * int32(chunksPerTile)
+	baseChunkY := tileY * int32(chunksPerTile)
+	for cy := 0; cy < chunksPerTile; cy++ {
+		for cx := 0; cx < chunksPerTile; cx++ {
+			coord := timeshadedb.ChunkCoord{X: baseChunkX + int32(cx), Y: baseChunkY + int32(cy)}
+			chunk, err := s.db.ChunkAt(ctx, timeshadedb.ChunkAtOptions{Key: key, Tick: tick, Chunk: coord})
+			if err != nil {
+				continue
+			}
+			for py := 0; py < timeshadedb.ChunkSize; py++ {
+				for px := 0; px < timeshadedb.ChunkSize; px++ {
+					color565 := chunk.Pixels[py*timeshadedb.ChunkSize+px]
+					offset := img.PixOffset(cx*timeshadedb.ChunkSize+px, cy*timeshadedb.ChunkSize+py)
+					r, g, b := rgb565ToRGB(color565)
+					img.Pix[offset] = r
+					img.Pix[offset+1] = g
+					img.Pix[offset+2] = b
+					img.Pix[offset+3] = 0xff
+				}
+			}
+		}
+	}
+	return img
 }
 
 func (s *webServer) downsampledTileAt(ctx context.Context, ts time.Time, z, x, y int) (*timeshadedb.TileResult, error) {
@@ -412,6 +502,37 @@ func parseTilePath(urlPath string) (int, int, int, error) {
 	return parsed[0], parsed[1], parsed[2], nil
 }
 
+func parseChunkTilePath(urlPath string) (timeshadedb.DatastoreKey, int, int, int, error) {
+	rel := strings.TrimPrefix(path.Clean(urlPath), "/api/chunk/tiles/")
+	parts := strings.Split(rel, "/")
+	if len(parts) != 6 {
+		return timeshadedb.DatastoreKey{}, 0, 0, 0, fmt.Errorf("expected /api/chunk/tiles/{savefile_uuid}/{force}/{surface}/{z}/{x}/{y}.png")
+	}
+	savefileUUID, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return timeshadedb.DatastoreKey{}, 0, 0, 0, fmt.Errorf("invalid savefile UUID")
+	}
+	force, err := url.PathUnescape(parts[1])
+	if err != nil {
+		return timeshadedb.DatastoreKey{}, 0, 0, 0, fmt.Errorf("invalid force")
+	}
+	surface, err := url.PathUnescape(parts[2])
+	if err != nil {
+		return timeshadedb.DatastoreKey{}, 0, 0, 0, fmt.Errorf("invalid surface")
+	}
+	yText := strings.TrimSuffix(parts[5], ".png")
+	values := []string{parts[3], parts[4], yText}
+	parsed := [3]int{}
+	for i, value := range values {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return timeshadedb.DatastoreKey{}, 0, 0, 0, fmt.Errorf("invalid tile coordinate %q", value)
+		}
+		parsed[i] = n
+	}
+	return timeshadedb.DatastoreKey{SavefileUUID: savefileUUID, Surface: surface, Force: force}, parsed[0], parsed[1], parsed[2], nil
+}
+
 func parseChunkIngestPath(urlPath string) (string, bool, error) {
 	rel := strings.TrimPrefix(path.Clean(urlPath), "/api/ingest/chunk/")
 	if rel == "" || rel == "." || strings.HasPrefix(rel, "..") {
@@ -437,6 +558,25 @@ func parseTimestampSec(r *http.Request) (uint32, error) {
 		return 0, fmt.Errorf("invalid ts query parameter")
 	}
 	return uint32(ts), nil
+}
+
+func parseGameTick(r *http.Request) (uint64, error) {
+	tickText := r.URL.Query().Get("tick")
+	if tickText == "" {
+		return 0, fmt.Errorf("missing tick query parameter")
+	}
+	tick, err := strconv.ParseUint(tickText, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid tick query parameter")
+	}
+	return tick, nil
+}
+
+func rgb565ToRGB(v uint16) (uint8, uint8, uint8) {
+	r := uint8((uint32(v>>11) & 0x1f) * 255 / 31)
+	g := uint8((uint32(v>>5) & 0x3f) * 255 / 63)
+	b := uint8((uint32(v) & 0x1f) * 255 / 31)
+	return r, g, b
 }
 
 func minTileZoom(cols, rows int) int {

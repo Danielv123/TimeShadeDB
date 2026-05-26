@@ -194,6 +194,41 @@ func TestWebChunkIngestAPI(t *testing.T) {
 		t.Fatalf("chunk metadata = %+v", meta)
 	}
 
+	savesReq := httptest.NewRequest(http.MethodGet, "/api/chunk/saves", nil)
+	savesResp := httptest.NewRecorder()
+	handler.ServeHTTP(savesResp, savesReq)
+	if savesResp.Code != http.StatusOK {
+		t.Fatalf("chunk save catalog status = %d, body %s", savesResp.Code, savesResp.Body.String())
+	}
+	var catalog timeshadedb.ChunkSaveCatalog
+	if err := json.Unmarshal(savesResp.Body.Bytes(), &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Saves) != 1 || catalog.Saves[0].SavefileUUID != saveID {
+		t.Fatalf("chunk save catalog = %+v", catalog)
+	}
+	if got := catalog.Saves[0].Datastores[0]; got.Force != "player" || got.Surface != "nauvis" || got.MinTileX != -1 || got.MinTileY != -1 {
+		t.Fatalf("chunk datastore summary = %+v", got)
+	}
+
+	chunkTileReq := httptest.NewRequest(http.MethodGet, "/api/chunk/tiles/"+saveID+"/player/nauvis/0/-1/-1.png?tick=10", nil)
+	chunkTileResp := httptest.NewRecorder()
+	handler.ServeHTTP(chunkTileResp, chunkTileReq)
+	if chunkTileResp.Code != http.StatusOK {
+		t.Fatalf("chunk tile status = %d, body %s", chunkTileResp.Code, chunkTileResp.Body.String())
+	}
+	chunkImg, err := png.Decode(chunkTileResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := chunkImg.Bounds().Dx(), timeshadedb.TileSize; got != want {
+		t.Fatalf("chunk tile width = %d, want %d", got, want)
+	}
+	r, g, b, a := chunkImg.At(9*timeshadedb.ChunkSize, 10*timeshadedb.ChunkSize).RGBA()
+	if r == 0 && g == 0 && b == 0 || a>>8 != 255 {
+		t.Fatalf("chunk tile pixel = rgba(%d,%d,%d,%d), want nonblack opaque", r>>8, g>>8, b>>8, a>>8)
+	}
+
 	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
 		Key:   timeshadedb.DatastoreKey{SavefileUUID: saveID, Surface: "nauvis", Force: "player"},
 		Tick:  10,

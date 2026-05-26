@@ -647,6 +647,104 @@ func (db *DB) ingestMetadata(savefileUUID string) (*IngestMetadata, error) {
 	return meta, nil
 }
 
+func (db *DB) chunkSaveCatalog() (*ChunkSaveCatalog, error) {
+	db.chunkMu.RLock()
+	loaded := db.chunkLoaded
+	db.chunkMu.RUnlock()
+	if !loaded {
+		db.chunkMu.Lock()
+		if err := db.loadChunksLocked(); err != nil {
+			db.chunkMu.Unlock()
+			return nil, err
+		}
+		db.chunkMu.Unlock()
+	}
+
+	db.chunkMu.RLock()
+	defer db.chunkMu.RUnlock()
+	saveMap := map[string]*ChunkSaveSummary{}
+	for key, ds := range db.chunkDatastores {
+		save := saveMap[key.SavefileUUID]
+		if save == nil {
+			save = &ChunkSaveSummary{SavefileUUID: key.SavefileUUID}
+			saveMap[key.SavefileUUID] = save
+		}
+		save.Datastores = append(save.Datastores, summarizeChunkDatastore(ds))
+	}
+	catalog := &ChunkSaveCatalog{Saves: make([]ChunkSaveSummary, 0, len(saveMap))}
+	for _, save := range saveMap {
+		forceSet := map[string]struct{}{}
+		surfaceSet := map[string]struct{}{}
+		for _, ds := range save.Datastores {
+			forceSet[ds.Force] = struct{}{}
+			surfaceSet[ds.Surface] = struct{}{}
+		}
+		save.Forces = sortedStringKeys(forceSet)
+		save.Surfaces = sortedStringKeys(surfaceSet)
+		sort.Slice(save.Datastores, func(i, j int) bool {
+			if save.Datastores[i].Force != save.Datastores[j].Force {
+				return save.Datastores[i].Force < save.Datastores[j].Force
+			}
+			return save.Datastores[i].Surface < save.Datastores[j].Surface
+		})
+		catalog.Saves = append(catalog.Saves, *save)
+	}
+	sort.Slice(catalog.Saves, func(i, j int) bool {
+		return catalog.Saves[i].SavefileUUID < catalog.Saves[j].SavefileUUID
+	})
+	return catalog, nil
+}
+
+func summarizeChunkDatastore(ds *chunkDatastore) ChunkDatastoreSummary {
+	out := ChunkDatastoreSummary{
+		Surface:      ds.key.Surface,
+		Force:        ds.key.Force,
+		LatestTick:   ds.latestTick,
+		LatestRowSeq: ds.latestRowSeq,
+	}
+	first := true
+	for coord := range ds.chunks {
+		if first {
+			out.MinChunkX = coord.X
+			out.MaxChunkX = coord.X
+			out.MinChunkY = coord.Y
+			out.MaxChunkY = coord.Y
+			first = false
+		} else {
+			if coord.X < out.MinChunkX {
+				out.MinChunkX = coord.X
+			}
+			if coord.X > out.MaxChunkX {
+				out.MaxChunkX = coord.X
+			}
+			if coord.Y < out.MinChunkY {
+				out.MinChunkY = coord.Y
+			}
+			if coord.Y > out.MaxChunkY {
+				out.MaxChunkY = coord.Y
+			}
+		}
+		out.ChunkCount++
+	}
+	if out.ChunkCount > 0 {
+		chunksPerTile := TileSize / ChunkSize
+		out.MinTileX = floorDiv32(out.MinChunkX, chunksPerTile)
+		out.MaxTileX = floorDiv32(out.MaxChunkX, chunksPerTile)
+		out.MinTileY = floorDiv32(out.MinChunkY, chunksPerTile)
+		out.MaxTileY = floorDiv32(out.MaxChunkY, chunksPerTile)
+	}
+	return out
+}
+
+func sortedStringKeys(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func ParseChunkTSVRow(savefileUUID, line string) (ParsedChunkRow, error) {
 	return parseChunkTSVRow(savefileUUID, line, true)
 }
