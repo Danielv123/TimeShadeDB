@@ -3,6 +3,7 @@ package timeshadedb
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,7 +90,22 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if len(meta.Datastores) != 1 || meta.Datastores[0].LatestTick != 12 || meta.Datastores[0].LatestChunkX != -7 {
 		t.Fatalf("metadata = %+v", meta)
 	}
+	dataPath := chunkDataPath(dbPath, key, ChunkCoord{X: -7, Y: -6})
+	indexPath := chunkIndexPath(dbPath, key, ChunkCoord{X: -7, Y: -6})
+	if _, err := os.Stat(dataPath); err != nil {
+		t.Fatalf("chunk data file missing: %v", err)
+	}
+	_, idx, err := readChunkIndex(indexPath)
+	if err != nil {
+		t.Fatalf("chunk index unreadable: %v", err)
+	}
+	if len(idx.snapshots) != 1 || len(idx.deltas) != 2 {
+		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 2 deltas", len(idx.snapshots), len(idx.deltas))
+	}
 	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(chunkLogPath(dbPath)); err != nil {
 		t.Fatal(err)
 	}
 
