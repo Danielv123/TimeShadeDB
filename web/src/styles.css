@@ -212,6 +212,15 @@ h1 {
   image-rendering: pixelated;
 }
 
+.leaflet-tile,
+.leaflet-fade-anim .leaflet-tile {
+  transition: none !important;
+}
+
+.leaflet-container img.leaflet-tile {
+  mix-blend-mode: normal !important;
+}
+
 .leaflet-control-zoom {
   border: 1px solid #cfd6cc !important;
   box-shadow: 0 8px 22px rgb(23 32 38 / 0.16) !important;
