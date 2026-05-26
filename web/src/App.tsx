@@ -35,6 +35,7 @@ type SliderStyle = CSSProperties & {
 };
 
 const tileRequestThrottleMs = 100;
+const metadataRefreshMs = 10_000;
 const tileSize = 512;
 const maxDisplayZoom = 4;
 const playbackSpeedOptions = [60, 300, 900, 1800, 3600, 7200, 18000, 36000];
@@ -134,6 +135,7 @@ export function App() {
   const lastRequestAtRef = useRef(0);
   const pendingRequestTickRef = useRef(0);
   const tickRef = useRef(0);
+  const selectedDatastoreKeyRef = useRef("");
   const [catalog, setCatalog] = useState<SaveCatalog | null>(null);
   const [selectedSaveID, setSelectedSaveID] = useState<string | null>(() => selectedSaveFromPath());
   const [selectedForce, setSelectedForce] = useState("");
@@ -170,6 +172,17 @@ export function App() {
       ) ?? null
     );
   }, [selectedForce, selectedSave, selectedSurface]);
+  const selectedDatastoreKey = selectedDatastore
+    ? `${selectedSave?.savefile_uuid ?? ""}\0${selectedDatastore.force}\0${selectedDatastore.surface}`
+    : "";
+  const selectedDatastoreBoundsKey = selectedDatastore
+    ? [
+        selectedDatastore.min_tile_x,
+        selectedDatastore.max_tile_x,
+        selectedDatastore.min_tile_y,
+        selectedDatastore.max_tile_y
+      ].join("\0")
+    : "";
   const minZoom = useMemo(() => minZoomForDatastore(selectedDatastore), [selectedDatastore]);
 
   const navigateToSave = useCallback((savefileUUID: string | null) => {
@@ -213,25 +226,39 @@ export function App() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/chunk/saves")
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(`Save list request failed: ${response.status}`);
-        }
-        return response.json() as Promise<SaveCatalog>;
-      })
-      .then((nextCatalog) => {
-        if (!cancelled) {
-          setCatalog(nextCatalog);
-        }
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : String(err));
-        }
-      });
+    let inFlight: AbortController | null = null;
+    const loadCatalog = () => {
+      if (inFlight) {
+        return;
+      }
+      inFlight = new AbortController();
+      fetch("/api/chunk/saves", { signal: inFlight.signal })
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(`Save list request failed: ${response.status}`);
+          }
+          return response.json() as Promise<SaveCatalog>;
+        })
+        .then((nextCatalog) => {
+          if (!cancelled) {
+            setCatalog(nextCatalog);
+          }
+        })
+        .catch((err: unknown) => {
+          if (!cancelled && !(err instanceof DOMException && err.name === "AbortError")) {
+            setError(err instanceof Error ? err.message : String(err));
+          }
+        })
+        .finally(() => {
+          inFlight = null;
+        });
+    };
+    loadCatalog();
+    const refreshTimer = window.setInterval(loadCatalog, metadataRefreshMs);
     return () => {
       cancelled = true;
+      window.clearInterval(refreshTimer);
+      inFlight?.abort();
     };
   }, []);
 
@@ -277,15 +304,27 @@ export function App() {
       setTick(0);
       setRequestTick(0);
       tickRef.current = 0;
+      selectedDatastoreKeyRef.current = "";
       return;
     }
     const nextTick = selectedDatastore.latest_tick || 0;
-    tickRef.current = nextTick;
-    setTick(nextTick);
-    setRequestTick(nextTick);
-    pendingRequestTickRef.current = nextTick;
-    lastRequestAtRef.current = performance.now();
-  }, [selectedDatastore]);
+    if (selectedDatastoreKeyRef.current !== selectedDatastoreKey) {
+      selectedDatastoreKeyRef.current = selectedDatastoreKey;
+      tickRef.current = nextTick;
+      setTick(nextTick);
+      setRequestTick(nextTick);
+      pendingRequestTickRef.current = nextTick;
+      lastRequestAtRef.current = performance.now();
+      return;
+    }
+    if (tickRef.current > nextTick) {
+      tickRef.current = nextTick;
+      setTick(nextTick);
+      setRequestTick(nextTick);
+      pendingRequestTickRef.current = nextTick;
+      lastRequestAtRef.current = performance.now();
+    }
+  }, [selectedDatastore, selectedDatastoreKey]);
 
   useEffect(() => {
     tickRef.current = tick;
@@ -348,18 +387,29 @@ export function App() {
       pendingLayerRef.current = null;
       borderRef.current = null;
     };
-  }, [minZoom, selectedDatastore]);
+  }, [selectedDatastoreKey]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!selectedSave || !selectedDatastore || !selectedForce || !selectedSurface || !map) {
+    if (!selectedDatastore || !map) {
+      return;
+    }
+    const bounds = datastoreBounds(selectedDatastore);
+    map.setMinZoom(minZoom);
+    map.setMaxBounds(bounds.pad(0.35));
+    borderRef.current?.setBounds(bounds);
+  }, [minZoom, selectedDatastore, selectedDatastoreBoundsKey]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!selectedSaveID || !selectedDatastore || !selectedForce || !selectedSurface || !map) {
       return;
     }
     const seq = ++renderSeqRef.current;
     pendingLayerRef.current?.remove();
     const bounds = datastoreBounds(selectedDatastore);
     const nextLayer = decodedTileLayer(
-      tileLayerUrl(selectedSave.savefile_uuid, selectedForce, selectedSurface, requestTick),
+      tileLayerUrl(selectedSaveID, selectedForce, selectedSurface, requestTick),
       {
         tileSize,
         minZoom,
@@ -415,7 +465,15 @@ export function App() {
         nextLayer.remove();
       }
     };
-  }, [minZoom, requestTick, selectedDatastore, selectedForce, selectedSave, selectedSurface]);
+  }, [
+    minZoom,
+    requestTick,
+    selectedDatastoreBoundsKey,
+    selectedDatastoreKey,
+    selectedForce,
+    selectedSaveID,
+    selectedSurface
+  ]);
 
   const sliderDisabled = !selectedDatastore || selectedDatastore.latest_tick <= 0;
   const progress = useMemo(() => {
