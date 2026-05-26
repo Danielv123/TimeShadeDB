@@ -38,6 +38,7 @@ Measured the local `factorio` DB before changing persistence from one `.cdat` an
 | Time | Layout | Files | Logical MiB | Estimated allocated MiB | Estimated slack MiB | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | 2026-05-27T00:20:00+02:00 | Per-32x32-chunk `.cdat/.cidx` | 20485 | 73.01 | 2571.88 | 2498.78 | 10,216 `.cdat`, 10,216 `.cidx`, 53 `.json`; tiny files amplify exFAT allocation-unit overhead by about 35.2x |
+| 2026-05-27T00:28:00+02:00 | Per-512x512-tile `.tdat/.tidx` smoke test | 17 | 0.06 | 2.12 | 2.06 | 2,048 TSV rows, 198 touched chunks, 6 `.tdat`, 6 `.tidx`, 5 `.json`; separate `build\timeshadedb-tile-shards.exe` on a throwaway `build\tile-shard-smoke-*` DB |
 
 The 512x512 tile-sharded format is expected to reduce the current 20k+ chunk data/index files to roughly two files per touched 512x512 tile per datastore, while retaining legacy per-chunk readers for existing databases.
 
