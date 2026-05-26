@@ -49,10 +49,15 @@ func TestParseChunkTSVRowEmptyPayloadIsBlack(t *testing.T) {
 func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "db.tshd")
-	db, err := Open(OpenOptions{Path: dbPath})
+	db, err := Open(OpenOptions{Path: dbPath, Format: FormatChunks})
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertPathMissing(t, filepath.Join(dbPath, "tiles"))
+	assertPathMissing(t, filepath.Join(dbPath, "wal"))
+	assertPathMissing(t, filepath.Join(dbPath, "factorio_chunks"))
+	assertPathMissing(t, filepath.Join(dbPath, "palette.bin"))
+	assertPathMissing(t, filepath.Join(dbPath, "stats.json"))
 	key := DatastoreKey{SavefileUUID: "save-1", Surface: "nauvis", Force: "player"}
 	first := make([]uint16, ChunkPixelCount)
 	for i := range first {
@@ -107,6 +112,9 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if _, err := os.Stat(dataPath); err != nil {
 		t.Fatalf("chunk data file missing: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(dbPath, "datastores")); err != nil {
+		t.Fatalf("datastores directory missing: %v", err)
+	}
 	_, idx, err := readChunkIndex(indexPath)
 	if err != nil {
 		t.Fatalf("chunk index unreadable: %v", err)
@@ -115,9 +123,6 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 2 deltas", len(idx.snapshots), len(idx.deltas))
 	}
 	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(chunkLogPath(dbPath)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -137,4 +142,13 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 
 func repeatedRGB565Hex(color uint16) string {
 	return strings.Repeat(fmt.Sprintf("%04x", color), ChunkPixelCount)
+}
+
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err == nil {
+		t.Fatalf("path should not exist: %s", path)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", path, err)
+	}
 }

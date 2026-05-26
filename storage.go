@@ -45,8 +45,10 @@ type manifest struct {
 	CanvasWidth   int    `json:"canvas_width"`
 	CanvasHeight  int    `json:"canvas_height"`
 	TileSize      int    `json:"tile_size"`
+	ChunkSize     int    `json:"chunk_size,omitempty"`
+	PixelFormat   string `json:"pixel_format,omitempty"`
 	TimestampUnit string `json:"timestamp_unit"`
-	PaletteFile   string `json:"palette_file"`
+	PaletteFile   string `json:"palette_file,omitempty"`
 	Codec         string `json:"codec"`
 	CodecLevel    int    `json:"codec_level"`
 }
@@ -210,7 +212,14 @@ func openDB(opts OpenOptions) (*DB, error) {
 		if opts.ReadOnly {
 			return nil, fmt.Errorf("timeshadedb: database does not exist: %s", opts.Path)
 		}
-		return createDB(opts.Path, opts.CacheSize)
+		switch opts.Format {
+		case FormatChunks:
+			return createChunkDB(opts.Path, opts.CacheSize)
+		case "", FormatLegacyTiles:
+			return createTileDB(opts.Path, opts.CacheSize)
+		default:
+			return nil, fmt.Errorf("timeshadedb: unsupported create format %q", opts.Format)
+		}
 	}
 	if statErr != nil {
 		return nil, statErr
@@ -218,7 +227,7 @@ func openDB(opts OpenOptions) (*DB, error) {
 	return loadDB(opts)
 }
 
-func createDB(path string, cacheSize int64) (*DB, error) {
+func createTileDB(path string, cacheSize int64) (*DB, error) {
 	if err := os.MkdirAll(filepath.Join(path, "tiles"), 0o755); err != nil {
 		return nil, err
 	}
@@ -227,6 +236,7 @@ func createDB(path string, cacheSize int64) (*DB, error) {
 	}
 	db := &DB{
 		path:          path,
+		format:        FormatLegacyTiles,
 		paletteMap:    map[uint32]uint8{},
 		nextSeq:       1,
 		compressor:    newCompressionPool(),
@@ -265,12 +275,17 @@ func createDB(path string, cacheSize int64) (*DB, error) {
 }
 
 func loadDB(opts OpenOptions) (*DB, error) {
-	if err := readManifest(opts.Path); err != nil {
+	m, err := readManifest(opts.Path)
+	if err != nil {
 		return nil, err
+	}
+	if m.Version == 2 {
+		return loadChunkDB(opts)
 	}
 	db := &DB{
 		path:          opts.Path,
 		readOnly:      opts.ReadOnly,
+		format:        FormatLegacyTiles,
 		paletteMap:    map[uint32]uint8{},
 		nextSeq:       1,
 		cacheSize:     opts.CacheSize,
@@ -385,19 +400,31 @@ func writeManifest(path string) error {
 	return os.WriteFile(filepath.Join(path, "manifest.json"), data, 0o644)
 }
 
-func readManifest(path string) error {
+func readManifest(path string) (manifest, error) {
 	data, err := os.ReadFile(filepath.Join(path, "manifest.json"))
 	if err != nil {
-		return err
+		return manifest{}, err
 	}
 	var m manifest
 	if err := json.Unmarshal(data, &m); err != nil {
-		return err
+		return manifest{}, err
 	}
-	if m.Format != "timeShadeDB" || m.Version != 1 || m.CanvasWidth != CanvasWidth || m.CanvasHeight != CanvasHeight || m.TileSize != TileSize {
-		return fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
+	if m.Format != "timeShadeDB" {
+		return manifest{}, fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
 	}
-	return nil
+	switch m.Version {
+	case 1:
+		if m.CanvasWidth != CanvasWidth || m.CanvasHeight != CanvasHeight || m.TileSize != TileSize {
+			return manifest{}, fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
+		}
+	case 2:
+		if m.ChunkSize != ChunkSize || m.PixelFormat != "rgb565" {
+			return manifest{}, fmt.Errorf("timeshadedb: unsupported chunk manifest in %s", path)
+		}
+	default:
+		return manifest{}, fmt.Errorf("timeshadedb: unsupported manifest version %d in %s", m.Version, path)
+	}
+	return m, nil
 }
 
 func (db *DB) ingestPlacement(ts time.Time, x, y int, rgb RGB) error {
@@ -406,6 +433,9 @@ func (db *DB) ingestPlacement(ts time.Time, x, y int, rgb RGB) error {
 	}
 	if db.readOnly {
 		return errors.New("timeshadedb: database opened read-only")
+	}
+	if db.format == FormatChunks {
+		return errors.New("timeshadedb: placements require a legacy tile database")
 	}
 	if x < 0 || x >= CanvasWidth || y < 0 || y >= CanvasHeight {
 		return fmt.Errorf("timeshadedb: coordinate out of bounds: %d,%d", x, y)
@@ -704,6 +734,9 @@ func (db *DB) tileAt(ctx context.Context, opts TileAtOptions) (*TileResult, erro
 	if db.closed {
 		return nil, errors.New("timeshadedb: database is closed")
 	}
+	if db.format == FormatChunks {
+		return nil, errors.New("timeshadedb: tile queries require a legacy tile database")
+	}
 	if opts.Tile.X < 0 || opts.Tile.X >= TileCols || opts.Tile.Y < 0 || opts.Tile.Y >= TileRows {
 		return nil, fmt.Errorf("timeshadedb: tile out of bounds: %d,%d", opts.Tile.X, opts.Tile.Y)
 	}
@@ -909,7 +942,7 @@ func (db *DB) close() error {
 		return nil
 	}
 	var errs []error
-	if !db.readOnly {
+	if !db.readOnly && db.format != FormatChunks {
 		for _, t := range db.tiles {
 			if t == nil {
 				continue

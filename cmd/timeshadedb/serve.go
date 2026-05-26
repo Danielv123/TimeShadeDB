@@ -43,7 +43,7 @@ type metadataResponse struct {
 const viteDevURL = "http://127.0.0.1:5173"
 
 func serveHTTP(ctx context.Context, addr, dbPath string, cacheSize int64, dev bool) error {
-	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, CacheSize: cacheSize})
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, CacheSize: cacheSize, Format: timeshadedb.FormatChunks})
 	if err != nil {
 		return err
 	}

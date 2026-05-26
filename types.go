@@ -24,6 +24,7 @@ type RGB struct {
 type DB struct {
 	path     string
 	readOnly bool
+	format   string
 
 	palette    []RGB
 	paletteMap map[uint32]uint8
@@ -55,7 +56,13 @@ type OpenOptions struct {
 	Path      string
 	ReadOnly  bool
 	CacheSize int64
+	Format    string
 }
+
+const (
+	FormatLegacyTiles = "legacy-tiles"
+	FormatChunks      = "chunks"
+)
 
 type TileCoord struct {
 	X int

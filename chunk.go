@@ -22,8 +22,6 @@ import (
 const (
 	ChunkSize           = 32
 	ChunkPixelCount     = ChunkSize * ChunkSize
-	chunkEventsDir      = "factorio_chunks"
-	chunkEventsFile     = "events.jsonl"
 	chunkDatastoresDir  = "datastores"
 	chunkPayloadHex     = ChunkPixelCount * 2 * 2
 	chunkPayloadBytes   = ChunkPixelCount * 2
@@ -107,6 +105,63 @@ type ParsedChunkRow struct {
 	Pixels [ChunkPixelCount]uint16
 }
 
+func createChunkDB(path string, cacheSize int64) (*DB, error) {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, err
+	}
+	db := &DB{
+		path:            path,
+		format:          FormatChunks,
+		compressor:      newCompressionPool(),
+		cacheSize:       cacheSize,
+		chunkDatastores: map[DatastoreKey]*chunkDatastore{},
+		nextChunkSeq:    1,
+		chunkLoaded:     true,
+	}
+	if err := writeChunkManifest(path); err != nil {
+		_ = db.close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func loadChunkDB(opts OpenOptions) (*DB, error) {
+	db := &DB{
+		path:            opts.Path,
+		readOnly:        opts.ReadOnly,
+		format:          FormatChunks,
+		cacheSize:       opts.CacheSize,
+		chunkDatastores: map[DatastoreKey]*chunkDatastore{},
+		nextChunkSeq:    1,
+	}
+	if !opts.ReadOnly {
+		db.compressor = newCompressionPool()
+	}
+	if err := db.loadChunksLocked(); err != nil {
+		_ = db.close()
+		return nil, err
+	}
+	return db, nil
+}
+
+func writeChunkManifest(path string) error {
+	m := manifest{
+		Format:        "timeShadeDB",
+		Version:       2,
+		ChunkSize:     ChunkSize,
+		PixelFormat:   "rgb565",
+		TimestampUnit: "factorio_tick",
+		Codec:         "zstd",
+		CodecLevel:    9,
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(filepath.Join(path, "manifest.json"), data, 0o644)
+}
+
 func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -116,6 +171,9 @@ func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResu
 	}
 	if db.readOnly {
 		return nil, errors.New("timeshadedb: database opened read-only")
+	}
+	if db.format == FormatLegacyTiles {
+		return nil, errors.New("timeshadedb: chunk ingest requires a chunk database")
 	}
 	if len(in.Pixels) != ChunkPixelCount {
 		return nil, fmt.Errorf("timeshadedb: chunk has %d pixels, expected %d", len(in.Pixels), ChunkPixelCount)
@@ -148,9 +206,6 @@ func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResu
 
 	entry := chunkLogEntry{Seq: seq, Tick: in.Tick, Key: in.Key, Chunk: in.Chunk, Changes: changes}
 	if err := db.writeChunkFrameLocked(ds, in.Chunk, chunk, entry, !wasSeen); err != nil {
-		return nil, err
-	}
-	if err := db.appendChunkLogEntryLocked(entry); err != nil {
 		return nil, err
 	}
 	ds.events[in.Chunk] = append(ds.events[in.Chunk], entry)
@@ -403,64 +458,10 @@ func (db *DB) loadChunksLocked() error {
 	}
 	db.chunkDatastores = map[DatastoreKey]*chunkDatastore{}
 	db.nextChunkSeq = 1
-	loadedBinary, err := db.loadChunkDataFilesLocked()
-	if err != nil {
-		return err
-	}
-	if loadedBinary {
-		db.chunkLoaded = true
-		return nil
-	}
-	path := chunkLogPath(db.path)
-	f, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		db.chunkLoaded = true
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for lineNo := 1; scanner.Scan(); lineNo++ {
-		var entry chunkLogEntry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return fmt.Errorf("timeshadedb: chunk log line %d: %w", lineNo, err)
-		}
-		if err := db.applyChunkLogEntryLocked(entry); err != nil {
-			return fmt.Errorf("timeshadedb: chunk log line %d: %w", lineNo, err)
-		}
-	}
-	if err := scanner.Err(); err != nil {
+	if _, err := db.loadChunkDataFilesLocked(); err != nil {
 		return err
 	}
 	db.chunkLoaded = true
-	return nil
-}
-
-func (db *DB) applyChunkLogEntryLocked(entry chunkLogEntry) error {
-	if err := validateDatastoreKey(entry.Key); err != nil {
-		return err
-	}
-	ds := db.chunkDatastoreLocked(entry.Key)
-	chunk := ds.chunkLocked(entry.Chunk)
-	for _, change := range entry.Changes {
-		if int(change.Pos) >= ChunkPixelCount {
-			return fmt.Errorf("chunk event position out of bounds: %d", change.Pos)
-		}
-		chunk.pixels[change.Pos] = change.Color
-	}
-	chunk.seen = true
-	chunk.latestTick = entry.Tick
-	chunk.latestRowSeq = entry.Seq
-	ds.events[entry.Chunk] = append(ds.events[entry.Chunk], entry)
-	ds.latestTick = entry.Tick
-	ds.latestChunk = entry.Chunk
-	ds.latestRowSeq = entry.Seq
-	if entry.Seq >= db.nextChunkSeq {
-		db.nextChunkSeq = entry.Seq + 1
-	}
 	return nil
 }
 
@@ -672,27 +673,8 @@ func (ds *chunkDatastore) chunkLocked(coord ChunkCoord) *factorioChunkState {
 	return chunk
 }
 
-func (db *DB) appendChunkLogEntryLocked(entry chunkLogEntry) error {
-	if err := os.MkdirAll(filepath.Join(db.path, chunkEventsDir), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(chunkLogPath(db.path), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	data, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(append(data, '\n')); err != nil {
-		return err
-	}
-	return f.Sync()
-}
-
 func (db *DB) loadChunkDataFilesLocked() (bool, error) {
-	root := filepath.Join(db.path, chunkEventsDir, chunkDatastoresDir)
+	root := filepath.Join(db.path, chunkDatastoresDir)
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -1002,17 +984,13 @@ func readChunkMetadata(dsDir string) (DatastoreKey, error) {
 	return key, validateDatastoreKey(key)
 }
 
-func chunkLogPath(root string) string {
-	return filepath.Join(root, chunkEventsDir, chunkEventsFile)
-}
-
 func chunkDatastoreID(key DatastoreKey) string {
 	sum := sha256.Sum256([]byte(key.SavefileUUID + "\x00" + key.Surface + "\x00" + key.Force))
 	return hex.EncodeToString(sum[:16])
 }
 
 func chunkDatastorePath(root string, key DatastoreKey) string {
-	return filepath.Join(root, chunkEventsDir, chunkDatastoresDir, chunkDatastoreID(key))
+	return filepath.Join(root, chunkDatastoresDir, chunkDatastoreID(key))
 }
 
 func chunkFileStem(coord ChunkCoord) string {

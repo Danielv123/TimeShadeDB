@@ -159,8 +159,9 @@ deduplicate unchanged pixels.
 - Map bounds are dynamic. New chunks are created on first ingest.
 - A datastore is identified by `(savefile_uuid, surface, force)`.
 - Latest-state data is always available in memory while the server is running.
-- Historical durability comes from append-only chunk data files, chunk indexes,
-  and a WAL for active writes.
+- Historical durability comes from append-only chunk data files and chunk
+  indexes. There is no separate tile directory or write-ahead-log directory in
+  the chunk format.
 
 ## Public API
 
@@ -285,7 +286,7 @@ When a TSV row arrives:
 The live HTTP path should be bounded and backpressured:
 
 ```text
-HTTP request -> TSV parser -> datastore router -> chunk worker -> WAL/frame writer
+HTTP request -> TSV parser -> datastore router -> chunk worker -> chunk frame writer
 ```
 
 ### HTTP reader
@@ -336,9 +337,9 @@ Each active chunk should have a single owner for mutation. The owner:
 1. Reads the live `Pixels` array.
 2. Builds a delta event for every changed pixel.
 3. Updates the live `Pixels` array.
-4. Appends changed events to the active WAL.
-5. Appends changed events to the active delta frame builder.
-6. Schedules frame/snapshot writes when thresholds are reached.
+4. Appends changed events directly to the chunk `.cdat` file.
+5. Updates the chunk `.cidx` sidecar atomically.
+6. Schedules snapshot writes when thresholds are reached.
 
 Chunk-level ownership avoids locks on the hot pixel arrays. A fixed worker pool
 can own many chunks by hashing `(datastore_key, chunk_x, chunk_y)` to a queue.
@@ -367,9 +368,6 @@ db.tshd/
         cx_-000001_cy_000010.cidx
         cx_000000_cy_000010.cdat
         cx_000000_cy_000010.cidx
-      wal/
-        active.wal
-  stats.json
 ```
 
 `datastore_id` is a stable hash or escaped identifier derived from:
@@ -587,35 +585,17 @@ the HTTP boundary.
 
 ## Durability Model
 
-Continuous ingestion is the primary mode, so crash safety is part of the first
-HTTP ingest implementation.
+Continuous ingestion is the primary mode, so the chunk frame files are also the
+durability log. Avoid maintaining a second WAL format beside `.cdat` / `.cidx`.
 
 Writer flow:
 
-1. Append accepted changed events to the datastore WAL.
-2. Update the live in-memory chunk snapshot.
-3. Append completed frame headers and compressed payloads to `.cdat`.
-4. Flush the chunk data file.
-5. Write `*.cidx.tmp`.
-6. Atomically rename `*.cidx.tmp` to `*.cidx`.
-7. Truncate or checkpoint WAL entries that are now represented in chunk frames.
-
-WAL layout:
-
-```text
-datastores/{datastore_id}/wal/active.wal
-```
-
-WAL entries include:
-
-```text
-savefile_uuid/surface/force datastore id
-tick
-chunk_x
-chunk_y
-event_seq
-changed pixel events
-```
+1. Update the live in-memory chunk snapshot.
+2. Append a snapshot or delta frame header and compressed payload to `.cdat`.
+3. Flush the chunk data file.
+4. Write `*.cidx.tmp`.
+5. Atomically rename `*.cidx.tmp` to `*.cidx`.
+6. On startup, ignore any trailing `.cdat` frame not referenced by `.cidx`.
 
 On startup:
 
@@ -623,8 +603,7 @@ On startup:
 2. Load chunk indexes.
 3. Rebuild the latest in-memory snapshot for active chunks from the latest
    snapshot plus deltas.
-4. Replay any WAL entries newer than the persisted indexes.
-5. Resume ingest.
+4. Resume ingest.
 
 ## Multithreading Plan
 
@@ -720,7 +699,7 @@ Correctness tests:
 7. Include negative chunk coordinates.
 8. Include repeated writes to the same chunk at the same tick.
 9. Include unchanged chunk snapshots and verify unchanged pixels are discarded.
-10. Restart after ingest and verify WAL recovery.
+10. Restart after ingest and verify chunk frame/index recovery.
 
 HTTP tests:
 
@@ -756,7 +735,7 @@ average_http_ingest_latency_ms
 query_p50_ms
 query_p95_ms
 query_p99_ms
-wal_recovery_time_ms
+chunk_recovery_time_ms
 live_memory_bytes_by_datastore
 ```
 
@@ -793,10 +772,9 @@ live_memory_bytes_by_datastore
 
 ### Phase 4: Durability
 
-- Add datastore WAL for active unfinalized writes.
-- Recover WAL on startup.
+- Use `.cdat` as the append-only durability log.
 - Add atomic index updates per chunk.
-- Add checkpoint/truncation once WAL entries are persisted in frames.
+- Ignore unindexed trailing frames after a crash.
 - Add crash/restart tests.
 
 ### Phase 5: Performance and tooling

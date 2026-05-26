@@ -141,7 +141,7 @@ func TestWebAPI(t *testing.T) {
 func TestWebChunkIngestAPI(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db.tshd")
-	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath})
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, Format: timeshadedb.FormatChunks})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestWebChunkIngestAPI(t *testing.T) {
 func TestTailChunkTSVOnceResumesFromServerMetadata(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db.tshd")
-	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath})
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, Format: timeshadedb.FormatChunks})
 	if err != nil {
 		t.Fatal(err)
 	}
