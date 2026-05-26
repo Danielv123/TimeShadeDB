@@ -3,4 +3,5 @@ db.tshd/
 *.tshd/
 *.raw
 *.png
+*.prof
 timeshadedb.exe

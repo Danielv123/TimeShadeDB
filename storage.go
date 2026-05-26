@@ -169,8 +169,12 @@ func newCompressionPool() *compressionPool {
 			if fastErr == nil {
 				defer fast.Close()
 			}
+			best, bestErr := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+			if bestErr == nil {
+				defer best.Close()
+			}
 			for job := range p.jobs {
-				payload, err := compressWithFastEncoder(job.raw, job.kind, fast, fastErr)
+				payload, err := compressWithReusableEncoders(job.raw, job.kind, fast, fastErr, best, bestErr)
 				job.resp <- compressionResult{payload: payload, err: err}
 			}
 		}()
@@ -592,11 +596,7 @@ func (db *DB) writeFrame(f *os.File, kind uint8, timestampSec, maxTimeSec, event
 }
 
 func compressZstd(raw []byte, kind uint8) ([]byte, error) {
-	level := zstd.SpeedBestCompression
-	if kind == frameKindDelta && len(raw) < 4096 {
-		level = zstd.SpeedFastest
-	}
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(compressionLevel(raw, kind)))
 	if err != nil {
 		return nil, err
 	}
@@ -604,14 +604,24 @@ func compressZstd(raw []byte, kind uint8) ([]byte, error) {
 	return enc.EncodeAll(raw, nil), nil
 }
 
-func compressWithFastEncoder(raw []byte, kind uint8, fast *zstd.Encoder, fastErr error) ([]byte, error) {
+func compressionLevel(raw []byte, kind uint8) zstd.EncoderLevel {
 	if kind == frameKindDelta && len(raw) < 4096 {
+		return zstd.SpeedFastest
+	}
+	return zstd.SpeedBestCompression
+}
+
+func compressWithReusableEncoders(raw []byte, kind uint8, fast *zstd.Encoder, fastErr error, best *zstd.Encoder, bestErr error) ([]byte, error) {
+	if compressionLevel(raw, kind) == zstd.SpeedFastest {
 		if fastErr != nil {
 			return nil, fastErr
 		}
 		return fast.EncodeAll(raw, nil), nil
 	}
-	return compressZstd(raw, kind)
+	if bestErr != nil {
+		return nil, bestErr
+	}
+	return best.EncodeAll(raw, nil), nil
 }
 
 func decompressZstd(payload []byte, rawLen uint32) ([]byte, error) {
