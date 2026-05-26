@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 
 type Metadata = {
@@ -18,6 +18,7 @@ type SliderStyle = CSSProperties & {
 
 const tileRequestThrottleMs = 100;
 const maxDisplayZoom = 4;
+const playbackSpeedOptions = [1, 5, 10, 30, 60, 300, 900, 3600];
 
 const DecodedTileLayer = L.TileLayer.extend({
   createTile(coords: L.Coords, done: L.DoneCallback) {
@@ -72,12 +73,15 @@ export function App() {
   const requestTimerRef = useRef<number | null>(null);
   const lastRequestAtRef = useRef(0);
   const pendingRequestTimestampRef = useRef(0);
+  const timestampRef = useRef(0);
   const [meta, setMeta] = useState<Metadata | null>(null);
   const [timestamp, setTimestamp] = useState(0);
   const [requestTimestamp, setRequestTimestamp] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(60);
   const [error, setError] = useState<string | null>(null);
 
-  const scheduleTileRequest = (nextTimestamp: number) => {
+  const scheduleTileRequest = useCallback((nextTimestamp: number) => {
     pendingRequestTimestampRef.current = nextTimestamp;
     const now = performance.now();
     const elapsed = now - lastRequestAtRef.current;
@@ -98,7 +102,7 @@ export function App() {
       lastRequestAtRef.current = performance.now();
       setRequestTimestamp(pendingRequestTimestampRef.current);
     }, tileRequestThrottleMs - elapsed);
-  };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -115,6 +119,7 @@ export function App() {
         }
         setMeta(nextMeta);
         const initialTimestamp = nextMeta.toSec || nextMeta.fromSec || 0;
+        timestampRef.current = initialTimestamp;
         setTimestamp(initialTimestamp);
         setRequestTimestamp(initialTimestamp);
         pendingRequestTimestampRef.current = initialTimestamp;
@@ -131,12 +136,40 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    timestampRef.current = timestamp;
+  }, [timestamp]);
+
+  useEffect(() => {
     return () => {
       if (requestTimerRef.current !== null) {
         window.clearTimeout(requestTimerRef.current);
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!isPlaying || !meta || meta.fromSec === meta.toSec) {
+      return;
+    }
+    const interval = window.setInterval(() => {
+      const baseTimestamp = Number.isFinite(timestampRef.current)
+        ? timestampRef.current
+        : meta.fromSec;
+      const nextTimestamp = Math.min(
+        meta.toSec,
+        Math.max(meta.fromSec, baseTimestamp + playbackSpeed)
+      );
+      timestampRef.current = nextTimestamp;
+      setTimestamp(nextTimestamp);
+      scheduleTileRequest(nextTimestamp);
+      if (nextTimestamp >= meta.toSec) {
+        setIsPlaying(false);
+      }
+    }, 1000);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [isPlaying, meta, playbackSpeed, scheduleTileRequest]);
 
   useEffect(() => {
     if (!meta || !mapNode.current || mapRef.current) {
@@ -264,6 +297,48 @@ export function App() {
 
         <section className="controlGroup" aria-label="Timestamp">
           <div className="timestampReadout">{formatTimestamp(timestamp)}</div>
+          <div className="playbackControls">
+            <button
+              className="playbackButton"
+              type="button"
+              disabled={sliderDisabled}
+              aria-pressed={isPlaying}
+              onClick={() => {
+                if (isPlaying) {
+                  setIsPlaying(false);
+                  return;
+                }
+                if (meta && timestampRef.current >= meta.toSec) {
+                  timestampRef.current = meta.fromSec;
+                  setTimestamp(meta.fromSec);
+                  scheduleTileRequest(meta.fromSec);
+                }
+                setIsPlaying(true);
+              }}
+            >
+              <span className="playbackIcon" aria-hidden="true">
+                {isPlaying ? "||" : ">"}
+              </span>
+              <span>{isPlaying ? "Pause" : "Play"}</span>
+            </button>
+            <label className="speedControl">
+              <span>Speed</span>
+              <select
+                value={playbackSpeed}
+                disabled={sliderDisabled}
+                aria-label="Playback speed"
+                onChange={(event) => {
+                  setPlaybackSpeed(Number(event.currentTarget.value));
+                }}
+              >
+                {playbackSpeedOptions.map((speed) => (
+                  <option key={speed} value={speed}>
+                    {speed}x
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <input
             className="timeSlider"
             type="range"
@@ -275,11 +350,13 @@ export function App() {
             style={{ "--progress": `${progress}%` } as SliderStyle}
             onInput={(event) => {
               const nextTimestamp = Number(event.currentTarget.value);
+              timestampRef.current = nextTimestamp;
               setTimestamp(nextTimestamp);
               scheduleTileRequest(nextTimestamp);
             }}
             onChange={(event) => {
               const nextTimestamp = Number(event.currentTarget.value);
+              timestampRef.current = nextTimestamp;
               setTimestamp(nextTimestamp);
               scheduleTileRequest(nextTimestamp);
             }}
