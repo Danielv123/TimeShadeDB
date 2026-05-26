@@ -229,6 +229,25 @@ func TestWebChunkIngestAPI(t *testing.T) {
 		t.Fatalf("chunk tile pixel = rgba(%d,%d,%d,%d), want rgba(255,0,0,255)", r>>8, g>>8, b>>8, a>>8)
 	}
 
+	downsampledChunkTileReq := httptest.NewRequest(http.MethodGet, "/api/chunk/tiles/"+saveID+"/player/nauvis/-1/-1/-1.png?tick=10", nil)
+	downsampledChunkTileResp := httptest.NewRecorder()
+	handler.ServeHTTP(downsampledChunkTileResp, downsampledChunkTileReq)
+	if downsampledChunkTileResp.Code != http.StatusOK {
+		t.Fatalf("downsampled chunk tile status = %d, body %s", downsampledChunkTileResp.Code, downsampledChunkTileResp.Body.String())
+	}
+	downsampledChunkImg, err := png.Decode(downsampledChunkTileResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, a = downsampledChunkImg.At(400, 416).RGBA()
+	if r>>8 != 255 || g>>8 != 0 || b>>8 != 0 || a>>8 != 255 {
+		t.Fatalf("downsampled chunk tile pixel = rgba(%d,%d,%d,%d), want rgba(255,0,0,255)", r>>8, g>>8, b>>8, a>>8)
+	}
+	r, g, b, a = downsampledChunkImg.At(9*timeshadedb.ChunkSize, 10*timeshadedb.ChunkSize).RGBA()
+	if r>>8 != 0 || g>>8 != 0 || b>>8 != 0 || a>>8 != 255 {
+		t.Fatalf("downsampled chunk tile reused native position = rgba(%d,%d,%d,%d), want black", r>>8, g>>8, b>>8, a>>8)
+	}
+
 	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
 		Key:   timeshadedb.DatastoreKey{SavefileUUID: saveID, Surface: "nauvis", Force: "player"},
 		Tick:  10,

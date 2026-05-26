@@ -301,7 +301,11 @@ func (s *webServer) handleChunkTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	img := s.renderChunkTile(r.Context(), key, tick, int32(x), int32(y))
+	img, err := s.chunkTileAtZoom(r.Context(), key, tick, z, x, y)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -372,6 +376,13 @@ func (s *webServer) tileAtZoom(ctx context.Context, ts time.Time, z, x, y int) (
 	return s.downsampledTileAt(ctx, ts, z, x, y)
 }
 
+func (s *webServer) chunkTileAtZoom(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, z, x, y int) (*image.RGBA, error) {
+	if z == 0 {
+		return s.renderChunkTile(ctx, key, tick, int32(x), int32(y)), nil
+	}
+	return s.downsampledChunkTileAt(ctx, key, tick, z, x, y)
+}
+
 func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, tileX, tileY int32) *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, timeshadedb.TileSize, timeshadedb.TileSize))
 	for i := 3; i < len(img.Pix); i += 4 {
@@ -401,6 +412,47 @@ func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.Datasto
 		}
 	}
 	return img
+}
+
+func (s *webServer) downsampledChunkTileAt(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, z, x, y int) (*image.RGBA, error) {
+	scale, err := zoomScale(z)
+	if err != nil {
+		return nil, err
+	}
+	img := image.NewRGBA(image.Rect(0, 0, timeshadedb.TileSize, timeshadedb.TileSize))
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = 0xff
+	}
+	worldX0 := int64(x) * int64(timeshadedb.TileSize) * scale
+	worldY0 := int64(y) * int64(timeshadedb.TileSize) * scale
+	sampleOffset := scale / 2
+	chunks := map[timeshadedb.ChunkCoord]*timeshadedb.ChunkResult{}
+	for outY := 0; outY < timeshadedb.TileSize; outY++ {
+		srcY := worldY0 + int64(outY)*scale + sampleOffset
+		chunkY := int32(floorDivInt64(srcY, int64(timeshadedb.ChunkSize)))
+		localY := int(srcY - int64(chunkY)*int64(timeshadedb.ChunkSize))
+		for outX := 0; outX < timeshadedb.TileSize; outX++ {
+			srcX := worldX0 + int64(outX)*scale + sampleOffset
+			chunkX := int32(floorDivInt64(srcX, int64(timeshadedb.ChunkSize)))
+			localX := int(srcX - int64(chunkX)*int64(timeshadedb.ChunkSize))
+			coord := timeshadedb.ChunkCoord{X: chunkX, Y: chunkY}
+			chunk, ok := chunks[coord]
+			if !ok {
+				chunk, _ = s.db.ChunkAt(ctx, timeshadedb.ChunkAtOptions{Key: key, Tick: tick, Chunk: coord})
+				chunks[coord] = chunk
+			}
+			if chunk == nil {
+				continue
+			}
+			color565 := chunk.Pixels[localY*timeshadedb.ChunkSize+localX]
+			offset := img.PixOffset(outX, outY)
+			r, g, b := rgb565ToRGB(color565)
+			img.Pix[offset] = r
+			img.Pix[offset+1] = g
+			img.Pix[offset+2] = b
+		}
+	}
+	return img, nil
 }
 
 func (s *webServer) downsampledTileAt(ctx context.Context, ts time.Time, z, x, y int) (*timeshadedb.TileResult, error) {
@@ -614,6 +666,14 @@ func zoomScale(z int) (int64, error) {
 		return 0, fmt.Errorf("tile zoom %d is too small", z)
 	}
 	return int64(1) << uint(shift), nil
+}
+
+func floorDivInt64(v, d int64) int64 {
+	q := v / d
+	if v < 0 && v%d != 0 {
+		q--
+	}
+	return q
 }
 
 func downsampledTileSpan(canvasSize int, worldStart, scale int64) int {
