@@ -25,8 +25,9 @@ Measured `serve` plus `tail-chunk-tsv` against the local `chunk-charted.tsv` Fac
 | 2026-05-26T21:32:00+02:00 | Tune default batch size and avoid client-side RGB565 decode on fresh sends | 10240 | 60 | 122880 | 122867.2 | same as above |
 | 2026-05-26T21:40:00+02:00 | Final exact consecutive-repeat shortcut check | 10240 | 60 | 122880 | 122847.4 | same as above |
 | 2026-05-26T21:50:00+02:00 | Cache exact encoded payloads per datastore/chunk within each batch | 10240 | 60 | 143360 | 143324.3 | same as above |
+| 2026-05-26T22:18:00+02:00 | Process each 512x512 tile batch through a GOMAXPROCS-sized worker pool | 10240 | 60 | 194560 | 194540.0 | same as above |
 
-Best sustained 60-second result so far is 143,324 chunks/min, about 102.4x the 1,400 chunks/min baseline. Shorter 30-second tuning runs reached 131,042 chunks/min at 8,192-row batches and 143,307 chunks/min at 10,240-row batches before the final per-batch exact payload cache.
+Best sustained 60-second result so far is 194,540 chunks/min, about 139.0x the 1,400 chunks/min baseline. Shorter 30-second tuning runs reached 131,042 chunks/min at 8,192-row batches and 143,307 chunks/min at 10,240-row batches before the final per-batch exact payload cache.
 
 ## Tile API benchmark
 
