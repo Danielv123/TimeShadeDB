@@ -224,7 +224,7 @@ func (db *DB) Close() error
 CLI commands should be adjusted around the new format:
 
 ```text
-timeshadedb serve --db db.tshd --addr 127.0.0.1:8080
+timeshadedb serve --db db.tshd
 timeshadedb import-chunk-tsv --input chunk-charted.tsv --savefile UUID --db db.tshd
 timeshadedb tail-chunk-tsv --input chunk-charted.tsv --savefile UUID --base-url http://127.0.0.1:8080
 timeshadedb query-chunk --db db.tshd --savefile UUID --surface nauvis --force player --tick 123456 --chunk 10,-4 --out chunk.rgb565

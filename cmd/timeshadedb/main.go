@@ -266,7 +266,7 @@ func run(ctx context.Context, args []string) error {
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		path := fs.String("db", "", "database directory")
-		addr := fs.String("addr", "127.0.0.1:8080", "HTTP listen address")
+		addr := fs.String("addr", "0.0.0.0:8080", "HTTP listen address")
 		dev := fs.Bool("dev", false, "start Vite dev server and proxy web requests to it")
 		cacheSize := fs.Int64("cache-size", 64*1024*1024, "decoded snapshot cache bytes")
 		if err := fs.Parse(args[1:]); err != nil {
