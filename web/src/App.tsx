@@ -297,8 +297,6 @@ export function App() {
             <source media="(prefers-color-scheme: dark)" srcSet={logoDarkUrl} />
             <img className="brandLogo" src={logoLightUrl} alt="TimeShadeDB" />
           </picture>
-          <p className="eyebrow">timeShadeDB</p>
-          <h1>Canvas query</h1>
         </div>
 
         <section className="controlGroup" aria-label="Timestamp">
