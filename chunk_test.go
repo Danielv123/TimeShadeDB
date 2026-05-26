@@ -22,7 +22,7 @@ func TestParseChunkTSVRowSupportsCombinedAndSplitCoords(t *testing.T) {
 		t.Fatalf("combined key = %+v", combined.Key)
 	}
 	if combined.Pixels[0] != 0x2462 || combined.Pixels[ChunkPixelCount-1] != 0x2462 {
-		t.Fatalf("combined pixels not decoded as big-endian hex RGB565")
+		t.Fatalf("combined pixels not decoded as little-endian hex RGB565")
 	}
 
 	split, err := ParseChunkTSVRow("save-1", "13\tnauvis\t-7\t-6\tplayer\t"+payload)
@@ -174,7 +174,7 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 }
 
 func repeatedRGB565Hex(color uint16) string {
-	return strings.Repeat(fmt.Sprintf("%04x", color), ChunkPixelCount)
+	return strings.Repeat(fmt.Sprintf("%02x%02x", byte(color), byte(color>>8)), ChunkPixelCount)
 }
 
 func sliceToChunkPixels(in []uint16) [ChunkPixelCount]uint16 {

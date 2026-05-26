@@ -150,7 +150,7 @@ func TestWebChunkIngestAPI(t *testing.T) {
 
 	handler := newWebServer(db, http.NotFoundHandler()).routes()
 	saveID := "save-1"
-	firstPayload := testRGB565Hex(0x001f)
+	firstPayload := testRGB565Hex(0xf800)
 	body := "10\tnauvis\t-7,-6\tplayer\t" + firstPayload + "\n"
 	req := httptest.NewRequest(http.MethodPost, "/api/ingest/chunk/"+saveID, strings.NewReader(body))
 	resp := httptest.NewRecorder()
@@ -237,7 +237,7 @@ func TestWebChunkIngestAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chunk.Pixels[0] != 0x001f || chunk.Pixels[timeshadedb.ChunkPixelCount-1] != 0x001f {
+	if chunk.Pixels[0] != 0xf800 || chunk.Pixels[timeshadedb.ChunkPixelCount-1] != 0xf800 {
 		t.Fatalf("chunk pixels were not ingested")
 	}
 }
@@ -393,5 +393,5 @@ func writeSample(path string) error {
 }
 
 func testRGB565Hex(color uint16) string {
-	return strings.Repeat(fmt.Sprintf("%04x", color), timeshadedb.ChunkPixelCount)
+	return strings.Repeat(fmt.Sprintf("%02x%02x", byte(color), byte(color>>8)), timeshadedb.ChunkPixelCount)
 }

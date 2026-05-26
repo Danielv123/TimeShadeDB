@@ -851,7 +851,7 @@ func decodeRGB565Hex(s string) ([ChunkPixelCount]uint16, error) {
 		return pixels, fmt.Errorf("timeshadedb: RGB565 payload has %d bytes, expected %d", len(raw), chunkPayloadBytes)
 	}
 	for i := 0; i < ChunkPixelCount; i++ {
-		pixels[i] = uint16(raw[i*2])<<8 | uint16(raw[i*2+1])
+		pixels[i] = binary.LittleEndian.Uint16(raw[i*2 : i*2+2])
 	}
 	return pixels, nil
 }

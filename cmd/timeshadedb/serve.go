@@ -388,7 +388,7 @@ func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.Datasto
 				for px := 0; px < timeshadedb.ChunkSize; px++ {
 					color565 := chunk.Pixels[py*timeshadedb.ChunkSize+px]
 					offset := img.PixOffset(cx*timeshadedb.ChunkSize+px, cy*timeshadedb.ChunkSize+py)
-					r, g, b := bgr565ToRGB(color565)
+					r, g, b := rgb565ToRGB(color565)
 					img.Pix[offset] = r
 					img.Pix[offset+1] = g
 					img.Pix[offset+2] = b
@@ -572,10 +572,10 @@ func parseGameTick(r *http.Request) (uint64, error) {
 	return tick, nil
 }
 
-func bgr565ToRGB(v uint16) (uint8, uint8, uint8) {
-	r := uint8((uint32(v) & 0x1f) * 255 / 31)
+func rgb565ToRGB(v uint16) (uint8, uint8, uint8) {
+	r := uint8((uint32(v>>11) & 0x1f) * 255 / 31)
 	g := uint8((uint32(v>>5) & 0x3f) * 255 / 63)
-	b := uint8((uint32(v>>11) & 0x1f) * 255 / 31)
+	b := uint8((uint32(v) & 0x1f) * 255 / 31)
 	return r, g, b
 }
 
