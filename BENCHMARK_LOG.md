@@ -11,3 +11,22 @@
 | 2026-05-26T11:49:48.5684279+02:00 | Use pgzip reader for faster gzip decompression | 5000000 | 4.2533366 | 1175547.69 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample5m-pgzip.tshd --max-rows 5000000` |
 | 2026-05-26T11:53:38.5645338+02:00 | Increase pgzip read-ahead block size to 1 MiB | 5000000 | 3.9621918 | 1261927.80 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample5m-pgzip-1mb-2.tshd --max-rows 5000000` |
 | 2026-05-26T11:58:15.5413137+02:00 | Current sustained import throughput check | 20000000 | 13.4056739 | 1491905.60 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample20m-current.tshd --max-rows 20000000` |
+
+## Tile API benchmark
+
+Measured `serve` over the actual HTTP tile API against `full.tshd` with a 64 MiB decoded snapshot cache. The request generator sampled tile coordinates weighted by each tile's `changed_placements_stored` in `full.tshd/stats.json`, then sampled timestamps uniformly across the `/api/meta` dataset time range. Each run used 1,000 requests, concurrency 16, seed 12345, and read the full PNG response body.
+
+| Time | Server | Commit | Requests | Concurrency | Seconds | Tiles/sec | Mean bytes/tile | P50 ms | P95 ms | P99 ms | Max ms | Command |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 2026-05-26T13:04:04+02:00 | old tileserver | `2a974eae` | 1000 | 16 | 21.0053497 | 47.61 | 136498.06 | 236.78 | 945.74 | 1282.95 | 1707.89 | `go run .\cmd\tileapibench -base-url http://127.0.0.1:18080 -stats full.tshd\stats.json -requests 1000 -concurrency 16 -seed 12345` |
+| 2026-05-26T13:04:04+02:00 | optimized tileserver | `e601eac` | 1000 | 16 | 0.3332554 | 3000.70 | 65096.66 | 5.64 | 9.59 | 12.31 | 14.84 | `go run .\cmd\tileapibench -base-url http://127.0.0.1:18081 -stats full.tshd\stats.json -requests 1000 -concurrency 16 -seed 12345` |
+
+Optimizations in `e601eac`:
+
+- Stop delta replay once the next indexed delta frame starts after the requested timestamp.
+- Apply delta payloads directly into the tile buffer instead of allocating decoded `deltaEvent` slices.
+- Encode API tiles as indexed-color PNGs, copying palette IDs directly into `image.Paletted` rows instead of expanding every pixel to RGBA.
+- Use `png.BestSpeed` for served API tiles. This keeps compression enabled while avoiding the original default-compression CPU cost.
+- Mark timestamped tile URLs as immutable-cacheable with `Cache-Control: public, max-age=31536000, immutable`.
+
+Result: the weighted random tile API workload improved from 47.61 to 3000.70 tiles/sec, a 63.03x throughput increase, while mean response size dropped from 136.5 KiB to 65.1 KiB.
