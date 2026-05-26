@@ -1,5 +1,7 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
+import logoDarkUrl from "../images/logo_dark_transparent.png";
+import logoLightUrl from "../images/logo_light_transparent.png";
 
 type Metadata = {
   canvasWidth: number;
@@ -290,7 +292,11 @@ export function App() {
   return (
     <main className="shell">
       <aside className="sidebar">
-        <div>
+        <div className="brandHeader">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcSet={logoDarkUrl} />
+            <img className="brandLogo" src={logoLightUrl} alt="TimeShadeDB" />
+          </picture>
           <p className="eyebrow">timeShadeDB</p>
           <h1>Canvas query</h1>
         </div>

@@ -1,12 +1,63 @@
 :root {
+  color-scheme: light;
   font-family:
     Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
-  color: #172026;
-  background: #f3f5f1;
+  --color-page: #f3f5f1;
+  --color-sidebar: #fbfcf8;
+  --color-map: #dfe5dc;
+  --color-text: #172026;
+  --color-heading: #172026;
+  --color-muted: #65716c;
+  --color-accent-muted: #54726f;
+  --color-panel: #ffffff;
+  --color-border: #d8ddd2;
+  --color-control-border: #d4dacf;
+  --color-tile-border: #d9ded4;
+  --color-track: #d9ded5;
+  --color-primary: #31706d;
+  --color-primary-border: #2f6b67;
+  --color-danger: #e85d42;
+  --color-danger-border: #9b3d2c;
+  --color-error-bg: #fff2ef;
+  --color-error-border: #e2a091;
+  --color-error-text: #8b2d1d;
+  --shadow-sidebar: 2px 0 20px rgb(35 42 35 / 0.08);
+  --shadow-control: 0 2px 8px rgb(24 29 25 / 0.3);
+  --shadow-zoom: 0 8px 22px rgb(23 32 38 / 0.16);
+  color: var(--color-text);
+  background: var(--color-page);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-page: #11181c;
+    --color-sidebar: #172026;
+    --color-map: #202a2f;
+    --color-text: #e8f0ee;
+    --color-heading: #f7fbfa;
+    --color-muted: #a6b4b0;
+    --color-accent-muted: #7ec7c2;
+    --color-panel: #202b30;
+    --color-border: #314047;
+    --color-control-border: #405158;
+    --color-tile-border: #35464d;
+    --color-track: #3a484e;
+    --color-primary: #2a8f89;
+    --color-primary-border: #56b4ae;
+    --color-danger: #d85c45;
+    --color-danger-border: #f18d7b;
+    --color-error-bg: #3b201c;
+    --color-error-border: #9d5648;
+    --color-error-text: #ffd8d0;
+    --shadow-sidebar: 2px 0 20px rgb(0 0 0 / 0.28);
+    --shadow-control: 0 2px 8px rgb(0 0 0 / 0.45);
+    --shadow-zoom: 0 8px 22px rgb(0 0 0 / 0.36);
+  }
 }
 
 * {
@@ -41,15 +92,26 @@ select {
   gap: 28px;
   min-width: 0;
   padding: 26px 24px;
-  border-right: 1px solid #d8ddd2;
-  background: #fbfcf8;
-  box-shadow: 2px 0 20px rgb(35 42 35 / 0.08);
+  border-right: 1px solid var(--color-border);
+  background: var(--color-sidebar);
+  box-shadow: var(--shadow-sidebar);
   z-index: 2;
+}
+
+.brandHeader {
+  display: grid;
+  gap: 10px;
+}
+
+.brandLogo {
+  display: block;
+  width: min(100%, 244px);
+  height: auto;
 }
 
 .eyebrow {
   margin: 0 0 8px;
-  color: #54726f;
+  color: var(--color-accent-muted);
   font-size: 0.76rem;
   font-weight: 700;
   letter-spacing: 0;
@@ -58,7 +120,7 @@ select {
 
 h1 {
   margin: 0;
-  color: #172026;
+  color: var(--color-heading);
   font-size: 1.8rem;
   line-height: 1.1;
   font-weight: 760;
@@ -73,10 +135,10 @@ h1 {
 .timestampReadout {
   min-height: 48px;
   padding: 11px 12px;
-  border: 1px solid #d4dacf;
+  border: 1px solid var(--color-control-border);
   border-radius: 8px;
-  background: #ffffff;
-  color: #1d282d;
+  background: var(--color-panel);
+  color: var(--color-heading);
   font-size: 0.96rem;
   font-weight: 650;
   line-height: 1.35;
@@ -97,17 +159,17 @@ h1 {
   min-width: 0;
   height: 40px;
   padding: 0 14px;
-  border: 1px solid #2f6b67;
+  border: 1px solid var(--color-primary-border);
   border-radius: 8px;
-  background: #31706d;
+  background: var(--color-primary);
   color: #ffffff;
   cursor: pointer;
   font-weight: 720;
 }
 
 .playbackButton[aria-pressed="true"] {
-  border-color: #9b3d2c;
-  background: #e85d42;
+  border-color: var(--color-danger-border);
+  background: var(--color-danger);
 }
 
 .playbackButton:disabled {
@@ -131,7 +193,7 @@ h1 {
 }
 
 .speedControl span {
-  color: #65716c;
+  color: var(--color-muted);
   font-size: 0.72rem;
   line-height: 1;
 }
@@ -140,10 +202,10 @@ h1 {
   width: 100%;
   height: 40px;
   padding: 0 28px 0 10px;
-  border: 1px solid #d4dacf;
+  border: 1px solid var(--color-control-border);
   border-radius: 8px;
-  background: #ffffff;
-  color: #1d282d;
+  background: var(--color-panel);
+  color: var(--color-heading);
   cursor: pointer;
   font-weight: 650;
 }
@@ -172,10 +234,10 @@ h1 {
   border-radius: 999px;
   background: linear-gradient(
     90deg,
-    #31706d 0%,
-    #31706d var(--progress),
-    #d9ded5 var(--progress),
-    #d9ded5 100%
+    var(--color-primary) 0%,
+    var(--color-primary) var(--progress),
+    var(--color-track) var(--progress),
+    var(--color-track) 100%
   );
 }
 
@@ -184,38 +246,38 @@ h1 {
   height: 20px;
   margin-top: -6px;
   appearance: none;
-  border: 3px solid #ffffff;
+  border: 3px solid var(--color-panel);
   border-radius: 50%;
-  background: #e85d42;
-  box-shadow: 0 2px 8px rgb(24 29 25 / 0.3);
+  background: var(--color-danger);
+  box-shadow: var(--shadow-control);
 }
 
 .timeSlider::-moz-range-track {
   height: 8px;
   border-radius: 999px;
-  background: #d9ded5;
+  background: var(--color-track);
 }
 
 .timeSlider::-moz-range-progress {
   height: 8px;
   border-radius: 999px;
-  background: #31706d;
+  background: var(--color-primary);
 }
 
 .timeSlider::-moz-range-thumb {
   width: 16px;
   height: 16px;
-  border: 3px solid #ffffff;
+  border: 3px solid var(--color-panel);
   border-radius: 50%;
-  background: #e85d42;
-  box-shadow: 0 2px 8px rgb(24 29 25 / 0.3);
+  background: var(--color-danger);
+  box-shadow: var(--shadow-control);
 }
 
 .rangeLabels {
   display: flex;
   justify-content: space-between;
   gap: 14px;
-  color: #65716c;
+  color: var(--color-muted);
   font-size: 0.72rem;
   line-height: 1.35;
 }
@@ -234,31 +296,31 @@ h1 {
 .statsGrid div {
   min-width: 0;
   padding: 12px;
-  border: 1px solid #d9ded4;
+  border: 1px solid var(--color-tile-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--color-panel);
 }
 
 .statsGrid dt {
   margin: 0 0 6px;
-  color: #66716b;
+  color: var(--color-muted);
   font-size: 0.72rem;
 }
 
 .statsGrid dd {
   margin: 0;
   overflow-wrap: anywhere;
-  color: #1e282b;
+  color: var(--color-heading);
   font-size: 0.95rem;
   font-weight: 680;
 }
 
 .errorBox {
   padding: 12px;
-  border: 1px solid #e2a091;
+  border: 1px solid var(--color-error-border);
   border-radius: 8px;
-  background: #fff2ef;
-  color: #8b2d1d;
+  background: var(--color-error-bg);
+  color: var(--color-error-text);
   font-size: 0.9rem;
   line-height: 1.35;
 }
@@ -266,17 +328,17 @@ h1 {
 .mapPane {
   min-width: 0;
   min-height: 0;
-  background: #dfe5dc;
+  background: var(--color-map);
 }
 
 .map {
   width: 100%;
   height: 100%;
-  background: #dfe5dc;
+  background: var(--color-map);
 }
 
 .leaflet-container {
-  background: #dfe5dc;
+  background: var(--color-map);
 }
 
 .leaflet-pane,
@@ -297,12 +359,12 @@ h1 {
 }
 
 .leaflet-control-zoom {
-  border: 1px solid #cfd6cc !important;
-  box-shadow: 0 8px 22px rgb(23 32 38 / 0.16) !important;
+  border: 1px solid var(--color-control-border) !important;
+  box-shadow: var(--shadow-zoom) !important;
 }
 
 .leaflet-control-zoom a {
-  color: #172026 !important;
+  color: var(--color-heading) !important;
 }
 
 @media (max-width: 760px) {
@@ -315,7 +377,7 @@ h1 {
     gap: 18px;
     padding: 18px;
     border-right: 0;
-    border-bottom: 1px solid #d8ddd2;
+    border-bottom: 1px solid var(--color-border);
   }
 
   h1 {

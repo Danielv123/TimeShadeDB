@@ -3,6 +3,10 @@ db.tshd/
 *.tshd/
 *.raw
 *.png
+!web/images/
+!web/images/logo_dark_transparent.png
+!web/images/logo_light_transparent.png
+!web/dist/assets/*.png
 *.prof
 timeshadedb
 timeshadedb.exe
