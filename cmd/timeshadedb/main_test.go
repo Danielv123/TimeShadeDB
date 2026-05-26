@@ -150,7 +150,7 @@ func TestWebChunkIngestAPI(t *testing.T) {
 
 	handler := newWebServer(db, http.NotFoundHandler()).routes()
 	saveID := "save-1"
-	firstPayload := testRGB565Hex(0x2462)
+	firstPayload := testRGB565Hex(0x001f)
 	body := "10\tnauvis\t-7,-6\tplayer\t" + firstPayload + "\n"
 	req := httptest.NewRequest(http.MethodPost, "/api/ingest/chunk/"+saveID, strings.NewReader(body))
 	resp := httptest.NewRecorder()
@@ -225,8 +225,8 @@ func TestWebChunkIngestAPI(t *testing.T) {
 		t.Fatalf("chunk tile width = %d, want %d", got, want)
 	}
 	r, g, b, a := chunkImg.At(9*timeshadedb.ChunkSize, 10*timeshadedb.ChunkSize).RGBA()
-	if r == 0 && g == 0 && b == 0 || a>>8 != 255 {
-		t.Fatalf("chunk tile pixel = rgba(%d,%d,%d,%d), want nonblack opaque", r>>8, g>>8, b>>8, a>>8)
+	if r>>8 != 255 || g>>8 != 0 || b>>8 != 0 || a>>8 != 255 {
+		t.Fatalf("chunk tile pixel = rgba(%d,%d,%d,%d), want rgba(255,0,0,255)", r>>8, g>>8, b>>8, a>>8)
 	}
 
 	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
@@ -237,7 +237,7 @@ func TestWebChunkIngestAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chunk.Pixels[0] != 0x2462 || chunk.Pixels[timeshadedb.ChunkPixelCount-1] != 0x2462 {
+	if chunk.Pixels[0] != 0x001f || chunk.Pixels[timeshadedb.ChunkPixelCount-1] != 0x001f {
 		t.Fatalf("chunk pixels were not ingested")
 	}
 }
