@@ -14,9 +14,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -127,6 +129,27 @@ type ParsedChunkRow struct {
 	HasPayload bool
 }
 
+type chunkIngestWork struct {
+	row   ParsedChunkRow
+	seq   uint64
+	ds    *chunkDatastore
+	chunk *factorioChunkState
+}
+
+type chunkTileBatchKey struct {
+	key   DatastoreKey
+	tileX int32
+	tileY int32
+}
+
+type chunkTileBatchResult struct {
+	result   IngestChunkResult
+	touched  map[DatastoreKey]struct{}
+	progress map[DatastoreKey]chunkDatastoreProgress
+	events   map[DatastoreKey]map[ChunkCoord][]chunkLogEntry
+	err      error
+}
+
 func createChunkDB(path string, cacheSize int64) (*DB, error) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, err
@@ -228,13 +251,8 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 
 	touched := map[DatastoreKey]struct{}{}
 	touchedDatastores := map[DatastoreKey]*chunkDatastore{}
-	writes := make([]chunkWrite, 0, len(rows))
-	result := &IngestChunkResult{}
-	type payloadKey struct {
-		key   DatastoreKey
-		chunk ChunkCoord
-	}
-	lastPayloads := map[payloadKey]string{}
+	groups := map[chunkTileBatchKey][]chunkIngestWork{}
+	groupOrder := make([]chunkTileBatchKey, 0)
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -243,26 +261,139 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 		chunk := ds.chunkLocked(row.Chunk)
 		seq := db.nextChunkSeq
 		db.nextChunkSeq++
+		touchedDatastores[row.Key] = ds
+		key := chunkTileKey(row.Key, row.Chunk)
+		if _, ok := groups[key]; !ok {
+			groupOrder = append(groupOrder, key)
+		}
+		groups[key] = append(groups[key], chunkIngestWork{row: row, seq: seq, ds: ds, chunk: chunk})
+	}
+	for _, ds := range touchedDatastores {
+		if err := db.ensureChunkDatastoreFilesLocked(ds); err != nil {
+			return nil, err
+		}
+	}
+
+	workerResults := db.processChunkTileBatches(ctx, groups, groupOrder)
+	result := &IngestChunkResult{}
+	progress := map[DatastoreKey]chunkDatastoreProgress{}
+	events := map[DatastoreKey]map[ChunkCoord][]chunkLogEntry{}
+	for _, workerResult := range workerResults {
+		if workerResult.err != nil {
+			return nil, workerResult.err
+		}
+		result.AcceptedRows += workerResult.result.AcceptedRows
+		result.ChangedPixels += workerResult.result.ChangedPixels
+		result.UnchangedPixels += workerResult.result.UnchangedPixels
+		if workerResult.result.LatestRowSeq > result.LatestRowSeq {
+			result.LatestRowSeq = workerResult.result.LatestRowSeq
+		}
+		for key := range workerResult.touched {
+			touched[key] = struct{}{}
+		}
+		for key, workerProgress := range workerResult.progress {
+			if current, ok := progress[key]; !ok || workerProgress.LatestRowSeq > current.LatestRowSeq {
+				progress[key] = workerProgress
+			}
+		}
+		for key, chunkEvents := range workerResult.events {
+			target := events[key]
+			if target == nil {
+				target = map[ChunkCoord][]chunkLogEntry{}
+				events[key] = target
+			}
+			for coord, entries := range chunkEvents {
+				target[coord] = append(target[coord], entries...)
+			}
+		}
+	}
+	for key, chunkEvents := range events {
+		ds := touchedDatastores[key]
+		for coord, entries := range chunkEvents {
+			ds.events[coord] = append(ds.events[coord], entries...)
+		}
+	}
+	for key, latest := range progress {
+		ds := touchedDatastores[key]
+		ds.latestTick = latest.LatestTick
+		ds.latestChunk = ChunkCoord{X: latest.LatestChunkX, Y: latest.LatestChunkY}
+		ds.latestRowSeq = latest.LatestRowSeq
+	}
+	for _, ds := range touchedDatastores {
+		if err := db.writeChunkProgressLocked(ds); err != nil {
+			return nil, err
+		}
+	}
+	result.DatastoresTouched = len(touched)
+	return result, nil
+}
+
+func (db *DB) processChunkTileBatches(ctx context.Context, groups map[chunkTileBatchKey][]chunkIngestWork, order []chunkTileBatchKey) []chunkTileBatchResult {
+	if len(order) == 0 {
+		return nil
+	}
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > len(order) {
+		workerCount = len(order)
+	}
+	jobs := make(chan chunkTileBatchKey)
+	results := make(chan chunkTileBatchResult, len(order))
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer wg.Done()
+			for key := range jobs {
+				results <- db.processChunkTileBatch(ctx, groups[key])
+			}
+		}()
+	}
+	for _, key := range order {
+		jobs <- key
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+	out := make([]chunkTileBatchResult, 0, len(order))
+	for result := range results {
+		out = append(out, result)
+	}
+	return out
+}
+
+func (db *DB) processChunkTileBatch(ctx context.Context, batch []chunkIngestWork) chunkTileBatchResult {
+	result := chunkTileBatchResult{
+		touched:  map[DatastoreKey]struct{}{},
+		progress: map[DatastoreKey]chunkDatastoreProgress{},
+		events:   map[DatastoreKey]map[ChunkCoord][]chunkLogEntry{},
+	}
+	writes := make([]chunkWrite, 0, len(batch))
+	lastPayloads := map[ChunkCoord]string{}
+	for _, work := range batch {
+		if err := ctx.Err(); err != nil {
+			result.err = err
+			return result
+		}
+		row := work.row
+		ds := work.ds
+		chunk := work.chunk
+		seq := work.seq
 		pixels := row.Pixels
 		if row.HasPayload {
-			pk := payloadKey{key: row.Key, chunk: row.Chunk}
-			if lastPayload, ok := lastPayloads[pk]; ok && chunk.seen && row.PayloadHex == lastPayload {
+			if lastPayload, ok := lastPayloads[row.Chunk]; ok && chunk.seen && row.PayloadHex == lastPayload {
 				chunk.latestTick = row.Tick
 				chunk.latestRowSeq = seq
-				ds.latestTick = row.Tick
-				ds.latestChunk = row.Chunk
-				ds.latestRowSeq = seq
-				touched[row.Key] = struct{}{}
-				touchedDatastores[row.Key] = ds
-				result.AcceptedRows++
-				result.UnchangedPixels += ChunkPixelCount
-				result.LatestRowSeq = seq
+				result.recordChunkProgress(row, seq, 0, ChunkPixelCount)
 				continue
 			}
-			lastPayloads[pk] = row.PayloadHex
+			lastPayloads[row.Chunk] = row.PayloadHex
 			decoded, err := decodeRGB565Hex(row.PayloadHex)
 			if err != nil {
-				return nil, err
+				result.err = err
+				return result
 			}
 			pixels = decoded
 		}
@@ -284,28 +415,40 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 				write.snapshotPixels = chunk.pixels
 			}
 			writes = append(writes, write)
-			ds.events[row.Chunk] = append(ds.events[row.Chunk], entry)
+			chunkEvents := result.events[row.Key]
+			if chunkEvents == nil {
+				chunkEvents = map[ChunkCoord][]chunkLogEntry{}
+				result.events[row.Key] = chunkEvents
+			}
+			chunkEvents[row.Chunk] = append(chunkEvents[row.Chunk], entry)
 		}
-		ds.latestTick = row.Tick
-		ds.latestChunk = row.Chunk
-		ds.latestRowSeq = seq
-		touched[row.Key] = struct{}{}
-		touchedDatastores[row.Key] = ds
-		result.AcceptedRows++
-		result.ChangedPixels += uint64(len(changes))
-		result.UnchangedPixels += uint64(ChunkPixelCount - len(changes))
-		result.LatestRowSeq = seq
+		result.recordChunkProgress(row, seq, uint64(len(changes)), uint64(ChunkPixelCount-len(changes)))
 	}
 	if err := db.writeChunkBatchLocked(writes); err != nil {
-		return nil, err
+		result.err = err
+		return result
 	}
-	for _, ds := range touchedDatastores {
-		if err := db.writeChunkProgressLocked(ds); err != nil {
-			return nil, err
+	result.result.DatastoresTouched = len(result.touched)
+	return result
+}
+
+func (r *chunkTileBatchResult) recordChunkProgress(row ParsedChunkRow, seq uint64, changed, unchanged uint64) {
+	r.touched[row.Key] = struct{}{}
+	r.result.AcceptedRows++
+	r.result.ChangedPixels += changed
+	r.result.UnchangedPixels += unchanged
+	if seq > r.result.LatestRowSeq {
+		r.result.LatestRowSeq = seq
+	}
+	current, ok := r.progress[row.Key]
+	if !ok || seq > current.LatestRowSeq {
+		r.progress[row.Key] = chunkDatastoreProgress{
+			LatestTick:   row.Tick,
+			LatestChunkX: row.Chunk.X,
+			LatestChunkY: row.Chunk.Y,
+			LatestRowSeq: seq,
 		}
 	}
-	result.DatastoresTouched = len(touched)
-	return result, nil
 }
 
 func (db *DB) chunkAt(ctx context.Context, opts ChunkAtOptions) (*ChunkResult, error) {
@@ -536,6 +679,22 @@ func decodeRGB565Hex(s string) ([ChunkPixelCount]uint16, error) {
 		pixels[i] = uint16(raw[i*2])<<8 | uint16(raw[i*2+1])
 	}
 	return pixels, nil
+}
+
+func chunkTileKey(key DatastoreKey, coord ChunkCoord) chunkTileBatchKey {
+	return chunkTileBatchKey{
+		key:   key,
+		tileX: floorDiv32(coord.X, TileSize/ChunkSize),
+		tileY: floorDiv32(coord.Y, TileSize/ChunkSize),
+	}
+}
+
+func floorDiv32(v int32, d int) int32 {
+	q := v / int32(d)
+	if v < 0 && v%int32(d) != 0 {
+		q--
+	}
+	return q
 }
 
 func validateDatastoreKey(key DatastoreKey) error {
