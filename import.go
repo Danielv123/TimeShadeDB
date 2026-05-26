@@ -1,6 +1,7 @@
 package timeshadedb
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
 	"encoding/csv"
@@ -55,9 +56,9 @@ type TileStats struct {
 }
 
 type csvParseJob struct {
-	seq uint64
-	row uint64
-	rec []string
+	seq  uint64
+	row  uint64
+	line string
 }
 
 type parsedPlacement struct {
@@ -91,14 +92,13 @@ func ImportCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts Im
 		return nil, err
 	}
 	defer gz.Close()
-	r := csv.NewReader(gz)
-	r.FieldsPerRecord = -1
-	header, err := r.Read()
+	r := bufio.NewReaderSize(gz, 1<<20)
+	header, err := r.ReadString('\n')
 	if err != nil {
 		return nil, err
 	}
-	if len(header) < 4 || header[0] != "timestamp" || header[2] != "pixel_color" || header[3] != "coordinate" {
-		return nil, fmt.Errorf("timeshadedb: unexpected CSV header: %v", header)
+	if strings.TrimRight(header, "\r\n") != "timestamp,user_id,pixel_color,coordinate" {
+		return nil, fmt.Errorf("timeshadedb: unexpected CSV header: %q", strings.TrimRight(header, "\r\n"))
 	}
 	rows, err := importCSVRows(ctx, db, r, opts)
 	if err != nil {
@@ -112,7 +112,7 @@ func ImportCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts Im
 	return stats, nil
 }
 
-func importCSVRows(ctx context.Context, db *DB, r *csv.Reader, opts ImportOptions) (uint64, error) {
+func importCSVRows(ctx context.Context, db *DB, r *bufio.Reader, opts ImportOptions) (uint64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	workers := runtime.NumCPU()
@@ -150,25 +150,29 @@ func importCSVRows(ctx context.Context, db *DB, r *csv.Reader, opts ImportOption
 				sourceErr <- err
 				return
 			}
-			rec, err := r.Read()
-			if errors.Is(err, io.EOF) {
-				sourceErr <- nil
+			line, err := r.ReadString('\n')
+			if err != nil && !errors.Is(err, io.EOF) {
+				sourceErr <- err
 				return
 			}
-			if err != nil {
-				sourceErr <- err
+			if err != nil && errors.Is(err, io.EOF) && line == "" {
+				sourceErr <- nil
 				return
 			}
 			if opts.MaxRows > 0 && seq >= opts.MaxRows {
 				sourceErr <- nil
 				return
 			}
-			job := csvParseJob{seq: seq, row: seq + 2, rec: rec}
+			job := csvParseJob{seq: seq, row: seq + 2, line: line}
 			select {
 			case jobs <- job:
 				seq++
 			case <-ctx.Done():
 				sourceErr <- ctx.Err()
+				return
+			}
+			if errors.Is(err, io.EOF) {
+				sourceErr <- nil
 				return
 			}
 		}
@@ -288,23 +292,42 @@ func drainErrors(errCh <-chan error) []error {
 }
 
 func parseCSVJob(job csvParseJob) parsedPlacement {
-	rec := job.rec
-	if len(rec) < 4 {
-		return parsedPlacement{seq: job.seq, row: job.row, err: fmt.Errorf("timeshadedb: row %d has %d fields", job.row, len(rec))}
+	tsText, colorText, coordText, err := splitPlacementLine(job.line)
+	if err != nil {
+		return parsedPlacement{seq: job.seq, row: job.row, err: fmt.Errorf("row %d: %w", job.row, err)}
 	}
-	ts, err := parseTimestamp(rec[0])
+	ts, err := parseTimestamp(tsText)
 	if err != nil {
 		return parsedPlacement{seq: job.seq, row: job.row, err: fmt.Errorf("row %d timestamp: %w", job.row, err)}
 	}
-	rgb, err := parseRGB(rec[2])
+	rgb, err := parseRGB(colorText)
 	if err != nil {
 		return parsedPlacement{seq: job.seq, row: job.row, err: fmt.Errorf("row %d color: %w", job.row, err)}
 	}
-	x, y, err := parseCoord(rec[3])
+	x, y, err := parseCoord(coordText)
 	if err != nil {
 		return parsedPlacement{seq: job.seq, row: job.row, err: fmt.Errorf("row %d coordinate: %w", job.row, err)}
 	}
 	return parsedPlacement{seq: job.seq, row: job.row, ts: ts, x: x, y: y, rgb: rgb}
+}
+
+func splitPlacementLine(line string) (string, string, string, error) {
+	line = strings.TrimRight(line, "\r\n")
+	first := strings.IndexByte(line, ',')
+	if first < 0 {
+		return "", "", "", fmt.Errorf("malformed placement row")
+	}
+	secondRel := strings.IndexByte(line[first+1:], ',')
+	if secondRel < 0 {
+		return "", "", "", fmt.Errorf("malformed placement row")
+	}
+	second := first + 1 + secondRel
+	thirdRel := strings.IndexByte(line[second+1:], ',')
+	if thirdRel < 0 {
+		return "", "", "", fmt.Errorf("malformed placement row")
+	}
+	third := second + 1 + thirdRel
+	return line[:first], line[second+1 : third], line[third+1:], nil
 }
 
 func VerifyCSV(ctx context.Context, db *DB, inputPath string) (*VerifyStats, error) {
@@ -533,6 +556,7 @@ func parseRGB(s string) (RGB, error) {
 }
 
 func parseCoord(s string) (int, int, error) {
+	s = strings.Trim(strings.TrimSpace(s), "\"")
 	parts := strings.Split(strings.TrimSpace(s), ",")
 	if len(parts) < 2 {
 		return 0, 0, fmt.Errorf("expected x,y, got %q", s)
