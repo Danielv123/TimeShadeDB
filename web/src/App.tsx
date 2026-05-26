@@ -186,6 +186,7 @@ export function App() {
       zoomSnap: 0.25,
       zoomControl: true,
       attributionControl: false,
+      fadeAnimation: false,
       maxBounds: bounds.pad(0.35),
       maxBoundsViscosity: 0.7
     });
