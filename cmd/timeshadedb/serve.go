@@ -31,6 +31,7 @@ type metadataResponse struct {
 	TileSize     int    `json:"tileSize"`
 	TileCols     int    `json:"tileCols"`
 	TileRows     int    `json:"tileRows"`
+	MinZoom      int    `json:"minZoom"`
 	FromSec      uint32 `json:"fromSec"`
 	ToSec        uint32 `json:"toSec"`
 }
@@ -90,6 +91,7 @@ func (s *webServer) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		TileSize:     timeshadedb.TileSize,
 		TileCols:     timeshadedb.TileCols,
 		TileRows:     timeshadedb.TileRows,
+		MinZoom:      minTileZoom(timeshadedb.TileCols, timeshadedb.TileRows),
 		FromSec:      from,
 		ToSec:        to,
 	})
@@ -105,7 +107,7 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if z != 0 || x < 0 || x >= timeshadedb.TileCols || y < 0 || y >= timeshadedb.TileRows {
+	if z > 0 || !tileInZoomBounds(z, x, y) {
 		writeAPIError(w, http.StatusNotFound, "tile out of bounds")
 		return
 	}
@@ -114,10 +116,7 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res, err := s.db.TileAt(r.Context(), timeshadedb.TileAtOptions{
-		Timestamp: time.Unix(int64(ts), 0).UTC(),
-		Tile:      timeshadedb.TileCoord{X: x, Y: y},
-	})
+	res, err := s.tileAtZoom(r.Context(), time.Unix(int64(ts), 0).UTC(), z, x, y)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -127,6 +126,91 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 	if err := encodeTilePNG(w, res, timeshadedb.TileSize, timeshadedb.TileSize, png.BestSpeed); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+func (s *webServer) tileAtZoom(ctx context.Context, ts time.Time, z, x, y int) (*timeshadedb.TileResult, error) {
+	if z == 0 {
+		return s.db.TileAt(ctx, timeshadedb.TileAtOptions{
+			Timestamp: ts,
+			Tile:      timeshadedb.TileCoord{X: x, Y: y},
+		})
+	}
+	return s.downsampledTileAt(ctx, ts, z, x, y)
+}
+
+func (s *webServer) downsampledTileAt(ctx context.Context, ts time.Time, z, x, y int) (*timeshadedb.TileResult, error) {
+	scale, err := zoomScale(z)
+	if err != nil {
+		return nil, err
+	}
+	worldX0 := int64(x) * int64(timeshadedb.TileSize) * scale
+	worldY0 := int64(y) * int64(timeshadedb.TileSize) * scale
+	validWidth := downsampledTileSpan(timeshadedb.CanvasWidth, worldX0, scale)
+	validHeight := downsampledTileSpan(timeshadedb.CanvasHeight, worldY0, scale)
+	if validWidth <= 0 || validHeight <= 0 {
+		return nil, fmt.Errorf("tile out of bounds")
+	}
+
+	type nativeKey struct {
+		x int
+		y int
+	}
+	nativeTiles := make(map[nativeKey]*timeshadedb.TileResult)
+	var palette []timeshadedb.RGB
+	loadNative := func(tileX, tileY int) (*timeshadedb.TileResult, error) {
+		key := nativeKey{x: tileX, y: tileY}
+		if res := nativeTiles[key]; res != nil {
+			return res, nil
+		}
+		res, err := s.db.TileAt(ctx, timeshadedb.TileAtOptions{
+			Timestamp: ts,
+			Tile:      timeshadedb.TileCoord{X: tileX, Y: tileY},
+		})
+		if err != nil {
+			return nil, err
+		}
+		nativeTiles[key] = res
+		if palette == nil {
+			palette = res.Palette
+		}
+		return res, nil
+	}
+
+	pixels := make([]uint8, validWidth*validHeight)
+	sampleOffset := scale / 2
+	for outY := 0; outY < validHeight; outY++ {
+		srcY := worldY0 + int64(outY)*scale + sampleOffset
+		if srcY >= int64(timeshadedb.CanvasHeight) {
+			continue
+		}
+		tileY := int(srcY / int64(timeshadedb.TileSize))
+		localY := int(srcY % int64(timeshadedb.TileSize))
+		for outX := 0; outX < validWidth; outX++ {
+			srcX := worldX0 + int64(outX)*scale + sampleOffset
+			if srcX >= int64(timeshadedb.CanvasWidth) {
+				continue
+			}
+			tileX := int(srcX / int64(timeshadedb.TileSize))
+			localX := int(srcX % int64(timeshadedb.TileSize))
+			native, err := loadNative(tileX, tileY)
+			if err != nil {
+				return nil, err
+			}
+			if localX < native.Width && localY < native.Height {
+				pixels[outY*validWidth+outX] = native.Pixels[localY*native.Width+localX]
+			}
+		}
+	}
+	if palette == nil {
+		palette = []timeshadedb.RGB{}
+	}
+	return &timeshadedb.TileResult{
+		Tile:    timeshadedb.TileCoord{X: x, Y: y},
+		Width:   validWidth,
+		Height:  validHeight,
+		Palette: palette,
+		Pixels:  pixels,
+	}, nil
 }
 
 func (s *webServer) handleStatic(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +262,59 @@ func parseTimestampSec(r *http.Request) (uint32, error) {
 		return 0, fmt.Errorf("invalid ts query parameter")
 	}
 	return uint32(ts), nil
+}
+
+func minTileZoom(cols, rows int) int {
+	maxTiles := cols
+	if rows > maxTiles {
+		maxTiles = rows
+	}
+	zoom := 0
+	for tiles := 1; tiles < maxTiles; tiles <<= 1 {
+		zoom--
+	}
+	return zoom
+}
+
+func tileInZoomBounds(z, x, y int) bool {
+	scale, err := zoomScale(z)
+	if err != nil {
+		return false
+	}
+	span := int64(timeshadedb.TileSize) * scale
+	cols := ceilDivInt64(int64(timeshadedb.CanvasWidth), span)
+	rows := ceilDivInt64(int64(timeshadedb.CanvasHeight), span)
+	return x >= 0 && int64(x) < cols && y >= 0 && int64(y) < rows
+}
+
+func zoomScale(z int) (int64, error) {
+	if z > 0 {
+		return 0, fmt.Errorf("positive tile zoom %d has no native data", z)
+	}
+	shift := -z
+	if shift >= 31 {
+		return 0, fmt.Errorf("tile zoom %d is too small", z)
+	}
+	return int64(1) << uint(shift), nil
+}
+
+func downsampledTileSpan(canvasSize int, worldStart, scale int64) int {
+	remaining := int64(canvasSize) - worldStart
+	if remaining <= 0 {
+		return 0
+	}
+	span := ceilDivInt64(remaining, scale)
+	if span > int64(timeshadedb.TileSize) {
+		return timeshadedb.TileSize
+	}
+	return int(span)
+}
+
+func ceilDivInt64(n, d int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	return (n + d - 1) / d
 }
 
 func encodeTilePNG(w io.Writer, res *timeshadedb.TileResult, width, height int, level png.CompressionLevel) error {

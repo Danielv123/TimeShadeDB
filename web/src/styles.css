@@ -207,13 +207,25 @@ h1 {
   background: #dfe5dc;
 }
 
+.leaflet-pane,
+.leaflet-layer,
+.leaflet-tile-container,
+.leaflet-tile,
+.canvasTile {
+  background: transparent !important;
+}
+
 .leaflet-tile,
 .canvasTile {
   image-rendering: pixelated;
 }
 
+.leaflet-layer,
+.leaflet-tile-container,
+.leaflet-zoom-animated,
 .leaflet-tile,
-.leaflet-fade-anim .leaflet-tile {
+.leaflet-fade-anim .leaflet-tile,
+.leaflet-zoom-anim .leaflet-zoom-animated {
   transition: none !important;
 }
 

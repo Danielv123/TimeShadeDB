@@ -92,6 +92,9 @@ func TestWebAPI(t *testing.T) {
 	if got, want := meta.CanvasWidth, 2000; got != want {
 		t.Fatalf("canvas width = %d, want %d", got, want)
 	}
+	if got, want := meta.MinZoom, -2; got != want {
+		t.Fatalf("min zoom = %d, want %d", got, want)
+	}
 	if meta.FromSec == 0 || meta.ToSec == 0 || meta.FromSec > meta.ToSec {
 		t.Fatalf("unexpected time range: %d..%d", meta.FromSec, meta.ToSec)
 	}
@@ -112,6 +115,24 @@ func TestWebAPI(t *testing.T) {
 	r, g, b, a := img.At(1, 1).RGBA()
 	if r>>8 != 4 || g>>8 != 5 || b>>8 != 6 || a>>8 != 255 {
 		t.Fatalf("pixel = rgba(%d,%d,%d,%d), want rgba(4,5,6,255)", r>>8, g>>8, b>>8, a>>8)
+	}
+
+	downsampledReq := httptest.NewRequest(http.MethodGet, "/api/tiles/-1/0/0.png?ts=1648814520", nil)
+	downsampledResp := httptest.NewRecorder()
+	handler.ServeHTTP(downsampledResp, downsampledReq)
+	if downsampledResp.Code != http.StatusOK {
+		t.Fatalf("downsampled tile status = %d, body %s", downsampledResp.Code, downsampledResp.Body.String())
+	}
+	downsampledImg, err := png.Decode(downsampledResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := downsampledImg.Bounds().Dx(), timeshadedb.TileSize; got != want {
+		t.Fatalf("downsampled tile png width = %d, want %d", got, want)
+	}
+	r, g, b, a = downsampledImg.At(0, 0).RGBA()
+	if r>>8 != 4 || g>>8 != 5 || b>>8 != 6 || a>>8 != 255 {
+		t.Fatalf("downsampled pixel = rgba(%d,%d,%d,%d), want rgba(4,5,6,255)", r>>8, g>>8, b>>8, a>>8)
 	}
 }
 

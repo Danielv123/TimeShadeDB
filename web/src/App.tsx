@@ -7,6 +7,7 @@ type Metadata = {
   tileSize: number;
   tileCols: number;
   tileRows: number;
+  minZoom: number;
   fromSec: number;
   toSec: number;
 };
@@ -16,38 +17,38 @@ type SliderStyle = CSSProperties & {
 };
 
 const tileRequestThrottleMs = 100;
+const maxDisplayZoom = 4;
 
-function tileLayerUrl(timestamp: number) {
-  return `/api/tiles/0/{x}/{y}.png?ts=${timestamp}`;
-}
-
-function concreteTileUrl(timestamp: number, x: number, y: number) {
-  return `/api/tiles/0/${x}/${y}.png?ts=${timestamp}`;
-}
-
-function loadTileImage(src: string) {
-  return new Promise<void>((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      if (typeof img.decode !== "function") {
-        resolve();
+const DecodedTileLayer = L.TileLayer.extend({
+  createTile(coords: L.Coords, done: L.DoneCallback) {
+    const tile = document.createElement("img");
+    L.DomEvent.on(tile, "load", () => {
+      if (typeof tile.decode !== "function") {
+        done(undefined, tile);
         return;
       }
-      img.decode().then(resolve, reject);
-    };
-    img.onerror = () => reject(new Error(`Failed to load ${src}`));
-    img.src = src;
-  });
+      tile.decode().then(
+        () => done(undefined, tile),
+        (error: unknown) => done(error instanceof Error ? error : new Error(String(error)), tile)
+      );
+    });
+    L.DomEvent.on(tile, "error", () => {
+      done(new Error(`Failed to load tile ${tile.src}`), tile);
+    });
+    tile.alt = "";
+    tile.decoding = "async";
+    tile.role = "presentation";
+    tile.src = this.getTileUrl(coords);
+    return tile;
+  }
+}) as unknown as typeof L.TileLayer;
+
+function decodedTileLayer(url: string, options: L.TileLayerOptions) {
+  return new DecodedTileLayer(url, options) as L.TileLayer;
 }
 
-function preloadTimestampTiles(meta: Metadata, timestamp: number) {
-  const loads: Promise<void>[] = [];
-  for (let y = 0; y < meta.tileRows; y++) {
-    for (let x = 0; x < meta.tileCols; x++) {
-      loads.push(loadTileImage(concreteTileUrl(timestamp, x, y)));
-    }
-  }
-  return Promise.all(loads);
+function tileLayerUrl(timestamp: number) {
+  return `/api/tiles/{z}/{x}/{y}.png?ts=${timestamp}`;
 }
 
 function formatTimestamp(sec: number) {
@@ -147,8 +148,8 @@ export function App() {
     ]);
     const map = L.map(mapNode.current, {
       crs: L.CRS.Simple,
-      minZoom: -2,
-      maxZoom: 0,
+      minZoom: meta.minZoom,
+      maxZoom: maxDisplayZoom,
       zoomSnap: 0.25,
       zoomControl: true,
       attributionControl: false,
@@ -186,65 +187,53 @@ export function App() {
       [0, meta.canvasWidth]
     ]);
     let nextLayer: L.TileLayer | null = null;
-    let cancelled = false;
 
-    preloadTimestampTiles(meta, requestTimestamp)
-      .then(() => {
-        if (cancelled || renderSeqRef.current !== seq) {
-          return;
-        }
-        nextLayer = L.tileLayer(tileLayerUrl(requestTimestamp), {
-          tileSize: meta.tileSize,
-          minNativeZoom: 0,
-          maxNativeZoom: 0,
-          bounds,
-          noWrap: true,
-          updateWhenIdle: false,
-          keepBuffer: 1,
-          opacity: 1,
-          className: "canvasTile"
-        }).addTo(map);
-        pendingLayerRef.current = nextLayer;
+    nextLayer = decodedTileLayer(tileLayerUrl(requestTimestamp), {
+      tileSize: meta.tileSize,
+      minZoom: meta.minZoom,
+      maxZoom: maxDisplayZoom,
+      maxNativeZoom: 0,
+      bounds,
+      noWrap: true,
+      updateWhenIdle: false,
+      updateWhenZooming: true,
+      keepBuffer: 1,
+      opacity: 1,
+      className: "canvasTile"
+    }).addTo(map);
+    pendingLayerRef.current = nextLayer;
 
-        nextLayer.once("load", () => {
-          if (!nextLayer || renderSeqRef.current !== seq) {
-            nextLayer?.remove();
-            return;
-          }
-          nextLayer.bringToFront();
-          const previousLayer = activeLayerRef.current;
-          activeLayerRef.current = nextLayer;
-          pendingLayerRef.current = null;
-          setError(null);
-          if (previousLayer && previousLayer !== nextLayer) {
-            requestAnimationFrame(() => {
-              requestAnimationFrame(() => {
-                previousLayer.remove();
-              });
-            });
-          }
+    nextLayer.once("load", () => {
+      if (!nextLayer || renderSeqRef.current !== seq) {
+        nextLayer?.remove();
+        return;
+      }
+      nextLayer.bringToFront();
+      const previousLayer = activeLayerRef.current;
+      activeLayerRef.current = nextLayer;
+      pendingLayerRef.current = null;
+      setError(null);
+      if (previousLayer && previousLayer !== nextLayer) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            previousLayer.remove();
+          });
         });
-        nextLayer.once("tileerror", (event) => {
-          if (!nextLayer || renderSeqRef.current !== seq) {
-            return;
-          }
-          nextLayer.remove();
-          if (pendingLayerRef.current === nextLayer) {
-            pendingLayerRef.current = null;
-          }
-          const coords = (event as L.TileEvent).coords;
-          setError(`Failed to load tile ${coords.x},${coords.y} for ${requestTimestamp}`);
-        });
-      })
-      .catch((err: unknown) => {
-        if (cancelled || renderSeqRef.current !== seq) {
-          return;
-        }
-        setError(err instanceof Error ? err.message : String(err));
-      });
+      }
+    });
+    nextLayer.once("tileerror", (event) => {
+      if (!nextLayer || renderSeqRef.current !== seq) {
+        return;
+      }
+      nextLayer.remove();
+      if (pendingLayerRef.current === nextLayer) {
+        pendingLayerRef.current = null;
+      }
+      const coords = (event as L.TileEvent).coords;
+      setError(`Failed to load tile z${coords.z} ${coords.x},${coords.y} for ${requestTimestamp}`);
+    });
 
     return () => {
-      cancelled = true;
       if (renderSeqRef.current !== seq) {
         return;
       }
