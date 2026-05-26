@@ -3,15 +3,31 @@ import L from "leaflet";
 import logoDarkUrl from "../images/logo_dark_transparent.png";
 import logoLightUrl from "../images/logo_light_transparent.png";
 
-type Metadata = {
-  canvasWidth: number;
-  canvasHeight: number;
-  tileSize: number;
-  tileCols: number;
-  tileRows: number;
-  minZoom: number;
-  fromSec: number;
-  toSec: number;
+type SaveCatalog = {
+  saves: SaveSummary[];
+};
+
+type SaveSummary = {
+  savefile_uuid: string;
+  forces: string[];
+  surfaces: string[];
+  datastores: DatastoreSummary[];
+};
+
+type DatastoreSummary = {
+  surface: string;
+  force: string;
+  latest_tick: number;
+  latest_row_seq: number;
+  chunk_count: number;
+  min_chunk_x: number;
+  max_chunk_x: number;
+  min_chunk_y: number;
+  max_chunk_y: number;
+  min_tile_x: number;
+  max_tile_x: number;
+  min_tile_y: number;
+  max_tile_y: number;
 };
 
 type SliderStyle = CSSProperties & {
@@ -19,8 +35,9 @@ type SliderStyle = CSSProperties & {
 };
 
 const tileRequestThrottleMs = 100;
+const tileSize = 512;
 const maxDisplayZoom = 4;
-const playbackSpeedOptions = [1, 5, 10, 30, 60, 300, 900, 3600];
+const playbackSpeedOptions = [60, 300, 900, 1800, 3600, 7200, 18000, 36000];
 
 const DecodedTileLayer = L.TileLayer.extend({
   createTile(coords: L.Coords, done: L.DoneCallback) {
@@ -50,19 +67,60 @@ function decodedTileLayer(url: string, options: L.TileLayerOptions) {
   return new DecodedTileLayer(url, options) as L.TileLayer;
 }
 
-function tileLayerUrl(timestamp: number) {
-  return `/api/tiles/{z}/{x}/{y}.png?ts=${timestamp}`;
+function selectedSaveFromPath() {
+  const match = /^\/saves\/([^/]+)\/?$/.exec(window.location.pathname);
+  return match ? decodeURIComponent(match[1]) : null;
 }
 
-function formatTimestamp(sec: number) {
-  if (!Number.isFinite(sec) || sec <= 0) {
-    return "No timestamp";
+function savePath(savefileUUID: string) {
+  return `/saves/${encodeURIComponent(savefileUUID)}`;
+}
+
+function tileLayerUrl(savefileUUID: string, force: string, surface: string, tick: number) {
+  return `/api/chunk/tiles/${encodeURIComponent(savefileUUID)}/${encodeURIComponent(force)}/${encodeURIComponent(surface)}/{z}/{x}/{y}.png?tick=${tick}`;
+}
+
+function formatTick(tick: number) {
+  if (!Number.isFinite(tick) || tick <= 0) {
+    return "Tick 0";
   }
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "medium",
-    timeZone: "UTC"
-  }).format(new Date(sec * 1000));
+  return `Tick ${Math.trunc(tick).toLocaleString()}`;
+}
+
+function uniqueSorted(values: string[]) {
+  return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
+}
+
+function preferredValue(values: string[], preferred: string) {
+  if (values.includes(preferred)) {
+    return preferred;
+  }
+  return values[0] ?? "";
+}
+
+function datastoreBounds(datastore: DatastoreSummary) {
+  if (datastore.chunk_count <= 0) {
+    return L.latLngBounds([[-tileSize, 0], [0, tileSize]]);
+  }
+  const west = datastore.min_tile_x * tileSize;
+  const east = (datastore.max_tile_x + 1) * tileSize;
+  const north = -datastore.min_tile_y * tileSize;
+  const south = -(datastore.max_tile_y + 1) * tileSize;
+  return L.latLngBounds([[south, west], [north, east]]);
+}
+
+function minZoomForDatastore(datastore: DatastoreSummary | null) {
+  if (!datastore || datastore.chunk_count <= 0) {
+    return 0;
+  }
+  const cols = Math.max(1, datastore.max_tile_x - datastore.min_tile_x + 1);
+  const rows = Math.max(1, datastore.max_tile_y - datastore.min_tile_y + 1);
+  const maxTiles = Math.max(cols, rows);
+  let zoom = 0;
+  for (let tiles = 1; tiles < maxTiles; tiles <<= 1) {
+    zoom--;
+  }
+  return zoom;
 }
 
 export function App() {
@@ -74,17 +132,55 @@ export function App() {
   const renderSeqRef = useRef(0);
   const requestTimerRef = useRef<number | null>(null);
   const lastRequestAtRef = useRef(0);
-  const pendingRequestTimestampRef = useRef(0);
-  const timestampRef = useRef(0);
-  const [meta, setMeta] = useState<Metadata | null>(null);
-  const [timestamp, setTimestamp] = useState(0);
-  const [requestTimestamp, setRequestTimestamp] = useState(0);
+  const pendingRequestTickRef = useRef(0);
+  const tickRef = useRef(0);
+  const [catalog, setCatalog] = useState<SaveCatalog | null>(null);
+  const [selectedSaveID, setSelectedSaveID] = useState<string | null>(() => selectedSaveFromPath());
+  const [selectedForce, setSelectedForce] = useState("");
+  const [selectedSurface, setSelectedSurface] = useState("");
+  const [tick, setTick] = useState(0);
+  const [requestTick, setRequestTick] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [playbackSpeed, setPlaybackSpeed] = useState(60);
+  const [playbackSpeed, setPlaybackSpeed] = useState(3600);
   const [error, setError] = useState<string | null>(null);
 
-  const scheduleTileRequest = useCallback((nextTimestamp: number) => {
-    pendingRequestTimestampRef.current = nextTimestamp;
+  const saves = catalog?.saves ?? [];
+  const selectedSave = useMemo(
+    () => saves.find((save) => save.savefile_uuid === selectedSaveID) ?? null,
+    [saves, selectedSaveID]
+  );
+  const forces = selectedSave?.forces ?? [];
+  const surfacesForForce = useMemo(() => {
+    if (!selectedSave || !selectedForce) {
+      return [];
+    }
+    return uniqueSorted(
+      selectedSave.datastores
+        .filter((datastore) => datastore.force === selectedForce)
+        .map((datastore) => datastore.surface)
+    );
+  }, [selectedSave, selectedForce]);
+  const selectedDatastore = useMemo(() => {
+    if (!selectedSave) {
+      return null;
+    }
+    return (
+      selectedSave.datastores.find(
+        (datastore) => datastore.force === selectedForce && datastore.surface === selectedSurface
+      ) ?? null
+    );
+  }, [selectedForce, selectedSave, selectedSurface]);
+  const minZoom = useMemo(() => minZoomForDatastore(selectedDatastore), [selectedDatastore]);
+
+  const navigateToSave = useCallback((savefileUUID: string | null) => {
+    const nextPath = savefileUUID ? savePath(savefileUUID) : "/";
+    window.history.pushState({}, "", nextPath);
+    setSelectedSaveID(savefileUUID);
+    setError(null);
+  }, []);
+
+  const scheduleTileRequest = useCallback((nextTick: number) => {
+    pendingRequestTickRef.current = nextTick;
     const now = performance.now();
     const elapsed = now - lastRequestAtRef.current;
     if (elapsed >= tileRequestThrottleMs) {
@@ -93,7 +189,7 @@ export function App() {
         requestTimerRef.current = null;
       }
       lastRequestAtRef.current = now;
-      setRequestTimestamp(nextTimestamp);
+      setRequestTick(nextTick);
       return;
     }
     if (requestTimerRef.current !== null) {
@@ -102,30 +198,32 @@ export function App() {
     requestTimerRef.current = window.setTimeout(() => {
       requestTimerRef.current = null;
       lastRequestAtRef.current = performance.now();
-      setRequestTimestamp(pendingRequestTimestampRef.current);
+      setRequestTick(pendingRequestTickRef.current);
     }, tileRequestThrottleMs - elapsed);
   }, []);
 
   useEffect(() => {
+    const onPopState = () => {
+      setSelectedSaveID(selectedSaveFromPath());
+      setError(null);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
-    fetch("/api/meta")
+    fetch("/api/chunk/saves")
       .then((response) => {
         if (!response.ok) {
-          throw new Error(`Metadata request failed: ${response.status}`);
+          throw new Error(`Save list request failed: ${response.status}`);
         }
-        return response.json() as Promise<Metadata>;
+        return response.json() as Promise<SaveCatalog>;
       })
-      .then((nextMeta) => {
-        if (cancelled) {
-          return;
+      .then((nextCatalog) => {
+        if (!cancelled) {
+          setCatalog(nextCatalog);
         }
-        setMeta(nextMeta);
-        const initialTimestamp = nextMeta.toSec || nextMeta.fromSec || 0;
-        timestampRef.current = initialTimestamp;
-        setTimestamp(initialTimestamp);
-        setRequestTimestamp(initialTimestamp);
-        pendingRequestTimestampRef.current = initialTimestamp;
-        lastRequestAtRef.current = performance.now();
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -138,8 +236,60 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    timestampRef.current = timestamp;
-  }, [timestamp]);
+    if (!catalog || !selectedSaveID) {
+      return;
+    }
+    if (!catalog.saves.some((save) => save.savefile_uuid === selectedSaveID)) {
+      setError(`Save not found: ${selectedSaveID}`);
+    }
+  }, [catalog, selectedSaveID]);
+
+  useEffect(() => {
+    if (!selectedSave) {
+      setSelectedForce("");
+      setSelectedSurface("");
+      setIsPlaying(false);
+      return;
+    }
+    setSelectedForce((current) => {
+      if (current && selectedSave.forces.includes(current)) {
+        return current;
+      }
+      return preferredValue(selectedSave.forces, "player");
+    });
+  }, [selectedSave]);
+
+  useEffect(() => {
+    if (!selectedSave || !selectedForce) {
+      setSelectedSurface("");
+      return;
+    }
+    setSelectedSurface((current) => {
+      if (current && surfacesForForce.includes(current)) {
+        return current;
+      }
+      return preferredValue(surfacesForForce, "nauvis");
+    });
+  }, [selectedForce, selectedSave, surfacesForForce]);
+
+  useEffect(() => {
+    if (!selectedDatastore) {
+      setTick(0);
+      setRequestTick(0);
+      tickRef.current = 0;
+      return;
+    }
+    const nextTick = selectedDatastore.latest_tick || 0;
+    tickRef.current = nextTick;
+    setTick(nextTick);
+    setRequestTick(nextTick);
+    pendingRequestTickRef.current = nextTick;
+    lastRequestAtRef.current = performance.now();
+  }, [selectedDatastore]);
+
+  useEffect(() => {
+    tickRef.current = tick;
+  }, [tick]);
 
   useEffect(() => {
     return () => {
@@ -150,40 +300,30 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!isPlaying || !meta || meta.fromSec === meta.toSec) {
+    if (!isPlaying || !selectedDatastore || selectedDatastore.latest_tick <= 0) {
       return;
     }
     const interval = window.setInterval(() => {
-      const baseTimestamp = Number.isFinite(timestampRef.current)
-        ? timestampRef.current
-        : meta.fromSec;
-      const nextTimestamp = Math.min(
-        meta.toSec,
-        Math.max(meta.fromSec, baseTimestamp + playbackSpeed)
-      );
-      timestampRef.current = nextTimestamp;
-      setTimestamp(nextTimestamp);
-      scheduleTileRequest(nextTimestamp);
-      if (nextTimestamp >= meta.toSec) {
+      const baseTick = Number.isFinite(tickRef.current) ? tickRef.current : 0;
+      const nextTick = Math.min(selectedDatastore.latest_tick, Math.max(0, baseTick + playbackSpeed));
+      tickRef.current = nextTick;
+      setTick(nextTick);
+      scheduleTileRequest(nextTick);
+      if (nextTick >= selectedDatastore.latest_tick) {
         setIsPlaying(false);
       }
     }, 1000);
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [isPlaying, meta, playbackSpeed, scheduleTileRequest]);
+    return () => window.clearInterval(interval);
+  }, [isPlaying, playbackSpeed, scheduleTileRequest, selectedDatastore]);
 
   useEffect(() => {
-    if (!meta || !mapNode.current || mapRef.current) {
+    if (!selectedDatastore || !mapNode.current) {
       return;
     }
-    const bounds = L.latLngBounds([
-      [-meta.canvasHeight, 0],
-      [0, meta.canvasWidth]
-    ]);
+    const bounds = datastoreBounds(selectedDatastore);
     const map = L.map(mapNode.current, {
       crs: L.CRS.Simple,
-      minZoom: meta.minZoom,
+      minZoom,
       maxZoom: maxDisplayZoom,
       zoomSnap: 0.25,
       zoomControl: true,
@@ -208,39 +348,37 @@ export function App() {
       pendingLayerRef.current = null;
       borderRef.current = null;
     };
-  }, [meta]);
+  }, [minZoom, selectedDatastore]);
 
   useEffect(() => {
     const map = mapRef.current;
-    if (!meta || !map || !requestTimestamp) {
+    if (!selectedSave || !selectedDatastore || !selectedForce || !selectedSurface || !map) {
       return;
     }
     const seq = ++renderSeqRef.current;
     pendingLayerRef.current?.remove();
-    const bounds = L.latLngBounds([
-      [-meta.canvasHeight, 0],
-      [0, meta.canvasWidth]
-    ]);
-    let nextLayer: L.TileLayer | null = null;
-
-    nextLayer = decodedTileLayer(tileLayerUrl(requestTimestamp), {
-      tileSize: meta.tileSize,
-      minZoom: meta.minZoom,
-      maxZoom: maxDisplayZoom,
-      maxNativeZoom: 0,
-      bounds,
-      noWrap: true,
-      updateWhenIdle: false,
-      updateWhenZooming: true,
-      keepBuffer: 1,
-      opacity: 1,
-      className: "canvasTile"
-    }).addTo(map);
+    const bounds = datastoreBounds(selectedDatastore);
+    const nextLayer = decodedTileLayer(
+      tileLayerUrl(selectedSave.savefile_uuid, selectedForce, selectedSurface, requestTick),
+      {
+        tileSize,
+        minZoom,
+        maxZoom: maxDisplayZoom,
+        maxNativeZoom: 0,
+        bounds,
+        noWrap: true,
+        updateWhenIdle: false,
+        updateWhenZooming: true,
+        keepBuffer: 1,
+        opacity: 1,
+        className: "canvasTile"
+      }
+    ).addTo(map);
     pendingLayerRef.current = nextLayer;
 
     nextLayer.once("load", () => {
-      if (!nextLayer || renderSeqRef.current !== seq) {
-        nextLayer?.remove();
+      if (renderSeqRef.current !== seq) {
+        nextLayer.remove();
         return;
       }
       nextLayer.bringToFront();
@@ -250,14 +388,12 @@ export function App() {
       setError(null);
       if (previousLayer && previousLayer !== nextLayer) {
         requestAnimationFrame(() => {
-          requestAnimationFrame(() => {
-            previousLayer.remove();
-          });
+          requestAnimationFrame(() => previousLayer.remove());
         });
       }
     });
     nextLayer.once("tileerror", (event) => {
-      if (!nextLayer || renderSeqRef.current !== seq) {
+      if (renderSeqRef.current !== seq) {
         return;
       }
       nextLayer.remove();
@@ -265,7 +401,7 @@ export function App() {
         pendingLayerRef.current = null;
       }
       const coords = (event as L.TileEvent).coords;
-      setError(`Failed to load tile z${coords.z} ${coords.x},${coords.y} for ${requestTimestamp}`);
+      setError(`Failed to load tile z${coords.z} ${coords.x},${coords.y} for ${formatTick(requestTick)}`);
     });
 
     return () => {
@@ -274,128 +410,214 @@ export function App() {
       }
       if (pendingLayerRef.current === nextLayer) {
         pendingLayerRef.current = null;
-        nextLayer?.remove();
-      } else if (nextLayer && activeLayerRef.current !== nextLayer) {
+        nextLayer.remove();
+      } else if (activeLayerRef.current !== nextLayer) {
         nextLayer.remove();
       }
     };
-  }, [meta, requestTimestamp]);
+  }, [minZoom, requestTick, selectedDatastore, selectedForce, selectedSave, selectedSurface]);
 
-  const sliderDisabled = !meta || meta.fromSec === meta.toSec;
+  const sliderDisabled = !selectedDatastore || selectedDatastore.latest_tick <= 0;
   const progress = useMemo(() => {
-    if (!meta || meta.toSec <= meta.fromSec) {
+    if (!selectedDatastore || selectedDatastore.latest_tick <= 0) {
       return 100;
     }
-    return ((timestamp - meta.fromSec) / (meta.toSec - meta.fromSec)) * 100;
-  }, [meta, timestamp]);
+    return (tick / selectedDatastore.latest_tick) * 100;
+  }, [selectedDatastore, tick]);
+
+  const showSaveList = !selectedSave;
 
   return (
     <main className="shell">
       <aside className="sidebar">
         <div className="brandHeader">
-          <picture>
-            <source media="(prefers-color-scheme: dark)" srcSet={logoDarkUrl} />
-            <img className="brandLogo" src={logoLightUrl} alt="TimeShadeDB" />
-          </picture>
+          <button className="brandButton" type="button" onClick={() => navigateToSave(null)}>
+            <picture>
+              <source media="(prefers-color-scheme: dark)" srcSet={logoDarkUrl} />
+              <img className="brandLogo" src={logoLightUrl} alt="TimeShadeDB" />
+            </picture>
+          </button>
         </div>
 
-        <section className="controlGroup" aria-label="Timestamp">
-          <div className="timestampReadout">{formatTimestamp(timestamp)}</div>
-          <div className="playbackControls">
-            <button
-              className="playbackButton"
-              type="button"
-              disabled={sliderDisabled}
-              aria-pressed={isPlaying}
-              onClick={() => {
-                if (isPlaying) {
-                  setIsPlaying(false);
-                  return;
-                }
-                if (meta && timestampRef.current >= meta.toSec) {
-                  timestampRef.current = meta.fromSec;
-                  setTimestamp(meta.fromSec);
-                  scheduleTileRequest(meta.fromSec);
-                }
-                setIsPlaying(true);
-              }}
-            >
-              <span className="playbackIcon" aria-hidden="true">
-                {isPlaying ? "||" : ">"}
-              </span>
-              <span>{isPlaying ? "Pause" : "Play"}</span>
-            </button>
-            <label className="speedControl">
-              <span>Speed</span>
-              <select
-                value={playbackSpeed}
+        {selectedSave ? (
+          <>
+            <section className="controlGroup" aria-label="Game tick">
+              <div className="timestampReadout">{formatTick(tick)}</div>
+              <div className="playbackControls">
+                <button
+                  className="playbackButton"
+                  type="button"
+                  disabled={sliderDisabled}
+                  aria-pressed={isPlaying}
+                  onClick={() => {
+                    if (isPlaying) {
+                      setIsPlaying(false);
+                      return;
+                    }
+                    if (selectedDatastore && tickRef.current >= selectedDatastore.latest_tick) {
+                      tickRef.current = 0;
+                      setTick(0);
+                      scheduleTileRequest(0);
+                    }
+                    setIsPlaying(true);
+                  }}
+                >
+                  <span className="playbackIcon" aria-hidden="true">
+                    {isPlaying ? "||" : ">"}
+                  </span>
+                  <span>{isPlaying ? "Pause" : "Play"}</span>
+                </button>
+                <label className="speedControl">
+                  <span>Speed</span>
+                  <select
+                    value={playbackSpeed}
+                    disabled={sliderDisabled}
+                    aria-label="Playback speed"
+                    onChange={(event) => setPlaybackSpeed(Number(event.currentTarget.value))}
+                  >
+                    {playbackSpeedOptions.map((speed) => (
+                      <option key={speed} value={speed}>
+                        {speed.toLocaleString()} ticks/s
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <input
+                className="timeSlider"
+                type="range"
+                min={0}
+                max={selectedDatastore?.latest_tick ?? 0}
+                value={tick}
+                step={1}
                 disabled={sliderDisabled}
-                aria-label="Playback speed"
-                onChange={(event) => {
-                  setPlaybackSpeed(Number(event.currentTarget.value));
+                style={{ "--progress": `${progress}%` } as SliderStyle}
+                onInput={(event) => {
+                  const nextTick = Number(event.currentTarget.value);
+                  tickRef.current = nextTick;
+                  setTick(nextTick);
+                  scheduleTileRequest(nextTick);
                 }}
-              >
-                {playbackSpeedOptions.map((speed) => (
-                  <option key={speed} value={speed}>
-                    {speed}x
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          <input
-            className="timeSlider"
-            type="range"
-            min={meta?.fromSec ?? 0}
-            max={meta?.toSec ?? 0}
-            value={timestamp}
-            step={1}
-            disabled={sliderDisabled}
-            style={{ "--progress": `${progress}%` } as SliderStyle}
-            onInput={(event) => {
-              const nextTimestamp = Number(event.currentTarget.value);
-              timestampRef.current = nextTimestamp;
-              setTimestamp(nextTimestamp);
-              scheduleTileRequest(nextTimestamp);
-            }}
-            onChange={(event) => {
-              const nextTimestamp = Number(event.currentTarget.value);
-              timestampRef.current = nextTimestamp;
-              setTimestamp(nextTimestamp);
-              scheduleTileRequest(nextTimestamp);
-            }}
-          />
-          <div className="rangeLabels">
-            <span>{formatTimestamp(meta?.fromSec ?? 0)}</span>
-            <span>{formatTimestamp(meta?.toSec ?? 0)}</span>
-          </div>
-        </section>
+                onChange={(event) => {
+                  const nextTick = Number(event.currentTarget.value);
+                  tickRef.current = nextTick;
+                  setTick(nextTick);
+                  scheduleTileRequest(nextTick);
+                }}
+              />
+              <div className="rangeLabels">
+                <span>{formatTick(0)}</span>
+                <span>{formatTick(selectedDatastore?.latest_tick ?? 0)}</span>
+              </div>
+            </section>
 
-        <dl className="statsGrid">
-          <div>
-            <dt>Canvas</dt>
-            <dd>{meta ? `${meta.canvasWidth} x ${meta.canvasHeight}` : "-"}</dd>
-          </div>
-          <div>
-            <dt>Tiles</dt>
-            <dd>{meta ? `${meta.tileCols} x ${meta.tileRows}` : "-"}</dd>
-          </div>
-          <div>
-            <dt>Tile size</dt>
-            <dd>{meta ? `${meta.tileSize}px` : "-"}</dd>
-          </div>
-          <div>
-            <dt>Unix sec</dt>
-            <dd>{timestamp || "-"}</dd>
-          </div>
-        </dl>
+            <dl className="statsGrid">
+              <div>
+                <dt>Save</dt>
+                <dd>{selectedSave.savefile_uuid}</dd>
+              </div>
+              <div>
+                <dt>Chunks</dt>
+                <dd>{selectedDatastore ? selectedDatastore.chunk_count.toLocaleString() : "-"}</dd>
+              </div>
+              <div>
+                <dt>Tiles</dt>
+                <dd>
+                  {selectedDatastore
+                    ? `${selectedDatastore.max_tile_x - selectedDatastore.min_tile_x + 1} x ${
+                        selectedDatastore.max_tile_y - selectedDatastore.min_tile_y + 1
+                      }`
+                    : "-"}
+                </dd>
+              </div>
+              <div>
+                <dt>Row seq</dt>
+                <dd>{selectedDatastore ? selectedDatastore.latest_row_seq.toLocaleString() : "-"}</dd>
+              </div>
+            </dl>
+
+            <section className="controlGroup" aria-label="Force">
+              <label className="selectControl">
+                <span>Force</span>
+                <select
+                  value={selectedForce}
+                  onChange={(event) => {
+                    setSelectedForce(event.currentTarget.value);
+                    setIsPlaying(false);
+                  }}
+                >
+                  {forces.map((force) => (
+                    <option key={force} value={force}>
+                      {force}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </section>
+
+            <section className="surfacePanel" aria-label="Surfaces">
+              <div className="panelLabel">Surfaces</div>
+              <div className="surfaceList">
+                {surfacesForForce.map((surface) => (
+                  <button
+                    key={surface}
+                    className="surfaceButton"
+                    type="button"
+                    aria-pressed={surface === selectedSurface}
+                    onClick={() => {
+                      setSelectedSurface(surface);
+                      setIsPlaying(false);
+                    }}
+                  >
+                    {surface}
+                  </button>
+                ))}
+              </div>
+            </section>
+          </>
+        ) : (
+          <section className="controlGroup">
+            <div className="timestampReadout">Saves</div>
+            <dl className="statsGrid">
+              <div>
+                <dt>Count</dt>
+                <dd>{saves.length.toLocaleString()}</dd>
+              </div>
+              <div>
+                <dt>Database</dt>
+                <dd>Chunks</dd>
+              </div>
+            </dl>
+          </section>
+        )}
 
         {error ? <div className="errorBox">{error}</div> : null}
       </aside>
 
-      <section className="mapPane" aria-label="Canvas map">
-        <div ref={mapNode} className="map" />
-      </section>
+      {showSaveList ? (
+        <section className="savePane" aria-label="Saves">
+          <div className="saveList">
+            {saves.map((save) => (
+              <button
+                className="saveItem"
+                key={save.savefile_uuid}
+                type="button"
+                onClick={() => navigateToSave(save.savefile_uuid)}
+              >
+                <span className="saveName">{save.savefile_uuid}</span>
+                <span className="saveMeta">
+                  {save.datastores.length.toLocaleString()} datastores - {save.forces.join(", ") || "no forces"}
+                </span>
+              </button>
+            ))}
+            {catalog && saves.length === 0 ? <div className="emptyState">No saves have been ingested.</div> : null}
+          </div>
+        </section>
+      ) : (
+        <section className="mapPane" aria-label="Chunk map">
+          <div ref={mapNode} className="map" />
+        </section>
+      )}
     </main>
   );
 }
