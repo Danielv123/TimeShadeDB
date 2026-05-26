@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -12,6 +13,8 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -37,10 +40,16 @@ func run(ctx context.Context, args []string) error {
 		path := fs.String("db", "", "database directory")
 		maxRows := fs.Uint64("max-rows", 0, "optional import row limit for sampling")
 		pprofAddr := fs.String("pprof", "", "optional pprof listen address")
+		cpuProfile := fs.String("cpuprofile", "", "optional CPU profile output path")
+		memProfile := fs.String("memprofile", "", "optional heap profile output path")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		if err := startPprof(*pprofAddr); err != nil {
+			return err
+		}
+		profiles, err := startProfiles(*cpuProfile, *memProfile)
+		if err != nil {
 			return err
 		}
 		if *input == "" || *path == "" {
@@ -54,6 +63,9 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		stats, err := timeshadedb.ImportCSVWithOptions(ctx, db, *input, timeshadedb.ImportOptions{MaxRows: *maxRows})
+		if profileErr := profiles.Stop(); err == nil {
+			err = profileErr
+		}
 		if err != nil {
 			return err
 		}
@@ -190,6 +202,8 @@ func run(ctx context.Context, args []string) error {
 		fs := flag.NewFlagSet("compact", flag.ExitOnError)
 		path := fs.String("db", "", "database directory")
 		pprofAddr := fs.String("pprof", "", "optional pprof listen address")
+		cpuProfile := fs.String("cpuprofile", "", "optional CPU profile output path")
+		memProfile := fs.String("memprofile", "", "optional heap profile output path")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -199,12 +213,19 @@ func run(ctx context.Context, args []string) error {
 		if err := startPprof(*pprofAddr); err != nil {
 			return err
 		}
+		profiles, err := startProfiles(*cpuProfile, *memProfile)
+		if err != nil {
+			return err
+		}
 		db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: *path})
 		if err != nil {
 			return err
 		}
 		defer db.Close()
 		stats, err := db.Compact(ctx)
+		if profileErr := profiles.Stop(); err == nil {
+			err = profileErr
+		}
 		if err != nil {
 			return err
 		}
@@ -216,6 +237,8 @@ func run(ctx context.Context, args []string) error {
 		cacheSize := fs.Int64("cache-size", 0, "decoded snapshot cache bytes")
 		seed := fs.Int64("seed", 1, "random seed")
 		pprofAddr := fs.String("pprof", "", "optional pprof listen address")
+		cpuProfile := fs.String("cpuprofile", "", "optional CPU profile output path")
+		memProfile := fs.String("memprofile", "", "optional heap profile output path")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -225,12 +248,19 @@ func run(ctx context.Context, args []string) error {
 		if err := startPprof(*pprofAddr); err != nil {
 			return err
 		}
+		profiles, err := startProfiles(*cpuProfile, *memProfile)
+		if err != nil {
+			return err
+		}
 		db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: *path, ReadOnly: true, CacheSize: *cacheSize})
 		if err != nil {
 			return err
 		}
 		defer db.Close()
 		stats, err := db.Benchmark(ctx, timeshadedb.BenchmarkOptions{Queries: *queries, Seed: *seed})
+		if profileErr := profiles.Stop(); err == nil {
+			err = profileErr
+		}
 		if err != nil {
 			return err
 		}
@@ -299,4 +329,51 @@ func startPprof(addr string) error {
 		_ = http.Serve(ln, nil)
 	}()
 	return nil
+}
+
+type profileSession struct {
+	cpuFile *os.File
+	memPath string
+}
+
+func startProfiles(cpuPath, memPath string) (*profileSession, error) {
+	s := &profileSession{memPath: memPath}
+	if cpuPath == "" {
+		return s, nil
+	}
+	f, err := os.Create(cpuPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	s.cpuFile = f
+	return s, nil
+}
+
+func (s *profileSession) Stop() error {
+	var errs []error
+	if s.cpuFile != nil {
+		pprof.StopCPUProfile()
+		if err := s.cpuFile.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.memPath != "" {
+		runtime.GC()
+		f, err := os.Create(s.memPath)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				errs = append(errs, err)
+			}
+			if err := f.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
