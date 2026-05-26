@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -398,6 +399,38 @@ func TestSendAppendedChunkRowsDefersPartialTrailingLine(t *testing.T) {
 	}
 }
 
+func TestPostChunkRowsRetriesConnectionErrors(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, fmt.Errorf("connection refused")
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(body), "row-1\nrow-2\n"; got != want {
+			t.Fatalf("posted body = %q, want %q", got, want)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"accepted_rows":2}`)),
+		}, nil
+	})}
+	reporter := newChunkProgressReporter(io.Discard, 0)
+	if err := postChunkRows(context.Background(), client, "http://timeshadedb.invalid", "save-1", []string{"row-1", "row-2"}, reporter, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if reporter.totalRows != 2 {
+		t.Fatalf("reported rows = %d, want 2", reporter.totalRows)
+	}
+}
+
 func TestStaticWebAppServesEmbeddedIndex(t *testing.T) {
 	fsys, err := timeshadedb.WebDistFS()
 	if err != nil {
@@ -492,4 +525,10 @@ func writeSample(path string) error {
 
 func testRGB565Hex(color uint16) string {
 	return strings.Repeat(fmt.Sprintf("%02x%02x", byte(color), byte(color>>8)), timeshadedb.ChunkPixelCount)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

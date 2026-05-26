@@ -24,6 +24,7 @@ type tailChunkTSVOptions struct {
 	PollInterval     time.Duration
 	ProgressInterval time.Duration
 	RequestTimeout   time.Duration
+	RetryInterval    time.Duration
 	ProgressOutput   io.Writer
 	Once             bool
 }
@@ -45,13 +46,16 @@ func tailChunkTSV(ctx context.Context, opts tailChunkTSVOptions) error {
 	if opts.RequestTimeout <= 0 {
 		opts.RequestTimeout = 5 * time.Minute
 	}
+	if opts.RetryInterval <= 0 {
+		opts.RetryInterval = 5 * time.Second
+	}
 	reporter := newChunkProgressReporter(opts.ProgressOutput, opts.ProgressInterval)
 	baseURL, err := normalizeBaseURL(opts.BaseURL)
 	if err != nil {
 		return err
 	}
 	client := &http.Client{Timeout: opts.RequestTimeout}
-	meta, err := fetchIngestMetadata(ctx, client, baseURL, opts.SavefileUUID)
+	meta, err := fetchIngestMetadata(ctx, client, baseURL, opts.SavefileUUID, opts.RetryInterval)
 	if err != nil {
 		return err
 	}
@@ -108,7 +112,7 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 		if len(targets) == 0 || lastMatchedOffset >= 0 {
 			batch = append(batch, line)
 			if len(batch) >= opts.BatchRows {
-				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
+				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter, opts.RetryInterval); err != nil {
 					return 0, err
 				}
 				batch = batch[:0]
@@ -117,7 +121,7 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 		offset = nextOffset
 	}
 	if len(batch) > 0 {
-		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
+		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter, opts.RetryInterval); err != nil {
 			return 0, err
 		}
 	}
@@ -155,7 +159,7 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		return offset, err
 	}
 	if info.Size() < offset {
-		meta, err := fetchIngestMetadata(ctx, client, baseURL, opts.SavefileUUID)
+		meta, err := fetchIngestMetadata(ctx, client, baseURL, opts.SavefileUUID, opts.RetryInterval)
 		if err != nil {
 			return offset, err
 		}
@@ -180,7 +184,7 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		if strings.TrimSpace(line) != "" {
 			batch = append(batch, line)
 			if len(batch) >= opts.BatchRows {
-				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
+				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter, opts.RetryInterval); err != nil {
 					return offset, err
 				}
 				batch = batch[:0]
@@ -189,7 +193,7 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		offset += lineBytes
 	}
 	if len(batch) > 0 {
-		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
+		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter, opts.RetryInterval); err != nil {
 			return offset, err
 		}
 	}
@@ -211,16 +215,35 @@ func readChunkTSVLine(reader *bufio.Reader) (line string, bytesRead int64, compl
 	return strings.TrimRight(raw, "\r\n"), int64(len(raw)), complete, nil
 }
 
-func fetchIngestMetadata(ctx context.Context, client *http.Client, baseURL, savefileUUID string) (*timeshadedb.IngestMetadata, error) {
+func fetchIngestMetadata(ctx context.Context, client *http.Client, baseURL, savefileUUID string, retryInterval time.Duration) (*timeshadedb.IngestMetadata, error) {
+	for {
+		meta, err := fetchIngestMetadataOnce(ctx, client, baseURL, savefileUUID)
+		if err == nil {
+			return meta, nil
+		}
+		if !isRetryableIngestError(err) {
+			return nil, err
+		}
+		if err := waitForRetry(ctx, retryInterval); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func fetchIngestMetadataOnce(ctx context.Context, client *http.Client, baseURL, savefileUUID string) (*timeshadedb.IngestMetadata, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/api/ingest/chunk/"+url.PathEscape(savefileUUID)+"/meta", nil)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, retryableIngestError{err: err}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, retryableIngestError{err: fmt.Errorf("metadata request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))}
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("metadata request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -232,32 +255,82 @@ func fetchIngestMetadata(ctx context.Context, client *http.Client, baseURL, save
 	return &meta, nil
 }
 
-func postChunkRows(ctx context.Context, client *http.Client, baseURL, savefileUUID string, rows []string, reporter *chunkProgressReporter) error {
+func postChunkRows(ctx context.Context, client *http.Client, baseURL, savefileUUID string, rows []string, reporter *chunkProgressReporter, retryInterval time.Duration) error {
 	body := bytes.NewBuffer(nil)
 	for _, row := range rows {
 		body.WriteString(row)
 		body.WriteByte('\n')
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/ingest/chunk/"+url.PathEscape(savefileUUID), body)
+	return postChunkRowsWithRetry(ctx, client, baseURL, savefileUUID, body.Bytes(), len(rows), reporter, retryInterval)
+}
+
+func postChunkRowsWithRetry(ctx context.Context, client *http.Client, baseURL, savefileUUID string, body []byte, rowCount int, reporter *chunkProgressReporter, retryInterval time.Duration) error {
+	for {
+		err := postChunkRowsOnce(ctx, client, baseURL, savefileUUID, body)
+		if err == nil {
+			reporter.record(rowCount)
+			return nil
+		}
+		if !isRetryableIngestError(err) {
+			return err
+		}
+		if err := waitForRetry(ctx, retryInterval); err != nil {
+			return err
+		}
+	}
+}
+
+func postChunkRowsOnce(ctx context.Context, client *http.Client, baseURL, savefileUUID string, body []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/ingest/chunk/"+url.PathEscape(savefileUUID), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "text/tab-separated-values")
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return retryableIngestError{err: err}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		time.Sleep(500 * time.Millisecond)
-		return postChunkRows(ctx, client, baseURL, savefileUUID, rows, reporter)
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return retryableIngestError{err: fmt.Errorf("ingest request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("ingest request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	reporter.record(len(rows))
 	return nil
+}
+
+type retryableIngestError struct {
+	err error
+}
+
+func (e retryableIngestError) Error() string {
+	return e.err.Error()
+}
+
+func (e retryableIngestError) Unwrap() error {
+	return e.err
+}
+
+func isRetryableIngestError(err error) bool {
+	_, ok := err.(retryableIngestError)
+	return ok
+}
+
+func waitForRetry(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type chunkProgressReporter struct {
