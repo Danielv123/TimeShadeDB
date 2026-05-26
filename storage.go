@@ -439,18 +439,22 @@ func (db *DB) ingestTilePlacement(p tilePlacement, writeWAL bool) error {
 	t.builder = append(t.builder, ev)
 	t.changedPlacements++
 	t.changesSinceSnap++
-	if shouldFlushDelta(t.builder) {
+	if db.shouldFlushDelta(t) {
 		return db.flushDelta(t)
 	}
 	return nil
 }
 
-func shouldFlushDelta(events []deltaEvent) bool {
+func (db *DB) shouldFlushDelta(t *tileState) bool {
+	events := t.builder
 	if len(events) == 0 {
 		return false
 	}
 	if len(events) >= deltaFrameMaxEvents {
 		return true
+	}
+	if db.batchMode {
+		return db.shouldSnapshot(t, events[len(events)-1].sec)
 	}
 	return events[len(events)-1].sec-events[0].sec >= deltaFrameMaxSpan
 }
@@ -515,6 +519,9 @@ func (db *DB) flushDelta(t *tileState) error {
 func (db *DB) shouldSnapshot(t *tileState, sec uint32) bool {
 	if t.changesSinceSnap == 0 {
 		return false
+	}
+	if db.batchMode {
+		return t.changesSinceSnap >= timeSnapshotMinChanges
 	}
 	pixels := t.w * t.h
 	changeLimit := pixels / 4

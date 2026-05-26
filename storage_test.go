@@ -192,7 +192,7 @@ func TestImportDoesNotSnapshotEverySparseDeltaFrame(t *testing.T) {
 	if got, max := stats.Tiles[0].SnapshotCount, uint64(3); got > max {
 		t.Fatalf("tile snapshot count = %d, want <= %d", got, max)
 	}
-	if got, want := stats.Tiles[0].DeltaFrameCount, uint64(10); got != want {
+	if got, want := stats.Tiles[0].DeltaFrameCount, uint64(1); got != want {
 		t.Fatalf("tile delta frame count = %d, want %d", got, want)
 	}
 }
