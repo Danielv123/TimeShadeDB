@@ -145,9 +145,9 @@ type compressionPool struct {
 }
 
 type compressionJob struct {
-	raw  []byte
-	kind uint8
-	resp chan compressionResult
+	raw   []byte
+	level zstd.EncoderLevel
+	resp  chan compressionResult
 }
 
 type compressionResult struct {
@@ -174,7 +174,7 @@ func newCompressionPool() *compressionPool {
 				defer best.Close()
 			}
 			for job := range p.jobs {
-				payload, err := compressWithReusableEncoders(job.raw, job.kind, fast, fastErr, best, bestErr)
+				payload, err := compressWithReusableEncoders(job.raw, job.level, fast, fastErr, best, bestErr)
 				job.resp <- compressionResult{payload: payload, err: err}
 			}
 		}()
@@ -182,12 +182,12 @@ func newCompressionPool() *compressionPool {
 	return p
 }
 
-func (p *compressionPool) compress(raw []byte, kind uint8) ([]byte, error) {
+func (p *compressionPool) compress(raw []byte, level zstd.EncoderLevel) ([]byte, error) {
 	if p == nil {
-		return compressZstd(raw, kind)
+		return compressZstd(raw, level)
 	}
 	resp := make(chan compressionResult, 1)
-	p.jobs <- compressionJob{raw: raw, kind: kind, resp: resp}
+	p.jobs <- compressionJob{raw: raw, level: level, resp: resp}
 	result := <-resp
 	return result.payload, result.err
 }
@@ -573,7 +573,7 @@ func (db *DB) writeFrame(f *os.File, kind uint8, timestampSec, maxTimeSec, event
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	payload, err := db.compressor.compress(raw, kind)
+	payload, err := db.compressor.compress(raw, db.compressionLevel(raw, kind))
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -595,8 +595,8 @@ func (db *DB) writeFrame(f *os.File, kind uint8, timestampSec, maxTimeSec, event
 	return uint64(offset), uint32(len(payload)), checksum, nil
 }
 
-func compressZstd(raw []byte, kind uint8) ([]byte, error) {
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(compressionLevel(raw, kind)))
+func compressZstd(raw []byte, level zstd.EncoderLevel) ([]byte, error) {
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
 	if err != nil {
 		return nil, err
 	}
@@ -604,15 +604,18 @@ func compressZstd(raw []byte, kind uint8) ([]byte, error) {
 	return enc.EncodeAll(raw, nil), nil
 }
 
-func compressionLevel(raw []byte, kind uint8) zstd.EncoderLevel {
+func (db *DB) compressionLevel(raw []byte, kind uint8) zstd.EncoderLevel {
+	if db.batchMode {
+		return zstd.SpeedFastest
+	}
 	if kind == frameKindDelta && len(raw) < 4096 {
 		return zstd.SpeedFastest
 	}
 	return zstd.SpeedBestCompression
 }
 
-func compressWithReusableEncoders(raw []byte, kind uint8, fast *zstd.Encoder, fastErr error, best *zstd.Encoder, bestErr error) ([]byte, error) {
-	if compressionLevel(raw, kind) == zstd.SpeedFastest {
+func compressWithReusableEncoders(raw []byte, level zstd.EncoderLevel, fast *zstd.Encoder, fastErr error, best *zstd.Encoder, bestErr error) ([]byte, error) {
+	if level == zstd.SpeedFastest {
 		if fastErr != nil {
 			return nil, fastErr
 		}
