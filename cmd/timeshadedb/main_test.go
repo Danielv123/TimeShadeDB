@@ -300,6 +300,85 @@ func TestTailChunkTSVOnceResumesFromServerMetadata(t *testing.T) {
 	}
 }
 
+func TestSendAppendedChunkRowsDefersPartialTrailingLine(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db.tshd")
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, Format: timeshadedb.FormatChunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	handler := newWebServer(db, http.NotFoundHandler()).routes()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	saveID := "save-1"
+	firstRow := "10\tnauvis\t-7,-6\tplayer\t" + testRGB565Hex(0x2462)
+	secondRow := "11\tnauvis\t-7,-6\tplayer\t" + testRGB565Hex(0xcdac)
+	partialSecondRowLen := len(secondRow) - 27
+	input := filepath.Join(dir, "chunk-charted.tsv")
+	if err := os.WriteFile(input, []byte(firstRow+"\n"+secondRow[:partialSecondRowLen]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var progress bytes.Buffer
+	opts := tailChunkTSVOptions{
+		InputPath:        input,
+		SavefileUUID:     saveID,
+		BaseURL:          server.URL,
+		BatchRows:        128,
+		PollInterval:     time.Second,
+		ProgressInterval: time.Hour,
+		ProgressOutput:   &progress,
+	}
+	offset, err := sendAppendedChunkRows(context.Background(), server.Client(), opts, server.URL, 0, newChunkProgressReporter(&progress, time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := offset, int64(len(firstRow)+1); got != want {
+		t.Fatalf("offset after partial line = %d, want %d", got, want)
+	}
+	meta, err := db.IngestMetadata(saveID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Datastores) != 1 || meta.Datastores[0].LatestTick != 10 {
+		t.Fatalf("metadata after partial line = %+v", meta)
+	}
+
+	f, err := os.OpenFile(input, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(secondRow[partialSecondRowLen:] + "\n"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	offset, err = sendAppendedChunkRows(context.Background(), server.Client(), opts, server.URL, offset, newChunkProgressReporter(&progress, time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := offset, int64(len(firstRow)+1+len(secondRow)+1); got != want {
+		t.Fatalf("offset after completed line = %d, want %d", got, want)
+	}
+	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
+		Key:   timeshadedb.DatastoreKey{SavefileUUID: saveID, Surface: "nauvis", Force: "player"},
+		Tick:  11,
+		Chunk: timeshadedb.ChunkCoord{X: -7, Y: -6},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Pixels[0] != 0xcdac {
+		t.Fatalf("completed partial line was not sent, pixel = %#04x", chunk.Pixels[0])
+	}
+}
+
 func TestStaticWebAppServesEmbeddedIndex(t *testing.T) {
 	fsys, err := timeshadedb.WebDistFS()
 	if err != nil {

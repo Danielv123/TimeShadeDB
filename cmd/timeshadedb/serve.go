@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -244,11 +245,12 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	if err := encodeTilePNG(w, res, timeshadedb.TileSize, timeshadedb.TileSize, png.BestSpeed); err != nil {
+	var buf bytes.Buffer
+	if err := encodeTilePNG(&buf, res, timeshadedb.TileSize, timeshadedb.TileSize, png.BestSpeed); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	writePNGResponse(w, buf.Bytes())
 }
 
 func (s *webServer) handleChunkSaves(w http.ResponseWriter, r *http.Request) {
@@ -300,11 +302,12 @@ func (s *webServer) handleChunkTile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	img := s.renderChunkTile(r.Context(), key, tick, int32(x), int32(y))
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	if err := png.Encode(w, img); err != nil {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	writePNGResponse(w, buf.Bytes())
 }
 
 func (s *webServer) handleChunkIngest(w http.ResponseWriter, r *http.Request) {
@@ -653,6 +656,12 @@ func encodeTilePNG(w io.Writer, res *timeshadedb.TileResult, width, height int, 
 	}
 	enc := png.Encoder{CompressionLevel: level}
 	return enc.Encode(w, img)
+}
+
+func writePNGResponse(w http.ResponseWriter, data []byte) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	_, _ = w.Write(data)
 }
 
 func writeAPIJSON(w http.ResponseWriter, v any) {

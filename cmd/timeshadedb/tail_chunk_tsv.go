@@ -79,12 +79,19 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 	if len(targets) > 0 {
 		lastMatchedOffset = -1
 	}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 8192), 1024*1024)
 	var batch []string
-	for lineNo := 1; scanner.Scan(); lineNo++ {
-		line := scanner.Text()
-		lineBytes := int64(len(line)) + 1
+	reader := bufio.NewReader(f)
+	for lineNo := 1; ; lineNo++ {
+		line, lineBytes, complete, err := readChunkTSVLine(reader)
+		if err != nil {
+			return 0, err
+		}
+		if lineBytes == 0 {
+			break
+		}
+		if !complete && !opts.Once {
+			break
+		}
 		nextOffset := offset + lineBytes
 		if len(targets) > 0 {
 			row, parseErr := timeshadedb.ParseChunkTSVRow(opts.SavefileUUID, line)
@@ -108,9 +115,6 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 			}
 		}
 		offset = nextOffset
-	}
-	if err := scanner.Err(); err != nil {
-		return 0, err
 	}
 	if len(batch) > 0 {
 		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
@@ -163,26 +167,26 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 	reader := bufio.NewReader(f)
 	var batch []string
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil && err != io.EOF {
+		line, lineBytes, complete, err := readChunkTSVLine(reader)
+		if err != nil {
 			return offset, err
 		}
-		if line != "" {
-			trimmed := strings.TrimRight(line, "\r\n")
-			if strings.TrimSpace(trimmed) != "" {
-				batch = append(batch, trimmed)
-				if len(batch) >= opts.BatchRows {
-					if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
-						return offset, err
-					}
-					batch = batch[:0]
-				}
-			}
-			offset += int64(len(line))
-		}
-		if err == io.EOF {
+		if lineBytes == 0 {
 			break
 		}
+		if !complete {
+			break
+		}
+		if strings.TrimSpace(line) != "" {
+			batch = append(batch, line)
+			if len(batch) >= opts.BatchRows {
+				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
+					return offset, err
+				}
+				batch = batch[:0]
+			}
+		}
+		offset += lineBytes
 	}
 	if len(batch) > 0 {
 		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
@@ -190,6 +194,21 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		}
 	}
 	return offset, nil
+}
+
+func readChunkTSVLine(reader *bufio.Reader) (line string, bytesRead int64, complete bool, err error) {
+	raw, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", 0, false, err
+	}
+	if raw == "" {
+		return "", 0, false, nil
+	}
+	complete = strings.HasSuffix(raw, "\n")
+	if err == io.EOF && !complete {
+		return strings.TrimRight(raw, "\r\n"), int64(len(raw)), false, nil
+	}
+	return strings.TrimRight(raw, "\r\n"), int64(len(raw)), complete, nil
 }
 
 func fetchIngestMetadata(ctx context.Context, client *http.Client, baseURL, savefileUUID string) (*timeshadedb.IngestMetadata, error) {
