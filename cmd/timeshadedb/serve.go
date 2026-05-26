@@ -287,28 +287,11 @@ func (s *webServer) handleChunkIngest(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusRequestEntityTooLarge, "too many rows in request")
 		return
 	}
-	touched := map[timeshadedb.DatastoreKey]struct{}{}
-	result := timeshadedb.IngestChunkResult{}
-	for _, row := range rows {
-		pixels := make([]uint16, timeshadedb.ChunkPixelCount)
-		copy(pixels, row.Pixels[:])
-		part, err := s.db.IngestChunk(r.Context(), timeshadedb.ChunkIngest{
-			Key:    row.Key,
-			Tick:   row.Tick,
-			Chunk:  row.Chunk,
-			Pixels: pixels,
-		})
-		if err != nil {
-			writeAPIError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		touched[row.Key] = struct{}{}
-		result.AcceptedRows += part.AcceptedRows
-		result.ChangedPixels += part.ChangedPixels
-		result.UnchangedPixels += part.UnchangedPixels
-		result.LatestRowSeq = part.LatestRowSeq
+	result, err := s.db.IngestChunkRows(r.Context(), rows)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	result.DatastoresTouched = len(touched)
 	writeAPIJSON(w, result)
 }
 

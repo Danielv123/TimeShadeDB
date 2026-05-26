@@ -79,11 +79,17 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	}
 	second := append([]uint16(nil), first...)
 	second[3] = 0xcdac
-	changed, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 12, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: second})
+	third := append([]uint16(nil), second...)
+	third[4] = 0x844a
+	batchRows := []ParsedChunkRow{
+		{Key: key, Tick: 12, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: sliceToChunkPixels(second)},
+		{Key: key, Tick: 13, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: sliceToChunkPixels(third)},
+	}
+	changed, err := db.IngestChunkRows(ctx, batchRows)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed.ChangedPixels != 1 || changed.UnchangedPixels != ChunkPixelCount-1 {
+	if changed.ChangedPixels != 2 || changed.UnchangedPixels != 2*ChunkPixelCount-2 {
 		t.Fatalf("second ingest changed=%d unchanged=%d", changed.ChangedPixels, changed.UnchangedPixels)
 	}
 	historical, err := db.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 11, Chunk: ChunkCoord{X: -7, Y: -6}})
@@ -100,11 +106,21 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if latest.Pixels[3] != 0xcdac {
 		t.Fatalf("latest pixel = %#04x, want 0xcdac", latest.Pixels[3])
 	}
+	if latest.Pixels[4] != 0x2462 {
+		t.Fatalf("tick 12 pixel 4 = %#04x, want 0x2462", latest.Pixels[4])
+	}
+	tick13, err := db.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 13, Chunk: ChunkCoord{X: -7, Y: -6}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tick13.Pixels[4] != 0x844a {
+		t.Fatalf("tick 13 pixel 4 = %#04x, want 0x844a", tick13.Pixels[4])
+	}
 	meta, err := db.IngestMetadata("save-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(meta.Datastores) != 1 || meta.Datastores[0].LatestTick != 12 || meta.Datastores[0].LatestChunkX != -7 {
+	if len(meta.Datastores) != 1 || meta.Datastores[0].LatestTick != 13 || meta.Datastores[0].LatestChunkX != -7 {
 		t.Fatalf("metadata = %+v", meta)
 	}
 	dataPath := chunkDataPath(dbPath, key, ChunkCoord{X: -7, Y: -6})
@@ -119,8 +135,8 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chunk index unreadable: %v", err)
 	}
-	if len(idx.snapshots) != 1 || len(idx.deltas) != 2 {
-		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 2 deltas", len(idx.snapshots), len(idx.deltas))
+	if len(idx.snapshots) != 1 || len(idx.deltas) != 3 {
+		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 3 deltas", len(idx.snapshots), len(idx.deltas))
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -131,17 +147,26 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	afterReload, err := reopened.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 12, Chunk: ChunkCoord{X: -7, Y: -6}})
+	afterReload, err := reopened.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 13, Chunk: ChunkCoord{X: -7, Y: -6}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if afterReload.Pixels[3] != 0xcdac {
 		t.Fatalf("reloaded pixel = %#04x, want 0xcdac", afterReload.Pixels[3])
 	}
+	if afterReload.Pixels[4] != 0x844a {
+		t.Fatalf("reloaded pixel 4 = %#04x, want 0x844a", afterReload.Pixels[4])
+	}
 }
 
 func repeatedRGB565Hex(color uint16) string {
 	return strings.Repeat(fmt.Sprintf("%04x", color), ChunkPixelCount)
+}
+
+func sliceToChunkPixels(in []uint16) [ChunkPixelCount]uint16 {
+	var pixels [ChunkPixelCount]uint16
+	copy(pixels[:], in)
+	return pixels
 }
 
 func assertPathMissing(t *testing.T, path string) {

@@ -153,6 +153,10 @@ func (db *DB) IngestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResu
 	return db.ingestChunk(ctx, in)
 }
 
+func (db *DB) IngestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*IngestChunkResult, error) {
+	return db.ingestChunkRows(ctx, rows)
+}
+
 func (db *DB) TileAt(ctx context.Context, opts TileAtOptions) (*TileResult, error) {
 	return db.tileAt(ctx, opts)
 }

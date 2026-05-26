@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -83,6 +85,15 @@ type chunkFrameInfo struct {
 	compressedLen uint32
 	checksum      uint32
 	payload       []byte
+}
+
+type chunkWrite struct {
+	ds             *chunkDatastore
+	coord          ChunkCoord
+	chunk          *factorioChunkState
+	entry          chunkLogEntry
+	snapshot       bool
+	snapshotPixels [ChunkPixelCount]uint16
 }
 
 type chunkPixelChange struct {
@@ -163,8 +174,25 @@ func writeChunkManifest(path string) error {
 }
 
 func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResult, error) {
+	if len(in.Pixels) != ChunkPixelCount {
+		return nil, fmt.Errorf("timeshadedb: chunk has %d pixels, expected %d", len(in.Pixels), ChunkPixelCount)
+	}
+	var pixels [ChunkPixelCount]uint16
+	copy(pixels[:], in.Pixels)
+	return db.ingestChunkRows(ctx, []ParsedChunkRow{{
+		Key:    in.Key,
+		Tick:   in.Tick,
+		Chunk:  in.Chunk,
+		Pixels: pixels,
+	}})
+}
+
+func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*IngestChunkResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if len(rows) == 0 {
+		return &IngestChunkResult{}, nil
 	}
 	if db.closed {
 		return nil, errors.New("timeshadedb: database is closed")
@@ -175,11 +203,10 @@ func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResu
 	if db.format == FormatLegacyTiles {
 		return nil, errors.New("timeshadedb: chunk ingest requires a chunk database")
 	}
-	if len(in.Pixels) != ChunkPixelCount {
-		return nil, fmt.Errorf("timeshadedb: chunk has %d pixels, expected %d", len(in.Pixels), ChunkPixelCount)
-	}
-	if err := validateDatastoreKey(in.Key); err != nil {
-		return nil, err
+	for _, row := range rows {
+		if err := validateDatastoreKey(row.Key); err != nil {
+			return nil, err
+		}
 	}
 
 	db.chunkMu.Lock()
@@ -187,39 +214,50 @@ func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResu
 	if err := db.loadChunksLocked(); err != nil {
 		return nil, err
 	}
-	ds := db.chunkDatastoreLocked(in.Key)
-	chunk := ds.chunkLocked(in.Chunk)
-	seq := db.nextChunkSeq
-	db.nextChunkSeq++
-	wasSeen := chunk.seen
 
-	changes := make([]chunkPixelChange, 0, ChunkPixelCount)
-	for i, color := range in.Pixels {
-		if !chunk.seen || chunk.pixels[i] != color {
-			chunk.pixels[i] = color
-			changes = append(changes, chunkPixelChange{Pos: uint16(i), Color: color})
+	touched := map[DatastoreKey]struct{}{}
+	writes := make([]chunkWrite, 0, len(rows))
+	result := &IngestChunkResult{}
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
+		ds := db.chunkDatastoreLocked(row.Key)
+		chunk := ds.chunkLocked(row.Chunk)
+		seq := db.nextChunkSeq
+		db.nextChunkSeq++
+		wasSeen := chunk.seen
+		changes := make([]chunkPixelChange, 0, ChunkPixelCount)
+		for i, color := range row.Pixels {
+			if !chunk.seen || chunk.pixels[i] != color {
+				chunk.pixels[i] = color
+				changes = append(changes, chunkPixelChange{Pos: uint16(i), Color: color})
+			}
+		}
+		chunk.seen = true
+		chunk.latestTick = row.Tick
+		chunk.latestRowSeq = seq
+		entry := chunkLogEntry{Seq: seq, Tick: row.Tick, Key: row.Key, Chunk: row.Chunk, Changes: changes}
+		write := chunkWrite{ds: ds, coord: row.Chunk, chunk: chunk, entry: entry, snapshot: !wasSeen}
+		if write.snapshot {
+			write.snapshotPixels = chunk.pixels
+		}
+		writes = append(writes, write)
+		ds.events[row.Chunk] = append(ds.events[row.Chunk], entry)
+		ds.latestTick = row.Tick
+		ds.latestChunk = row.Chunk
+		ds.latestRowSeq = seq
+		touched[row.Key] = struct{}{}
+		result.AcceptedRows++
+		result.ChangedPixels += uint64(len(changes))
+		result.UnchangedPixels += uint64(ChunkPixelCount - len(changes))
+		result.LatestRowSeq = seq
 	}
-	chunk.seen = true
-	chunk.latestTick = in.Tick
-	chunk.latestRowSeq = seq
-
-	entry := chunkLogEntry{Seq: seq, Tick: in.Tick, Key: in.Key, Chunk: in.Chunk, Changes: changes}
-	if err := db.writeChunkFrameLocked(ds, in.Chunk, chunk, entry, !wasSeen); err != nil {
+	if err := db.writeChunkBatchLocked(writes); err != nil {
 		return nil, err
 	}
-	ds.events[in.Chunk] = append(ds.events[in.Chunk], entry)
-	ds.latestTick = in.Tick
-	ds.latestChunk = in.Chunk
-	ds.latestRowSeq = seq
-
-	return &IngestChunkResult{
-		AcceptedRows:      1,
-		ChangedPixels:     uint64(len(changes)),
-		UnchangedPixels:   uint64(ChunkPixelCount - len(changes)),
-		DatastoresTouched: 1,
-		LatestRowSeq:      seq,
-	}, nil
+	result.DatastoresTouched = len(touched)
+	return result, nil
 }
 
 func (db *DB) chunkAt(ctx context.Context, opts ChunkAtOptions) (*ChunkResult, error) {
@@ -466,6 +504,44 @@ func (db *DB) loadChunksLocked() error {
 }
 
 func (db *DB) writeChunkFrameLocked(ds *chunkDatastore, coord ChunkCoord, chunk *factorioChunkState, entry chunkLogEntry, snapshot bool) error {
+	write := chunkWrite{ds: ds, coord: coord, chunk: chunk, entry: entry, snapshot: snapshot}
+	if snapshot {
+		write.snapshotPixels = chunk.pixels
+	}
+	return db.writeChunkBatchLocked([]chunkWrite{write})
+}
+
+func (db *DB) writeChunkBatchLocked(writes []chunkWrite) error {
+	type groupKey struct {
+		key   DatastoreKey
+		coord ChunkCoord
+	}
+	groups := map[groupKey][]chunkWrite{}
+	order := make([]groupKey, 0)
+	for _, write := range writes {
+		k := groupKey{key: write.ds.key, coord: write.coord}
+		if _, ok := groups[k]; !ok {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], write)
+	}
+	for _, k := range order {
+		group := groups[k]
+		if len(group) == 0 {
+			continue
+		}
+		if err := db.writeChunkGroupLocked(group); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
+	first := writes[0]
+	ds := first.ds
+	coord := first.coord
+	chunk := first.chunk
 	dsDir := chunkDatastorePath(db.path, ds.key)
 	if err := os.MkdirAll(filepath.Join(dsDir, "chunks"), 0o755); err != nil {
 		return err
@@ -490,49 +566,54 @@ func (db *DB) writeChunkFrameLocked(ds *chunkDatastore, coord ChunkCoord, chunk 
 			return err
 		}
 	}
-
-	var kind uint8
-	var raw []byte
-	if snapshot {
-		kind = frameKindSnapshot
-		raw = encodeChunkSnapshot(chunk.pixels)
-	} else {
-		kind = frameKindDelta
-		raw = encodeChunkDeltaPayload(entry.Tick, entry.Changes)
+	for _, write := range writes {
+		entry := write.entry
+		var kind uint8
+		var raw []byte
+		if write.snapshot {
+			kind = frameKindSnapshot
+			raw = encodeChunkSnapshot(write.snapshotPixels)
+		} else {
+			kind = frameKindDelta
+			raw = encodeChunkDeltaPayload(entry.Tick, entry.Changes)
+		}
+		offset, compLen, checksum, err := db.writeChunkFrame(f, kind, entry.Tick, uint32(len(entry.Changes)), raw, false)
+		if err != nil {
+			return err
+		}
+		if write.snapshot {
+			chunk.index.snapshots = append(chunk.index.snapshots, chunkSnapshotRecord{
+				Tick:               entry.Tick,
+				FrameOffset:        offset,
+				FrameHeaderLen:     chunkFrameHeaderLen,
+				CompressedLen:      compLen,
+				RawLen:             uint32(len(raw)),
+				FirstDeltaFrameIdx: uint32(len(chunk.index.deltas)),
+				EventSeq:           entry.Seq,
+				Checksum:           checksum,
+			})
+		} else {
+			chunk.index.deltas = append(chunk.index.deltas, chunkDeltaRecord{
+				MinTick:        entry.Tick,
+				MaxTick:        entry.Tick,
+				FrameOffset:    offset,
+				FrameHeaderLen: chunkFrameHeaderLen,
+				CompressedLen:  compLen,
+				RawLen:         uint32(len(raw)),
+				EventCount:     uint32(len(entry.Changes)),
+				FirstEventSeq:  entry.Seq,
+				LastEventSeq:   entry.Seq,
+				Checksum:       checksum,
+			})
+		}
 	}
-	offset, compLen, checksum, err := db.writeChunkFrame(f, kind, entry.Tick, uint32(len(entry.Changes)), raw)
-	if err != nil {
+	if err := f.Sync(); err != nil {
 		return err
-	}
-	if snapshot {
-		chunk.index.snapshots = append(chunk.index.snapshots, chunkSnapshotRecord{
-			Tick:               entry.Tick,
-			FrameOffset:        offset,
-			FrameHeaderLen:     chunkFrameHeaderLen,
-			CompressedLen:      compLen,
-			RawLen:             uint32(len(raw)),
-			FirstDeltaFrameIdx: uint32(len(chunk.index.deltas)),
-			EventSeq:           entry.Seq,
-			Checksum:           checksum,
-		})
-	} else {
-		chunk.index.deltas = append(chunk.index.deltas, chunkDeltaRecord{
-			MinTick:        entry.Tick,
-			MaxTick:        entry.Tick,
-			FrameOffset:    offset,
-			FrameHeaderLen: chunkFrameHeaderLen,
-			CompressedLen:  compLen,
-			RawLen:         uint32(len(raw)),
-			EventCount:     uint32(len(entry.Changes)),
-			FirstEventSeq:  entry.Seq,
-			LastEventSeq:   entry.Seq,
-			Checksum:       checksum,
-		})
 	}
 	return writeChunkIndex(db.path, ds.key, coord, chunk.index)
 }
 
-func (db *DB) writeChunkFrame(f *os.File, kind uint8, tick uint64, eventCount uint32, raw []byte) (uint64, uint32, uint32, error) {
+func (db *DB) writeChunkFrame(f *os.File, kind uint8, tick uint64, eventCount uint32, raw []byte, sync bool) (uint64, uint32, uint32, error) {
 	offset, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, 0, 0, err
@@ -556,17 +637,27 @@ func (db *DB) writeChunkFrame(f *os.File, kind uint8, tick uint64, eventCount ui
 	if _, err := f.Write(payload); err != nil {
 		return 0, 0, 0, err
 	}
-	if err := f.Sync(); err != nil {
-		return 0, 0, 0, err
+	if sync {
+		if err := f.Sync(); err != nil {
+			return 0, 0, 0, err
+		}
 	}
 	return uint64(offset), uint32(len(payload)), checksum, nil
 }
 
+func (db *DB) writeChunkFrameSync(f *os.File, kind uint8, tick uint64, eventCount uint32, raw []byte) (uint64, uint32, uint32, error) {
+	offset, compLen, checksum, err := db.writeChunkFrame(f, kind, tick, eventCount, raw, true)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return offset, compLen, checksum, nil
+}
+
 func (db *DB) compressChunkPayload(raw []byte, kind uint8) ([]byte, error) {
 	if db.compressor != nil {
-		return db.compressor.compress(raw, db.compressionLevel(raw, kind))
+		return db.compressor.compress(raw, zstd.SpeedFastest)
 	}
-	return compressZstd(raw, db.compressionLevel(raw, kind))
+	return compressZstd(raw, zstd.SpeedFastest)
 }
 
 func writeChunkDataHeader(f *os.File, coord ChunkCoord) error {
