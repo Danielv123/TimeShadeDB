@@ -135,8 +135,15 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chunk index unreadable: %v", err)
 	}
-	if len(idx.snapshots) != 1 || len(idx.deltas) != 3 {
-		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 3 deltas", len(idx.snapshots), len(idx.deltas))
+	if len(idx.snapshots) != 1 || len(idx.deltas) != 2 {
+		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 2 deltas", len(idx.snapshots), len(idx.deltas))
+	}
+	noChange, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 14, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: third})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noChange.ChangedPixels != 0 || noChange.UnchangedPixels != ChunkPixelCount {
+		t.Fatalf("no-change ingest changed=%d unchanged=%d", noChange.ChangedPixels, noChange.UnchangedPixels)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -156,6 +163,13 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	}
 	if afterReload.Pixels[4] != 0x844a {
 		t.Fatalf("reloaded pixel 4 = %#04x, want 0x844a", afterReload.Pixels[4])
+	}
+	reloadedMeta, err := reopened.IngestMetadata("save-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloadedMeta.Datastores) != 1 || reloadedMeta.Datastores[0].LatestTick != 14 || reloadedMeta.Datastores[0].LatestRowSeq != 5 {
+		t.Fatalf("reloaded metadata = %+v", reloadedMeta)
 	}
 }
 

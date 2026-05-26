@@ -31,12 +31,21 @@ const (
 )
 
 type chunkDatastore struct {
-	key          DatastoreKey
-	chunks       map[ChunkCoord]*factorioChunkState
-	events       map[ChunkCoord][]chunkLogEntry
-	latestTick   uint64
-	latestChunk  ChunkCoord
-	latestRowSeq uint64
+	key             DatastoreKey
+	chunks          map[ChunkCoord]*factorioChunkState
+	events          map[ChunkCoord][]chunkLogEntry
+	latestTick      uint64
+	latestChunk     ChunkCoord
+	latestRowSeq    uint64
+	dirsReady       bool
+	metadataWritten bool
+}
+
+type chunkDatastoreProgress struct {
+	LatestTick   uint64 `json:"latest_tick"`
+	LatestChunkX int32  `json:"latest_chunk_x"`
+	LatestChunkY int32  `json:"latest_chunk_y"`
+	LatestRowSeq uint64 `json:"latest_row_seq"`
 }
 
 type factorioChunkState struct {
@@ -110,10 +119,12 @@ type chunkLogEntry struct {
 }
 
 type ParsedChunkRow struct {
-	Key    DatastoreKey
-	Tick   uint64
-	Chunk  ChunkCoord
-	Pixels [ChunkPixelCount]uint16
+	Key        DatastoreKey
+	Tick       uint64
+	Chunk      ChunkCoord
+	Pixels     [ChunkPixelCount]uint16
+	PayloadHex string
+	HasPayload bool
 }
 
 func createChunkDB(path string, cacheSize int64) (*DB, error) {
@@ -216,8 +227,13 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	}
 
 	touched := map[DatastoreKey]struct{}{}
+	touchedDatastores := map[DatastoreKey]*chunkDatastore{}
 	writes := make([]chunkWrite, 0, len(rows))
 	result := &IngestChunkResult{}
+	var lastPayloadKey DatastoreKey
+	var lastPayloadChunk ChunkCoord
+	var lastPayload string
+	var lastPayloadValid bool
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -226,9 +242,30 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 		chunk := ds.chunkLocked(row.Chunk)
 		seq := db.nextChunkSeq
 		db.nextChunkSeq++
+		pixels := row.Pixels
+		if row.HasPayload {
+			if chunk.seen && lastPayloadValid && row.Key == lastPayloadKey && row.Chunk == lastPayloadChunk && row.PayloadHex == lastPayload {
+				chunk.latestTick = row.Tick
+				chunk.latestRowSeq = seq
+				ds.latestTick = row.Tick
+				ds.latestChunk = row.Chunk
+				ds.latestRowSeq = seq
+				touched[row.Key] = struct{}{}
+				touchedDatastores[row.Key] = ds
+				result.AcceptedRows++
+				result.UnchangedPixels += ChunkPixelCount
+				result.LatestRowSeq = seq
+				continue
+			}
+			decoded, err := decodeRGB565Hex(row.PayloadHex)
+			if err != nil {
+				return nil, err
+			}
+			pixels = decoded
+		}
 		wasSeen := chunk.seen
 		changes := make([]chunkPixelChange, 0, ChunkPixelCount)
-		for i, color := range row.Pixels {
+		for i, color := range pixels {
 			if !chunk.seen || chunk.pixels[i] != color {
 				chunk.pixels[i] = color
 				changes = append(changes, chunkPixelChange{Pos: uint16(i), Color: color})
@@ -237,17 +274,28 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 		chunk.seen = true
 		chunk.latestTick = row.Tick
 		chunk.latestRowSeq = seq
-		entry := chunkLogEntry{Seq: seq, Tick: row.Tick, Key: row.Key, Chunk: row.Chunk, Changes: changes}
-		write := chunkWrite{ds: ds, coord: row.Chunk, chunk: chunk, entry: entry, snapshot: !wasSeen}
-		if write.snapshot {
-			write.snapshotPixels = chunk.pixels
+		if row.HasPayload {
+			lastPayloadKey = row.Key
+			lastPayloadChunk = row.Chunk
+			lastPayload = row.PayloadHex
+			lastPayloadValid = true
+		} else {
+			lastPayloadValid = false
 		}
-		writes = append(writes, write)
-		ds.events[row.Chunk] = append(ds.events[row.Chunk], entry)
+		entry := chunkLogEntry{Seq: seq, Tick: row.Tick, Key: row.Key, Chunk: row.Chunk, Changes: changes}
+		if !wasSeen || len(changes) > 0 {
+			write := chunkWrite{ds: ds, coord: row.Chunk, chunk: chunk, entry: entry, snapshot: !wasSeen}
+			if write.snapshot {
+				write.snapshotPixels = chunk.pixels
+			}
+			writes = append(writes, write)
+			ds.events[row.Chunk] = append(ds.events[row.Chunk], entry)
+		}
 		ds.latestTick = row.Tick
 		ds.latestChunk = row.Chunk
 		ds.latestRowSeq = seq
 		touched[row.Key] = struct{}{}
+		touchedDatastores[row.Key] = ds
 		result.AcceptedRows++
 		result.ChangedPixels += uint64(len(changes))
 		result.UnchangedPixels += uint64(ChunkPixelCount - len(changes))
@@ -255,6 +303,11 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	}
 	if err := db.writeChunkBatchLocked(writes); err != nil {
 		return nil, err
+	}
+	for _, ds := range touchedDatastores {
+		if err := db.writeChunkProgressLocked(ds); err != nil {
+			return nil, err
+		}
 	}
 	result.DatastoresTouched = len(touched)
 	return result, nil
@@ -380,6 +433,10 @@ func (db *DB) ingestMetadata(savefileUUID string) (*IngestMetadata, error) {
 }
 
 func ParseChunkTSVRow(savefileUUID, line string) (ParsedChunkRow, error) {
+	return parseChunkTSVRow(savefileUUID, line, true)
+}
+
+func parseChunkTSVRow(savefileUUID, line string, decodePayload bool) (ParsedChunkRow, error) {
 	savefileUUID = strings.TrimSpace(savefileUUID)
 	line = strings.TrimRight(line, "\r\n")
 	fields := strings.Split(line, "\t")
@@ -424,16 +481,25 @@ func ParseChunkTSVRow(savefileUUID, line string) (ParsedChunkRow, error) {
 	if err := validateDatastoreKey(key); err != nil {
 		return ParsedChunkRow{}, err
 	}
-	pixels, err := decodeRGB565Hex(colorData)
-	if err != nil {
-		return ParsedChunkRow{}, err
+	row := ParsedChunkRow{
+		Key:   key,
+		Tick:  tick,
+		Chunk: ChunkCoord{X: int32(chunkX), Y: int32(chunkY)},
 	}
-	return ParsedChunkRow{
-		Key:    key,
-		Tick:   tick,
-		Chunk:  ChunkCoord{X: int32(chunkX), Y: int32(chunkY)},
-		Pixels: pixels,
-	}, nil
+	if decodePayload {
+		pixels, err := decodeRGB565Hex(colorData)
+		if err != nil {
+			return ParsedChunkRow{}, err
+		}
+		row.Pixels = pixels
+	} else {
+		if colorData != "" && len(colorData) != chunkPayloadHex {
+			return ParsedChunkRow{}, fmt.Errorf("timeshadedb: RGB565 hex payload has %d chars, expected %d", len(colorData), chunkPayloadHex)
+		}
+		row.PayloadHex = colorData
+		row.HasPayload = true
+	}
+	return row, nil
 }
 
 func ParseChunkTSV(savefileUUID string, body *bufio.Scanner) ([]ParsedChunkRow, error) {
@@ -443,7 +509,7 @@ func ParseChunkTSV(savefileUUID string, body *bufio.Scanner) ([]ParsedChunkRow, 
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		row, err := ParseChunkTSVRow(savefileUUID, line)
+		row, err := parseChunkTSVRow(savefileUUID, line, false)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNo, err)
 		}
@@ -542,11 +608,7 @@ func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
 	ds := first.ds
 	coord := first.coord
 	chunk := first.chunk
-	dsDir := chunkDatastorePath(db.path, ds.key)
-	if err := os.MkdirAll(filepath.Join(dsDir, "chunks"), 0o755); err != nil {
-		return err
-	}
-	if err := writeChunkMetadata(dsDir, ds.key); err != nil {
+	if err := db.ensureChunkDatastoreFilesLocked(ds); err != nil {
 		return err
 	}
 	dataPath := chunkDataPath(db.path, ds.key, coord)
@@ -577,7 +639,7 @@ func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
 			kind = frameKindDelta
 			raw = encodeChunkDeltaPayload(entry.Tick, entry.Changes)
 		}
-		offset, compLen, checksum, err := db.writeChunkFrame(f, kind, entry.Tick, uint32(len(entry.Changes)), raw, false)
+		offset, compLen, checksum, err := db.writeChunkFrame(f, kind, entry.Tick, uint32(len(entry.Changes)), raw)
 		if err != nil {
 			return err
 		}
@@ -607,18 +669,46 @@ func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
 			})
 		}
 	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
 	return writeChunkIndex(db.path, ds.key, coord, chunk.index)
 }
 
-func (db *DB) writeChunkFrame(f *os.File, kind uint8, tick uint64, eventCount uint32, raw []byte, sync bool) (uint64, uint32, uint32, error) {
+func (db *DB) ensureChunkDatastoreFilesLocked(ds *chunkDatastore) error {
+	dsDir := chunkDatastorePath(db.path, ds.key)
+	if !ds.dirsReady {
+		if err := os.MkdirAll(filepath.Join(dsDir, "chunks"), 0o755); err != nil {
+			return err
+		}
+		ds.dirsReady = true
+	}
+	if !ds.metadataWritten {
+		if err := writeChunkMetadata(dsDir, ds.key); err != nil {
+			return err
+		}
+		ds.metadataWritten = true
+	}
+	return nil
+}
+
+func (db *DB) writeChunkProgressLocked(ds *chunkDatastore) error {
+	if err := db.ensureChunkDatastoreFilesLocked(ds); err != nil {
+		return err
+	}
+	dsDir := chunkDatastorePath(db.path, ds.key)
+	progress := chunkDatastoreProgress{
+		LatestTick:   ds.latestTick,
+		LatestChunkX: ds.latestChunk.X,
+		LatestChunkY: ds.latestChunk.Y,
+		LatestRowSeq: ds.latestRowSeq,
+	}
+	return writeChunkProgress(dsDir, progress)
+}
+
+func (db *DB) writeChunkFrame(f *os.File, kind uint8, tick uint64, eventCount uint32, raw []byte) (uint64, uint32, uint32, error) {
 	offset, err := f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	payload, err := db.compressChunkPayload(raw, kind)
+	payload, err := db.compressChunkPayload(raw)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -637,23 +727,10 @@ func (db *DB) writeChunkFrame(f *os.File, kind uint8, tick uint64, eventCount ui
 	if _, err := f.Write(payload); err != nil {
 		return 0, 0, 0, err
 	}
-	if sync {
-		if err := f.Sync(); err != nil {
-			return 0, 0, 0, err
-		}
-	}
 	return uint64(offset), uint32(len(payload)), checksum, nil
 }
 
-func (db *DB) writeChunkFrameSync(f *os.File, kind uint8, tick uint64, eventCount uint32, raw []byte) (uint64, uint32, uint32, error) {
-	offset, compLen, checksum, err := db.writeChunkFrame(f, kind, tick, eventCount, raw, true)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	return offset, compLen, checksum, nil
-}
-
-func (db *DB) compressChunkPayload(raw []byte, kind uint8) ([]byte, error) {
+func (db *DB) compressChunkPayload(raw []byte) ([]byte, error) {
 	if db.compressor != nil {
 		return db.compressor.compress(raw, zstd.SpeedFastest)
 	}
@@ -784,6 +861,14 @@ func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 			return false, err
 		}
 		ds := db.chunkDatastoreLocked(key)
+		ds.dirsReady = true
+		ds.metadataWritten = true
+		var progress *chunkDatastoreProgress
+		if savedProgress, err := readChunkProgress(dsDir); err == nil {
+			progress = &savedProgress
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
 		chunksDir := filepath.Join(dsDir, "chunks")
 		chunkFiles, err := os.ReadDir(chunksDir)
 		if errors.Is(err, os.ErrNotExist) {
@@ -805,6 +890,11 @@ func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 				return false, err
 			}
 			loaded = true
+		}
+		if progress != nil {
+			ds.latestTick = progress.LatestTick
+			ds.latestChunk = ChunkCoord{X: progress.LatestChunkX, Y: progress.LatestChunkY}
+			ds.latestRowSeq = progress.LatestRowSeq
 		}
 	}
 	return loaded, nil
@@ -846,6 +936,9 @@ func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx ch
 		}
 		if crc32.ChecksumIEEE(raw) != info.checksum {
 			return errors.New("timeshadedb: chunk frame checksum mismatch")
+		}
+		if info.kind != frame.kind {
+			return fmt.Errorf("timeshadedb: chunk index kind mismatch: index %d frame %d", frame.kind, info.kind)
 		}
 		switch frame.kind {
 		case frameKindSnapshot:
@@ -1061,6 +1154,32 @@ func writeChunkMetadata(dsDir string, key DatastoreKey) error {
 	}
 	data = append(data, '\n')
 	return os.WriteFile(filepath.Join(dsDir, "metadata.json"), data, 0o644)
+}
+
+func writeChunkProgress(dsDir string, progress chunkDatastoreProgress) error {
+	data, err := json.MarshalIndent(progress, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	path := filepath.Join(dsDir, "progress.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func readChunkProgress(dsDir string) (chunkDatastoreProgress, error) {
+	data, err := os.ReadFile(filepath.Join(dsDir, "progress.json"))
+	if err != nil {
+		return chunkDatastoreProgress{}, err
+	}
+	var progress chunkDatastoreProgress
+	if err := json.Unmarshal(data, &progress); err != nil {
+		return chunkDatastoreProgress{}, err
+	}
+	return progress, nil
 }
 
 func readChunkMetadata(dsDir string) (DatastoreKey, error) {
