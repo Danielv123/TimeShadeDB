@@ -227,6 +227,7 @@ CLI commands should be adjusted around the new format:
 timeshadedb serve --db db.tshd
 timeshadedb import-chunk-tsv --input chunk-charted.tsv --savefile UUID --db db.tshd
 timeshadedb tail-chunk-tsv --input chunk-charted.tsv --savefile UUID --base-url http://127.0.0.1:8080
+timeshadedb copy-chunks --src legacy-db.tshd --dst tile-sharded-db.tshd
 timeshadedb query-chunk --db db.tshd --savefile UUID --surface nauvis --force player --tick 123456 --chunk 10,-4 --out chunk.rgb565
 timeshadedb stats --db db.tshd
 timeshadedb inspect-index --db db.tshd --savefile UUID --surface nauvis --force player --chunk 10,-4

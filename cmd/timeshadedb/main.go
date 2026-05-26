@@ -29,7 +29,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve|tail-chunk-tsv>")
+		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve|tail-chunk-tsv|copy-chunks>")
 	}
 	switch args[0] {
 	case "import-csv":
@@ -223,6 +223,38 @@ func run(ctx context.Context, args []string) error {
 		stats, err := db.Compact(ctx)
 		if profileErr := profiles.Stop(); err == nil {
 			err = profileErr
+		}
+		if err != nil {
+			return err
+		}
+		return writeJSON(stats)
+	case "copy-chunks":
+		fs := flag.NewFlagSet("copy-chunks", flag.ExitOnError)
+		srcPath := fs.String("src", "", "source chunk database directory")
+		dstPath := fs.String("dst", "", "destination chunk database directory to create")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *srcPath == "" || *dstPath == "" {
+			return fmt.Errorf("copy-chunks requires --src and --dst")
+		}
+		if _, err := os.Stat(*dstPath); err == nil {
+			return fmt.Errorf("destination database path already exists: %s", *dstPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		src, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: *srcPath, ReadOnly: true, Format: timeshadedb.FormatChunks})
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		dst, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: *dstPath, Format: timeshadedb.FormatChunks})
+		if err != nil {
+			return err
+		}
+		stats, err := src.CopyChunksTo(ctx, dst)
+		if closeErr := dst.Close(); err == nil {
+			err = closeErr
 		}
 		if err != nil {
 			return err

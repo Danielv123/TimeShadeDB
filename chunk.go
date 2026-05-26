@@ -30,6 +30,7 @@ const (
 	chunkPayloadHex     = ChunkPixelCount * 2 * 2
 	chunkPayloadBytes   = ChunkPixelCount * 2
 	chunkFrameHeaderLen = uint16(37)
+	chunkCopyBatchRows  = 4096
 )
 
 type chunkDatastore struct {
@@ -154,6 +155,14 @@ type chunkTileBatchResult struct {
 	progress map[DatastoreKey]chunkDatastoreProgress
 	events   map[DatastoreKey]map[ChunkCoord][]chunkLogEntry
 	err      error
+}
+
+type chunkCopyDatastore struct {
+	key          DatastoreKey
+	latestTick   uint64
+	latestChunk  ChunkCoord
+	latestRowSeq uint64
+	events       map[ChunkCoord][]chunkLogEntry
 }
 
 func createChunkDB(path string, cacheSize int64) (*DB, error) {
@@ -349,6 +358,157 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	}
 	result.DatastoresTouched = len(touched)
 	return result, nil
+}
+
+func (db *DB) copyChunksTo(ctx context.Context, dst *DB) (*ChunkCopyStats, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if db.closed {
+		return nil, errors.New("timeshadedb: source database is closed")
+	}
+	if dst == nil || dst.closed {
+		return nil, errors.New("timeshadedb: destination database is closed")
+	}
+	if db.format != FormatChunks || dst.format != FormatChunks {
+		return nil, errors.New("timeshadedb: chunk copy requires chunk databases")
+	}
+	if dst.readOnly {
+		return nil, errors.New("timeshadedb: destination database opened read-only")
+	}
+	if db == dst {
+		return nil, errors.New("timeshadedb: source and destination databases must differ")
+	}
+
+	datastores, err := db.snapshotChunkCopyDatastores(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stats := &ChunkCopyStats{Datastores: len(datastores)}
+	var batch []ParsedChunkRow
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		res, err := dst.IngestChunkRows(ctx, batch)
+		if err != nil {
+			return err
+		}
+		stats.RowsCopied += res.AcceptedRows
+		stats.ChangedPixels += res.ChangedPixels
+		batch = batch[:0]
+		return nil
+	}
+	for _, ds := range datastores {
+		coords := make([]ChunkCoord, 0, len(ds.events))
+		for coord := range ds.events {
+			coords = append(coords, coord)
+		}
+		sort.Slice(coords, func(i, j int) bool {
+			if coords[i].X != coords[j].X {
+				return coords[i].X < coords[j].X
+			}
+			return coords[i].Y < coords[j].Y
+		})
+		latestPixels := map[ChunkCoord][ChunkPixelCount]uint16{}
+		for _, coord := range coords {
+			entries := append([]chunkLogEntry(nil), ds.events[coord]...)
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].Seq != entries[j].Seq {
+					return entries[i].Seq < entries[j].Seq
+				}
+				return entries[i].Tick < entries[j].Tick
+			})
+			var pixels [ChunkPixelCount]uint16
+			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				for _, change := range entry.Changes {
+					if int(change.Pos) >= len(pixels) {
+						return nil, fmt.Errorf("timeshadedb: chunk log position out of bounds: %d", change.Pos)
+					}
+					pixels[change.Pos] = change.Color
+				}
+				batch = append(batch, ParsedChunkRow{Key: ds.key, Tick: entry.Tick, Chunk: coord, Pixels: pixels})
+				if len(batch) >= chunkCopyBatchRows {
+					if err := flush(); err != nil {
+						return nil, err
+					}
+				}
+			}
+			latestPixels[coord] = pixels
+			stats.Chunks++
+		}
+		if ds.latestRowSeq > 0 {
+			if pixels, ok := latestPixels[ds.latestChunk]; ok {
+				batch = append(batch, ParsedChunkRow{Key: ds.key, Tick: ds.latestTick, Chunk: ds.latestChunk, Pixels: pixels})
+				stats.ProgressRows++
+				if len(batch) >= chunkCopyBatchRows {
+					if err := flush(); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
+func (db *DB) snapshotChunkCopyDatastores(ctx context.Context) ([]chunkCopyDatastore, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	db.chunkMu.RLock()
+	loaded := db.chunkLoaded
+	db.chunkMu.RUnlock()
+	if !loaded {
+		db.chunkMu.Lock()
+		if err := db.loadChunksLocked(); err != nil {
+			db.chunkMu.Unlock()
+			return nil, err
+		}
+		db.chunkMu.Unlock()
+	}
+	db.chunkMu.RLock()
+	defer db.chunkMu.RUnlock()
+	keys := make([]DatastoreKey, 0, len(db.chunkDatastores))
+	for key := range db.chunkDatastores {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].SavefileUUID != keys[j].SavefileUUID {
+			return keys[i].SavefileUUID < keys[j].SavefileUUID
+		}
+		if keys[i].Force != keys[j].Force {
+			return keys[i].Force < keys[j].Force
+		}
+		return keys[i].Surface < keys[j].Surface
+	})
+	out := make([]chunkCopyDatastore, 0, len(keys))
+	for _, key := range keys {
+		ds := db.chunkDatastores[key]
+		copyDS := chunkCopyDatastore{
+			key:          key,
+			latestTick:   ds.latestTick,
+			latestChunk:  ds.latestChunk,
+			latestRowSeq: ds.latestRowSeq,
+			events:       make(map[ChunkCoord][]chunkLogEntry, len(ds.events)),
+		}
+		for coord, entries := range ds.events {
+			copied := make([]chunkLogEntry, len(entries))
+			for i, entry := range entries {
+				copied[i] = entry
+				copied[i].Changes = append([]chunkPixelChange(nil), entry.Changes...)
+			}
+			copyDS.events[coord] = copied
+		}
+		out = append(out, copyDS)
+	}
+	return out, nil
 }
 
 func (db *DB) processChunkTileBatches(ctx context.Context, groups map[chunkTileBatchKey][]chunkIngestWork, order []chunkTileBatchKey) []chunkTileBatchResult {

@@ -111,6 +111,14 @@ type IngestChunkResult struct {
 	LatestRowSeq      uint64 `json:"latest_row_seq,omitempty"`
 }
 
+type ChunkCopyStats struct {
+	Datastores    int    `json:"datastores"`
+	Chunks        int    `json:"chunks"`
+	RowsCopied    uint64 `json:"rows_copied"`
+	ProgressRows  uint64 `json:"progress_rows"`
+	ChangedPixels uint64 `json:"changed_pixels"`
+}
+
 type ChunkAtOptions struct {
 	Key   DatastoreKey
 	Tick  uint64
@@ -183,6 +191,10 @@ func (db *DB) IngestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResu
 
 func (db *DB) IngestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*IngestChunkResult, error) {
 	return db.ingestChunkRows(ctx, rows)
+}
+
+func (db *DB) CopyChunksTo(ctx context.Context, dst *DB) (*ChunkCopyStats, error) {
+	return db.copyChunksTo(ctx, dst)
 }
 
 func (db *DB) TileAt(ctx context.Context, opts TileAtOptions) (*TileResult, error) {

@@ -260,6 +260,50 @@ func TestLoadLegacyPerChunkFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	copyPath := filepath.Join(filepath.Dir(dbPath), "copy.tshd")
+	srcCopy, err := Open(OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstCopy, err := Open(OpenOptions{Path: copyPath, Format: FormatChunks})
+	if err != nil {
+		_ = srcCopy.Close()
+		t.Fatal(err)
+	}
+	copyStats, err := srcCopy.CopyChunksTo(ctx, dstCopy)
+	if closeErr := dstCopy.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := srcCopy.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copyStats.Datastores != 1 || copyStats.Chunks != 1 || copyStats.RowsCopied == 0 {
+		t.Fatalf("copy stats = %+v", copyStats)
+	}
+	if _, err := os.Stat(chunkTileDataPath(copyPath, key, chunkTileCoordForChunk(coord))); err != nil {
+		t.Fatalf("copied tile shard missing: %v", err)
+	}
+	if _, err := os.Stat(chunkDataPath(copyPath, key, coord)); !os.IsNotExist(err) {
+		t.Fatalf("copied DB should not contain legacy chunk data file: %v", err)
+	}
+	copiedDB, err := Open(OpenOptions{Path: copyPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copiedChunk, err := copiedDB.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 10, Chunk: coord})
+	if closeErr := copiedDB.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copiedChunk.Pixels[0] != 0x2462 || copiedChunk.Pixels[ChunkPixelCount-1] != 0x2462 {
+		t.Fatalf("copied chunk pixels were not loaded")
+	}
+
 	rw, err := Open(OpenOptions{Path: dbPath})
 	if err != nil {
 		t.Fatal(err)
