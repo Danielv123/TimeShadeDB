@@ -34,6 +34,7 @@ type DB struct {
 	seqMu          sync.Mutex
 	nextSeq        uint64
 	skipWAL        bool
+	batchMode      bool
 	compressor     *compressionPool
 
 	cacheMu       sync.Mutex

@@ -35,6 +35,7 @@ func run(ctx context.Context, args []string) error {
 		fs := flag.NewFlagSet("import-csv", flag.ExitOnError)
 		input := fs.String("input", "", "gzip CSV input")
 		path := fs.String("db", "", "database directory")
+		maxRows := fs.Uint64("max-rows", 0, "optional import row limit for sampling")
 		pprofAddr := fs.String("pprof", "", "optional pprof listen address")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -52,7 +53,7 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		stats, err := timeshadedb.ImportCSV(ctx, db, *input)
+		stats, err := timeshadedb.ImportCSVWithOptions(ctx, db, *input, timeshadedb.ImportOptions{MaxRows: *maxRows})
 		if err != nil {
 			return err
 		}

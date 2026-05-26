@@ -30,6 +30,8 @@ const (
 
 	defaultDeltaFrameMaxEvents = 16384
 	defaultDeltaFrameMaxSpan   = 60
+	minSnapshotSizeRuleBytes   = 64 * 1024
+	timeSnapshotMinChanges     = 4096
 )
 
 var (
@@ -144,6 +146,7 @@ type compressionPool struct {
 
 type compressionJob struct {
 	raw  []byte
+	kind uint8
 	resp chan compressionResult
 }
 
@@ -163,7 +166,7 @@ func newCompressionPool() *compressionPool {
 		go func() {
 			defer p.wg.Done()
 			for job := range p.jobs {
-				payload, err := compressZstd(job.raw)
+				payload, err := compressZstd(job.raw, job.kind)
 				job.resp <- compressionResult{payload: payload, err: err}
 			}
 		}()
@@ -171,12 +174,12 @@ func newCompressionPool() *compressionPool {
 	return p
 }
 
-func (p *compressionPool) compress(raw []byte) ([]byte, error) {
+func (p *compressionPool) compress(raw []byte, kind uint8) ([]byte, error) {
 	if p == nil {
-		return compressZstd(raw)
+		return compressZstd(raw, kind)
 	}
 	resp := make(chan compressionResult, 1)
-	p.jobs <- compressionJob{raw: raw, resp: resp}
+	p.jobs <- compressionJob{raw: raw, kind: kind, resp: resp}
 	result := <-resp
 	return result.payload, result.err
 }
@@ -491,14 +494,16 @@ func (db *DB) flushDelta(t *tileState) error {
 			return err
 		}
 	}
-	if err := db.writeTileIndex(t); err != nil {
-		return err
-	}
-	if t.wal != nil {
-		if err := db.clearTileWAL(t); err != nil {
+	if !db.batchMode {
+		if err := db.writeTileIndex(t); err != nil {
 			return err
 		}
-		return db.openTileWAL(t)
+		if t.wal != nil {
+			if err := db.clearTileWAL(t); err != nil {
+				return err
+			}
+			return db.openTileWAL(t)
+		}
 	}
 	return nil
 }
@@ -515,14 +520,14 @@ func (db *DB) shouldSnapshot(t *tileState, sec uint32) bool {
 	if t.changesSinceSnap >= changeLimit {
 		return true
 	}
-	if t.lastSnapshotBytes > 0 && t.deltaBytesSinceSnap*4 >= t.lastSnapshotBytes*3 {
+	if t.changesSinceSnap >= timeSnapshotMinChanges && t.lastSnapshotBytes >= minSnapshotSizeRuleBytes && t.deltaBytesSinceSnap*4 >= t.lastSnapshotBytes*3 {
 		return true
 	}
 	age := sec - t.lastSnapshotSec
-	if age >= 15*60 && t.changesSinceSnap > 0 {
+	if age >= 15*60 && t.changesSinceSnap >= timeSnapshotMinChanges {
 		return true
 	}
-	return age >= 60*60
+	return age >= 60*60 && t.changesSinceSnap > 0
 }
 
 func (db *DB) writeSnapshot(t *tileState, sec uint32) error {
@@ -553,7 +558,7 @@ func (db *DB) writeFrame(f *os.File, kind uint8, timestampSec, maxTimeSec, event
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	payload, err := db.compressor.compress(raw)
+	payload, err := db.compressor.compress(raw, kind)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -575,8 +580,12 @@ func (db *DB) writeFrame(f *os.File, kind uint8, timestampSec, maxTimeSec, event
 	return uint64(offset), uint32(len(payload)), checksum, nil
 }
 
-func compressZstd(raw []byte) ([]byte, error) {
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+func compressZstd(raw []byte, kind uint8) ([]byte, error) {
+	level := zstd.SpeedBestCompression
+	if kind == frameKindDelta && len(raw) < 4096 {
+		level = zstd.SpeedFastest
+	}
+	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(level))
 	if err != nil {
 		return nil, err
 	}
@@ -1015,6 +1024,9 @@ func (db *DB) paletteID(rgb RGB) (uint8, error) {
 	db.palette = append(db.palette, rgb)
 	id := uint8(len(db.palette))
 	db.paletteMap[key] = id
+	if db.batchMode {
+		return id, nil
+	}
 	return id, db.writePalette()
 }
 

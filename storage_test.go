@@ -3,6 +3,7 @@ package timeshadedb
 import (
 	"compress/gzip"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -132,6 +133,28 @@ func TestImportAndVerifySmallCSV(t *testing.T) {
 	defer ro.Close()
 	if _, err := VerifyCSV(context.Background(), ro, input); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestImportDoesNotSnapshotEverySparseDeltaFrame(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sparse.csv.gzip")
+	if err := writeSparseGzipCSV(input, 20); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(OpenOptions{Path: filepath.Join(dir, "db.tshd")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := ImportCSV(context.Background(), db, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, max := stats.Tiles[0].SnapshotCount, uint64(3); got > max {
+		t.Fatalf("tile snapshot count = %d, want <= %d", got, max)
+	}
+	if got, want := stats.Tiles[0].DeltaFrameCount, uint64(10); got != want {
+		t.Fatalf("tile delta frame count = %d, want %d", got, want)
 	}
 }
 
@@ -293,6 +316,26 @@ func writeGzipCSV(path string) error {
 	gz := gzip.NewWriter(f)
 	if _, err := gz.Write(data); err != nil {
 		return err
+	}
+	return gz.Close()
+}
+
+func writeSparseGzipCSV(path string, rows int) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	if _, err := gz.Write([]byte("timestamp,user_id,pixel_color,coordinate\n")); err != nil {
+		return err
+	}
+	base := time.Unix(1648814400, 0).UTC()
+	for i := 0; i < rows; i++ {
+		line := fmt.Sprintf("%s,u%d,#010203,\"%d,%d\"\n", base.Add(time.Duration(i)*time.Minute).Format("2006-01-02 15:04:05.000 UTC"), i, i, i)
+		if _, err := gz.Write([]byte(line)); err != nil {
+			return err
+		}
 	}
 	return gz.Close()
 }

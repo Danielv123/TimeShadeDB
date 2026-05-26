@@ -36,6 +36,10 @@ type VerifyStats struct {
 	TilesChecked int    `json:"tiles_checked"`
 }
 
+type ImportOptions struct {
+	MaxRows uint64
+}
+
 type TileStats struct {
 	Tile                         TileCoord `json:"tile"`
 	Width                        int       `json:"width"`
@@ -67,9 +71,15 @@ type parsedPlacement struct {
 }
 
 func ImportCSV(ctx context.Context, db *DB, inputPath string) (*ImportStats, error) {
+	return ImportCSVWithOptions(ctx, db, inputPath, ImportOptions{})
+}
+
+func ImportCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts ImportOptions) (*ImportStats, error) {
 	db.skipWAL = true
+	db.batchMode = true
 	defer func() {
 		db.skipWAL = false
+		db.batchMode = false
 	}()
 	f, err := os.Open(inputPath)
 	if err != nil {
@@ -90,7 +100,7 @@ func ImportCSV(ctx context.Context, db *DB, inputPath string) (*ImportStats, err
 	if len(header) < 4 || header[0] != "timestamp" || header[2] != "pixel_color" || header[3] != "coordinate" {
 		return nil, fmt.Errorf("timeshadedb: unexpected CSV header: %v", header)
 	}
-	rows, err := importCSVRows(ctx, db, r)
+	rows, err := importCSVRows(ctx, db, r, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +112,7 @@ func ImportCSV(ctx context.Context, db *DB, inputPath string) (*ImportStats, err
 	return stats, nil
 }
 
-func importCSVRows(ctx context.Context, db *DB, r *csv.Reader) (uint64, error) {
+func importCSVRows(ctx context.Context, db *DB, r *csv.Reader, opts ImportOptions) (uint64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	workers := runtime.NumCPU()
@@ -147,6 +157,10 @@ func importCSVRows(ctx context.Context, db *DB, r *csv.Reader) (uint64, error) {
 			}
 			if err != nil {
 				sourceErr <- err
+				return
+			}
+			if opts.MaxRows > 0 && seq >= opts.MaxRows {
+				sourceErr <- nil
 				return
 			}
 			job := csvParseJob{seq: seq, row: seq + 2, rec: rec}
