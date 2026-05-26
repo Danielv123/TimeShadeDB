@@ -5,11 +5,13 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"timeshadedb"
@@ -136,6 +138,125 @@ func TestWebAPI(t *testing.T) {
 	}
 }
 
+func TestWebChunkIngestAPI(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db.tshd")
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	handler := newWebServer(db, http.NotFoundHandler()).routes()
+	saveID := "save-1"
+	firstPayload := testRGB565Hex(0x2462)
+	body := "10\tnauvis\t-7,-6\tplayer\t" + firstPayload + "\n"
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest/chunk/"+saveID, strings.NewReader(body))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("chunk ingest status = %d, body %s", resp.Code, resp.Body.String())
+	}
+	var result timeshadedb.IngestChunkResult
+	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.AcceptedRows != 1 || result.ChangedPixels != timeshadedb.ChunkPixelCount || result.DatastoresTouched != 1 {
+		t.Fatalf("chunk ingest result = %+v", result)
+	}
+
+	dupReq := httptest.NewRequest(http.MethodPost, "/api/ingest/chunk/"+saveID, strings.NewReader(body))
+	dupResp := httptest.NewRecorder()
+	handler.ServeHTTP(dupResp, dupReq)
+	if dupResp.Code != http.StatusOK {
+		t.Fatalf("duplicate ingest status = %d, body %s", dupResp.Code, dupResp.Body.String())
+	}
+	var duplicate timeshadedb.IngestChunkResult
+	if err := json.Unmarshal(dupResp.Body.Bytes(), &duplicate); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.ChangedPixels != 0 || duplicate.UnchangedPixels != timeshadedb.ChunkPixelCount {
+		t.Fatalf("duplicate result = %+v", duplicate)
+	}
+
+	metaReq := httptest.NewRequest(http.MethodGet, "/api/ingest/chunk/"+saveID+"/meta", nil)
+	metaResp := httptest.NewRecorder()
+	handler.ServeHTTP(metaResp, metaReq)
+	if metaResp.Code != http.StatusOK {
+		t.Fatalf("chunk metadata status = %d, body %s", metaResp.Code, metaResp.Body.String())
+	}
+	var meta timeshadedb.IngestMetadata
+	if err := json.Unmarshal(metaResp.Body.Bytes(), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.Datastores) != 1 || meta.Datastores[0].Surface != "nauvis" || meta.Datastores[0].LatestTick != 10 {
+		t.Fatalf("chunk metadata = %+v", meta)
+	}
+
+	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
+		Key:   timeshadedb.DatastoreKey{SavefileUUID: saveID, Surface: "nauvis", Force: "player"},
+		Tick:  10,
+		Chunk: timeshadedb.ChunkCoord{X: -7, Y: -6},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Pixels[0] != 0x2462 || chunk.Pixels[timeshadedb.ChunkPixelCount-1] != 0x2462 {
+		t.Fatalf("chunk pixels were not ingested")
+	}
+}
+
+func TestTailChunkTSVOnceResumesFromServerMetadata(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db.tshd")
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	handler := newWebServer(db, http.NotFoundHandler()).routes()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	saveID := "save-1"
+	firstRow := "10\tnauvis\t-7,-6\tplayer\t" + testRGB565Hex(0x2462)
+	secondRow := "11\tnauvis\t-7,-6\tplayer\t" + testRGB565Hex(0xcdac)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/ingest/chunk/"+saveID, strings.NewReader(firstRow+"\n"))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("pre-ingest status = %d, body %s", resp.Code, resp.Body.String())
+	}
+
+	input := filepath.Join(dir, "chunk-charted.tsv")
+	if err := os.WriteFile(input, []byte(firstRow+"\n"+secondRow+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{
+		"tail-chunk-tsv",
+		"--input", input,
+		"--savefile", saveID,
+		"--base-url", server.URL,
+		"--once",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
+		Key:   timeshadedb.DatastoreKey{SavefileUUID: saveID, Surface: "nauvis", Force: "player"},
+		Tick:  11,
+		Chunk: timeshadedb.ChunkCoord{X: -7, Y: -6},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Pixels[0] != 0xcdac {
+		t.Fatalf("tail sender did not resume and send second row, pixel = %#04x", chunk.Pixels[0])
+	}
+}
+
 func TestStaticWebAppServesEmbeddedIndex(t *testing.T) {
 	fsys, err := timeshadedb.WebDistFS()
 	if err != nil {
@@ -226,4 +347,8 @@ func writeSample(path string) error {
 		return err
 	}
 	return os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+func testRGB565Hex(color uint16) string {
+	return strings.Repeat(fmt.Sprintf("%04x", color), timeshadedb.ChunkPixelCount)
 }

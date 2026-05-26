@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -42,7 +43,7 @@ type metadataResponse struct {
 const viteDevURL = "http://127.0.0.1:5173"
 
 func serveHTTP(ctx context.Context, addr, dbPath string, cacheSize int64, dev bool) error {
-	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, ReadOnly: true, CacheSize: cacheSize})
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, CacheSize: cacheSize})
 	if err != nil {
 		return err
 	}
@@ -188,6 +189,7 @@ func (s *webServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/meta", s.handleMetadata)
 	mux.HandleFunc("/api/tiles/", s.handleTile)
+	mux.HandleFunc("/api/ingest/chunk/", s.handleChunkIngest)
 	mux.HandleFunc("/", s.handleStatic)
 	return mux
 }
@@ -239,6 +241,75 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 	if err := encodeTilePNG(w, res, timeshadedb.TileSize, timeshadedb.TileSize, png.BestSpeed); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+func (s *webServer) handleChunkIngest(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, "database is not open")
+		return
+	}
+	savefileUUID, isMeta, err := parseChunkIngestPath(r.URL.Path)
+	if err != nil {
+		writeAPIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if isMeta {
+		if r.Method != http.MethodGet {
+			writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		meta, err := s.db.IngestMetadata(savefileUUID)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeAPIJSON(w, meta)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 4096*8192)
+	scanner := bufio.NewScanner(r.Body)
+	scanner.Buffer(make([]byte, 0, 8192), 1024*1024)
+	rows, err := timeshadedb.ParseChunkTSV(savefileUUID, scanner)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(rows) == 0 {
+		writeAPIError(w, http.StatusBadRequest, "request body contains no rows")
+		return
+	}
+	if len(rows) > 4096 {
+		writeAPIError(w, http.StatusRequestEntityTooLarge, "too many rows in request")
+		return
+	}
+	touched := map[timeshadedb.DatastoreKey]struct{}{}
+	result := timeshadedb.IngestChunkResult{}
+	for _, row := range rows {
+		pixels := make([]uint16, timeshadedb.ChunkPixelCount)
+		copy(pixels, row.Pixels[:])
+		part, err := s.db.IngestChunk(r.Context(), timeshadedb.ChunkIngest{
+			Key:    row.Key,
+			Tick:   row.Tick,
+			Chunk:  row.Chunk,
+			Pixels: pixels,
+		})
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		touched[row.Key] = struct{}{}
+		result.AcceptedRows += part.AcceptedRows
+		result.ChangedPixels += part.ChangedPixels
+		result.UnchangedPixels += part.UnchangedPixels
+		result.LatestRowSeq = part.LatestRowSeq
+	}
+	result.DatastoresTouched = len(touched)
+	writeAPIJSON(w, result)
 }
 
 func (s *webServer) tileAtZoom(ctx context.Context, ts time.Time, z, x, y int) (*timeshadedb.TileResult, error) {
@@ -351,6 +422,21 @@ func parseTilePath(urlPath string) (int, int, int, error) {
 		parsed[i] = n
 	}
 	return parsed[0], parsed[1], parsed[2], nil
+}
+
+func parseChunkIngestPath(urlPath string) (string, bool, error) {
+	rel := strings.TrimPrefix(path.Clean(urlPath), "/api/ingest/chunk/")
+	if rel == "" || rel == "." || strings.HasPrefix(rel, "..") {
+		return "", false, fmt.Errorf("expected /api/ingest/chunk/{savefile_uuid}")
+	}
+	parts := strings.Split(rel, "/")
+	if len(parts) == 1 {
+		return parts[0], false, nil
+	}
+	if len(parts) == 2 && parts[1] == "meta" {
+		return parts[0], true, nil
+	}
+	return "", false, fmt.Errorf("expected /api/ingest/chunk/{savefile_uuid} or /api/ingest/chunk/{savefile_uuid}/meta")
 }
 
 func parseTimestampSec(r *http.Request) (uint32, error) {

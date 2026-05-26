@@ -29,7 +29,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve>")
+		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve|tail-chunk-tsv>")
 	}
 	switch args[0] {
 	case "import-csv":
@@ -276,6 +276,28 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("serve requires --db")
 		}
 		return serveHTTP(ctx, *addr, *path, *cacheSize, *dev)
+	case "tail-chunk-tsv":
+		fs := flag.NewFlagSet("tail-chunk-tsv", flag.ExitOnError)
+		input := fs.String("input", "", "chunk-charted TSV file to watch")
+		savefileUUID := fs.String("savefile", "", "savefile UUID to use in ingest API path")
+		baseURL := fs.String("base-url", "http://127.0.0.1:8080", "TimeShadeDB base URL")
+		batchRows := fs.Int("batch-rows", 128, "maximum rows per POST")
+		pollInterval := fs.Duration("poll-interval", time.Second, "poll interval for appended rows")
+		once := fs.Bool("once", false, "send catch-up rows and exit without watching")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *input == "" || *savefileUUID == "" {
+			return fmt.Errorf("tail-chunk-tsv requires --input and --savefile")
+		}
+		return tailChunkTSV(ctx, tailChunkTSVOptions{
+			InputPath:    *input,
+			SavefileUUID: *savefileUUID,
+			BaseURL:      *baseURL,
+			BatchRows:    *batchRows,
+			PollInterval: *pollInterval,
+			Once:         *once,
+		})
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
