@@ -5,3 +5,5 @@ db.tshd/
 *.png
 *.prof
 timeshadedb.exe
+web/node_modules/
+web/dist/

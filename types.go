@@ -84,6 +84,10 @@ func (db *DB) TileAt(ctx context.Context, opts TileAtOptions) (*TileResult, erro
 	return db.tileAt(ctx, opts)
 }
 
+func (db *DB) TimeRange() (uint32, uint32) {
+	return db.timeRange()
+}
+
 func (db *DB) Close() error {
 	return db.close()
 }

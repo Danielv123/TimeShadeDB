@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
+	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"timeshadedb"
 )
 
 func TestCLISmoke(t *testing.T) {
@@ -53,6 +59,59 @@ func TestCLISmoke(t *testing.T) {
 		t.Fatal(err)
 	} else if info.Size() == 0 {
 		t.Fatal("exported PNG is empty")
+	}
+}
+
+func TestWebAPI(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "sample.csv.gzip")
+	dbPath := filepath.Join(dir, "db.tshd")
+	if err := writeSample(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), []string{"import-csv", "--input", input, "--db", dbPath}); err != nil {
+		t.Fatal(err)
+	}
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	handler := newWebServer(db, "").routes()
+	metaReq := httptest.NewRequest(http.MethodGet, "/api/meta", nil)
+	metaResp := httptest.NewRecorder()
+	handler.ServeHTTP(metaResp, metaReq)
+	if metaResp.Code != http.StatusOK {
+		t.Fatalf("metadata status = %d, body %s", metaResp.Code, metaResp.Body.String())
+	}
+	var meta metadataResponse
+	if err := json.Unmarshal(metaResp.Body.Bytes(), &meta); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := meta.CanvasWidth, 2000; got != want {
+		t.Fatalf("canvas width = %d, want %d", got, want)
+	}
+	if meta.FromSec == 0 || meta.ToSec == 0 || meta.FromSec > meta.ToSec {
+		t.Fatalf("unexpected time range: %d..%d", meta.FromSec, meta.ToSec)
+	}
+
+	tileReq := httptest.NewRequest(http.MethodGet, "/api/tiles/0/0/0.png?ts=1648814520", nil)
+	tileResp := httptest.NewRecorder()
+	handler.ServeHTTP(tileResp, tileReq)
+	if tileResp.Code != http.StatusOK {
+		t.Fatalf("tile status = %d, body %s", tileResp.Code, tileResp.Body.String())
+	}
+	img, err := png.Decode(tileResp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := img.Bounds().Dx(), timeshadedb.TileSize; got != want {
+		t.Fatalf("tile png width = %d, want %d", got, want)
+	}
+	r, g, b, a := img.At(1, 1).RGBA()
+	if r>>8 != 4 || g>>8 != 5 || b>>8 != 6 || a>>8 != 255 {
+		t.Fatalf("pixel = rgba(%d,%d,%d,%d), want rgba(4,5,6,255)", r>>8, g>>8, b>>8, a>>8)
 	}
 }
 

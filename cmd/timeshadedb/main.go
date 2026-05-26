@@ -6,9 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"image"
-	"image/color"
-	"image/png"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -31,7 +28,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark>")
+		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve>")
 	}
 	switch args[0] {
 	case "import-csv":
@@ -265,6 +262,19 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		return writeJSON(stats)
+	case "serve":
+		fs := flag.NewFlagSet("serve", flag.ExitOnError)
+		path := fs.String("db", "", "database directory")
+		addr := fs.String("addr", "127.0.0.1:8080", "HTTP listen address")
+		webDir := fs.String("web", "web/dist", "built web app directory")
+		cacheSize := fs.Int64("cache-size", 64*1024*1024, "decoded snapshot cache bytes")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *path == "" {
+			return fmt.Errorf("serve requires --db")
+		}
+		return serveHTTP(ctx, *addr, *path, *webDir, *cacheSize)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -293,28 +303,12 @@ func writeJSON(v any) error {
 }
 
 func writePNG(path string, res *timeshadedb.TileResult) error {
-	img := image.NewRGBA(image.Rect(0, 0, res.Width, res.Height))
-	for y := 0; y < res.Height; y++ {
-		for x := 0; x < res.Width; x++ {
-			id := res.Pixels[y*res.Width+x]
-			if id == 0 {
-				img.SetRGBA(x, y, color.RGBA{})
-				continue
-			}
-			palIdx := int(id) - 1
-			if palIdx < 0 || palIdx >= len(res.Palette) {
-				return fmt.Errorf("palette id %d out of range", id)
-			}
-			c := res.Palette[palIdx]
-			img.SetRGBA(x, y, color.RGBA{R: c.R, G: c.G, B: c.B, A: 255})
-		}
-	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return png.Encode(f, img)
+	return encodeTilePNG(f, res, res.Width, res.Height)
 }
 
 func startPprof(addr string) error {
