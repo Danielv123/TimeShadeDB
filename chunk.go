@@ -230,10 +230,11 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	touchedDatastores := map[DatastoreKey]*chunkDatastore{}
 	writes := make([]chunkWrite, 0, len(rows))
 	result := &IngestChunkResult{}
-	var lastPayloadKey DatastoreKey
-	var lastPayloadChunk ChunkCoord
-	var lastPayload string
-	var lastPayloadValid bool
+	type payloadKey struct {
+		key   DatastoreKey
+		chunk ChunkCoord
+	}
+	lastPayloads := map[payloadKey]string{}
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -244,7 +245,8 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 		db.nextChunkSeq++
 		pixels := row.Pixels
 		if row.HasPayload {
-			if chunk.seen && lastPayloadValid && row.Key == lastPayloadKey && row.Chunk == lastPayloadChunk && row.PayloadHex == lastPayload {
+			pk := payloadKey{key: row.Key, chunk: row.Chunk}
+			if lastPayload, ok := lastPayloads[pk]; ok && chunk.seen && row.PayloadHex == lastPayload {
 				chunk.latestTick = row.Tick
 				chunk.latestRowSeq = seq
 				ds.latestTick = row.Tick
@@ -257,6 +259,7 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 				result.LatestRowSeq = seq
 				continue
 			}
+			lastPayloads[pk] = row.PayloadHex
 			decoded, err := decodeRGB565Hex(row.PayloadHex)
 			if err != nil {
 				return nil, err
@@ -274,14 +277,6 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 		chunk.seen = true
 		chunk.latestTick = row.Tick
 		chunk.latestRowSeq = seq
-		if row.HasPayload {
-			lastPayloadKey = row.Key
-			lastPayloadChunk = row.Chunk
-			lastPayload = row.PayloadHex
-			lastPayloadValid = true
-		} else {
-			lastPayloadValid = false
-		}
 		entry := chunkLogEntry{Seq: seq, Tick: row.Tick, Key: row.Key, Chunk: row.Chunk, Changes: changes}
 		if !wasSeen || len(changes) > 0 {
 			write := chunkWrite{ds: ds, coord: row.Chunk, chunk: chunk, entry: entry, snapshot: !wasSeen}
