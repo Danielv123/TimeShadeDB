@@ -283,6 +283,7 @@ func run(ctx context.Context, args []string) error {
 		baseURL := fs.String("base-url", "http://127.0.0.1:8080", "TimeShadeDB base URL")
 		batchRows := fs.Int("batch-rows", 128, "maximum rows per POST")
 		pollInterval := fs.Duration("poll-interval", time.Second, "poll interval for appended rows")
+		progressInterval := fs.Duration("progress-interval", 10*time.Second, "progress report interval; set to 0 to only print summaries")
 		once := fs.Bool("once", false, "send catch-up rows and exit without watching")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -291,12 +292,13 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("tail-chunk-tsv requires --input and --savefile")
 		}
 		return tailChunkTSV(ctx, tailChunkTSVOptions{
-			InputPath:    *input,
-			SavefileUUID: *savefileUUID,
-			BaseURL:      *baseURL,
-			BatchRows:    *batchRows,
-			PollInterval: *pollInterval,
-			Once:         *once,
+			InputPath:        *input,
+			SavefileUUID:     *savefileUUID,
+			BaseURL:          *baseURL,
+			BatchRows:        *batchRows,
+			PollInterval:     *pollInterval,
+			ProgressInterval: *progressInterval,
+			Once:             *once,
 		})
 	default:
 		return fmt.Errorf("unknown command %q", args[0])

@@ -17,12 +17,14 @@ import (
 )
 
 type tailChunkTSVOptions struct {
-	InputPath    string
-	SavefileUUID string
-	BaseURL      string
-	BatchRows    int
-	PollInterval time.Duration
-	Once         bool
+	InputPath        string
+	SavefileUUID     string
+	BaseURL          string
+	BatchRows        int
+	PollInterval     time.Duration
+	ProgressInterval time.Duration
+	ProgressOutput   io.Writer
+	Once             bool
 }
 
 type resumeTarget struct {
@@ -39,6 +41,7 @@ func tailChunkTSV(ctx context.Context, opts tailChunkTSVOptions) error {
 	if opts.PollInterval <= 0 {
 		return fmt.Errorf("poll-interval must be positive")
 	}
+	reporter := newChunkProgressReporter(opts.ProgressOutput, opts.ProgressInterval)
 	baseURL, err := normalizeBaseURL(opts.BaseURL)
 	if err != nil {
 		return err
@@ -48,17 +51,18 @@ func tailChunkTSV(ctx context.Context, opts tailChunkTSVOptions) error {
 	if err != nil {
 		return err
 	}
-	offset, err := catchUpChunkTSV(ctx, client, opts, baseURL, meta)
+	offset, err := catchUpChunkTSV(ctx, client, opts, baseURL, meta, reporter)
 	if err != nil {
 		return err
 	}
+	reporter.reportFinal()
 	if opts.Once {
 		return nil
 	}
-	return watchChunkTSV(ctx, client, opts, baseURL, offset)
+	return watchChunkTSV(ctx, client, opts, baseURL, offset, reporter)
 }
 
-func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSVOptions, baseURL string, meta *timeshadedb.IngestMetadata) (int64, error) {
+func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSVOptions, baseURL string, meta *timeshadedb.IngestMetadata, reporter *chunkProgressReporter) (int64, error) {
 	f, err := os.Open(opts.InputPath)
 	if err != nil {
 		return 0, err
@@ -88,7 +92,7 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 		} else if len(targets) == 0 || lastMatchedOffset >= 0 {
 			batch = append(batch, line)
 			if len(batch) >= opts.BatchRows {
-				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch); err != nil {
+				if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
 					return 0, err
 				}
 				batch = batch[:0]
@@ -100,21 +104,21 @@ func catchUpChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSV
 		return 0, err
 	}
 	if len(batch) > 0 {
-		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch); err != nil {
+		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
 			return 0, err
 		}
 	}
 	return offset, nil
 }
 
-func watchChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSVOptions, baseURL string, offset int64) error {
+func watchChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSVOptions, baseURL string, offset int64, reporter *chunkProgressReporter) error {
 	ticker := time.NewTicker(opts.PollInterval)
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		next, err := sendAppendedChunkRows(ctx, client, opts, baseURL, offset)
+		next, err := sendAppendedChunkRows(ctx, client, opts, baseURL, offset, reporter)
 		if err != nil {
 			return err
 		}
@@ -127,7 +131,7 @@ func watchChunkTSV(ctx context.Context, client *http.Client, opts tailChunkTSVOp
 	}
 }
 
-func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailChunkTSVOptions, baseURL string, offset int64) (int64, error) {
+func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailChunkTSVOptions, baseURL string, offset int64, reporter *chunkProgressReporter) (int64, error) {
 	f, err := os.Open(opts.InputPath)
 	if err != nil {
 		return offset, err
@@ -142,7 +146,7 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		if err != nil {
 			return offset, err
 		}
-		return catchUpChunkTSV(ctx, client, opts, baseURL, meta)
+		return catchUpChunkTSV(ctx, client, opts, baseURL, meta, reporter)
 	}
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return offset, err
@@ -162,7 +166,7 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 				}
 				batch = append(batch, trimmed)
 				if len(batch) >= opts.BatchRows {
-					if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch); err != nil {
+					if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
 						return offset, err
 					}
 					batch = batch[:0]
@@ -175,7 +179,7 @@ func sendAppendedChunkRows(ctx context.Context, client *http.Client, opts tailCh
 		}
 	}
 	if len(batch) > 0 {
-		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch); err != nil {
+		if err := postChunkRows(ctx, client, baseURL, opts.SavefileUUID, batch, reporter); err != nil {
 			return offset, err
 		}
 	}
@@ -203,7 +207,7 @@ func fetchIngestMetadata(ctx context.Context, client *http.Client, baseURL, save
 	return &meta, nil
 }
 
-func postChunkRows(ctx context.Context, client *http.Client, baseURL, savefileUUID string, rows []string) error {
+func postChunkRows(ctx context.Context, client *http.Client, baseURL, savefileUUID string, rows []string, reporter *chunkProgressReporter) error {
 	body := bytes.NewBuffer(nil)
 	for _, row := range rows {
 		body.WriteString(row)
@@ -221,13 +225,74 @@ func postChunkRows(ctx context.Context, client *http.Client, baseURL, savefileUU
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		time.Sleep(500 * time.Millisecond)
-		return postChunkRows(ctx, client, baseURL, savefileUUID, rows)
+		return postChunkRows(ctx, client, baseURL, savefileUUID, rows, reporter)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("ingest request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	reporter.record(len(rows))
 	return nil
+}
+
+type chunkProgressReporter struct {
+	out            io.Writer
+	interval       time.Duration
+	start          time.Time
+	lastReport     time.Time
+	lastReportRows uint64
+	totalRows      uint64
+}
+
+func newChunkProgressReporter(out io.Writer, interval time.Duration) *chunkProgressReporter {
+	if out == nil {
+		out = os.Stderr
+	}
+	now := time.Now()
+	return &chunkProgressReporter{out: out, interval: interval, start: now, lastReport: now}
+}
+
+func (r *chunkProgressReporter) record(rows int) {
+	if r == nil || rows <= 0 {
+		return
+	}
+	r.totalRows += uint64(rows)
+	if r.interval <= 0 {
+		return
+	}
+	now := time.Now()
+	if now.Sub(r.lastReport) >= r.interval {
+		r.report(now, false)
+	}
+}
+
+func (r *chunkProgressReporter) reportFinal() {
+	if r == nil || r.totalRows == 0 {
+		return
+	}
+	r.report(time.Now(), true)
+}
+
+func (r *chunkProgressReporter) report(now time.Time, final bool) {
+	windowRows := r.totalRows - r.lastReportRows
+	windowMinutes := now.Sub(r.lastReport).Minutes()
+	totalMinutes := now.Sub(r.start).Minutes()
+	windowRate := chunksPerMinute(windowRows, windowMinutes)
+	averageRate := chunksPerMinute(r.totalRows, totalMinutes)
+	label := "progress"
+	if final {
+		label = "summary"
+	}
+	fmt.Fprintf(r.out, "tail-chunk-tsv %s: pushed %d chunks total, %.1f chunks/min current, %.1f chunks/min average\n", label, r.totalRows, windowRate, averageRate)
+	r.lastReport = now
+	r.lastReportRows = r.totalRows
+}
+
+func chunksPerMinute(rows uint64, minutes float64) float64 {
+	if rows == 0 || minutes <= 0 {
+		return 0
+	}
+	return float64(rows) / minutes
 }
 
 func resumeTargets(meta *timeshadedb.IngestMetadata) map[resumeTarget]struct{} {

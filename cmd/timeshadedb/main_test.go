@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"timeshadedb"
 )
@@ -234,14 +235,21 @@ func TestTailChunkTSVOnceResumesFromServerMetadata(t *testing.T) {
 	if err := os.WriteFile(input, []byte(firstRow+"\n"+secondRow+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(context.Background(), []string{
-		"tail-chunk-tsv",
-		"--input", input,
-		"--savefile", saveID,
-		"--base-url", server.URL,
-		"--once",
+	var progress bytes.Buffer
+	if err := tailChunkTSV(context.Background(), tailChunkTSVOptions{
+		InputPath:        input,
+		SavefileUUID:     saveID,
+		BaseURL:          server.URL,
+		BatchRows:        128,
+		PollInterval:     time.Second,
+		ProgressInterval: 10 * time.Second,
+		ProgressOutput:   &progress,
+		Once:             true,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if got := progress.String(); !strings.Contains(got, "chunks/min") || !strings.Contains(got, "pushed 1 chunks total") {
+		t.Fatalf("progress output = %q", got)
 	}
 
 	chunk, err := db.ChunkAt(context.Background(), timeshadedb.ChunkAtOptions{
