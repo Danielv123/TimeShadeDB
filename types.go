@@ -47,6 +47,7 @@ type DB struct {
 	chunkMu         sync.RWMutex
 	chunkLoaded     bool
 	chunkDatastores map[DatastoreKey]*chunkDatastore
+	chunkTileLocks  sync.Map
 	nextChunkSeq    uint64
 
 	closed bool

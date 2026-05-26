@@ -244,35 +244,48 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	}
 
 	db.chunkMu.Lock()
-	defer db.chunkMu.Unlock()
 	if err := db.loadChunksLocked(); err != nil {
+		db.chunkMu.Unlock()
 		return nil, err
 	}
+	db.chunkMu.Unlock()
 
 	touched := map[DatastoreKey]struct{}{}
 	touchedDatastores := map[DatastoreKey]*chunkDatastore{}
-	groups := map[chunkTileBatchKey][]chunkIngestWork{}
+	rowGroups := map[chunkTileBatchKey][]ParsedChunkRow{}
 	groupOrder := make([]chunkTileBatchKey, 0)
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		ds := db.chunkDatastoreLocked(row.Key)
-		chunk := ds.chunkLocked(row.Chunk)
-		seq := db.nextChunkSeq
-		db.nextChunkSeq++
-		touchedDatastores[row.Key] = ds
 		key := chunkTileKey(row.Key, row.Chunk)
-		if _, ok := groups[key]; !ok {
+		if _, ok := rowGroups[key]; !ok {
 			groupOrder = append(groupOrder, key)
 		}
-		groups[key] = append(groups[key], chunkIngestWork{row: row, seq: seq, ds: ds, chunk: chunk})
+		rowGroups[key] = append(rowGroups[key], row)
+	}
+	releaseTileLocks := db.acquireChunkTileLocks(groupOrder)
+	defer releaseTileLocks()
+
+	groups := map[chunkTileBatchKey][]chunkIngestWork{}
+	db.chunkMu.Lock()
+	for _, key := range groupOrder {
+		for _, row := range rowGroups[key] {
+			ds := db.chunkDatastoreLocked(row.Key)
+			chunk := ds.chunkLocked(row.Chunk)
+			seq := db.nextChunkSeq
+			db.nextChunkSeq++
+			touchedDatastores[row.Key] = ds
+			groups[key] = append(groups[key], chunkIngestWork{row: row, seq: seq, ds: ds, chunk: chunk})
+		}
 	}
 	for _, ds := range touchedDatastores {
 		if err := db.ensureChunkDatastoreFilesLocked(ds); err != nil {
+			db.chunkMu.Unlock()
 			return nil, err
 		}
 	}
+	db.chunkMu.Unlock()
 
 	workerResults := db.processChunkTileBatches(ctx, groups, groupOrder)
 	result := &IngestChunkResult{}
@@ -307,6 +320,8 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 			}
 		}
 	}
+	db.chunkMu.Lock()
+	defer db.chunkMu.Unlock()
 	for key, chunkEvents := range events {
 		ds := touchedDatastores[key]
 		for coord, entries := range chunkEvents {
@@ -315,9 +330,11 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	}
 	for key, latest := range progress {
 		ds := touchedDatastores[key]
-		ds.latestTick = latest.LatestTick
-		ds.latestChunk = ChunkCoord{X: latest.LatestChunkX, Y: latest.LatestChunkY}
-		ds.latestRowSeq = latest.LatestRowSeq
+		if latest.LatestRowSeq > ds.latestRowSeq {
+			ds.latestTick = latest.LatestTick
+			ds.latestChunk = ChunkCoord{X: latest.LatestChunkX, Y: latest.LatestChunkY}
+			ds.latestRowSeq = latest.LatestRowSeq
+		}
 	}
 	for _, ds := range touchedDatastores {
 		if err := db.writeChunkProgressLocked(ds); err != nil {
@@ -362,6 +379,63 @@ func (db *DB) processChunkTileBatches(ctx context.Context, groups map[chunkTileB
 		out = append(out, result)
 	}
 	return out
+}
+
+func (db *DB) acquireChunkTileLocks(keys []chunkTileBatchKey) func() {
+	ordered := append([]chunkTileBatchKey(nil), keys...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return compareChunkTileBatchKey(ordered[i], ordered[j]) < 0
+	})
+	locks := make([]*sync.Mutex, 0, len(ordered))
+	for _, key := range ordered {
+		lock := db.chunkTileLock(key)
+		lock.Lock()
+		locks = append(locks, lock)
+	}
+	return func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].Unlock()
+		}
+	}
+}
+
+func (db *DB) chunkTileLock(key chunkTileBatchKey) *sync.Mutex {
+	v, _ := db.chunkTileLocks.LoadOrStore(key, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func compareChunkTileBatchKey(a, b chunkTileBatchKey) int {
+	if a.key.SavefileUUID != b.key.SavefileUUID {
+		if a.key.SavefileUUID < b.key.SavefileUUID {
+			return -1
+		}
+		return 1
+	}
+	if a.key.Surface != b.key.Surface {
+		if a.key.Surface < b.key.Surface {
+			return -1
+		}
+		return 1
+	}
+	if a.key.Force != b.key.Force {
+		if a.key.Force < b.key.Force {
+			return -1
+		}
+		return 1
+	}
+	if a.tileX != b.tileX {
+		if a.tileX < b.tileX {
+			return -1
+		}
+		return 1
+	}
+	if a.tileY != b.tileY {
+		if a.tileY < b.tileY {
+			return -1
+		}
+		return 1
+	}
+	return 0
 }
 
 func (db *DB) processChunkTileBatch(ctx context.Context, batch []chunkIngestWork) chunkTileBatchResult {
@@ -470,6 +544,9 @@ func (db *DB) chunkAt(ctx context.Context, opts ChunkAtOptions) (*ChunkResult, e
 		db.chunkMu.Unlock()
 	}
 
+	tileLock := db.chunkTileLock(chunkTileKey(opts.Key, opts.Chunk))
+	tileLock.Lock()
+	defer tileLock.Unlock()
 	db.chunkMu.RLock()
 	defer db.chunkMu.RUnlock()
 	ds := db.chunkDatastores[opts.Key]
