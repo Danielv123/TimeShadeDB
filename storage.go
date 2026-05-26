@@ -720,12 +720,6 @@ func (db *DB) readTileAt(ctx context.Context, t *tileState, sec uint32) (*TileRe
 			return nil, err
 		}
 		d := t.index.deltas[di]
-		if d.MaxTimestampSec <= snap.TimestampSec {
-			continue
-		}
-		if d.MinTimestampSec > sec {
-			break
-		}
 		info, err := readFrame(t.file, d.FrameOffset)
 		if err != nil {
 			return nil, err
@@ -746,7 +740,7 @@ func (db *DB) readTileAt(ctx context.Context, t *tileState, sec uint32) (*TileRe
 		}
 		for _, ev := range events {
 			if ev.sec > sec {
-				return tileResult(t, db.palette, pixels, snap.TimestampSec, replayed), nil
+				continue
 			}
 			if int(ev.pos) >= len(pixels) {
 				return nil, fmt.Errorf("timeshadedb: delta position out of bounds: %d", ev.pos)

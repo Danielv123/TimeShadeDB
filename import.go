@@ -41,6 +41,10 @@ type ImportOptions struct {
 	MaxRows uint64
 }
 
+type VerifyOptions struct {
+	MaxRows uint64
+}
+
 type TileStats struct {
 	Tile                         TileCoord `json:"tile"`
 	Width                        int       `json:"width"`
@@ -331,6 +335,10 @@ func splitPlacementLine(line string) (string, string, string, error) {
 }
 
 func VerifyCSV(ctx context.Context, db *DB, inputPath string) (*VerifyStats, error) {
+	return VerifyCSVWithOptions(ctx, db, inputPath, VerifyOptions{})
+}
+
+func VerifyCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts VerifyOptions) (*VerifyStats, error) {
 	f, err := os.Open(inputPath)
 	if err != nil {
 		return nil, err
@@ -365,6 +373,9 @@ func VerifyCSV(ctx context.Context, db *DB, inputPath string) (*VerifyStats, err
 		}
 		if err != nil {
 			return nil, err
+		}
+		if opts.MaxRows > 0 && rows >= opts.MaxRows {
+			break
 		}
 		ts, err := parseTimestamp(rec[0])
 		if err != nil {

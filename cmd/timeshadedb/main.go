@@ -107,6 +107,7 @@ func run(ctx context.Context, args []string) error {
 		fs := flag.NewFlagSet("verify", flag.ExitOnError)
 		input := fs.String("input", "", "gzip CSV input")
 		path := fs.String("db", "", "database directory")
+		maxRows := fs.Uint64("max-rows", 0, "optional verify row limit for sampled imports")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -118,7 +119,7 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		defer db.Close()
-		stats, err := timeshadedb.VerifyCSV(ctx, db, *input)
+		stats, err := timeshadedb.VerifyCSVWithOptions(ctx, db, *input, timeshadedb.VerifyOptions{MaxRows: *maxRows})
 		if err != nil {
 			return err
 		}

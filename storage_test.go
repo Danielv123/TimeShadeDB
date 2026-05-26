@@ -113,6 +113,45 @@ func TestTileAtHistoricalBeforeAndAfterDelta(t *testing.T) {
 	}
 }
 
+func TestTileAtReplaysOlderDeltaWrittenAfterSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	oldEvents, oldSpan := deltaFrameMaxEvents, deltaFrameMaxSpan
+	deltaFrameMaxEvents, deltaFrameMaxSpan = 1, 3600
+	defer func() {
+		deltaFrameMaxEvents, deltaFrameMaxSpan = oldEvents, oldSpan
+	}()
+	db, err := Open(OpenOptions{Path: filepath.Join(dir, "db.tshd")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := time.Unix(3600, 0).UTC()
+	older := time.Unix(10, 0).UTC()
+	if err := db.IngestPlacement(latest, 1, 1, RGB{R: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.IngestPlacement(older, 2, 2, RGB{G: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(OpenOptions{Path: filepath.Join(dir, "db.tshd"), ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	res, err := db.TileAt(context.Background(), TileAtOptions{Timestamp: latest, Tile: TileCoord{X: 0, Y: 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := res.Pixels[1*res.Width+1], uint8(1); got != want {
+		t.Fatalf("latest pixel = %d, want %d", got, want)
+	}
+	if got, want := res.Pixels[2*res.Width+2], uint8(2); got != want {
+		t.Fatalf("older post-snapshot pixel = %d, want %d", got, want)
+	}
+}
+
 func TestImportAndVerifySmallCSV(t *testing.T) {
 	dir := t.TempDir()
 	input := filepath.Join(dir, "sample.csv.gzip")
