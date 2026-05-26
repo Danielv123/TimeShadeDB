@@ -98,6 +98,11 @@ type chunkFrameInfo struct {
 	payload       []byte
 }
 
+type chunkTileCoord struct {
+	X int32
+	Y int32
+}
+
 type chunkWrite struct {
 	ds             *chunkDatastore
 	coord          ChunkCoord
@@ -909,12 +914,14 @@ func (db *DB) writeChunkFrameLocked(ds *chunkDatastore, coord ChunkCoord, chunk 
 func (db *DB) writeChunkBatchLocked(writes []chunkWrite) error {
 	type groupKey struct {
 		key   DatastoreKey
-		coord ChunkCoord
+		tileX int32
+		tileY int32
 	}
 	groups := map[groupKey][]chunkWrite{}
 	order := make([]groupKey, 0)
 	for _, write := range writes {
-		k := groupKey{key: write.ds.key, coord: write.coord}
+		tile := chunkTileCoordForChunk(write.coord)
+		k := groupKey{key: write.ds.key, tileX: tile.X, tileY: tile.Y}
 		if _, ok := groups[k]; !ok {
 			order = append(order, k)
 		}
@@ -925,22 +932,21 @@ func (db *DB) writeChunkBatchLocked(writes []chunkWrite) error {
 		if len(group) == 0 {
 			continue
 		}
-		if err := db.writeChunkGroupLocked(group); err != nil {
+		if err := db.writeChunkTileGroupLocked(group); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
+func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 	first := writes[0]
 	ds := first.ds
-	coord := first.coord
-	chunk := first.chunk
+	tile := chunkTileCoordForChunk(first.coord)
 	if err := db.ensureChunkDatastoreFilesLocked(ds); err != nil {
 		return err
 	}
-	dataPath := chunkDataPath(db.path, ds.key, coord)
+	dataPath := chunkTileDataPath(db.path, ds.key, tile)
 	newFile := false
 	if _, err := os.Stat(dataPath); errors.Is(err, os.ErrNotExist) {
 		newFile = true
@@ -953,12 +959,13 @@ func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
 	}
 	defer f.Close()
 	if newFile {
-		if err := writeChunkDataHeader(f, coord); err != nil {
+		if err := writeChunkTileDataHeader(f, tile); err != nil {
 			return err
 		}
 	}
 	for _, write := range writes {
 		entry := write.entry
+		chunk := write.chunk
 		var kind uint8
 		var raw []byte
 		if write.snapshot {
@@ -998,13 +1005,13 @@ func (db *DB) writeChunkGroupLocked(writes []chunkWrite) error {
 			})
 		}
 	}
-	return writeChunkIndex(db.path, ds.key, coord, chunk.index)
+	return writeChunkTileIndex(db.path, ds.key, tile, chunkIndexesForTile(ds, tile))
 }
 
 func (db *DB) ensureChunkDatastoreFilesLocked(ds *chunkDatastore) error {
 	dsDir := chunkDatastorePath(db.path, ds.key)
 	if !ds.dirsReady {
-		if err := os.MkdirAll(filepath.Join(dsDir, "chunks"), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(dsDir, "tiles"), 0o755); err != nil {
 			return err
 		}
 		ds.dirsReady = true
@@ -1072,6 +1079,18 @@ func writeChunkDataHeader(f *os.File, coord ChunkCoord) error {
 	_ = binary.Write(&buf, binary.LittleEndian, formatVersion)
 	_ = binary.Write(&buf, binary.LittleEndian, coord.X)
 	_ = binary.Write(&buf, binary.LittleEndian, coord.Y)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(ChunkSize))
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
+	_, err := f.Write(buf.Bytes())
+	return err
+}
+
+func writeChunkTileDataHeader(f *os.File, tile chunkTileCoord) error {
+	var buf bytes.Buffer
+	buf.WriteString("TDAT")
+	_ = binary.Write(&buf, binary.LittleEndian, formatVersion)
+	_ = binary.Write(&buf, binary.LittleEndian, tile.X)
+	_ = binary.Write(&buf, binary.LittleEndian, tile.Y)
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(ChunkSize))
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
 	_, err := f.Write(buf.Bytes())
@@ -1198,26 +1217,14 @@ func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
-		chunksDir := filepath.Join(dsDir, "chunks")
-		chunkFiles, err := os.ReadDir(chunksDir)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
+		if loadedLegacy, err := db.loadLegacyChunkIndexFilesLocked(ds, dsDir); err != nil {
 			return false, err
+		} else if loadedLegacy {
+			loaded = true
 		}
-		for _, file := range chunkFiles {
-			if file.IsDir() || filepath.Ext(file.Name()) != ".cidx" {
-				continue
-			}
-			idxPath := filepath.Join(chunksDir, file.Name())
-			coord, idx, err := readChunkIndex(idxPath)
-			if err != nil {
-				return false, err
-			}
-			if err := db.loadChunkFramesLocked(ds, coord, idx); err != nil {
-				return false, err
-			}
+		if loadedTiles, err := db.loadChunkTileIndexFilesLocked(ds, dsDir); err != nil {
+			return false, err
+		} else if loadedTiles {
 			loaded = true
 		}
 		if progress != nil {
@@ -1229,14 +1236,75 @@ func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 	return loaded, nil
 }
 
-func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx chunkIndex) error {
-	dataPath := chunkDataPath(db.path, ds.key, coord)
+func (db *DB) loadLegacyChunkIndexFilesLocked(ds *chunkDatastore, dsDir string) (bool, error) {
+	chunksDir := filepath.Join(dsDir, "chunks")
+	chunkFiles, err := os.ReadDir(chunksDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	loaded := false
+	for _, file := range chunkFiles {
+		if file.IsDir() || filepath.Ext(file.Name()) != ".cidx" {
+			continue
+		}
+		idxPath := filepath.Join(chunksDir, file.Name())
+		coord, idx, err := readChunkIndex(idxPath)
+		if err != nil {
+			return false, err
+		}
+		dataPath := chunkDataPath(db.path, ds.key, coord)
+		if err := db.loadChunkFramesLocked(ds, coord, idx, dataPath, func(f *os.File) error {
+			return readChunkDataHeader(f, coord)
+		}); err != nil {
+			return false, err
+		}
+		loaded = true
+	}
+	return loaded, nil
+}
+
+func (db *DB) loadChunkTileIndexFilesLocked(ds *chunkDatastore, dsDir string) (bool, error) {
+	tilesDir := filepath.Join(dsDir, "tiles")
+	tileFiles, err := os.ReadDir(tilesDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	loaded := false
+	for _, file := range tileFiles {
+		if file.IsDir() || filepath.Ext(file.Name()) != ".tidx" {
+			continue
+		}
+		idxPath := filepath.Join(tilesDir, file.Name())
+		tile, indexes, err := readChunkTileIndex(idxPath)
+		if err != nil {
+			return false, err
+		}
+		dataPath := chunkTileDataPath(db.path, ds.key, tile)
+		for coord, idx := range indexes {
+			if err := db.loadChunkFramesLocked(ds, coord, idx, dataPath, func(f *os.File) error {
+				return readChunkTileDataHeader(f, tile)
+			}); err != nil {
+				return false, err
+			}
+			loaded = true
+		}
+	}
+	return loaded, nil
+}
+
+func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx chunkIndex, dataPath string, readHeader func(*os.File) error) error {
 	f, err := os.Open(dataPath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if err := readChunkDataHeader(f, coord); err != nil {
+	if err := readHeader(f); err != nil {
 		return err
 	}
 	chunk := ds.chunkLocked(coord)
@@ -1340,6 +1408,25 @@ func readChunkDataHeader(f *os.File, coord ChunkCoord) error {
 	format := binary.LittleEndian.Uint16(hdr[16:18])
 	if version != formatVersion || x != coord.X || y != coord.Y || size != ChunkSize || format != 1 {
 		return errors.New("timeshadedb: chunk data header mismatch")
+	}
+	return nil
+}
+
+func readChunkTileDataHeader(f *os.File, tile chunkTileCoord) error {
+	hdr := make([]byte, 18)
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		return err
+	}
+	if string(hdr[:4]) != "TDAT" {
+		return errors.New("timeshadedb: bad chunk tile data magic")
+	}
+	version := binary.LittleEndian.Uint16(hdr[4:6])
+	x := int32(binary.LittleEndian.Uint32(hdr[6:10]))
+	y := int32(binary.LittleEndian.Uint32(hdr[10:14]))
+	size := binary.LittleEndian.Uint16(hdr[14:16])
+	format := binary.LittleEndian.Uint16(hdr[16:18])
+	if version != formatVersion || x != tile.X || y != tile.Y || size != ChunkSize || format != 1 {
+		return errors.New("timeshadedb: chunk tile data header mismatch")
 	}
 	return nil
 }
@@ -1476,6 +1563,148 @@ func readChunkIndex(path string) (ChunkCoord, chunkIndex, error) {
 	return coord, idx, nil
 }
 
+func writeChunkTileIndex(root string, key DatastoreKey, tile chunkTileCoord, indexes map[ChunkCoord]chunkIndex) error {
+	dataPath := chunkTileDataPath(root, key, tile)
+	info, err := os.Stat(dataPath)
+	if err != nil {
+		return err
+	}
+	coords := make([]ChunkCoord, 0, len(indexes))
+	for coord, idx := range indexes {
+		if len(idx.snapshots) == 0 && len(idx.deltas) == 0 {
+			continue
+		}
+		coords = append(coords, coord)
+	}
+	sort.Slice(coords, func(i, j int) bool {
+		if coords[i].X != coords[j].X {
+			return coords[i].X < coords[j].X
+		}
+		return coords[i].Y < coords[j].Y
+	})
+	var buf bytes.Buffer
+	buf.WriteString("TIDX")
+	_ = binary.Write(&buf, binary.LittleEndian, formatVersion)
+	_ = binary.Write(&buf, binary.LittleEndian, tile.X)
+	_ = binary.Write(&buf, binary.LittleEndian, tile.Y)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(ChunkSize))
+	_ = binary.Write(&buf, binary.LittleEndian, uint64(info.Size()))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(coords)))
+	for _, coord := range coords {
+		idx := indexes[coord]
+		_ = binary.Write(&buf, binary.LittleEndian, coord.X)
+		_ = binary.Write(&buf, binary.LittleEndian, coord.Y)
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(idx.snapshots)))
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(idx.deltas)))
+		for _, snap := range idx.snapshots {
+			fields := []any{snap.Tick, snap.FrameOffset, snap.FrameHeaderLen, snap.CompressedLen, snap.RawLen, snap.FirstDeltaFrameIdx, snap.EventSeq, snap.Checksum}
+			for _, field := range fields {
+				_ = binary.Write(&buf, binary.LittleEndian, field)
+			}
+		}
+		for _, delta := range idx.deltas {
+			fields := []any{delta.MinTick, delta.MaxTick, delta.FrameOffset, delta.FrameHeaderLen, delta.CompressedLen, delta.RawLen, delta.EventCount, delta.FirstEventSeq, delta.LastEventSeq, delta.Checksum}
+			for _, field := range fields {
+				_ = binary.Write(&buf, binary.LittleEndian, field)
+			}
+		}
+	}
+	path := chunkTileIndexPath(root, key, tile)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func readChunkTileIndex(path string) (chunkTileCoord, map[ChunkCoord]chunkIndex, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return chunkTileCoord{}, nil, err
+	}
+	r := bytes.NewReader(data)
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(r, magic); err != nil {
+		return chunkTileCoord{}, nil, err
+	}
+	if string(magic) != "TIDX" {
+		return chunkTileCoord{}, nil, errors.New("timeshadedb: bad chunk tile index magic")
+	}
+	var version uint16
+	var tile chunkTileCoord
+	var size uint16
+	var dataSize uint64
+	var chunkCount uint32
+	fields := []any{&version, &tile.X, &tile.Y, &size, &dataSize, &chunkCount}
+	for _, field := range fields {
+		if err := binary.Read(r, binary.LittleEndian, field); err != nil {
+			return chunkTileCoord{}, nil, err
+		}
+	}
+	if version != formatVersion || size != ChunkSize {
+		return chunkTileCoord{}, nil, errors.New("timeshadedb: chunk tile index header mismatch")
+	}
+	indexes := make(map[ChunkCoord]chunkIndex, chunkCount)
+	for i := uint32(0); i < chunkCount; i++ {
+		var coord ChunkCoord
+		var snapCount, deltaCount uint32
+		fields := []any{&coord.X, &coord.Y, &snapCount, &deltaCount}
+		for _, field := range fields {
+			if err := binary.Read(r, binary.LittleEndian, field); err != nil {
+				return chunkTileCoord{}, nil, err
+			}
+		}
+		if chunkTileCoordForChunk(coord) != tile {
+			return chunkTileCoord{}, nil, errors.New("timeshadedb: chunk tile index contains out-of-tile chunk")
+		}
+		idx := chunkIndex{
+			snapshots: make([]chunkSnapshotRecord, snapCount),
+			deltas:    make([]chunkDeltaRecord, deltaCount),
+		}
+		for i := range idx.snapshots {
+			fields := []any{
+				&idx.snapshots[i].Tick,
+				&idx.snapshots[i].FrameOffset,
+				&idx.snapshots[i].FrameHeaderLen,
+				&idx.snapshots[i].CompressedLen,
+				&idx.snapshots[i].RawLen,
+				&idx.snapshots[i].FirstDeltaFrameIdx,
+				&idx.snapshots[i].EventSeq,
+				&idx.snapshots[i].Checksum,
+			}
+			for _, field := range fields {
+				if err := binary.Read(r, binary.LittleEndian, field); err != nil {
+					return chunkTileCoord{}, nil, err
+				}
+			}
+		}
+		for i := range idx.deltas {
+			fields := []any{
+				&idx.deltas[i].MinTick,
+				&idx.deltas[i].MaxTick,
+				&idx.deltas[i].FrameOffset,
+				&idx.deltas[i].FrameHeaderLen,
+				&idx.deltas[i].CompressedLen,
+				&idx.deltas[i].RawLen,
+				&idx.deltas[i].EventCount,
+				&idx.deltas[i].FirstEventSeq,
+				&idx.deltas[i].LastEventSeq,
+				&idx.deltas[i].Checksum,
+			}
+			for _, field := range fields {
+				if err := binary.Read(r, binary.LittleEndian, field); err != nil {
+					return chunkTileCoord{}, nil, err
+				}
+			}
+		}
+		indexes[coord] = idx
+	}
+	if r.Len() != 0 {
+		return chunkTileCoord{}, nil, errors.New("timeshadedb: trailing bytes in chunk tile index")
+	}
+	return tile, indexes, nil
+}
+
 func writeChunkMetadata(dsDir string, key DatastoreKey) error {
 	data, err := json.MarshalIndent(key, "", "  ")
 	if err != nil {
@@ -1536,10 +1765,40 @@ func chunkFileStem(coord ChunkCoord) string {
 	return fmt.Sprintf("cx_%d_cy_%d", coord.X, coord.Y)
 }
 
+func chunkTileCoordForChunk(coord ChunkCoord) chunkTileCoord {
+	chunksPerTile := TileSize / ChunkSize
+	return chunkTileCoord{
+		X: floorDiv32(coord.X, chunksPerTile),
+		Y: floorDiv32(coord.Y, chunksPerTile),
+	}
+}
+
+func chunkTileFileStem(tile chunkTileCoord) string {
+	return fmt.Sprintf("tx_%d_ty_%d", tile.X, tile.Y)
+}
+
+func chunkIndexesForTile(ds *chunkDatastore, tile chunkTileCoord) map[ChunkCoord]chunkIndex {
+	indexes := map[ChunkCoord]chunkIndex{}
+	for coord, chunk := range ds.chunks {
+		if chunkTileCoordForChunk(coord) == tile {
+			indexes[coord] = chunk.index
+		}
+	}
+	return indexes
+}
+
 func chunkDataPath(root string, key DatastoreKey, coord ChunkCoord) string {
 	return filepath.Join(chunkDatastorePath(root, key), "chunks", chunkFileStem(coord)+".cdat")
 }
 
 func chunkIndexPath(root string, key DatastoreKey, coord ChunkCoord) string {
 	return filepath.Join(chunkDatastorePath(root, key), "chunks", chunkFileStem(coord)+".cidx")
+}
+
+func chunkTileDataPath(root string, key DatastoreKey, tile chunkTileCoord) string {
+	return filepath.Join(chunkDatastorePath(root, key), "tiles", chunkTileFileStem(tile)+".tdat")
+}
+
+func chunkTileIndexPath(root string, key DatastoreKey, tile chunkTileCoord) string {
+	return filepath.Join(chunkDatastorePath(root, key), "tiles", chunkTileFileStem(tile)+".tidx")
 }

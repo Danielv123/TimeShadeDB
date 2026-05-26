@@ -123,20 +123,8 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if len(meta.Datastores) != 1 || meta.Datastores[0].LatestTick != 13 || meta.Datastores[0].LatestChunkX != -7 {
 		t.Fatalf("metadata = %+v", meta)
 	}
-	dataPath := chunkDataPath(dbPath, key, ChunkCoord{X: -7, Y: -6})
-	indexPath := chunkIndexPath(dbPath, key, ChunkCoord{X: -7, Y: -6})
-	if _, err := os.Stat(dataPath); err != nil {
-		t.Fatalf("chunk data file missing: %v", err)
-	}
 	if _, err := os.Stat(filepath.Join(dbPath, "datastores")); err != nil {
 		t.Fatalf("datastores directory missing: %v", err)
-	}
-	_, idx, err := readChunkIndex(indexPath)
-	if err != nil {
-		t.Fatalf("chunk index unreadable: %v", err)
-	}
-	if len(idx.snapshots) != 1 || len(idx.deltas) != 2 {
-		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 2 deltas", len(idx.snapshots), len(idx.deltas))
 	}
 	noChange, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 14, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: third})
 	if err != nil {
@@ -144,6 +132,41 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	}
 	if noChange.ChangedPixels != 0 || noChange.UnchangedPixels != ChunkPixelCount {
 		t.Fatalf("no-change ingest changed=%d unchanged=%d", noChange.ChangedPixels, noChange.UnchangedPixels)
+	}
+	sameTile := make([]uint16, ChunkPixelCount)
+	for i := range sameTile {
+		sameTile[i] = 0xf800
+	}
+	sameTileCoord := ChunkCoord{X: -8, Y: -6}
+	sameTileResult, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 15, Chunk: sameTileCoord, Pixels: sameTile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameTileResult.ChangedPixels != ChunkPixelCount {
+		t.Fatalf("same-tile ingest changed=%d, want %d", sameTileResult.ChangedPixels, ChunkPixelCount)
+	}
+	tile := chunkTileCoordForChunk(ChunkCoord{X: -7, Y: -6})
+	if chunkTileCoordForChunk(sameTileCoord) != tile {
+		t.Fatal("test chunks should share one 512x512 tile")
+	}
+	dataPath := chunkTileDataPath(dbPath, key, tile)
+	indexPath := chunkTileIndexPath(dbPath, key, tile)
+	if _, err := os.Stat(dataPath); err != nil {
+		t.Fatalf("chunk tile data file missing: %v", err)
+	}
+	if _, err := os.Stat(chunkDataPath(dbPath, key, ChunkCoord{X: -7, Y: -6})); !os.IsNotExist(err) {
+		t.Fatalf("legacy chunk data file exists or stat failed unexpectedly: %v", err)
+	}
+	_, indexes, err := readChunkTileIndex(indexPath)
+	if err != nil {
+		t.Fatalf("chunk tile index unreadable: %v", err)
+	}
+	idx := indexes[ChunkCoord{X: -7, Y: -6}]
+	if len(idx.snapshots) != 1 || len(idx.deltas) != 2 {
+		t.Fatalf("chunk index snapshots=%d deltas=%d, want 1 snapshot and 2 deltas", len(idx.snapshots), len(idx.deltas))
+	}
+	if _, ok := indexes[sameTileCoord]; !ok {
+		t.Fatalf("same-tile chunk missing from tile index")
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -168,8 +191,71 @@ func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reloadedMeta.Datastores) != 1 || reloadedMeta.Datastores[0].LatestTick != 14 || reloadedMeta.Datastores[0].LatestRowSeq != 5 {
+	if len(reloadedMeta.Datastores) != 1 || reloadedMeta.Datastores[0].LatestTick != 15 || reloadedMeta.Datastores[0].LatestRowSeq != 6 {
 		t.Fatalf("reloaded metadata = %+v", reloadedMeta)
+	}
+}
+
+func TestLoadLegacyPerChunkFiles(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db.tshd")
+	key := DatastoreKey{SavefileUUID: "save-1", Surface: "nauvis", Force: "player"}
+	coord := ChunkCoord{X: -7, Y: -6}
+	if err := os.MkdirAll(filepath.Dir(chunkDataPath(dbPath, key, coord)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeChunkManifest(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeChunkMetadata(chunkDatastorePath(dbPath, key), key); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(chunkDataPath(dbPath, key, coord), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeChunkDataHeader(f, coord); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	var pixels [ChunkPixelCount]uint16
+	for i := range pixels {
+		pixels[i] = 0x2462
+	}
+	writer := &DB{compressor: newCompressionPool()}
+	raw := encodeChunkSnapshot(pixels)
+	offset, compLen, checksum, err := writer.writeChunkFrame(f, frameKindSnapshot, 10, uint32(ChunkPixelCount), raw)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := chunkIndex{snapshots: []chunkSnapshotRecord{{
+		Tick:               10,
+		FrameOffset:        offset,
+		FrameHeaderLen:     chunkFrameHeaderLen,
+		CompressedLen:      compLen,
+		RawLen:             uint32(len(raw)),
+		FirstDeltaFrameIdx: 0,
+		EventSeq:           1,
+		Checksum:           checksum,
+	}}}
+	if err := writeChunkIndex(dbPath, key, coord, idx); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := db.ChunkAt(ctx, ChunkAtOptions{Key: key, Tick: 10, Chunk: coord})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Pixels[0] != 0x2462 || got.Pixels[ChunkPixelCount-1] != 0x2462 {
+		t.Fatalf("legacy chunk pixels were not loaded")
 	}
 }
 

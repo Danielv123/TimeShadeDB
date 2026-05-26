@@ -31,6 +31,16 @@ Measured `serve` plus `tail-chunk-tsv` against the local `chunk-charted.tsv` Fac
 
 Best sustained 60-second single-source result so far is 194,540 chunks/min, about 139.0x the 1,400 chunks/min baseline. The true per-512-tile lock split measured 184,275 chunks/min for one source and 286,416 chunks/min total for two concurrent savefile streams over a 30-second capped run.
 
+## Factorio storage layout
+
+Measured the local `factorio` DB before changing persistence from one `.cdat` and one `.cidx` file per 32x32 chunk to one `.tdat` and one `.tidx` file per 512x512 tile. The DB was on `D:`, an exFAT volume with 128 KiB allocation units.
+
+| Time | Layout | Files | Logical MiB | Estimated allocated MiB | Estimated slack MiB | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| 2026-05-27T00:20:00+02:00 | Per-32x32-chunk `.cdat/.cidx` | 20485 | 73.01 | 2571.88 | 2498.78 | 10,216 `.cdat`, 10,216 `.cidx`, 53 `.json`; tiny files amplify exFAT allocation-unit overhead by about 35.2x |
+
+The 512x512 tile-sharded format is expected to reduce the current 20k+ chunk data/index files to roughly two files per touched 512x512 tile per datastore, while retaining legacy per-chunk readers for existing databases.
+
 ## Tile API benchmark
 
 Measured `serve` over the actual HTTP tile API against `full.tshd` with a 64 MiB decoded snapshot cache. The request generator sampled tile coordinates weighted by each tile's `changed_placements_stored` in `full.tshd/stats.json`, then sampled timestamps uniformly across the `/api/meta` dataset time range. Each run used 1,000 requests, concurrency 16, seed 12345, and read the full PNG response body.
