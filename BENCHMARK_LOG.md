@@ -9,3 +9,4 @@
 | 2026-05-26T11:21:34.0252306+02:00 | Add fixed UTC timestamp parse fast path | 1000000 | 2.3194512 | 431136.47 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample1m-fast-ts.tshd --max-rows 1000000` |
 | 2026-05-26T11:43:31.6560201+02:00 | Add fixed coordinate and RGB parse fast paths | 5000000 | 9.7053860 | 515177.86 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample5m-fast-coord-2.tshd --max-rows 5000000` |
 | 2026-05-26T11:49:48.5684279+02:00 | Use pgzip reader for faster gzip decompression | 5000000 | 4.2533366 | 1175547.69 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample5m-pgzip.tshd --max-rows 5000000` |
+| 2026-05-26T11:53:38.5645338+02:00 | Increase pgzip read-ahead block size to 1 MiB | 5000000 | 3.9621918 | 1261927.80 | `.\timeshadedb.exe import-csv --input 2022_place_canvas_history.csv.gzip --db sample5m-pgzip-1mb-2.tshd --max-rows 5000000` |

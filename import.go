@@ -45,6 +45,11 @@ type VerifyOptions struct {
 	MaxRows uint64
 }
 
+const (
+	gzipReadBlockSize   = 1 << 20
+	gzipReadAheadBlocks = 16
+)
+
 type TileStats struct {
 	Tile                         TileCoord `json:"tile"`
 	Width                        int       `json:"width"`
@@ -91,7 +96,7 @@ func ImportCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts Im
 		return nil, err
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
+	gz, err := gzip.NewReaderN(f, gzipReadBlockSize, gzipReadAheadBlocks)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +290,7 @@ func VerifyCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts Ve
 		return nil, err
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
+	gz, err := gzip.NewReaderN(f, gzipReadBlockSize, gzipReadAheadBlocks)
 	if err != nil {
 		return nil, err
 	}
