@@ -740,6 +740,9 @@ func (db *DB) readTileAt(ctx context.Context, t *tileState, sec uint32) (*TileRe
 			return nil, err
 		}
 		d := t.index.deltas[di]
+		if d.MinTimestampSec > sec {
+			break
+		}
 		info, err := readFrame(t.file, d.FrameOffset)
 		if err != nil {
 			return nil, err
@@ -754,22 +757,56 @@ func (db *DB) readTileAt(ctx context.Context, t *tileState, sec uint32) (*TileRe
 		if crc32.ChecksumIEEE(raw) != info.checksum || info.checksum != d.Checksum {
 			return nil, errors.New("timeshadedb: delta checksum mismatch")
 		}
-		events, err := decodeDeltaPayload(raw)
+		n, err := applyDeltaPayload(raw, pixels, sec)
 		if err != nil {
 			return nil, err
 		}
-		for _, ev := range events {
-			if ev.sec > sec {
-				continue
-			}
-			if int(ev.pos) >= len(pixels) {
-				return nil, fmt.Errorf("timeshadedb: delta position out of bounds: %d", ev.pos)
-			}
-			pixels[ev.pos] = ev.c
-			replayed++
-		}
+		replayed += n
 	}
 	return tileResult(t, db.palette, pixels, snap.TimestampSec, replayed), nil
+}
+
+func applyDeltaPayload(raw []byte, pixels []uint8, targetSec uint32) (int, error) {
+	if len(raw) < 14 || string(raw[:4]) != "TDEL" {
+		return 0, errors.New("timeshadedb: bad delta payload")
+	}
+	version := binary.LittleEndian.Uint16(raw[4:6])
+	if version != formatVersion {
+		return 0, fmt.Errorf("timeshadedb: unsupported delta payload version %d", version)
+	}
+	count := binary.LittleEndian.Uint32(raw[6:10])
+	pos := 14
+	sec := binary.LittleEndian.Uint32(raw[10:14])
+	replayed := 0
+	for i := uint32(0); i < count; i++ {
+		dt, n := binary.Uvarint(raw[pos:])
+		if n <= 0 {
+			return 0, errors.New("timeshadedb: bad delta timestamp varint")
+		}
+		pos += n
+		p, n := binary.Uvarint(raw[pos:])
+		if n <= 0 {
+			return 0, errors.New("timeshadedb: bad delta position varint")
+		}
+		pos += n
+		if pos >= len(raw) {
+			return 0, errors.New("timeshadedb: truncated delta color")
+		}
+		sec += uint32(dt)
+		if sec > targetSec {
+			return replayed, nil
+		}
+		if int(p) >= len(pixels) {
+			return 0, fmt.Errorf("timeshadedb: delta position out of bounds: %d", p)
+		}
+		pixels[p] = raw[pos]
+		replayed++
+		pos++
+	}
+	if pos != len(raw) {
+		return 0, errors.New("timeshadedb: trailing bytes in delta payload")
+	}
+	return replayed, nil
 }
 
 func tileResult(t *tileState, palette []RGB, pixels []uint8, snapSec uint32, replayed int) *TileResult {

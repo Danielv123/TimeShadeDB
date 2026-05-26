@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"image/png"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -308,7 +309,7 @@ func writePNG(path string, res *timeshadedb.TileResult) error {
 		return err
 	}
 	defer f.Close()
-	return encodeTilePNG(f, res, res.Width, res.Height)
+	return encodeTilePNG(f, res, res.Width, res.Height, png.DefaultCompression)
 }
 
 func startPprof(addr string) error {

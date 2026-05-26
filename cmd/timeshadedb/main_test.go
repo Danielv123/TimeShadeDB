@@ -115,6 +115,33 @@ func TestWebAPI(t *testing.T) {
 	}
 }
 
+func BenchmarkTileEndpointFullDB(b *testing.B) {
+	dbPath := filepath.Join("..", "..", "full.tshd")
+	if _, err := os.Stat(dbPath); err != nil {
+		b.Skipf("full test database not found: %v", err)
+	}
+	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, ReadOnly: true, CacheSize: 64 * 1024 * 1024})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	handler := newWebServer(db, "").routes()
+	req := httptest.NewRequest(http.MethodGet, "/api/tiles/0/0/1.png?ts=1649016052", nil)
+	b.ReportAllocs()
+	b.ResetTimer()
+	var responseBytes int
+	for i := 0; i < b.N; i++ {
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			b.Fatalf("tile status = %d, body %s", resp.Code, resp.Body.String())
+		}
+		responseBytes = resp.Body.Len()
+	}
+	b.ReportMetric(float64(responseBytes), "bytes/tile")
+}
+
 func writeSample(path string) error {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)

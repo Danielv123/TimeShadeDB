@@ -123,8 +123,8 @@ func (s *webServer) handleTile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "no-store")
-	if err := encodeTilePNG(w, res, timeshadedb.TileSize, timeshadedb.TileSize); err != nil {
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	if err := encodeTilePNG(w, res, timeshadedb.TileSize, timeshadedb.TileSize, png.BestSpeed); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 	}
 }
@@ -180,23 +180,27 @@ func parseTimestampSec(r *http.Request) (uint32, error) {
 	return uint32(ts), nil
 }
 
-func encodeTilePNG(w io.Writer, res *timeshadedb.TileResult, width, height int) error {
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
+func encodeTilePNG(w io.Writer, res *timeshadedb.TileResult, width, height int, level png.CompressionLevel) error {
+	if len(res.Palette) > 255 {
+		return fmt.Errorf("palette has %d colors, maximum PNG palette size is 255 plus transparency", len(res.Palette))
+	}
+	pal := make(color.Palette, 0, len(res.Palette)+1)
+	pal = append(pal, color.RGBA{})
+	for _, c := range res.Palette {
+		pal = append(pal, color.RGBA{R: c.R, G: c.G, B: c.B, A: 255})
+	}
+	img := image.NewPaletted(image.Rect(0, 0, width, height), pal)
 	for y := 0; y < res.Height; y++ {
-		for x := 0; x < res.Width; x++ {
-			id := res.Pixels[y*res.Width+x]
-			if id == 0 {
-				continue
-			}
-			palIdx := int(id) - 1
-			if palIdx < 0 || palIdx >= len(res.Palette) {
+		src := res.Pixels[y*res.Width : (y+1)*res.Width]
+		for _, id := range src {
+			if int(id) >= len(pal) {
 				return fmt.Errorf("palette id %d out of range", id)
 			}
-			c := res.Palette[palIdx]
-			img.SetRGBA(x, y, color.RGBA{R: c.R, G: c.G, B: c.B, A: 255})
 		}
+		copy(img.Pix[y*img.Stride:y*img.Stride+res.Width], src)
 	}
-	return png.Encode(w, img)
+	enc := png.Encoder{CompressionLevel: level}
+	return enc.Encode(w, img)
 }
 
 func writeAPIJSON(w http.ResponseWriter, v any) {
