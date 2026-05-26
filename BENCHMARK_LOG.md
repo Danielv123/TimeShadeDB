@@ -40,8 +40,10 @@ Measured the local `factorio` DB before changing persistence from one `.cdat` an
 | 2026-05-27T00:20:00+02:00 | Per-32x32-chunk `.cdat/.cidx` | 20485 | 73.01 | 2571.88 | 2498.78 | 10,216 `.cdat`, 10,216 `.cidx`, 53 `.json`; tiny files amplify exFAT allocation-unit overhead by about 35.2x |
 | 2026-05-27T00:28:00+02:00 | Per-512x512-tile `.tdat/.tidx` smoke test | 17 | 0.06 | 2.12 | 2.06 | 2,048 TSV rows, 198 touched chunks, 6 `.tdat`, 6 `.tidx`, 5 `.json`; separate `build\timeshadedb-tile-shards.exe` on a throwaway `build\tile-shard-smoke-*` DB |
 | 2026-05-27T00:34:00+02:00 | `copy-chunks` command smoke test | 17 | 0.06 | 2.12 | 2.06 | Copied throwaway tile-shard smoke DB to `build\copy-chunks-smoke-*`; stats: 2 datastores, 198 chunks, 206 copied rows, 6 `.tdat`, 6 `.tidx`, 5 `.json` |
+| 2026-05-27T00:43:00+02:00 | Live per-32x32-chunk `.cdat/.cidx` DB while original server kept running | 20945 | 74.51 | 2619.88 | 2545.37 | 10,445 `.cdat`, 10,445 `.cidx`, 53 `.json`; live DB continued growing under the old executable |
+| 2026-05-27T00:44:00+02:00 | Read-only live copy to per-512x512-tile `.tdat/.tidx` | 383 | 74.03 | 117.12 | 43.10 | `copy-chunks --src .\factorio --dst build\factorio-tile-copy-20260527-003656`; 26 datastores, 10,441 chunks, 455,294 copied rows, 165 `.tdat`, 165 `.tidx`, 53 `.json`; temporary server returned `200 image/png` for `/api/chunk/tiles/speedrun/player/nauvis/0/-2/-2.png?tick=1785481` |
 
-The 512x512 tile-sharded format is expected to reduce the current 20k+ chunk data/index files to roughly two files per touched 512x512 tile per datastore, while retaining legacy per-chunk readers for existing databases.
+The 512x512 tile-sharded format reduced the measured live copy from roughly 2.62 GiB allocated to 117.12 MiB allocated on the 128 KiB-cluster `D:` volume, while retaining legacy per-chunk readers for existing databases.
 
 ## Tile API benchmark
 
