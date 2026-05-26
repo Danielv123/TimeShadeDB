@@ -4,6 +4,7 @@ db.tshd/
 *.raw
 *.png
 *.prof
+timeshadedb
 timeshadedb.exe
 web/node_modules/
 /build/
