@@ -165,8 +165,12 @@ func newCompressionPool() *compressionPool {
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer p.wg.Done()
+			fast, fastErr := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
+			if fastErr == nil {
+				defer fast.Close()
+			}
 			for job := range p.jobs {
-				payload, err := compressZstd(job.raw, job.kind)
+				payload, err := compressWithFastEncoder(job.raw, job.kind, fast, fastErr)
 				job.resp <- compressionResult{payload: payload, err: err}
 			}
 		}()
@@ -591,6 +595,16 @@ func compressZstd(raw []byte, kind uint8) ([]byte, error) {
 	}
 	defer enc.Close()
 	return enc.EncodeAll(raw, nil), nil
+}
+
+func compressWithFastEncoder(raw []byte, kind uint8, fast *zstd.Encoder, fastErr error) ([]byte, error) {
+	if kind == frameKindDelta && len(raw) < 4096 {
+		if fastErr != nil {
+			return nil, fastErr
+		}
+		return fast.EncodeAll(raw, nil), nil
+	}
+	return compressZstd(raw, kind)
 }
 
 func decompressZstd(payload []byte, rawLen uint32) ([]byte, error) {
