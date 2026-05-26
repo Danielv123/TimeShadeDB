@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,70 +118,6 @@ func ImportCSVWithOptions(ctx context.Context, db *DB, inputPath string, opts Im
 func importCSVRows(ctx context.Context, db *DB, r *bufio.Reader, opts ImportOptions) (uint64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	workers := runtime.NumCPU()
-	if workers < 1 {
-		workers = 1
-	}
-	jobs := make(chan csvParseJob, 2*workers)
-	parsed := make(chan parsedPlacement, 2*workers)
-	sourceErr := make(chan error, 1)
-
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				p := parseCSVJob(job)
-				select {
-				case parsed <- p:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(parsed)
-	}()
-	go func() {
-		defer close(jobs)
-		var seq uint64
-		for {
-			if err := ctx.Err(); err != nil {
-				sourceErr <- err
-				return
-			}
-			line, err := r.ReadString('\n')
-			if err != nil && !errors.Is(err, io.EOF) {
-				sourceErr <- err
-				return
-			}
-			if err != nil && errors.Is(err, io.EOF) && line == "" {
-				sourceErr <- nil
-				return
-			}
-			if opts.MaxRows > 0 && seq >= opts.MaxRows {
-				sourceErr <- nil
-				return
-			}
-			job := csvParseJob{seq: seq, row: seq + 2, line: line}
-			select {
-			case jobs <- job:
-				seq++
-			case <-ctx.Done():
-				sourceErr <- ctx.Err()
-				return
-			}
-			if errors.Is(err, io.EOF) {
-				sourceErr <- nil
-				return
-			}
-		}
-	}()
-
-	pending := map[uint64]parsedPlacement{}
 	tileQueues, tileDone := startImportTileWorkers(ctx, db)
 	tileQueuesClosed := false
 	closeQueues := func() {
@@ -192,58 +127,63 @@ func importCSVRows(ctx context.Context, db *DB, r *bufio.Reader, opts ImportOpti
 		}
 	}
 	defer closeQueues()
-	var next uint64
-	for p := range parsed {
+	var seq uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			cancel()
+			return seq, err
+		}
+		if opts.MaxRows > 0 && seq >= opts.MaxRows {
+			break
+		}
+		line, err := r.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			cancel()
+			return seq, err
+		}
+		if errors.Is(err, io.EOF) && line == "" {
+			break
+		}
+		p := parseCSVJob(csvParseJob{seq: seq, row: seq + 2, line: line})
 		if p.err != nil {
 			cancel()
-			return next, p.err
+			return seq, p.err
 		}
-		pending[p.seq] = p
-		for {
-			ready, ok := pending[next]
-			if !ok {
-				break
-			}
-			if ready.x < 0 || ready.x >= CanvasWidth || ready.y < 0 || ready.y >= CanvasHeight {
-				cancel()
-				return next, fmt.Errorf("row %d ingest: timeshadedb: coordinate out of bounds: %d,%d", ready.row, ready.x, ready.y)
-			}
-			c, err := db.paletteID(ready.rgb)
-			if err != nil {
-				cancel()
-				return next, fmt.Errorf("row %d ingest: %w", ready.row, err)
-			}
-			db.totalRows++
-			placement := tilePlacement{
-				sec: unixSec(ready.ts),
-				x:   ready.x,
-				y:   ready.y,
-				c:   c,
-				seq: db.nextEventSeq(),
-			}
-			queue := tileQueues[tileSlot(ready.x/TileSize, ready.y/TileSize)]
-			select {
-			case queue <- placement:
-			case <-ctx.Done():
-				cancel()
-				return next, ctx.Err()
-			}
-			delete(pending, next)
-			next++
+		if p.x < 0 || p.x >= CanvasWidth || p.y < 0 || p.y >= CanvasHeight {
+			cancel()
+			return seq, fmt.Errorf("row %d ingest: timeshadedb: coordinate out of bounds: %d,%d", p.row, p.x, p.y)
+		}
+		c, err := db.paletteID(p.rgb)
+		if err != nil {
+			cancel()
+			return seq, fmt.Errorf("row %d ingest: %w", p.row, err)
+		}
+		db.totalRows++
+		placement := tilePlacement{
+			sec: unixSec(p.ts),
+			x:   p.x,
+			y:   p.y,
+			c:   c,
+			seq: db.nextEventSeq(),
+		}
+		queue := tileQueues[tileSlot(p.x/TileSize, p.y/TileSize)]
+		select {
+		case queue <- placement:
+		case <-ctx.Done():
+			cancel()
+			return seq, ctx.Err()
+		}
+		seq++
+		if errors.Is(err, io.EOF) {
+			break
 		}
 	}
 	closeQueues()
 	if err := tileDone(); err != nil {
 		cancel()
-		return next, err
+		return seq, err
 	}
-	if err := <-sourceErr; err != nil {
-		return next, err
-	}
-	if len(pending) != 0 {
-		return next, errors.New("timeshadedb: parser pipeline ended with out-of-order rows pending")
-	}
-	return next, nil
+	return seq, nil
 }
 
 func startImportTileWorkers(ctx context.Context, db *DB) ([TileCount]chan tilePlacement, func() error) {
