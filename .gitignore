@@ -6,4 +6,3 @@ db.tshd/
 *.prof
 timeshadedb.exe
 web/node_modules/
-web/dist/

@@ -267,7 +267,7 @@ func run(ctx context.Context, args []string) error {
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		path := fs.String("db", "", "database directory")
 		addr := fs.String("addr", "127.0.0.1:8080", "HTTP listen address")
-		webDir := fs.String("web", "web/dist", "built web app directory")
+		dev := fs.Bool("dev", false, "start Vite dev server and proxy web requests to it")
 		cacheSize := fs.Int64("cache-size", 64*1024*1024, "decoded snapshot cache bytes")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -275,7 +275,7 @@ func run(ctx context.Context, args []string) error {
 		if *path == "" {
 			return fmt.Errorf("serve requires --db")
 		}
-		return serveHTTP(ctx, *addr, *path, *webDir, *cacheSize)
+		return serveHTTP(ctx, *addr, *path, *cacheSize, *dev)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

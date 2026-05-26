@@ -78,7 +78,7 @@ func TestWebAPI(t *testing.T) {
 	}
 	defer db.Close()
 
-	handler := newWebServer(db, "").routes()
+	handler := newWebServer(db, http.NotFoundHandler()).routes()
 	metaReq := httptest.NewRequest(http.MethodGet, "/api/meta", nil)
 	metaResp := httptest.NewRecorder()
 	handler.ServeHTTP(metaResp, metaReq)
@@ -136,6 +136,57 @@ func TestWebAPI(t *testing.T) {
 	}
 }
 
+func TestStaticWebAppServesEmbeddedIndex(t *testing.T) {
+	fsys, err := timeshadedb.WebDistFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newWebServer(nil, newSPAFileServer(fsys)).routes()
+
+	for _, target := range []string{"/", "/timeline/1648814520"} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body %s", target, resp.Code, resp.Body.String())
+		}
+		if !bytes.Contains(resp.Body.Bytes(), []byte(`<div id="root"></div>`)) {
+			t.Fatalf("%s did not serve embedded index.html", target)
+		}
+	}
+}
+
+func TestStaticWebAppServesExternalAssets(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("index"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.js"), []byte("console.log('ok');"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handler := newWebServer(nil, newSPAFileServer(os.DirFS(dir))).routes()
+
+	assetReq := httptest.NewRequest(http.MethodGet, "/app.js", nil)
+	assetResp := httptest.NewRecorder()
+	handler.ServeHTTP(assetResp, assetReq)
+	if assetResp.Code != http.StatusOK {
+		t.Fatalf("asset status = %d, body %s", assetResp.Code, assetResp.Body.String())
+	}
+	if got, want := assetResp.Body.String(), "console.log('ok');"; got != want {
+		t.Fatalf("asset body = %q, want %q", got, want)
+	}
+
+	fallbackReq := httptest.NewRequest(http.MethodGet, "/missing/route", nil)
+	fallbackResp := httptest.NewRecorder()
+	handler.ServeHTTP(fallbackResp, fallbackReq)
+	if fallbackResp.Code != http.StatusOK {
+		t.Fatalf("fallback status = %d, body %s", fallbackResp.Code, fallbackResp.Body.String())
+	}
+	if got, want := fallbackResp.Body.String(), "index"; got != want {
+		t.Fatalf("fallback body = %q, want %q", got, want)
+	}
+}
+
 func BenchmarkTileEndpointFullDB(b *testing.B) {
 	dbPath := filepath.Join("..", "..", "full.tshd")
 	if _, err := os.Stat(dbPath); err != nil {
@@ -147,7 +198,7 @@ func BenchmarkTileEndpointFullDB(b *testing.B) {
 	}
 	defer db.Close()
 
-	handler := newWebServer(db, "").routes()
+	handler := newWebServer(db, http.NotFoundHandler()).routes()
 	req := httptest.NewRequest(http.MethodGet, "/api/tiles/0/0/1.png?ts=1649016052", nil)
 	b.ReportAllocs()
 	b.ResetTimer()

@@ -292,15 +292,6 @@ h1 {
   image-rendering: pixelated;
 }
 
-.leaflet-layer,
-.leaflet-tile-container,
-.leaflet-zoom-animated,
-.leaflet-tile,
-.leaflet-fade-anim .leaflet-tile,
-.leaflet-zoom-anim .leaflet-zoom-animated {
-  transition: none !important;
-}
-
 .leaflet-container img.leaflet-tile {
   mix-blend-mode: normal !important;
 }

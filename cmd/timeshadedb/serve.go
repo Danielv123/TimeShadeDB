@@ -9,10 +9,13 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"io/fs"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"os/exec"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,7 +25,7 @@ import (
 
 type webServer struct {
 	db     *timeshadedb.DB
-	webDir string
+	static http.Handler
 }
 
 type metadataResponse struct {
@@ -36,21 +39,33 @@ type metadataResponse struct {
 	ToSec        uint32 `json:"toSec"`
 }
 
-func serveHTTP(ctx context.Context, addr, dbPath, webDir string, cacheSize int64) error {
+const viteDevURL = "http://127.0.0.1:5173"
+
+func serveHTTP(ctx context.Context, addr, dbPath string, cacheSize int64, dev bool) error {
 	db, err := timeshadedb.Open(timeshadedb.OpenOptions{Path: dbPath, ReadOnly: true, CacheSize: cacheSize})
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
+	static, cleanup, err := newStaticHandler(ctx, dev)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           newWebServer(db, webDir).routes(),
+		Handler:           newWebServer(db, static).routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(os.Stderr, "serving timeShadeDB on http://%s\n", addr)
+		if dev {
+			fmt.Fprintf(os.Stderr, "serving timeShadeDB on http://%s with Vite at %s\n", addr, viteDevURL)
+		} else {
+			fmt.Fprintf(os.Stderr, "serving timeShadeDB on http://%s\n", addr)
+		}
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -67,8 +82,106 @@ func serveHTTP(ctx context.Context, addr, dbPath, webDir string, cacheSize int64
 	}
 }
 
-func newWebServer(db *timeshadedb.DB, webDir string) *webServer {
-	return &webServer{db: db, webDir: webDir}
+func newStaticHandler(ctx context.Context, dev bool) (http.Handler, func(), error) {
+	if dev {
+		cmd, err := startViteDevServer(ctx)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		cleanup := func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
+		}
+		if err := waitForHTTP(ctx, viteDevURL, 10*time.Second); err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		proxy, err := newViteDevProxy(viteDevURL)
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		return proxy, cleanup, nil
+	}
+	fsys, err := timeshadedb.WebDistFS()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return newSPAFileServer(fsys), func() {}, nil
+}
+
+func startViteDevServer(ctx context.Context) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort")
+	cmd.Dir = "web"
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+func waitForHTTP(ctx context.Context, rawURL string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := http.Client{Timeout: time.Second}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode < 500 {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("vite dev server did not become ready at %s: %w", rawURL, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func newViteDevProxy(rawURL string) (http.Handler, error) {
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	baseDirector := proxy.Director
+	proxy.Director = func(r *http.Request) {
+		baseDirector(r)
+		r.Host = target.Host
+	}
+	return proxy, nil
+}
+
+func newSPAFileServer(fsys fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rel := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if rel == "" || rel == "." {
+			rel = "index.html"
+		}
+		if stat, err := fs.Stat(fsys, rel); err != nil || stat.IsDir() {
+			rel = "index.html"
+		}
+		http.ServeFileFS(w, r, fsys, rel)
+	})
+}
+
+func newWebServer(db *timeshadedb.DB, static http.Handler) *webServer {
+	if static == nil {
+		static = http.NotFoundHandler()
+	}
+	return &webServer{db: db, static: static}
 }
 
 func (s *webServer) routes() http.Handler {
@@ -218,19 +331,7 @@ func (s *webServer) handleStatic(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.webDir == "" {
-		http.Error(w, "web directory not configured", http.StatusNotFound)
-		return
-	}
-	rel := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
-	if rel == "" || rel == "." {
-		rel = "index.html"
-	}
-	fullPath := filepath.Join(s.webDir, filepath.FromSlash(rel))
-	if stat, err := os.Stat(fullPath); err != nil || stat.IsDir() {
-		fullPath = filepath.Join(s.webDir, "index.html")
-	}
-	http.ServeFile(w, r, fullPath)
+	s.static.ServeHTTP(w, r)
 }
 
 func parseTilePath(urlPath string) (int, int, int, error) {
