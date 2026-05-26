@@ -34,6 +34,18 @@ func TestParseChunkTSVRowSupportsCombinedAndSplitCoords(t *testing.T) {
 	}
 }
 
+func TestParseChunkTSVRowEmptyPayloadIsBlack(t *testing.T) {
+	row, err := ParseChunkTSVRow("save-1", "14\tnauvis\t-7,-6\tplayer\t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, pixel := range row.Pixels {
+		if pixel != 0 {
+			t.Fatalf("pixel %d = %#04x, want black", i, pixel)
+		}
+	}
+}
+
 func TestIngestChunkStoresChangesMetadataHistoryAndReloads(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "db.tshd")

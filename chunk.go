@@ -365,6 +365,9 @@ func ParseChunkTSV(savefileUUID string, body *bufio.Scanner) ([]ParsedChunkRow, 
 func decodeRGB565Hex(s string) ([ChunkPixelCount]uint16, error) {
 	var pixels [ChunkPixelCount]uint16
 	s = strings.TrimSpace(s)
+	if s == "" {
+		return pixels, nil
+	}
 	if len(s) != chunkPayloadHex {
 		return pixels, fmt.Errorf("timeshadedb: RGB565 hex payload has %d chars, expected %d", len(s), chunkPayloadHex)
 	}
