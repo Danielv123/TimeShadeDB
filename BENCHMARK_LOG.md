@@ -26,8 +26,10 @@ Measured `serve` plus `tail-chunk-tsv` against the local `chunk-charted.tsv` Fac
 | 2026-05-26T21:40:00+02:00 | Final exact consecutive-repeat shortcut check | 10240 | 60 | 122880 | 122847.4 | same as above |
 | 2026-05-26T21:50:00+02:00 | Cache exact encoded payloads per datastore/chunk within each batch | 10240 | 60 | 143360 | 143324.3 | same as above |
 | 2026-05-26T22:18:00+02:00 | Process each 512x512 tile batch through a GOMAXPROCS-sized worker pool | 10240 | 60 | 194560 | 194540.0 | same as above |
+| 2026-05-26T22:29:00+02:00 | Replace outer ingest lock with per-512-tile locks for tile work | 10240 | 60 | 184320 | 184275.1 | same as above |
+| 2026-05-26T22:32:00+02:00 | Two concurrent savefile streams with disjoint tile-lock keys | 10240 | 30 | 143360 | 286416.0 | two concurrent `tail-chunk-tsv` clients using `--savefile sourceA` and `--savefile sourceB` |
 
-Best sustained 60-second result so far is 194,540 chunks/min, about 139.0x the 1,400 chunks/min baseline. Shorter 30-second tuning runs reached 131,042 chunks/min at 8,192-row batches and 143,307 chunks/min at 10,240-row batches before the final per-batch exact payload cache.
+Best sustained 60-second single-source result so far is 194,540 chunks/min, about 139.0x the 1,400 chunks/min baseline. The true per-512-tile lock split measured 184,275 chunks/min for one source and 286,416 chunks/min total for two concurrent savefile streams over a 30-second capped run.
 
 ## Tile API benchmark
 
