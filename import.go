@@ -2,7 +2,6 @@ package timeshadedb
 
 import (
 	"bufio"
-	"compress/gzip"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	gzip "github.com/klauspost/pgzip"
 )
 
 type ImportStats struct {
