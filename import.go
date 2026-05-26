@@ -552,6 +552,9 @@ func parseFixedUint(s string, start, n int) (int, bool) {
 }
 
 func parseRGB(s string) (RGB, error) {
+	if rgb, ok := parseRGBFast(s); ok {
+		return rgb, nil
+	}
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "#")
 	if len(s) != 6 {
@@ -565,6 +568,9 @@ func parseRGB(s string) (RGB, error) {
 }
 
 func parseCoord(s string) (int, int, error) {
+	if x, y, ok := parseCoordFast(s); ok {
+		return x, y, nil
+	}
 	s = strings.Trim(strings.TrimSpace(s), "\"")
 	parts := strings.Split(strings.TrimSpace(s), ",")
 	if len(parts) < 2 {
@@ -579,4 +585,100 @@ func parseCoord(s string) (int, int, error) {
 		return 0, 0, err
 	}
 	return x, y, nil
+}
+
+func parseRGBFast(s string) (RGB, bool) {
+	start, end := trimSpaceRange(s)
+	s = s[start:end]
+	if len(s) != 7 || s[0] != '#' {
+		return RGB{}, false
+	}
+	r, ok := parseHexByte(s[1], s[2])
+	if !ok {
+		return RGB{}, false
+	}
+	g, ok := parseHexByte(s[3], s[4])
+	if !ok {
+		return RGB{}, false
+	}
+	b, ok := parseHexByte(s[5], s[6])
+	if !ok {
+		return RGB{}, false
+	}
+	return RGB{R: r, G: g, B: b}, true
+}
+
+func parseHexByte(hi, lo byte) (uint8, bool) {
+	h, ok := hexValue(hi)
+	if !ok {
+		return 0, false
+	}
+	l, ok := hexValue(lo)
+	if !ok {
+		return 0, false
+	}
+	return h<<4 | l, true
+}
+
+func hexValue(c byte) (uint8, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func parseCoordFast(s string) (int, int, bool) {
+	start, end := trimSpaceRange(s)
+	if start >= end {
+		return 0, 0, false
+	}
+	if s[start] == '"' {
+		start++
+	}
+	if end > start && s[end-1] == '"' {
+		end--
+	}
+	x, pos, ok := parseLeadingInt(s, start, end)
+	if !ok || pos >= end || s[pos] != ',' {
+		return 0, 0, false
+	}
+	y, pos, ok := parseLeadingInt(s, pos+1, end)
+	if !ok || pos != end {
+		return 0, 0, false
+	}
+	return x, y, true
+}
+
+func parseLeadingInt(s string, start, end int) (int, int, bool) {
+	if start >= end {
+		return 0, start, false
+	}
+	orig := start
+	var v int
+	for start < end {
+		c := s[start]
+		if c < '0' || c > '9' {
+			break
+		}
+		v = v*10 + int(c-'0')
+		start++
+	}
+	return v, start, start > orig
+}
+
+func trimSpaceRange(s string) (int, int) {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r' || s[end-1] == '\n') {
+		end--
+	}
+	return start, end
 }
