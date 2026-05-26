@@ -476,6 +476,9 @@ func readStats(path string) (*ImportStats, error) {
 
 func parseTimestamp(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
+	if t, ok := parseFixedUTCTimestamp(s); ok {
+		return t, nil
+	}
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, nil
 	}
@@ -491,6 +494,61 @@ func parseTimestamp(s string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("unsupported timestamp format %q", s)
+}
+
+func parseFixedUTCTimestamp(s string) (time.Time, bool) {
+	if len(s) < len("2006-01-02 15:04:05") {
+		return time.Time{}, false
+	}
+	if s[4] != '-' || s[7] != '-' || (s[10] != ' ' && s[10] != 'T') || s[13] != ':' || s[16] != ':' {
+		return time.Time{}, false
+	}
+	if s[10] == 'T' && !strings.HasSuffix(s, "Z") {
+		return time.Time{}, false
+	}
+	if s[10] == ' ' && !strings.HasSuffix(s, "UTC") {
+		return time.Time{}, false
+	}
+	year, ok := parseFixedUint(s, 0, 4)
+	if !ok {
+		return time.Time{}, false
+	}
+	month, ok := parseFixedUint(s, 5, 2)
+	if !ok {
+		return time.Time{}, false
+	}
+	day, ok := parseFixedUint(s, 8, 2)
+	if !ok {
+		return time.Time{}, false
+	}
+	hour, ok := parseFixedUint(s, 11, 2)
+	if !ok {
+		return time.Time{}, false
+	}
+	min, ok := parseFixedUint(s, 14, 2)
+	if !ok {
+		return time.Time{}, false
+	}
+	sec, ok := parseFixedUint(s, 17, 2)
+	if !ok {
+		return time.Time{}, false
+	}
+	return time.Date(year, time.Month(month), day, hour, min, sec, 0, time.UTC), true
+}
+
+func parseFixedUint(s string, start, n int) (int, bool) {
+	if len(s) < start+n {
+		return 0, false
+	}
+	var v int
+	for i := start; i < start+n; i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		v = v*10 + int(c-'0')
+	}
+	return v, true
 }
 
 func parseRGB(s string) (RGB, error) {
