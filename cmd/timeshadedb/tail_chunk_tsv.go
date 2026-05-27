@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,16 +18,18 @@ import (
 )
 
 type tailChunkTSVOptions struct {
-	InputPath        string
-	SavefileUUID     string
-	BaseURL          string
-	BatchRows        int
-	PollInterval     time.Duration
-	ProgressInterval time.Duration
-	RequestTimeout   time.Duration
-	RetryInterval    time.Duration
-	ProgressOutput   io.Writer
-	Once             bool
+	InputPath          string
+	EntityInputPath    string
+	SavefileUUID       string
+	BaseURL            string
+	VictoriaMetricsURL string
+	BatchRows          int
+	PollInterval       time.Duration
+	ProgressInterval   time.Duration
+	RequestTimeout     time.Duration
+	RetryInterval      time.Duration
+	ProgressOutput     io.Writer
+	Once               bool
 }
 
 type resumeTarget struct {
@@ -50,6 +53,46 @@ func tailChunkTSV(ctx context.Context, opts tailChunkTSVOptions) error {
 		opts.RetryInterval = 5 * time.Second
 	}
 	reporter := newChunkProgressReporter(opts.ProgressOutput, opts.ProgressInterval)
+	if opts.EntityInputPath != "" && opts.VictoriaMetricsURL == "" {
+		return fmt.Errorf("--entity-input requires --victoriametrics-url")
+	}
+	if opts.EntityInputPath != "" {
+		if _, err := os.Stat(opts.EntityInputPath); err != nil {
+			return fmt.Errorf("entity input: %w", err)
+		}
+		if _, err := normalizeVictoriaMetricsImportURL(opts.VictoriaMetricsURL); err != nil {
+			return err
+		}
+		entityOpts := tailEntityTSVOptions{
+			InputPath:          opts.EntityInputPath,
+			SavefileUUID:       opts.SavefileUUID,
+			VictoriaMetricsURL: opts.VictoriaMetricsURL,
+			BatchRows:          opts.BatchRows,
+			PollInterval:       opts.PollInterval,
+			ProgressInterval:   opts.ProgressInterval,
+			RequestTimeout:     opts.RequestTimeout,
+			RetryInterval:      opts.RetryInterval,
+			ProgressOutput:     opts.ProgressOutput,
+			Once:               opts.Once,
+		}
+		if opts.Once {
+			if err := tailEntityTSV(ctx, entityOpts); err != nil {
+				return err
+			}
+		} else {
+			entityCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- tailEntityTSV(entityCtx, entityOpts)
+			}()
+			go func() {
+				if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
+					fmt.Fprintf(os.Stderr, "tail-entity-tsv stopped: %v\n", err)
+				}
+			}()
+		}
+	}
 	baseURL, err := normalizeBaseURL(opts.BaseURL)
 	if err != nil {
 		return err

@@ -29,7 +29,7 @@ func main() {
 
 func run(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve|tail-chunk-tsv|copy-chunks>")
+		return fmt.Errorf("usage: timeshadedb <import-csv|query-tile|stats|verify|inspect-index|export-tile|compact|benchmark|serve|tail-chunk-tsv|tail-entity-tsv|copy-chunks>")
 	}
 	switch args[0] {
 	case "import-csv":
@@ -315,8 +315,10 @@ func run(ctx context.Context, args []string) error {
 	case "tail-chunk-tsv":
 		fs := flag.NewFlagSet("tail-chunk-tsv", flag.ExitOnError)
 		input := fs.String("input", "", "chunk-charted TSV file to watch")
+		entityInput := fs.String("entity-input", "", "optional entity-position TSV file to watch and send to VictoriaMetrics")
 		savefileUUID := fs.String("savefile", "", "savefile UUID to use in ingest API path")
 		baseURL := fs.String("base-url", "http://127.0.0.1:8080", "TimeShadeDB base URL")
+		victoriaMetricsURL := fs.String("victoriametrics-url", "", "VictoriaMetrics base URL or /api/v1/import/prometheus endpoint for entity points")
 		batchRows := fs.Int("batch-rows", 10240, "maximum rows per POST")
 		pollInterval := fs.Duration("poll-interval", time.Second, "poll interval for appended rows")
 		progressInterval := fs.Duration("progress-interval", 10*time.Second, "progress report interval; set to 0 to only print summaries")
@@ -330,15 +332,45 @@ func run(ctx context.Context, args []string) error {
 			return fmt.Errorf("tail-chunk-tsv requires --input and --savefile")
 		}
 		return tailChunkTSV(ctx, tailChunkTSVOptions{
-			InputPath:        *input,
-			SavefileUUID:     *savefileUUID,
-			BaseURL:          *baseURL,
-			BatchRows:        *batchRows,
-			PollInterval:     *pollInterval,
-			ProgressInterval: *progressInterval,
-			RequestTimeout:   *requestTimeout,
-			RetryInterval:    *retryInterval,
-			Once:             *once,
+			InputPath:          *input,
+			EntityInputPath:    *entityInput,
+			SavefileUUID:       *savefileUUID,
+			BaseURL:            *baseURL,
+			VictoriaMetricsURL: *victoriaMetricsURL,
+			BatchRows:          *batchRows,
+			PollInterval:       *pollInterval,
+			ProgressInterval:   *progressInterval,
+			RequestTimeout:     *requestTimeout,
+			RetryInterval:      *retryInterval,
+			Once:               *once,
+		})
+	case "tail-entity-tsv":
+		fs := flag.NewFlagSet("tail-entity-tsv", flag.ExitOnError)
+		input := fs.String("input", "", "entity-position TSV file to watch")
+		savefileUUID := fs.String("savefile", "", "savefile UUID label to attach")
+		victoriaMetricsURL := fs.String("victoriametrics-url", "http://127.0.0.1:8428", "VictoriaMetrics base URL or /api/v1/import/prometheus endpoint")
+		batchRows := fs.Int("batch-rows", 10240, "maximum entity points per POST")
+		pollInterval := fs.Duration("poll-interval", time.Second, "poll interval for appended rows")
+		progressInterval := fs.Duration("progress-interval", 10*time.Second, "progress report interval; set to 0 to only print summaries")
+		requestTimeout := fs.Duration("request-timeout", 5*time.Minute, "HTTP timeout for each ingest request")
+		retryInterval := fs.Duration("retry-interval", 5*time.Second, "wait duration before retrying ingest requests")
+		once := fs.Bool("once", false, "send existing rows and exit without watching")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *input == "" || *savefileUUID == "" {
+			return fmt.Errorf("tail-entity-tsv requires --input and --savefile")
+		}
+		return tailEntityTSV(ctx, tailEntityTSVOptions{
+			InputPath:          *input,
+			SavefileUUID:       *savefileUUID,
+			VictoriaMetricsURL: *victoriaMetricsURL,
+			BatchRows:          *batchRows,
+			PollInterval:       *pollInterval,
+			ProgressInterval:   *progressInterval,
+			RequestTimeout:     *requestTimeout,
+			RetryInterval:      *retryInterval,
+			Once:               *once,
 		})
 	default:
 		return fmt.Errorf("unknown command %q", args[0])

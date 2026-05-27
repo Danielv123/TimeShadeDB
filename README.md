@@ -14,3 +14,29 @@ powershell.exe -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
 The build script rebuilds the web bundle, compiles the Go binary with the current embedded assets, and writes a package archive under `build/packages/`.
+
+## Factorio export
+
+The `timeshadedb_exporter` mod writes Factorio export files under
+`script-output/timeshadedb/`:
+
+```text
+chunk-charted.tsv
+entity-positions.tsv
+```
+
+Import entity movement into VictoriaMetrics with:
+
+```powershell
+timeshadedb tail-entity-tsv --input entity-positions.tsv --savefile SAVE_UUID --victoriametrics-url http://127.0.0.1:8428
+```
+
+The chunk tailer can watch both files together:
+
+```powershell
+timeshadedb tail-chunk-tsv --input chunk-charted.tsv --entity-input entity-positions.tsv --savefile SAVE_UUID --base-url http://127.0.0.1:8080 --victoriametrics-url http://127.0.0.1:8428
+```
+
+Entity coordinates are stored as `timeshadedb_entity_x` and
+`timeshadedb_entity_y` series labelled by savefile, surface, force, entity type,
+entity id, and path segment. No tile label is written.

@@ -7,7 +7,7 @@ db.tshd/
 !web/images/logo_dark_transparent.png
 !web/images/logo_light_transparent.png
 *.prof
-timeshadedb
+/timeshadedb
 timeshadedb.exe
 web/node_modules/
 web/dist/

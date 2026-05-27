@@ -503,6 +503,52 @@ func TestPostChunkRowsRetriesConnectionErrors(t *testing.T) {
 	}
 }
 
+func TestTailEntityTSVOncePostsPrometheusWithoutTileLabels(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "entity-positions.tsv")
+	if err := os.WriteFile(input, []byte("10\tnauvis\tplayer\tplayer\tDaniel\t4\t1.5\t-2.25\t0\t0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/import/prometheus" {
+			t.Fatalf("path = %s, want /api/v1/import/prometheus", r.URL.Path)
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = string(data)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	var progress bytes.Buffer
+	if err := tailEntityTSV(context.Background(), tailEntityTSVOptions{
+		InputPath:          input,
+		SavefileUUID:       "save-1",
+		VictoriaMetricsURL: server.URL,
+		BatchRows:          10,
+		PollInterval:       time.Second,
+		ProgressInterval:   time.Second,
+		ProgressOutput:     &progress,
+		Once:               true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `timeshadedb_entity_x{savefile="save-1",surface="nauvis",force="player",entity_type="player",entity_id="Daniel",segment="4"} 1.5 10`) {
+		t.Fatalf("missing x metric in body:\n%s", body)
+	}
+	if !strings.Contains(body, `timeshadedb_entity_y{savefile="save-1",surface="nauvis",force="player",entity_type="player",entity_id="Daniel",segment="4"} -2.25 10`) {
+		t.Fatalf("missing y metric in body:\n%s", body)
+	}
+	if strings.Contains(body, "tile_xy") {
+		t.Fatalf("entity body must not include tile_xy label:\n%s", body)
+	}
+	if got := progress.String(); !strings.Contains(got, "pushed 1 entity points total") {
+		t.Fatalf("progress output = %q", got)
+	}
+}
+
 func TestStaticWebAppServesEmbeddedIndex(t *testing.T) {
 	fsys, err := timeshadedb.WebDistFS()
 	if err != nil {

@@ -1,0 +1,9 @@
+{
+  "name": "timeshadedb_exporter",
+  "version": "0.1.0",
+  "title": "TimeShadeDB Exporter",
+  "author": "TimeShadeDB",
+  "factorio_version": "2.0",
+  "description": "Exports Factorio charted chunk tiles and adaptive moving-entity samples for TimeShadeDB.",
+  "dependencies": ["base >= 2.0.0"]
+}
