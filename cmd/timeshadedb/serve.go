@@ -391,11 +391,21 @@ func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.Datasto
 	chunksPerTile := timeshadedb.TileSize / timeshadedb.ChunkSize
 	baseChunkX := tileX * int32(chunksPerTile)
 	baseChunkY := tileY * int32(chunksPerTile)
+	coords := make([]timeshadedb.ChunkCoord, 0, chunksPerTile*chunksPerTile)
+	for cy := 0; cy < chunksPerTile; cy++ {
+		for cx := 0; cx < chunksPerTile; cx++ {
+			coords = append(coords, timeshadedb.ChunkCoord{X: baseChunkX + int32(cx), Y: baseChunkY + int32(cy)})
+		}
+	}
+	chunks, err := s.db.ChunksAt(ctx, key, tick, coords)
+	if err != nil {
+		return img
+	}
 	for cy := 0; cy < chunksPerTile; cy++ {
 		for cx := 0; cx < chunksPerTile; cx++ {
 			coord := timeshadedb.ChunkCoord{X: baseChunkX + int32(cx), Y: baseChunkY + int32(cy)}
-			chunk, err := s.db.ChunkAt(ctx, timeshadedb.ChunkAtOptions{Key: key, Tick: tick, Chunk: coord})
-			if err != nil {
+			chunk := chunks[coord]
+			if chunk == nil {
 				continue
 			}
 			for py := 0; py < timeshadedb.ChunkSize; py++ {
@@ -426,7 +436,24 @@ func (s *webServer) downsampledChunkTileAt(ctx context.Context, key timeshadedb.
 	worldX0 := int64(x) * int64(timeshadedb.TileSize) * scale
 	worldY0 := int64(y) * int64(timeshadedb.TileSize) * scale
 	sampleOffset := scale / 2
-	chunks := map[timeshadedb.ChunkCoord]*timeshadedb.ChunkResult{}
+	coordSet := map[timeshadedb.ChunkCoord]struct{}{}
+	for outY := 0; outY < timeshadedb.TileSize; outY++ {
+		srcY := worldY0 + int64(outY)*scale + sampleOffset
+		chunkY := int32(floorDivInt64(srcY, int64(timeshadedb.ChunkSize)))
+		for outX := 0; outX < timeshadedb.TileSize; outX++ {
+			srcX := worldX0 + int64(outX)*scale + sampleOffset
+			chunkX := int32(floorDivInt64(srcX, int64(timeshadedb.ChunkSize)))
+			coordSet[timeshadedb.ChunkCoord{X: chunkX, Y: chunkY}] = struct{}{}
+		}
+	}
+	coords := make([]timeshadedb.ChunkCoord, 0, len(coordSet))
+	for coord := range coordSet {
+		coords = append(coords, coord)
+	}
+	chunks, err := s.db.ChunksAt(ctx, key, tick, coords)
+	if err != nil {
+		return img, nil
+	}
 	for outY := 0; outY < timeshadedb.TileSize; outY++ {
 		srcY := worldY0 + int64(outY)*scale + sampleOffset
 		chunkY := int32(floorDivInt64(srcY, int64(timeshadedb.ChunkSize)))
@@ -436,11 +463,7 @@ func (s *webServer) downsampledChunkTileAt(ctx context.Context, key timeshadedb.
 			chunkX := int32(floorDivInt64(srcX, int64(timeshadedb.ChunkSize)))
 			localX := int(srcX - int64(chunkX)*int64(timeshadedb.ChunkSize))
 			coord := timeshadedb.ChunkCoord{X: chunkX, Y: chunkY}
-			chunk, ok := chunks[coord]
-			if !ok {
-				chunk, _ = s.db.ChunkAt(ctx, timeshadedb.ChunkAtOptions{Key: key, Tick: tick, Chunk: coord})
-				chunks[coord] = chunk
-			}
+			chunk := chunks[coord]
 			if chunk == nil {
 				continue
 			}

@@ -260,6 +260,18 @@ func TestWebChunkIngestAPI(t *testing.T) {
 	if chunk.Pixels[0] != 0xf800 || chunk.Pixels[timeshadedb.ChunkPixelCount-1] != 0xf800 {
 		t.Fatalf("chunk pixels were not ingested")
 	}
+
+	stats, err := statsValue(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkStats, ok := stats.(*timeshadedb.ChunkStats)
+	if !ok {
+		t.Fatalf("stats type = %T, want *timeshadedb.ChunkStats", stats)
+	}
+	if chunkStats.DatastoreCount != 1 || chunkStats.ChunkCount != 1 || chunkStats.SnapshotCount != 1 {
+		t.Fatalf("chunk stats = %+v", chunkStats)
+	}
 }
 
 func TestTailChunkTSVOnceResumesFromServerMetadata(t *testing.T) {

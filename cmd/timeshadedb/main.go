@@ -112,7 +112,11 @@ func run(ctx context.Context, args []string) error {
 			return err
 		}
 		defer db.Close()
-		return writeJSON(db.Stats())
+		stats, err := statsValue(db)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stats)
 	case "verify":
 		fs := flag.NewFlagSet("verify", flag.ExitOnError)
 		input := fs.String("input", "", "gzip CSV input")
@@ -339,6 +343,13 @@ func run(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func statsValue(db *timeshadedb.DB) (any, error) {
+	if db.Format() == timeshadedb.FormatChunks {
+		return db.ChunkStats()
+	}
+	return db.Stats(), nil
 }
 
 func parsePair(s string) (int, int, error) {

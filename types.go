@@ -119,6 +119,46 @@ type ChunkCopyStats struct {
 	ChangedPixels uint64 `json:"changed_pixels"`
 }
 
+type ChunkStats struct {
+	Format                      string                `json:"format"`
+	DatastoreCount              int                   `json:"datastore_count"`
+	ChunkCount                  uint64                `json:"chunk_count"`
+	TileShardCount              uint64                `json:"tile_shard_count"`
+	SnapshotCount               uint64                `json:"snapshot_count"`
+	AverageSnapshotBytes        uint64                `json:"average_snapshot_compressed_bytes"`
+	DeltaFrameCount             uint64                `json:"delta_frame_count"`
+	AverageDeltaFrameBytes      uint64                `json:"average_delta_frame_compressed_bytes"`
+	CompressedBytes             uint64                `json:"compressed_bytes"`
+	StoredPixelEvents           uint64                `json:"stored_pixel_events"`
+	MaxReplayEventsBetweenSnaps uint32                `json:"max_replay_events_between_snapshots"`
+	Datastores                  []ChunkDatastoreStats `json:"datastores"`
+}
+
+type ChunkDatastoreStats struct {
+	SavefileUUID                string `json:"savefile_uuid"`
+	Surface                     string `json:"surface"`
+	Force                       string `json:"force"`
+	LatestTick                  uint64 `json:"latest_tick"`
+	LatestRowSeq                uint64 `json:"latest_row_seq"`
+	ChunkCount                  uint64 `json:"chunk_count"`
+	TileShardCount              uint64 `json:"tile_shard_count"`
+	MinChunkX                   int32  `json:"min_chunk_x"`
+	MaxChunkX                   int32  `json:"max_chunk_x"`
+	MinChunkY                   int32  `json:"min_chunk_y"`
+	MaxChunkY                   int32  `json:"max_chunk_y"`
+	MinTileX                    int32  `json:"min_tile_x"`
+	MaxTileX                    int32  `json:"max_tile_x"`
+	MinTileY                    int32  `json:"min_tile_y"`
+	MaxTileY                    int32  `json:"max_tile_y"`
+	SnapshotCount               uint64 `json:"snapshot_count"`
+	AverageSnapshotBytes        uint64 `json:"average_snapshot_compressed_bytes"`
+	DeltaFrameCount             uint64 `json:"delta_frame_count"`
+	AverageDeltaFrameBytes      uint64 `json:"average_delta_frame_compressed_bytes"`
+	CompressedBytes             uint64 `json:"compressed_bytes"`
+	StoredPixelEvents           uint64 `json:"stored_pixel_events"`
+	MaxReplayEventsBetweenSnaps uint32 `json:"max_replay_events_between_snapshots"`
+}
+
 type ChunkAtOptions struct {
 	Key   DatastoreKey
 	Tick  uint64
@@ -205,12 +245,24 @@ func (db *DB) ChunkAt(ctx context.Context, opts ChunkAtOptions) (*ChunkResult, e
 	return db.chunkAt(ctx, opts)
 }
 
+func (db *DB) ChunksAt(ctx context.Context, key DatastoreKey, tick uint64, coords []ChunkCoord) (map[ChunkCoord]*ChunkResult, error) {
+	return db.chunksAt(ctx, key, tick, coords)
+}
+
 func (db *DB) IngestMetadata(savefileUUID string) (*IngestMetadata, error) {
 	return db.ingestMetadata(savefileUUID)
 }
 
 func (db *DB) ChunkSaveCatalog() (*ChunkSaveCatalog, error) {
 	return db.chunkSaveCatalog()
+}
+
+func (db *DB) ChunkStats() (*ChunkStats, error) {
+	return db.chunkStats()
+}
+
+func (db *DB) Format() string {
+	return db.format
 }
 
 func (db *DB) TimeRange() (uint32, uint32) {

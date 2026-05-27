@@ -519,22 +519,22 @@ an active chunk should not accumulate long replay chains.
 Create a snapshot at a delta frame boundary when any of these are true:
 
 ```text
-changes_since_snapshot >= 512
-delta_compressed_bytes_since_snapshot >= 0.75 * last_snapshot_compressed_bytes
-ticks_since_snapshot >= 60 * 60 and changes_since_snapshot > 0
-ticks_since_snapshot >= 60 * 60 * 10 even if activity is low
+changes_since_snapshot >= 1024
+delta_frames_since_snapshot >= 256
+delta_compressed_bytes_since_snapshot >= 2.0 * last_snapshot_compressed_bytes
 ```
 
-At 60 ticks per second, those time thresholds are roughly 1 minute and 10
-minutes. They should be configurable because Factorio servers can run at
-different speeds.
+These should be configurable because Factorio servers can run at different
+speeds and activity patterns. Do not snapshot only because time passed; most
+chunks are quiet, so time-only snapshots create storage churn without improving
+replay cost.
 
 Rationale:
 
-- `512` changed pixels caps worst-case replay at half a chunk.
-- The compressed-size rule avoids long delta chains once a new snapshot is
-  similarly cheap.
-- The tick rule gives predictable query latency for arbitrary ticks.
+- `1024` changed pixels caps worst-case replay at one full changed chunk.
+- The frame-count rule caps seek/decompression overhead for many tiny deltas.
+- The compressed-size rule avoids long delta chains once a new snapshot is much
+  cheaper than the accumulated delta payloads.
 
 Metrics to record per chunk:
 

@@ -351,6 +351,182 @@ func TestLoadLegacyPerChunkFiles(t *testing.T) {
 	}
 }
 
+func TestChunksAtBatchesInterleavedTileFrames(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db.tshd")
+	db, err := Open(OpenOptions{Path: dbPath, Format: FormatChunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := DatastoreKey{SavefileUUID: "save-1", Surface: "nauvis", Force: "player"}
+	a := ChunkCoord{X: -7, Y: -6}
+	b := ChunkCoord{X: -8, Y: -6}
+	firstA := make([]uint16, ChunkPixelCount)
+	firstB := make([]uint16, ChunkPixelCount)
+	for i := range firstA {
+		firstA[i] = 0x1001
+		firstB[i] = 0x2002
+	}
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 10, Chunk: a, Pixels: firstA}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 11, Chunk: b, Pixels: firstB}); err != nil {
+		t.Fatal(err)
+	}
+	secondA := append([]uint16(nil), firstA...)
+	secondA[3] = 0x3003
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 12, Chunk: a, Pixels: secondA}); err != nil {
+		t.Fatal(err)
+	}
+	secondB := append([]uint16(nil), firstB...)
+	secondB[5] = 0x4004
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 13, Chunk: b, Pixels: secondB}); err != nil {
+		t.Fatal(err)
+	}
+	thirdA := append([]uint16(nil), secondA...)
+	thirdA[7] = 0x5005
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 14, Chunk: a, Pixels: thirdA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	chunks, err := reopened.ChunksAt(ctx, key, 13, []ChunkCoord{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := chunks[a]; got == nil || got.Pixels[3] != 0x3003 || got.Pixels[7] != 0x1001 {
+		t.Fatalf("chunk A at tick 13 = %+v", got)
+	}
+	if got := chunks[b]; got == nil || got.Pixels[5] != 0x4004 || got.Pixels[3] != 0x2002 {
+		t.Fatalf("chunk B at tick 13 = %+v", got)
+	}
+}
+
+func TestChunkSnapshotHeuristicBoundsReplay(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db.tshd")
+	db, err := Open(OpenOptions{Path: dbPath, Format: FormatChunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := DatastoreKey{SavefileUUID: "save-1", Surface: "nauvis", Force: "player"}
+	coord := ChunkCoord{X: -7, Y: -6}
+	pixels := make([]uint16, ChunkPixelCount)
+	for i := range pixels {
+		pixels[i] = uint16(i)
+	}
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 1, Chunk: coord, Pixels: pixels}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < chunkSnapshotMaxDeltaFrames+8; i++ {
+		pixels[i%ChunkPixelCount]++
+		if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: uint64(i + 2), Chunk: coord, Pixels: pixels}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, indexes, err := readChunkTileIndex(chunkTileIndexPath(dbPath, key, chunkTileCoordForChunk(coord)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := indexes[coord]
+	if len(idx.snapshots) < 2 {
+		t.Fatalf("snapshot count = %d, want heuristic to add snapshots", len(idx.snapshots))
+	}
+	if replay := maxChunkReplayEvents(idx); replay > chunkSnapshotMaxDeltaEvents {
+		t.Fatalf("max replay events = %d, want <= %d", replay, chunkSnapshotMaxDeltaEvents)
+	}
+	for i, snap := range idx.snapshots {
+		end := uint32(len(idx.deltas))
+		if i+1 < len(idx.snapshots) {
+			end = idx.snapshots[i+1].FirstDeltaFrameIdx
+		}
+		if frames := end - snap.FirstDeltaFrameIdx; frames > chunkSnapshotMaxDeltaFrames {
+			t.Fatalf("snapshot %d has %d delta frames, want <= %d", i, frames, chunkSnapshotMaxDeltaFrames)
+		}
+	}
+}
+
+func TestChunkStatsReloadedFromTileShardFormat(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db.tshd")
+	db, err := Open(OpenOptions{Path: dbPath, Format: FormatChunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := DatastoreKey{SavefileUUID: "save-1", Surface: "nauvis", Force: "player"}
+	first := make([]uint16, ChunkPixelCount)
+	for i := range first {
+		first[i] = 0x2462
+	}
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 10, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: first}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 11, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: first}); err != nil {
+		t.Fatal(err)
+	}
+	second := append([]uint16(nil), first...)
+	second[3] = 0xcdac
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: key, Tick: 12, Chunk: ChunkCoord{X: -7, Y: -6}, Pixels: second}); err != nil {
+		t.Fatal(err)
+	}
+	otherKey := DatastoreKey{SavefileUUID: "save-1", Surface: "vulcanus", Force: "player"}
+	other := make([]uint16, ChunkPixelCount)
+	for i := range other {
+		other[i] = 0xf800
+	}
+	if _, err := db.IngestChunk(ctx, ChunkIngest{Key: otherKey, Tick: 20, Chunk: ChunkCoord{X: 0, Y: 0}, Pixels: other}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	stats, err := reopened.ChunkStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Format != FormatChunks || stats.DatastoreCount != 2 || stats.ChunkCount != 2 || stats.TileShardCount != 2 {
+		t.Fatalf("stats summary = %+v", stats)
+	}
+	if stats.SnapshotCount != 2 || stats.DeltaFrameCount != 1 {
+		t.Fatalf("stats frames snapshots=%d deltas=%d, want 2 snapshots and 1 delta", stats.SnapshotCount, stats.DeltaFrameCount)
+	}
+	if stats.StoredPixelEvents != 2*ChunkPixelCount+1 {
+		t.Fatalf("stored pixel events = %d, want %d", stats.StoredPixelEvents, 2*ChunkPixelCount+1)
+	}
+	if stats.CompressedBytes == 0 || stats.AverageSnapshotBytes == 0 || stats.AverageDeltaFrameBytes == 0 {
+		t.Fatalf("compressed byte stats not populated: %+v", stats)
+	}
+	if stats.MaxReplayEventsBetweenSnaps != 1 {
+		t.Fatalf("max replay events = %d, want 1", stats.MaxReplayEventsBetweenSnaps)
+	}
+	if len(stats.Datastores) != 2 {
+		t.Fatalf("datastore stats count = %d, want 2", len(stats.Datastores))
+	}
+	if stats.Datastores[0].Surface != "nauvis" || stats.Datastores[0].LatestRowSeq != 3 {
+		t.Fatalf("first datastore stats = %+v", stats.Datastores[0])
+	}
+	if stats.Datastores[1].Surface != "vulcanus" || stats.Datastores[1].LatestRowSeq != 4 {
+		t.Fatalf("second datastore stats = %+v", stats.Datastores[1])
+	}
+}
+
 func repeatedRGB565Hex(color uint16) string {
 	return strings.Repeat(fmt.Sprintf("%02x%02x", byte(color), byte(color>>8)), ChunkPixelCount)
 }
