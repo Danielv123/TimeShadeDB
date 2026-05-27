@@ -34,6 +34,16 @@ type SliderStyle = CSSProperties & {
   "--progress": string;
 };
 
+type MapUrlState = {
+  savefileUUID: string | null;
+  force: string | null;
+  surface: string | null;
+  x: number | null;
+  y: number | null;
+  z: number | null;
+  tick: number | null;
+};
+
 const tileRequestThrottleMs = 100;
 const metadataRefreshMs = 10_000;
 const tileSize = 512;
@@ -73,8 +83,69 @@ function selectedSaveFromPath() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+function stringParam(params: URLSearchParams, key: string) {
+  const value = params.get(key);
+  return value && value.trim() ? value : null;
+}
+
+function numberParam(params: URLSearchParams, key: string) {
+  const value = params.get(key);
+  if (!value) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function mapStateFromUrl(): MapUrlState {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    savefileUUID: selectedSaveFromPath(),
+    force: stringParam(params, "force"),
+    surface: stringParam(params, "surface"),
+    x: numberParam(params, "x"),
+    y: numberParam(params, "y"),
+    z: numberParam(params, "z"),
+    tick: numberParam(params, "tick")
+  };
+}
+
 function savePath(savefileUUID: string) {
   return `/saves/${encodeURIComponent(savefileUUID)}`;
+}
+
+function formattedUrlNumber(value: number, fractionDigits: number) {
+  return Number(value.toFixed(fractionDigits)).toString();
+}
+
+function urlForMapState(
+  savefileUUID: string | null,
+  force: string,
+  surface: string,
+  tick: number | null,
+  map: L.Map | null
+) {
+  if (!savefileUUID) {
+    return "/";
+  }
+  const params = new URLSearchParams();
+  if (force) {
+    params.set("force", force);
+  }
+  if (surface) {
+    params.set("surface", surface);
+  }
+  if (tick !== null && Number.isFinite(tick)) {
+    params.set("tick", Math.max(0, Math.trunc(tick)).toString());
+  }
+  if (map) {
+    const center = map.getCenter();
+    params.set("x", formattedUrlNumber(center.lng, 2));
+    params.set("y", formattedUrlNumber(center.lat, 2));
+    params.set("z", formattedUrlNumber(map.getZoom(), 2));
+  }
+  const query = params.toString();
+  return `${savePath(savefileUUID)}${query ? `?${query}` : ""}`;
 }
 
 function tileLayerUrl(savefileUUID: string, force: string, surface: string, tick: number) {
@@ -124,6 +195,23 @@ function minZoomForDatastore(datastore: DatastoreSummary | null) {
   return zoom;
 }
 
+function restoreMapViewFromUrl(map: L.Map, urlState: MapUrlState, minZoom: number) {
+  if (urlState.x === null || urlState.y === null || urlState.z === null) {
+    return false;
+  }
+  const zoom = Math.max(minZoom, Math.min(maxDisplayZoom, urlState.z));
+  map.setView([urlState.y, urlState.x], zoom, { animate: false });
+  return true;
+}
+
+function tickForDatastore(datastore: DatastoreSummary, urlState: MapUrlState) {
+  const latestTick = datastore.latest_tick || 0;
+  if (urlState.tick === null) {
+    return latestTick;
+  }
+  return Math.min(latestTick, Math.max(0, Math.trunc(urlState.tick)));
+}
+
 export function App() {
   const mapNode = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
@@ -136,10 +224,12 @@ export function App() {
   const pendingRequestTickRef = useRef(0);
   const tickRef = useRef(0);
   const selectedDatastoreKeyRef = useRef("");
+  const urlStateRef = useRef<MapUrlState>(mapStateFromUrl());
   const [catalog, setCatalog] = useState<SaveCatalog | null>(null);
-  const [selectedSaveID, setSelectedSaveID] = useState<string | null>(() => selectedSaveFromPath());
-  const [selectedForce, setSelectedForce] = useState("");
-  const [selectedSurface, setSelectedSurface] = useState("");
+  const [selectedSaveID, setSelectedSaveID] = useState<string | null>(() => urlStateRef.current.savefileUUID);
+  const [selectedForce, setSelectedForce] = useState(() => urlStateRef.current.force ?? "");
+  const [selectedSurface, setSelectedSurface] = useState(() => urlStateRef.current.surface ?? "");
+  const [urlViewRevision, setUrlViewRevision] = useState(0);
   const [tick, setTick] = useState(0);
   const [requestTick, setRequestTick] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -188,8 +278,17 @@ export function App() {
   const navigateToSave = useCallback((savefileUUID: string | null) => {
     const nextPath = savefileUUID ? savePath(savefileUUID) : "/";
     window.history.pushState({}, "", nextPath);
+    urlStateRef.current = mapStateFromUrl();
     setSelectedSaveID(savefileUUID);
     setError(null);
+  }, []);
+
+  const replaceMapUrl = useCallback((savefileUUID: string | null, force: string, surface: string, tick: number | null) => {
+    const nextUrl = urlForMapState(savefileUUID, force, surface, tick, mapRef.current);
+    if (`${window.location.pathname}${window.location.search}` !== nextUrl) {
+      window.history.replaceState({}, "", nextUrl);
+    }
+    urlStateRef.current = mapStateFromUrl();
   }, []);
 
   const scheduleTileRequest = useCallback((nextTick: number) => {
@@ -217,7 +316,12 @@ export function App() {
 
   useEffect(() => {
     const onPopState = () => {
-      setSelectedSaveID(selectedSaveFromPath());
+      const nextUrlState = mapStateFromUrl();
+      urlStateRef.current = nextUrlState;
+      setSelectedSaveID(nextUrlState.savefileUUID);
+      setSelectedForce(nextUrlState.force ?? "");
+      setSelectedSurface(nextUrlState.surface ?? "");
+      setUrlViewRevision((revision) => revision + 1);
       setError(null);
     };
     window.addEventListener("popstate", onPopState);
@@ -284,7 +388,7 @@ export function App() {
       }
       return preferredValue(selectedSave.forces, "player");
     });
-  }, [selectedSave]);
+  }, [selectedForce, selectedSave]);
 
   useEffect(() => {
     if (!selectedSave || !selectedForce) {
@@ -297,7 +401,7 @@ export function App() {
       }
       return preferredValue(surfacesForForce, "nauvis");
     });
-  }, [selectedForce, selectedSave, surfacesForForce]);
+  }, [selectedForce, selectedSave, selectedSurface, surfacesForForce]);
 
   useEffect(() => {
     if (!selectedDatastore) {
@@ -307,7 +411,8 @@ export function App() {
       selectedDatastoreKeyRef.current = "";
       return;
     }
-    const nextTick = selectedDatastore.latest_tick || 0;
+    const latestTick = selectedDatastore.latest_tick || 0;
+    const nextTick = tickForDatastore(selectedDatastore, urlStateRef.current);
     if (selectedDatastoreKeyRef.current !== selectedDatastoreKey) {
       selectedDatastoreKeyRef.current = selectedDatastoreKey;
       tickRef.current = nextTick;
@@ -317,14 +422,22 @@ export function App() {
       lastRequestAtRef.current = performance.now();
       return;
     }
-    if (tickRef.current > nextTick) {
+    if (urlStateRef.current.tick !== null && tickRef.current !== nextTick) {
       tickRef.current = nextTick;
       setTick(nextTick);
       setRequestTick(nextTick);
       pendingRequestTickRef.current = nextTick;
       lastRequestAtRef.current = performance.now();
+      return;
     }
-  }, [selectedDatastore, selectedDatastoreKey]);
+    if (tickRef.current > latestTick) {
+      tickRef.current = latestTick;
+      setTick(latestTick);
+      setRequestTick(latestTick);
+      pendingRequestTickRef.current = latestTick;
+      lastRequestAtRef.current = performance.now();
+    }
+  }, [selectedDatastore, selectedDatastoreKey, urlViewRevision]);
 
   useEffect(() => {
     tickRef.current = tick;
@@ -378,7 +491,9 @@ export function App() {
       fill: false,
       interactive: false
     }).addTo(map);
-    map.fitBounds(bounds);
+    if (!restoreMapViewFromUrl(map, urlStateRef.current, minZoom)) {
+      map.fitBounds(bounds);
+    }
     mapRef.current = map;
     return () => {
       map.remove();
@@ -394,11 +509,38 @@ export function App() {
     if (!selectedDatastore || !map) {
       return;
     }
+    restoreMapViewFromUrl(map, urlStateRef.current, minZoom);
+  }, [minZoom, selectedDatastore, selectedDatastoreKey, urlViewRevision]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!selectedDatastore || !map) {
+      return;
+    }
     const bounds = datastoreBounds(selectedDatastore);
     map.setMinZoom(minZoom);
     map.setMaxBounds(bounds.pad(0.35));
     borderRef.current?.setBounds(bounds);
   }, [minZoom, selectedDatastore, selectedDatastoreBoundsKey]);
+
+  useEffect(() => {
+    if (!selectedSaveID || !selectedDatastore) {
+      return;
+    }
+    replaceMapUrl(selectedSaveID, selectedForce, selectedSurface, tick);
+  }, [replaceMapUrl, selectedDatastore, selectedForce, selectedSaveID, selectedSurface, tick]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!selectedSaveID || !map) {
+      return;
+    }
+    const onMoveEnd = () => replaceMapUrl(selectedSaveID, selectedForce, selectedSurface, tickRef.current);
+    map.on("moveend zoomend", onMoveEnd);
+    return () => {
+      map.off("moveend zoomend", onMoveEnd);
+    };
+  }, [replaceMapUrl, selectedDatastoreKey, selectedForce, selectedSaveID, selectedSurface]);
 
   useEffect(() => {
     const map = mapRef.current;
