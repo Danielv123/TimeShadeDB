@@ -51,3 +51,10 @@ jobs:
           name: timeshadedb-linux-amd64
           path: build/packages/timeshadedb-linux-amd64.zip
           if-no-files-found: error
+
+      - name: Upload Factorio mod package
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeshadedb-exporter-factorio-mod
+          path: build/packages/timeshadedb_exporter_*.zip
+          if-no-files-found: error

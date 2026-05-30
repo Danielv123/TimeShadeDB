@@ -40,3 +40,13 @@ timeshadedb tail-chunk-tsv --input chunk-charted.tsv --entity-input entity-posit
 Entity coordinates are stored as `timeshadedb_entity_x` and
 `timeshadedb_entity_y` series labelled by savefile, surface, force, entity type,
 entity id, and path segment. No tile label is written.
+
+## Factorio mod deployment
+
+GitHub Actions publishes the Factorio mod to the Factorio Mod Portal when a tag
+named `factorio-v<version>` is pushed, where `<version>` matches
+`timeshadedb_exporter/info.json`.
+
+Configure the repository secret `FACTORIO_MOD_PORTAL_API_KEY` with a Factorio
+API key that has `ModPortal: Publish Mods` permission. The deploy workflow can
+also be run manually from GitHub Actions.

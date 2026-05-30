@@ -1,0 +1,95 @@
+name: Deploy Factorio mod
+
+on:
+  push:
+    tags:
+      - factorio-v*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-factorio-mod-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: factorio-mod-portal
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Read mod metadata
+        id: mod
+        shell: pwsh
+        run: |
+          $info = Get-Content timeshadedb_exporter/info.json -Raw | ConvertFrom-Json
+          $expectedTag = "factorio-v$($info.version)"
+          if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_NAME -ne $expectedTag) {
+            throw "Tag '$env:GITHUB_REF_NAME' does not match expected Factorio mod tag '$expectedTag'."
+          }
+          "name=$($info.name)" >> $env:GITHUB_OUTPUT
+          "version=$($info.version)" >> $env:GITHUB_OUTPUT
+          "zip_path=build/packages/$($info.name)_$($info.version).zip" >> $env:GITHUB_OUTPUT
+
+      - name: Build Factorio mod package
+        shell: pwsh
+        run: ./scripts/build.ps1 -SkipPackage
+
+      - name: Upload Factorio mod package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.mod.outputs.name }}-${{ steps.mod.outputs.version }}
+          path: ${{ steps.mod.outputs.zip_path }}
+          if-no-files-found: error
+
+      - name: Publish to Factorio Mod Portal
+        shell: bash
+        env:
+          FACTORIO_MOD_PORTAL_API_KEY: ${{ secrets.FACTORIO_MOD_PORTAL_API_KEY }}
+          MOD_NAME: ${{ steps.mod.outputs.name }}
+          ZIP_PATH: ${{ steps.mod.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FACTORIO_MOD_PORTAL_API_KEY}" ]; then
+            echo "::error::Missing FACTORIO_MOD_PORTAL_API_KEY secret."
+            exit 1
+          fi
+
+          init_response="$(
+            curl -fsS \
+              -X POST "https://mods.factorio.com/api/v2/mods/init_publish" \
+              -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}" \
+              -F "mod=${MOD_NAME}"
+          )"
+
+          upload_url="$(
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["upload_url"])' <<< "${init_response}"
+          )"
+
+          curl -fsS \
+            -X POST "${upload_url}" \
+            -F "file=@${ZIP_PATH}" \
+            -F "description=<timeshadedb_exporter/README.md" \
+            -F "source_url=https://github.com/${GITHUB_REPOSITORY}"
