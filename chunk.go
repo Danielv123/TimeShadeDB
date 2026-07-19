@@ -235,20 +235,16 @@ func loadChunkDB(opts OpenOptions) (*DB, error) {
 
 func writeChunkManifest(path string) error {
 	m := manifest{
-		Format:        "timeShadeDB",
-		Version:       2,
-		ChunkSize:     ChunkSize,
-		PixelFormat:   "rgb565",
-		TimestampUnit: "factorio_tick",
-		Codec:         "zstd",
-		CodecLevel:    9,
+		Format:           "timeShadeDB",
+		StorageVersion:   2,
+		DatastoreVersion: currentDatastoreVersion,
+		ChunkSize:        ChunkSize,
+		PixelFormat:      "rgb565",
+		TimestampUnit:    "factorio_tick",
+		Codec:            "zstd",
+		CodecLevel:       9,
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return os.WriteFile(filepath.Join(path, "manifest.json"), data, 0o644)
+	return writeDataManifest(path, m)
 }
 
 func (db *DB) ingestChunk(ctx context.Context, in ChunkIngest) (*IngestChunkResult, error) {

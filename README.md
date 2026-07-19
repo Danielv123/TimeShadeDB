@@ -15,6 +15,19 @@ powershell.exe -ExecutionPolicy Bypass -File scripts\build.ps1
 
 The build script rebuilds the web bundle, compiles the Go binary with the current embedded assets, and writes a package archive under `build/packages/`.
 
+## Datastore upgrades
+
+`manifest.json` contains a datastore-wide `datastore_version`, separate from the
+storage-family `version` and the versions embedded in binary files. Writable
+opens automatically run every registered `N -> N+1` migration. Read-only opens
+reject outdated datastores, and newer versions are always rejected.
+
+Migrations copy the active datastore, validate the copy, and then atomically
+replace a small root manifest that selects the new generation. The source stays
+active if any step fails. Upgrades require space for another full copy and all
+other writers must be stopped. Previous and interrupted generations remain
+unselected for manual cleanup.
+
 ## Factorio export
 
 The `timeshadedb_exporter` mod writes Factorio export files under
