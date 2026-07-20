@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -40,17 +39,18 @@ var (
 )
 
 type manifest struct {
-	Format        string `json:"format"`
-	Version       int    `json:"version"`
-	CanvasWidth   int    `json:"canvas_width"`
-	CanvasHeight  int    `json:"canvas_height"`
-	TileSize      int    `json:"tile_size"`
-	ChunkSize     int    `json:"chunk_size,omitempty"`
-	PixelFormat   string `json:"pixel_format,omitempty"`
-	TimestampUnit string `json:"timestamp_unit"`
-	PaletteFile   string `json:"palette_file,omitempty"`
-	Codec         string `json:"codec"`
-	CodecLevel    int    `json:"codec_level"`
+	Format           string `json:"format"`
+	StorageVersion   int    `json:"version"`
+	DatastoreVersion int    `json:"datastore_version"`
+	CanvasWidth      int    `json:"canvas_width"`
+	CanvasHeight     int    `json:"canvas_height"`
+	TileSize         int    `json:"tile_size"`
+	ChunkSize        int    `json:"chunk_size,omitempty"`
+	PixelFormat      string `json:"pixel_format,omitempty"`
+	TimestampUnit    string `json:"timestamp_unit"`
+	PaletteFile      string `json:"palette_file,omitempty"`
+	Codec            string `json:"codec"`
+	CodecLevel       int    `json:"codec_level"`
 }
 
 type tileState struct {
@@ -224,7 +224,7 @@ func openDB(opts OpenOptions) (*DB, error) {
 	if statErr != nil {
 		return nil, statErr
 	}
-	return loadDB(opts)
+	return openExistingDBWithMigrations(opts, datastoreMigrations[:])
 }
 
 func createTileDB(path string, cacheSize int64) (*DB, error) {
@@ -279,7 +279,7 @@ func loadDB(opts OpenOptions) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if m.Version == 2 {
+	if m.StorageVersion == 2 {
 		return loadChunkDB(opts)
 	}
 	db := &DB{
@@ -382,49 +382,45 @@ func newTileState(x, y int) *tileState {
 
 func writeManifest(path string) error {
 	m := manifest{
-		Format:        "timeShadeDB",
-		Version:       1,
-		CanvasWidth:   CanvasWidth,
-		CanvasHeight:  CanvasHeight,
-		TileSize:      TileSize,
-		TimestampUnit: "unix_second",
-		PaletteFile:   "palette.bin",
-		Codec:         "zstd",
-		CodecLevel:    9,
+		Format:           "timeShadeDB",
+		StorageVersion:   1,
+		DatastoreVersion: currentDatastoreVersion,
+		CanvasWidth:      CanvasWidth,
+		CanvasHeight:     CanvasHeight,
+		TileSize:         TileSize,
+		TimestampUnit:    "unix_second",
+		PaletteFile:      "palette.bin",
+		Codec:            "zstd",
+		CodecLevel:       9,
 	}
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return os.WriteFile(filepath.Join(path, "manifest.json"), data, 0o644)
+	return writeDataManifest(path, m)
 }
 
 func readManifest(path string) (manifest, error) {
-	data, err := os.ReadFile(filepath.Join(path, "manifest.json"))
-	if err != nil {
-		return manifest{}, err
+	m, err := readDataManifest(path)
+	if err == nil {
+		err = validateManifest(path, m)
 	}
-	var m manifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return manifest{}, err
-	}
+	return m, err
+}
+
+func validateManifest(path string, m manifest) error {
 	if m.Format != "timeShadeDB" {
-		return manifest{}, fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
+		return fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
 	}
-	switch m.Version {
+	switch m.StorageVersion {
 	case 1:
 		if m.CanvasWidth != CanvasWidth || m.CanvasHeight != CanvasHeight || m.TileSize != TileSize {
-			return manifest{}, fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
+			return fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
 		}
 	case 2:
 		if m.ChunkSize != ChunkSize || m.PixelFormat != "rgb565" {
-			return manifest{}, fmt.Errorf("timeshadedb: unsupported chunk manifest in %s", path)
+			return fmt.Errorf("timeshadedb: unsupported chunk manifest in %s", path)
 		}
 	default:
-		return manifest{}, fmt.Errorf("timeshadedb: unsupported manifest version %d in %s", m.Version, path)
+		return fmt.Errorf("timeshadedb: unsupported manifest version %d in %s", m.StorageVersion, path)
 	}
-	return m, nil
+	return nil
 }
 
 func (db *DB) ingestPlacement(ts time.Time, x, y int, rgb RGB) error {

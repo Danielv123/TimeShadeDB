@@ -398,6 +398,7 @@ Human-readable database metadata:
 {
   "format": "timeShadeDB",
   "version": 2,
+  "datastore_version": 1,
   "chunk_size": 32,
   "pixel_format": "rgb565",
   "timestamp_unit": "factorio_tick",
@@ -405,6 +406,13 @@ Human-readable database metadata:
   "codec_level": 9
 }
 ```
+
+`version` selects the storage family; `datastore_version` orders migrations of
+the complete database. Existing manifests without `datastore_version` are
+version 1. A successful migration stores the copied data under
+`generations/<generation>/` and atomically replaces the root `manifest.json`
+with a selector for that generation. Failed or incomplete copies are never
+selected; inactive generations are retained until an operator removes them.
 
 ### Chunk data file: `chunks/cx_*_cy_*.cdat`
 
