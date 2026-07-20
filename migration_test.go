@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,11 +26,7 @@ func TestNewDatastoresWriteDatastoreVersion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			version, err := datastoreVersion(m)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if version != currentDatastoreVersion {
+			if version := m.DatastoreVersion; version != currentDatastoreVersion {
 				t.Fatalf("datastore version = %d, want %d", version, currentDatastoreVersion)
 			}
 		})
@@ -43,11 +38,7 @@ func TestMissingDatastoreVersionUsesBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	version, err := datastoreVersion(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if version != baselineDatastoreVersion {
+	if version := m.DatastoreVersion; version != baselineDatastoreVersion {
 		t.Fatalf("missing datastore version = %d, want %d", version, baselineDatastoreVersion)
 	}
 }
@@ -103,20 +94,25 @@ func TestIncrementalMigrationPublishesOneGeneration(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	for _, name := range []string{"stale.tmp", "stale.compact", "stale.bak"} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	var calls []string
+	runs := 0
 	migrations := []datastoreMigration{
 		{
 			name: "one-to-two",
 			run: func(stage string) error {
-				calls = append(calls, "run-1")
+				runs++
 				return os.WriteFile(filepath.Join(stage, "v2.marker"), []byte("ok"), 0o644)
 			},
 		},
 		{
 			name: "two-to-three",
 			run: func(stage string) error {
-				calls = append(calls, "run-2")
+				runs++
 				if _, err := os.Stat(filepath.Join(stage, "v2.marker")); err != nil {
 					return err
 				}
@@ -124,11 +120,7 @@ func TestIncrementalMigrationPublishesOneGeneration(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				version, err := datastoreVersion(m)
-				if err != nil {
-					return err
-				}
-				if version != 2 {
+				if version := m.DatastoreVersion; version != 2 {
 					return errors.New("first migration version was not published")
 				}
 				return nil
@@ -157,11 +149,10 @@ func TestIncrementalMigrationPublishesOneGeneration(t *testing.T) {
 	if filepath.Clean(dataPath) == filepath.Clean(path) {
 		t.Fatal("migration did not publish a managed generation")
 	}
-	version, err := datastoreVersion(m)
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"stale.tmp", "stale.compact", "stale.bak"} {
+		assertPathMissing(t, filepath.Join(dataPath, name))
 	}
-	if version != 3 {
+	if version := m.DatastoreVersion; version != 3 {
 		t.Fatalf("selected version = %d, want 3", version)
 	}
 
@@ -172,8 +163,8 @@ func TestIncrementalMigrationPublishesOneGeneration(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"run-1", "run-2"}; !slices.Equal(calls, want) {
-		t.Fatalf("migration calls = %v, want %v", calls, want)
+	if runs != len(migrations) {
+		t.Fatalf("migration runs = %d, want %d", runs, len(migrations))
 	}
 }
 
@@ -206,9 +197,8 @@ func TestFailedMigrationLeavesFlatDatastoreSelected(t *testing.T) {
 	if filepath.Clean(dataPath) != filepath.Clean(path) {
 		t.Fatal("failed migration selected a generation")
 	}
-	version, err := datastoreVersion(m)
-	if err != nil || version != 1 {
-		t.Fatalf("active datastore version = %d, error %v", version, err)
+	if version := m.DatastoreVersion; version != 1 {
+		t.Fatalf("active datastore version = %d, want 1", version)
 	}
 }
 
@@ -255,6 +245,44 @@ func TestVersionChecksDoNotModifyDatastore(t *testing.T) {
 	}
 	if _, err := Open(OpenOptions{Path: path}); err == nil || !strings.Contains(err.Error(), "invalid datastore version") {
 		t.Fatalf("invalid version error = %v", err)
+	}
+}
+
+func TestLegacyMigrationReplaysWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.tshd")
+	ts := time.Unix(1234, 0).UTC()
+	db, err := Open(OpenOptions{Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.IngestPlacement(ts, 7, 8, RGB{R: 9, G: 8, B: 7}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tile := range db.tiles {
+		if tile == nil {
+			continue
+		}
+		if tile.file != nil {
+			_ = tile.file.Close()
+		}
+		if tile.wal != nil {
+			_ = tile.wal.Close()
+		}
+	}
+	db.compressor.close()
+
+	noop := func(string) error { return nil }
+	migrated, err := openExistingDBWithMigrations(OpenOptions{Path: path}, []datastoreMigration{{name: "one", run: noop}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	result, err := migrated.TileAt(context.Background(), TileAtOptions{Timestamp: ts, Tile: TileCoord{X: 0, Y: 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Pixels[8*result.Width+7] != 1 {
+		t.Fatalf("migrated WAL pixel = %d, want 1", result.Pixels[8*result.Width+7])
 	}
 }
 

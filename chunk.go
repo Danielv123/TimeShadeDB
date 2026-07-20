@@ -234,16 +234,10 @@ func loadChunkDB(opts OpenOptions) (*DB, error) {
 }
 
 func writeChunkManifest(path string) error {
-	m := manifest{
-		Format:           "timeShadeDB",
-		StorageVersion:   2,
-		DatastoreVersion: currentDatastoreVersion,
-		ChunkSize:        ChunkSize,
-		PixelFormat:      "rgb565",
-		TimestampUnit:    "factorio_tick",
-		Codec:            "zstd",
-		CodecLevel:       9,
-	}
+	m := baseDataManifest(2)
+	m.ChunkSize = ChunkSize
+	m.PixelFormat = "rgb565"
+	m.TimestampUnit = "factorio_tick"
 	return writeDataManifest(path, m)
 }
 
@@ -2375,20 +2369,18 @@ func readChunkTileIndex(path string) (chunkTileCoord, map[ChunkCoord]chunkIndex,
 }
 
 func writeChunkMetadata(dsDir string, key DatastoreKey) error {
-	data, err := json.MarshalIndent(key, "", "  ")
+	data, err := marshalJSON(key)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	return os.WriteFile(filepath.Join(dsDir, "metadata.json"), data, 0o644)
 }
 
 func writeChunkProgress(dsDir string, progress chunkDatastoreProgress) error {
-	data, err := json.MarshalIndent(progress, "", "  ")
+	data, err := marshalJSON(progress)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	path := filepath.Join(dsDir, "progress.json")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {

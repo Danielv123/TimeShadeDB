@@ -13,6 +13,7 @@ import (
 
 const (
 	baselineDatastoreVersion = 1
+	dataManifestFormat       = "timeShadeDB"
 	rootManifestFormat       = "timeShadeDB-root"
 	generationsDir           = "generations"
 	currentDatastoreVersion  = baselineDatastoreVersion + len(datastoreMigrations)
@@ -39,10 +40,7 @@ func openExistingDBWithMigrations(opts OpenOptions, migrations []datastoreMigrat
 	if err != nil {
 		return nil, err
 	}
-	version, err := datastoreVersion(m)
-	if err != nil {
-		return nil, err
-	}
+	version := m.DatastoreVersion
 	if version > current {
 		return nil, fmt.Errorf("timeshadedb: datastore version %d is newer than supported version %d", version, current)
 	}
@@ -54,7 +52,7 @@ func openExistingDBWithMigrations(opts OpenOptions, migrations []datastoreMigrat
 	}
 
 	opts.Path = dataPath
-	return loadDB(opts)
+	return loadDBWithManifest(opts, m)
 }
 
 func validateMigrations(migrations []datastoreMigration) error {
@@ -64,13 +62,6 @@ func validateMigrations(migrations []datastoreMigration) error {
 		}
 	}
 	return nil
-}
-
-func datastoreVersion(m manifest) (int, error) {
-	if m.DatastoreVersion < baselineDatastoreVersion {
-		return 0, fmt.Errorf("timeshadedb: invalid datastore version %d", m.DatastoreVersion)
-	}
-	return m.DatastoreVersion, nil
 }
 
 func resolveDatastore(root string) (string, manifest, error) {
@@ -84,7 +75,7 @@ func resolveDatastore(root string) (string, manifest, error) {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return "", manifest{}, err
 	}
-	if envelope.Format == "timeShadeDB" {
+	if envelope.Format == dataManifestFormat {
 		m, err := decodeDataManifest(data)
 		if err == nil {
 			err = validateManifest(root, m)
@@ -143,14 +134,19 @@ func migrateDatastore(opts OpenOptions, source string, m manifest, migrations []
 		return nil, err
 	}
 	if m.StorageVersion == 1 {
-		if err := normalizeStaging(staging); err != nil {
+		needsNormalization, err := legacyNeedsNormalization(staging)
+		if err != nil {
 			return nil, err
+		}
+		if needsNormalization {
+			if err := normalizeStaging(staging); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	version := m.DatastoreVersion
-	for version < current {
-		migration := migrations[version-baselineDatastoreVersion]
+	for fromVersion := m.DatastoreVersion; fromVersion < current; fromVersion++ {
+		migration := migrations[fromVersion-baselineDatastoreVersion]
 		if err := migration.run(staging); err != nil {
 			return nil, fmt.Errorf("timeshadedb: migration %q: %w", migration.name, err)
 		}
@@ -158,15 +154,14 @@ func migrateDatastore(opts OpenOptions, source string, m manifest, migrations []
 		if err != nil {
 			return nil, err
 		}
-		m.DatastoreVersion = version + 1
+		m.DatastoreVersion = fromVersion + 1
 		if err := writeDataManifest(staging, m); err != nil {
 			return nil, err
 		}
-		version++
 	}
 
 	suffix := strings.TrimPrefix(filepath.Base(staging), ".staging-")
-	name := fmt.Sprintf("v%06d-%s", current, suffix)
+	name := fmt.Sprintf("v%06d-%s", m.DatastoreVersion, suffix)
 	generationPath := filepath.Join(generations, name)
 	if err := replaceFileAtomically(staging, generationPath); err != nil {
 		return nil, err
@@ -183,6 +178,24 @@ func migrateDatastore(opts OpenOptions, source string, m manifest, migrations []
 		return nil, err
 	}
 	return db, nil
+}
+
+func legacyNeedsNormalization(path string) (bool, error) {
+	for y := 0; y < TileRows; y++ {
+		for x := 0; x < TileCols; x++ {
+			info, err := os.Stat(walPath(path, x, y))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return false, err
+			}
+			if info.Size() != 0 && info.Size() != 6 {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func normalizeStaging(path string) error {
@@ -213,13 +226,16 @@ func copyDatastore(source, destination string, excludeGenerations bool) error {
 		if excludeGenerations && rel == generationsDir && entry.IsDir() {
 			return filepath.SkipDir
 		}
+		if !entry.IsDir() && isMigrationScratch(entry.Name()) {
+			return nil
+		}
 		target := filepath.Join(destination, rel)
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
 		if entry.IsDir() {
-			if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
+			if err := os.Mkdir(target, info.Mode().Perm()); err != nil {
 				return err
 			}
 			return os.Chmod(target, info.Mode().Perm())
@@ -229,6 +245,10 @@ func copyDatastore(source, destination string, excludeGenerations bool) error {
 		}
 		return copyFile(path, target, info.Mode().Perm())
 	})
+}
+
+func isMigrationScratch(name string) bool {
+	return strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".compact") || strings.HasSuffix(name, ".bak")
 }
 
 func copyFile(source, destination string, mode fs.FileMode) (retErr error) {
@@ -251,6 +271,16 @@ func copyFile(source, destination string, mode fs.FileMode) (retErr error) {
 		return err
 	}
 	return out.Sync()
+}
+
+func baseDataManifest(storageVersion int) manifest {
+	return manifest{
+		Format:           dataManifestFormat,
+		StorageVersion:   storageVersion,
+		DatastoreVersion: currentDatastoreVersion,
+		Codec:            "zstd",
+		CodecLevel:       9,
+	}
 }
 
 func readDataManifest(path string) (manifest, error) {

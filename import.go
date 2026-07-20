@@ -459,11 +459,10 @@ func (db *DB) Stats() *ImportStats {
 
 func (db *DB) writeStats() error {
 	stats := db.Stats()
-	data, err := json.MarshalIndent(stats, "", "  ")
+	data, err := marshalJSON(stats)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 	db.persistedStats = stats
 	return os.WriteFile(statsPath(db.path), data, 0o644)
 }
