@@ -279,6 +279,10 @@ func loadDB(opts OpenOptions) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	return loadDBWithManifest(opts, m)
+}
+
+func loadDBWithManifest(opts OpenOptions, m manifest) (*DB, error) {
 	if m.StorageVersion == 2 {
 		return loadChunkDB(opts)
 	}
@@ -381,18 +385,12 @@ func newTileState(x, y int) *tileState {
 }
 
 func writeManifest(path string) error {
-	m := manifest{
-		Format:           "timeShadeDB",
-		StorageVersion:   1,
-		DatastoreVersion: currentDatastoreVersion,
-		CanvasWidth:      CanvasWidth,
-		CanvasHeight:     CanvasHeight,
-		TileSize:         TileSize,
-		TimestampUnit:    "unix_second",
-		PaletteFile:      "palette.bin",
-		Codec:            "zstd",
-		CodecLevel:       9,
-	}
+	m := baseDataManifest(1)
+	m.CanvasWidth = CanvasWidth
+	m.CanvasHeight = CanvasHeight
+	m.TileSize = TileSize
+	m.TimestampUnit = "unix_second"
+	m.PaletteFile = "palette.bin"
 	return writeDataManifest(path, m)
 }
 
@@ -405,8 +403,11 @@ func readManifest(path string) (manifest, error) {
 }
 
 func validateManifest(path string, m manifest) error {
-	if m.Format != "timeShadeDB" {
+	if m.Format != dataManifestFormat {
 		return fmt.Errorf("timeshadedb: unsupported manifest in %s", path)
+	}
+	if m.DatastoreVersion < baselineDatastoreVersion {
+		return fmt.Errorf("timeshadedb: invalid datastore version %d", m.DatastoreVersion)
 	}
 	switch m.StorageVersion {
 	case 1:
