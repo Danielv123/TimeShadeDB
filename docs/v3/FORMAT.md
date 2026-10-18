@@ -1,0 +1,354 @@
+# TimeShadeDB v3 formats
+
+Status: format version 1. Normative unless a section says "tunable" or "recommended".
+The executable definitions are `internal/v3/core` (types and semantics),
+`internal/v3/core/memstore` (semantics as code) and `internal/v3/core/wire` (wire codecs).
+
+## 1. Conventions
+
+- All integers are little-endian. `i64`/`u32`/... are fixed width.
+- `uvarint` is unsigned LEB128 (Go `binary.AppendUvarint`), at most 10 bytes.
+  `varint` is zigzag (`(n << 1) ^ (n >> 63)`) followed by uvarint.
+- Times are `TimeMs`: int64 Unix milliseconds on the map clock (PLAN.md §4.1, D2).
+  Windows are aligned to the epoch: window of length `W` containing `t` is
+  `[floor(t/W)*W, floor(t/W)*W + W)`.
+- Names in ids: `EscapeName` keeps bytes in `[a-z0-9_-]` and writes every other byte of the
+  UTF-8 encoding, upper-case letters included, as `~XX` (upper-case hex). Upper case is
+  escaped so ids never collide on case-insensitive file systems; `.` is escaped so it can
+  separate parts.
+  - Datastore id: `Escape(map) "." Escape(surface) "." Escape(force)`,
+    e.g. `gw-bc41437d~2E1.nauvis.player` for map `gw-bc41437d.1`.
+  - Surface id: `Escape(map) "." Escape(surface)`, e.g. `gw-bc41437d~2E1.nauvis`.
+  - Ids are canonical: a parser rejects lower-case hex, unescaped bytes outside the set,
+    empty parts and the wrong number of parts. Raw names are at most 200 bytes.
+- A datastore is one (map, surface, force). Terrain, the palette and overlays are per
+  datastore. Movers are per surface (all forces; each sample carries its force).
+
+## 2. Grid
+
+| Constant | Value |
+|---|---|
+| chunk | 32 x 32 tiles; chunk image 32 x 32 pixels, row-major |
+| z0 tile | 16 x 16 chunks = 512 x 512 pixels, 1 pixel per world tile |
+| level z | z <= 0; one pixel covers 2^-z x 2^-z world tiles; every tile is 512 x 512 pixels |
+| grid origin | world tile -256 on both axes, at every level |
+| levels | `MinZ` = -10 to 0 |
+| bounds | z0 tile x, y in [-2048, 2048]; at level z, [-(2048 >> -z), 2048 >> -z] (at least +-1) |
+
+- Tile (z, x, y) covers world tiles `[-256 + x*512*2^-z, -256 + (x+1)*512*2^-z)` per axis.
+  The -256 origin makes each z0 tile one 512-tile gridworld instance (instance (0,0)
+  covers [-256, 256)), as in illisis `keys.ts`.
+- Chunk (cx, cy) is in z0 tile `(floor((cx+8)/16), floor((cy+8)/16))` at block
+  `b = ((cx+8) mod 16) + 16*((cy+8) mod 16)` (0..255, row-major). Inverse:
+  `cx = 16*x - 8 + (b & 15)`, `cy = 16*y - 8 + (b >> 4)`.
+- Pixel `p` (0..1023, row-major) of block `b` is tile pixel
+  `(32*(b & 15) + (p & 31), 32*(b >> 4) + (p >> 5))`, which is world tile
+  `(32*cx + (p & 31), 32*cy + (p >> 5))`.
+- The parent of tile (z, x, y) is (z-1, floor(x/2), floor(y/2)); its children are
+  (z+1, 2x+i, 2y+j). Child (i, j) fills the parent quadrant starting at pixel (256i, 256j).
+
+## 3. Colours, palette and coarse pixels
+
+- Colours are RGB565 exactly as `LuaForce.get_chunk_chart` returns them:
+  `r = v>>11 & 31, g = v>>5 & 63, b = v & 31`. 0 (black) means uncharted.
+  Viewers expand channels by bit replication (`r8 = r5<<3 | r5>>2`, `g8 = g6<<2 | g6>>4`).
+- Each datastore has an append-only palette of RGB565 colours. Entry 0 is always 0. Entries
+  are never changed or removed, so the first `n` entries (palette version `n`) are
+  immutable. The order is store-defined: two stores fed the same data may number colours
+  differently, so tests compare RGB565, never indices. At most 65,536 entries.
+- Coarse level pixels (z < 0) are the per-channel average of the 2 x 2 pixels below, rounded
+  half up: `((a+b+c+d+2) >> 2)` per channel. This is bit-identical to illisis
+  `shared/levels.ts`, so illisis z1-z4 data cross-checks the pyramid. Uncharted children
+  count as 0.
+
+## 4. Terrain semantics
+
+The full rules are on `core.TerrainStore`. In short:
+
+1. A `ChunkUpdate` (datastore, chunk, T, full pixels or deleted) goes into the open window
+   containing T. Per chunk and window the greatest T wins; on equal T the later arrival
+   wins. Deleted sets the chunk to all 0.
+2. Every datastore has a **horizon**. Updates with T < horizon are late and dropped
+   (terrain is absolute; the next update corrects it).
+3. `Commit(upTo)` closes every window ending at or before `upTo` and raises the horizon to
+   `floor(upTo/W)*W`. For each tile and closed window, chunks whose final content differs
+   from the committed content form a block. A non-empty block creates the tile's next
+   **version**, effective at the window end. A window that nets out creates nothing.
+4. Version 0 is all uncharted. The content of (datastore, tile, version) never changes.
+   The version effective at t is the newest with effective time <= t. Versions at times
+   before the horizon never change.
+5. Early flush (tunable): under memory pressure a store may write a window in several
+   blocks, all effective at the window end. Pixels at every t are unchanged; only version
+   numbers differ.
+6. **Live**: when a tile has open-window updates and t >= max(horizon, LastT) (LastT = the
+   newest accepted update time of the datastore), a live read also applies the newest open
+   update of each chunk. Live content has no version; it is served without caching.
+
+Coarse levels (z < 0, WP3) have their own versions per coarse tile: each snapshot the
+pyramid writes is the next version. Recommended schedule (tunable): write a snapshot of a
+coarse tile when a descendant changed and at least 5 min (z -1), 15 min (z -2) or 60 min
+(z <= -3) passed since its last snapshot, and always keep the latest state reachable. The
+reference oracle (`memstore.Pyramid`) snapshots at every change.
+
+## 5. On-disk layout
+
+```
+<db>/
+  timeshadedb-v3.json                    {"format":"timeshadedb-v3","version":1}
+  maps.json                              map metadata from "map" messages (WP6)
+  datastores/<datastore id>/
+    meta.json                            {"key":{...},"window_ms":60000,"grid_origin":-256,"format_version":1}
+    palette.bin                          append-only palette (5.2)
+    tiles/<x>_<y>.blk, .idx              z0 terrain series, one per tile (5.1, 5.3)
+    pyramid/<z>/<x>_<y>.blk, .idx        coarse snapshots, z = -1, -2, ... (5.4, WP3)
+    wal/                                 write-ahead log of open windows (WP2, tunable)
+  movers/<surface id>/
+    meta.json                            {"key":{...},"format_version":1}
+    windows/<YYYY-MM-DD>/<start>.mvw     closed 5-minute windows (5.5)
+    keyframes/<YYYY-MM-DD>/<t>.mvw       hourly keyframes (5.5)
+    days/<YYYY-MM-DD>.json               day index, core.DayIndex as JSON
+    wal/                                 open-window samples (WP4, tunable)
+  overlays/<datastore id>/               interval log and per-tile index (WP4, 5.6)
+```
+
+`<x>_<y>` uses decimal integers with a leading `-` for negatives, e.g. `tiles/-3_2.blk`.
+Every JSON file is written as tmp + rename. Unknown files are ignored.
+
+### 5.1 Series files (`.blk` + `.idx`)
+
+A series is an append-only record log (`core.Series`). Terrain keeps one per z0 tile, the
+pyramid one per coarse tile.
+
+`.blk`: a sequence of records, each a 32-byte header followed by its payload.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `TSB3` |
+| 4 | 1 | kind: 1 delta, 2 keyframe, 3 snapshot |
+| 5 | 1 | flags (bit 0 = wide: u16 palette indices) |
+| 6 | 2 | reserved, 0 |
+| 8 | 8 | `t_start` i64 |
+| 16 | 4 | `t_len` u32 (effective time `t_end = t_start + t_len`) |
+| 20 | 4 | payload length u32 |
+| 24 | 4 | CRC-32C (Castagnoli) of the payload |
+| 28 | 4 | CRC-32C of bytes 0..27 |
+
+`.idx`: fixed 24-byte records, one per `.blk` record, in the same order. The record number
+is the record's `Seq`.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `t_start` i64 |
+| 8 | 4 | `t_len` u32 |
+| 12 | 6 | offset of the record header in `.blk`, u48 |
+| 18 | 3 | payload length u24 (payloads are under 16 MiB) |
+| 21 | 1 | kind |
+| 22 | 1 | flags |
+| 23 | 1 | reserved, 0 |
+
+The PLAN sketched a 16-byte `.blk` header; it is 32 bytes here so the index can be rebuilt
+from `.blk` alone (it needs `t_start` and `t_len`) and torn headers are detectable.
+
+Rules:
+
+- Records are appended with non-decreasing `t_end`.
+- Write order: append the `.blk` record, fsync (per the fsync policy, tunable: group commit
+  about once a second), then append the `.idx` record.
+- Recovery on open: read the last `.idx` record; if it points past the end of `.blk` or its
+  header CRC fails, drop index records from the end until one is valid, then truncate `.blk`
+  after it. Then scan `.blk` from the last indexed record and append index records for any
+  complete, CRC-valid records found (index rebuilt from `.blk`). A missing `.idx` is rebuilt
+  entirely. A corrupt record in one tile never prevents opening the database.
+- Reading the state at t (`Series.Chain`): binary-search `.idx` for the last record with
+  `t_end <= t`, walk back to the newest keyframe or snapshot at or before it, and read the
+  whole range in one contiguous `.blk` read.
+
+### 5.2 `palette.bin`
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `TPL3` |
+| 4 | 4 | reserved, 0 |
+| 8 | 2n | entries, u16 RGB565 each; entry 0 is 0 |
+
+Append-only. The entry count is `(size - 8) / 2`; an odd trailing byte is a torn write and
+is truncated on open. A new colour is appended (and fsynced) before any block that uses its
+index.
+
+### 5.3 Terrain payloads
+
+Payloads are zstd frames (one frame per record). Inside, after decompression:
+
+**Delta block** (kind 1), for one tile and one window (or part of one, on early flush): the
+chunks that changed, in increasing block order. For each:
+
+```
+uvarint block            0..255
+uvarint n                number of pixels given, 1..1024
+positions                n == 1024: none (every pixel, in order)
+                         n <= 128:  n uvarints: first position, then (position - previous - 1)
+                         otherwise: a 128-byte bitmap, bit p (byte p>>3, bit p&7) set for each given pixel
+n indices                u8 each, or u16 LE each when the record's wide flag is set
+```
+
+Pixels not given keep their value. A deleted chunk is written as n = 1024 zeros. Writers
+choose positions for the pixels that differ from the committed content; when more than
+512 differ they should write the whole chunk.
+
+**Keyframe** (kind 2): the tile's full state after every earlier record with the same or
+earlier `t_end`: 262,144 indices (512 x 512, row-major), u8 or u16 LE when wide. It carries
+the same `t_start`/`t_len` as the delta it follows.
+
+Keyframe rule (tunable, WP2): write a keyframe when the delta bytes since the last keyframe
+reach 2x the size of that keyframe, and at most every 256 records of chain. The prototype
+measured keyframes as 55% of the bytes at a 256-record cap, so this rule should be tuned
+against the §5 disk target.
+
+Indices refer to the datastore palette (5.2). A record uses the wide flag if any index in it
+is above 255.
+
+### 5.4 Coarse snapshots (WP3)
+
+Kind 3 records in `pyramid/<z>/<x>_<y>` series: a zstd frame of 512 x 512 u16 RGB565 LE.
+`t_start` is the snapshot's effective time, `t_len` 0. Version n of a coarse tile is record
+n-1. (Tunable: WP3 may add delta records between snapshots; then versions count records
+that change content, as at z0.)
+
+### 5.5 Mover windows on disk (WP4)
+
+A `.mvw` file is a single zstd frame whose content is an MVW3 body (7.4). Closed windows
+have kind 1, keyframes kind 2. Because the file is already a zstd frame of the wire body,
+the server can send it unchanged with `Content-Encoding: zstd`. Windows with no rows are not
+written. A day index lists only windows and keyframes that exist.
+
+Live samples (the open window) are kept in memory with a WAL (tunable) and are bounded per
+surface by count.
+
+### 5.6 Overlays on disk (WP4, recommended)
+
+An append-only log of `core.OverlayEvent` records plus a per-tile index of interval
+positions, both rebuildable from the log. The format is WP4's choice; only the API output
+(API.md "overlays") is a contract.
+
+## 6. Version and compatibility rules
+
+- `timeshadedb-v3.json` `version` and every `meta.json` `format_version` are 1. A reader
+  rejects a higher version and never writes to it.
+- Additions that old readers can ignore (new JSON fields, new files) keep the version. Any
+  change to a byte layout in this document bumps it, and a migration (the copy-and-swap
+  generation framework in `migration.go`) converts existing data.
+
+## 7. Wire formats
+
+Bodies below are what HTTP carries after removing `Content-Encoding`. The server compresses
+with zstd when the client accepts it, else gzip, else identity (API.md), so viewers never
+decompress in JavaScript. Reference codecs: `internal/v3/core/wire` (Go) and
+`web/src/api/wire.ts` (TypeScript), tested against `web/fixtures/`.
+
+### 7.1 TSV3 tile
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `TSV3` |
+| 4 | 1 | format: 1 pal8, 2 pal16, 3 rgb565 |
+| 5 | 1 | z, i8 |
+| 6 | 1 | flags: bit 0 live (content of the open window, not a version) |
+| 7 | 1 | reserved, 0 |
+| 8 | 4 | x, i32 |
+| 12 | 4 | y, i32 |
+| 16 | 4 | version u32 (for live tiles: the committed version underneath) |
+| 20 | 4 | palette version u32: smallest palette length that decodes the tile (highest index + 1); 0 for rgb565 |
+| 24 | 2 | width, 512 |
+| 26 | 2 | height, 512 |
+| 28 | 4 | reserved, 0 |
+| 32 | | 262,144 pixels, row-major: u8 index (pal8), u16 LE index (pal16) or u16 LE RGB565 (rgb565) |
+
+z0 tiles are paletted: pal8 when every index is below 256, else pal16. Coarse tiles are
+rgb565. The encoding depends only on the content and the palette order, so the bytes of an
+immutable (datastore, tile, version) URL never change.
+
+### 7.2 TSD3 tile delta (z0)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `TSD3` |
+| 4 | 1 | format: 1 pal8, 2 pal16, 3 rgb565 |
+| 5 | 1 | z, always 0 |
+| 6 | 2 | entry count u16 (0..256) |
+| 8 | 4 | x, i32 |
+| 12 | 4 | y, i32 |
+| 16 | 4 | from version u32 |
+| 20 | 4 | to version u32 |
+| 24 | 4 | palette version u32 (as in TSV3) |
+| 28 | 4 | reserved, 0 |
+| 32 | | entries, block order strictly increasing |
+
+Entry: `u16 block`, `u16 reserved (0)`, then the chunk's 1,024 pixels at version `to`
+(row-major; u8 or u16 LE as the format says). The entries are exactly the chunks whose
+content differs between the two versions (`TerrainStore.ChangedChunks`). Applying them to
+the tile at `from` gives the tile at `to`.
+
+### 7.3 TSP3 palette
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `TSP3` |
+| 4 | 4 | entry count n u32 (the palette version) |
+| 8 | 2n | u16 LE RGB565; entry 0 is 0 |
+
+### 7.4 MVW3 mover window
+
+Used for closed windows, keyframes and the live payload, on the wire and (zstd-framed) on
+disk.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `MVW3` |
+| 4 | 1 | kind: 1 closed window, 2 keyframe, 3 live |
+| 5 | 1 | format version, 1 |
+| 6 | 2 | flags: bit 0 = the tick column holds data |
+| 8 | 8 | start i64 (window start, keyframe time, or live "now") |
+| 16 | 4 | len u32 (window length; 0 for keyframes; trail length for live) |
+| 20 | 4 | number of mover table entries |
+| 24 | 4 | number of rows |
+| 28 | 4 | mover table length in bytes |
+| 32 | | mover table: UTF-8 JSON array of `MoverMeta` objects (`{"id","k","f","name","n"?,"o"?,"c"?}`) |
+| | | then 8 columns, each `u32 byte length` followed by its bytes |
+
+Rows are sorted by (mover entry, t), and (entry, t) is unique. A journey whose meta changes
+inside the window has one entry per meta, with the same `id`. Entries are sorted by
+(`id`, first row time). Per entry, the running values (`t`, tick, x, y, orientation) start
+at (start, 0, 0, 0, 0).
+
+| # | Column | Per | Encoding |
+|---|---|---|---|
+| 1 | counts | entry | uvarint: the entry's number of rows |
+| 2 | dt | row | varint: t - previous t (first row: t - start; negative in keyframes) |
+| 3 | tick | row | varint: tick - previous tick; empty when header bit 0 is clear; rows with flag `no-tick` write 0 and keep the running tick |
+| 4 | x | row | varint: x units - previous x units (1 unit = 1/16 tile); gone rows write 0 and keep the running value |
+| 5 | y | row | same as x |
+| 6 | orientation | row | varint: (o - previous o) as a signed 16-bit difference, o in u16 units (65,536 per turn); gone rows write 0 |
+| 7 | flags | row | 1 byte (below) |
+| 8 | carriages | row with bit 6 | uvarint n, then per carriage: varint (cx - x) units, varint (cy - y) units, uvarint orientation u16 |
+
+Row flags (`core.MoverFlags`; bit 6 exists only on the wire):
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | stop | at rest at this sample |
+| 1 | gone | left this surface or instance; the row has no position |
+| 2 | handoff | on a gone: the journey resumed within 10 s (instance crossing, not an end) |
+| 3 | end-switch | the train's leading end flipped; x, y is the new leading carriage |
+| 4 | no-tick | tick unknown (imported data) |
+| 5 | no-heading | orientation unknown; derive it from the motion |
+| 6 | carriages | the carriage column has a block for this row |
+| 7 | reserved | 0 |
+
+Positions: a train's x, y is its leading carriage centre; carriages list every carriage from
+the leading end. Orientation is Factorio's (0 north, 0.25 east); a train's points from the
+second carriage to the first. Velocity is not stored: viewers derive it from neighbouring
+rows (with ticks when present: `ticks / (60 * speed)` seconds).
+
+Measured on a synthetic train track (1,000 samples, 250-350 ms apart): 8.1 B/sample raw,
+2.1 B/sample after zstd (`wire.TestMoverWindowSizeOnTrainTrack`). The PLAN target is
+6 B/sample stored on the imported data.

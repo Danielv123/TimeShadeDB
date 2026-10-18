@@ -1,0 +1,2 @@
+# Fixtures are compared byte for byte by Go and TypeScript tests: never convert line endings.
+web/fixtures/** -text
