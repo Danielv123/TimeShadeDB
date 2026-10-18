@@ -138,6 +138,10 @@ type DatastoreInfo struct {
 // implements it for every level z <= 0, delegating z0 to a TerrainStore. The HTTP API
 // (WP6) and the static exporter (WP12) only use this interface for reads.
 //
+// Versions effective before the datastore Horizon never change once served: new versions
+// become effective at or after the Horizon, except in offline builds (import, pyramid
+// rebuild) that run before the database is served.
+//
 // Every method returns ErrBadTile for tiles outside the grid or level, ErrUnknownDatastore
 // for unknown datastores and ErrNoTile for valid tiles that hold no data, and must not
 // allocate per-tile state for any of these.

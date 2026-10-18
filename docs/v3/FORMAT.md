@@ -90,6 +90,12 @@ coarse tile when a descendant changed and at least 5 min (z -1), 15 min (z -2) o
 (z <= -3) passed since its last snapshot, and always keep the latest state reachable. The
 reference oracle (`memstore.Pyramid`) snapshots at every change.
 
+Immutability rule for every level: once the server has served anything, a new version may
+only become effective at or after the datastore horizon, so `VersionAt(t)` for t below the
+horizon never changes (API.md caches those `view` answers as immutable). Coarse versions
+with older effective times may only be written by offline builds (import, rebuild) before
+the database is served.
+
 ## 5. On-disk layout
 
 ```
