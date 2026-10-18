@@ -10,5 +10,6 @@ db.tshd/
 /timeshadedb
 timeshadedb.exe
 web/node_modules/
-web/dist/
+web/dist/*
+!web/dist/.keep
 /build/
