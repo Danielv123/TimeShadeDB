@@ -23,7 +23,7 @@ import (
 
 // loadHistory replays the full z0 history of a surface into a reference terrain in
 // 60 s windows (the newest content of each touched chunk per window) and commits it.
-func loadHistory(t *testing.T, s mmSurface) (ter *memstore.Terrain, records, chunks int, hours float64) {
+func loadHistory(t testing.TB, s mmSurface) (ter *memstore.Terrain, records, chunks int, hours float64) {
 	ctx := context.Background()
 	ter = memstore.NewTerrain()
 	ups, records, chunks, hours := historyUpdates(t, s)
@@ -38,7 +38,7 @@ func loadHistory(t *testing.T, s mmSurface) (ter *memstore.Terrain, records, chu
 
 // historyUpdates decodes a surface's z0 history into chunk updates, one per touched
 // chunk and 60 s window (its content at the end of the window), sorted by time.
-func historyUpdates(t *testing.T, s mmSurface) (all []core.ChunkUpdate, records, chunks int, hours float64) {
+func historyUpdates(t testing.TB, s mmSurface) (all []core.ChunkUpdate, records, chunks int, hours float64) {
 	seen := map[[3]int32]bool{}
 	var first, last int64 = math.MaxInt64, math.MinInt64
 	for _, a := range listAreas(t, filepath.Join(s.dir, "0")) {
@@ -249,21 +249,27 @@ func TestIllisisHistory(t *testing.T) {
 	t.Logf("ALL: pyramid %d B in %d records = %.3f B/chunk-hour", allBytes, allRecs, float64(allBytes)/allChunkHours)
 }
 
-// TestIllisisTuning rebuilds nauvis with several option sets and reports size and cold
-// read cost. Set TSDB_TUNE=1 to run it.
+// TestIllisisTuning rebuilds every surface with several option sets and reports the
+// stored size over the whole map, nauvis alone, and the cold historical read cost on
+// nauvis. Set TSDB_TUNE=1 to run it.
 func TestIllisisTuning(t *testing.T) {
 	root := testdataRoot(t)
 	if os.Getenv("TSDB_TUNE") == "" {
 		t.Skip("TSDB_TUNE not set")
 	}
 	ctx := context.Background()
-	var s mmSurface
-	for _, c := range listSurfaces(t, root) {
-		if c.key.Surface == "nauvis" {
-			s = c
+	type surf struct {
+		s          mmSurface
+		ter        *memstore.Terrain
+		chunkHours float64
+	}
+	var surfs []surf
+	for _, s := range listSurfaces(t, root) {
+		ter, records, chunks, hours := loadHistory(t, s)
+		if records > 0 {
+			surfs = append(surfs, surf{s, ter, float64(chunks) * hours})
 		}
 	}
-	ter, _, chunks, hours := loadHistory(t, s)
 	iv := func(mins ...int) []core.TimeMs {
 		var out []core.TimeMs
 		for _, m := range mins {
@@ -275,24 +281,35 @@ func TestIllisisTuning(t *testing.T) {
 		name string
 		opt  Options
 	}{
-		{"5/15/60 r4 c128", Options{SnapshotRatio: 4, MaxChain: 128}},
-		{"5/15/60 r16 c256", Options{SnapshotRatio: 16, MaxChain: 256}},
-		{"5/15/60 r32 c512", Options{SnapshotRatio: 32, MaxChain: 512}},
-		{"5/15/60 r16 c256 zstd-best", Options{SnapshotRatio: 16, MaxChain: 256, ZstdLevel: 4}},
-		{"10/30/120 r16 c256", Options{Intervals: iv(10, 30, 120), SnapshotRatio: 16, MaxChain: 256}},
+		{"5/15/60 r16 c256", Options{Intervals: iv(5, 15, 60), SnapshotRatio: 16, MaxChain: 256}},
+		{"5/15/60 r32 c512", Options{Intervals: iv(5, 15, 60), SnapshotRatio: 32, MaxChain: 512}},
 		{"15/60/240 r16 c256", Options{Intervals: iv(15, 60, 240), SnapshotRatio: 16, MaxChain: 256}},
-		{"60/60/240 r16 c256", Options{Intervals: iv(60, 60, 240), SnapshotRatio: 16, MaxChain: 256}},
+		{"15/60/240 r32 c512", Options{Intervals: iv(15, 60, 240), SnapshotRatio: 32, MaxChain: 512}},
+		{"15/60/240 r64 c1024", Options{Intervals: iv(15, 60, 240), SnapshotRatio: 64, MaxChain: 1024}},
+		{"30/60/240 r32 c512", Options{Intervals: iv(30, 60, 240), SnapshotRatio: 32, MaxChain: 512}},
+		{"15/60/240/1440 r32 c512", Options{Intervals: iv(15, 60, 240, 240, 1440), SnapshotRatio: 32, MaxChain: 512}},
 	} {
-		ss := memstore.NewSeriesStore()
-		p := newPyramid(t, ter, ss, c.opt)
-		start := time.Now()
-		st := must[BuildStats](t)(p.Rebuild(ctx, s.key))
-		dur := time.Since(start)
-		stored, recs, perLevel := storedBytes(t, ss, s.key.ID()+"/pyramid/")
-		cold := coldHistorical(t, p, s.key, 200)
-		t.Logf("%-24s %8d B %5d rec %.3f B/chunk-hour (z-1 %d, z-2 %d, snapshots %d) build %v; cold hist read p50 %v p95 %v",
-			c.name, stored, recs, float64(stored)/(float64(chunks)*hours), perLevel[-1], perLevel[-2], st.SnapshotBytes,
-			dur.Round(time.Millisecond), pct(cold, 0.5), pct(cold, 0.95))
+		var all, nauvis int64
+		var allCH, nauvisCH float64
+		var cold []time.Duration
+		var dur time.Duration
+		for _, sf := range surfs {
+			ss := memstore.NewSeriesStore()
+			p := newPyramid(t, sf.ter, ss, c.opt)
+			start := time.Now()
+			must[BuildStats](t)(p.Rebuild(ctx, sf.s.key))
+			dur += time.Since(start)
+			stored, _, _ := storedBytes(t, ss, sf.s.key.ID()+"/pyramid/")
+			all += stored
+			allCH += sf.chunkHours
+			if sf.s.key.Surface == "nauvis" {
+				nauvis, nauvisCH = stored, sf.chunkHours
+				cold = coldHistorical(t, p, sf.s.key, 200)
+			}
+			p.Close()
+		}
+		t.Logf("%-24s all %8d B = %.3f B/chunk-hour; nauvis %8d B = %.3f; build %v; nauvis cold hist read p50 %v p95 %v",
+			c.name, all, float64(all)/allCH, nauvis, float64(nauvis)/nauvisCH, dur.Round(time.Millisecond), pct(cold, 0.5), pct(cold, 0.95))
 	}
 }
 

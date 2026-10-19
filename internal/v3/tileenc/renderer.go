@@ -268,13 +268,38 @@ func (r *Renderer) Tile(ctx context.Context, ds core.DatastoreKey, tile core.Til
 	})
 }
 
-// LiveTile returns the TSV3 body of a z0 tile's live content at t (API.md
-// "tile/{ds}/0/{x}/{y}/live.bin"): the committed content plus the newest open-window
-// update per chunk when live content applies at t, with the live flag set and the
-// committed version underneath. It is never cached.
+// LiveSource is a TileSource that also serves live content at every level (the
+// pyramid: coarse tiles whose z0 descendants changed since their latest version).
+type LiveSource interface {
+	ReadTile(ctx context.Context, ds core.DatastoreKey, tile core.TileCoord, t core.TimeMs, live bool) (*core.TileImage, core.TileState, error)
+}
+
+// LiveTile returns the TSV3 body of a tile's live content at t (API.md
+// "tile/{ds}/{z}/{x}/{y}/live.bin") with the live flag set and the committed version
+// underneath. At z0 it is the committed content plus the newest open-window update per
+// chunk when live content applies at t (terrain ReadTile). At z < 0 it needs a source
+// that implements LiveSource: the average of the committed z0 content not yet in a
+// coarse version, or the version effective at t when nothing is pending. It is never
+// cached.
 func (r *Renderer) LiveTile(ctx context.Context, ds core.DatastoreKey, tile core.TileCoord, t core.TimeMs, enc Encoding) (Body, core.TileState, error) {
-	if err := checkTile(tile); err != nil || tile.Z != 0 {
-		return Body{}, core.TileState{}, fmt.Errorf("%w: live tiles are z0 only: %v", core.ErrBadTile, tile)
+	if err := checkTile(tile); err != nil {
+		return Body{}, core.TileState{}, err
+	}
+	if tile.Z < 0 {
+		ls, ok := r.src.(LiveSource)
+		if !ok {
+			return Body{}, core.TileState{}, fmt.Errorf("%w: no live source for coarse tiles: %v", core.ErrBadTile, tile)
+		}
+		im, st, err := ls.ReadTile(ctx, ds, tile, t, true)
+		if err != nil {
+			return Body{}, st, err
+		}
+		raw, err := EncodeTile(wire.TileHeader{Z: tile.Z, X: tile.X, Y: tile.Y, Version: st.Version, Live: true}, im, nil)
+		if err != nil {
+			return Body{}, st, err
+		}
+		b, err := r.coarse.Compress(enc, raw)
+		return Body{Data: b, Encoding: enc}, st, err
 	}
 	im, st, err := r.terrain.ReadTile(ctx, ds, tile, t, true)
 	if err != nil {

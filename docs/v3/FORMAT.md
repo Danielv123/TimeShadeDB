@@ -86,18 +86,28 @@ The full rules are on `core.TerrainStore`. In short:
 
 Coarse levels (z < 0, WP3) have their own versions per coarse tile: each record the
 pyramid writes is the next version. Recommended schedule (tunable): write a version of a
-coarse tile when a descendant changed, at most once per aligned interval of 5 min (z -1),
-15 min (z -2) or 60 min (z <= -3), and always keep the latest state reachable. The
-reference oracle (`memstore.Pyramid`) writes a version at every change.
+coarse tile when a descendant changed, at most once per aligned interval of 15 min (z -1),
+60 min (z -2) or 240 min (z <= -3), and always keep the latest state reachable. The
+reference oracle (`memstore.Pyramid`) writes a version at every change. (The plan's 5/15/60
+min schedule stored about 2.3 B per chunk-hour over the illisis test map, which with z0
+exceeds the PLAN.md §5 disk target; see 5.4.)
 
 As implemented in `internal/v3/pyramid` (WP3): a version is built for time T and its
 content is exactly the 2 x 2 average of the committed z0 content at T, so it is
 effective at T. The live server builds at T = the datastore horizon after each commit;
-a level is due when a multiple of its interval lies between the previous build pass and
-T (with a commit every window: when T is a multiple). Each interval is a multiple of the
-finer one, so when a tile is built every finer level is current at T. A flush (shutdown,
-import) builds every pending tile at the horizon. An offline rebuild of an imported
-history produces the same versions as a live server that committed every window.
+a level is due when a multiple of its interval lies between the previous successful build
+pass and T (with a commit every window: when T is a multiple). Each interval is a multiple
+of the finer one, so when a tile is built every finer level is current at T. A tile
+without any version is built at the first build after a z0 descendant gets data, whatever
+the schedule, so a new surface or area appears at every level within one commit. A flush
+(shutdown, import) builds every pending tile at the horizon. An offline rebuild of an
+imported history produces the same versions as a live server that committed every window.
+A version is synced to disk before it is visible to readers.
+
+Between versions, a coarse tile whose z0 descendants changed has a **live latest**: the
+2 x 2 average of the committed z0 content as of the last build pass (not of open windows).
+It is not stored and has no version; at t >= the horizon of the last pass the tile reports
+`live` and a live sequence (like z0 rule 6) and `live.bin` serves it (API.md).
 
 Immutability rule for every level: once the server has served anything, a new version may
 only become effective at or after the datastore horizon, so `VersionAt(t)` for t below the
@@ -238,12 +248,17 @@ nothing). Two kinds:
   `(32*(b & 15) + (p & 31), 32*(b >> 4) + (p >> 5))`), except that the n values are
   u16 LE RGB565 colours, not palette indices.
 
-Snapshot rule (tunable; defaults measured on the illisis nauvis history): write a
-snapshot instead of a delta when more than half the pixels changed, after 256 deltas, or
-when the delta bytes since the last snapshot would exceed 16 times that snapshot. On the
-illisis nauvis history (7,483 chunks, 169 h) the pyramid z -1 to z -10 stored 2.49 MB,
-1.97 B per chunk-hour including record headers and index, with cold reads of any
-version at about 1 ms (`internal/v3/pyramid` TestIllisisHistory, TestIllisisTuning).
+Snapshot rule (tunable; defaults measured on the illisis test map): write a snapshot
+instead of a delta when more than half the pixels changed, after 512 deltas, or when the
+delta bytes since the last snapshot would exceed 32 times that snapshot. With the 15/60/240
+min schedule, an offline rebuild of the illisis history (all 12 surfaces) stores 3.02 MB,
+1.96 B per chunk-hour including record headers and index (nauvis alone 1.50), with cold
+reads of any historical version at p95 about 1.1 ms (`internal/v3/pyramid`
+TestIllisisHistory, TestIllisisTuning). The 5/15/60 schedule stored 2.29 B per chunk-hour.
+Replayed live through WP2's file-backed terrain store (a commit before every batch of
+1,024 updates, `Update` after each commit, a flush at the end), the whole map stored z0 at
+3.09 and the pyramid at 1.86 B per chunk-hour, 4.94 in total (`internal/v3/pyramid`
+TestWholeMapFileStores, build tag `integration`).
 
 ### 5.5 Mover windows on disk (WP4)
 

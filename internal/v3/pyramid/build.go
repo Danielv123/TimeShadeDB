@@ -21,6 +21,8 @@ type BuildStats struct {
 	Snapshots int `json:"snapshots"`
 	Deltas    int `json:"deltas"`
 	Unchanged int `json:"unchanged"`
+	// Syncs counts series synced before their new versions were published.
+	Syncs int `json:"syncs"`
 	// Bytes is the payload bytes appended (excluding series headers and index);
 	// SnapshotBytes the part of it in snapshots.
 	Bytes         int64 `json:"bytes"`
@@ -34,14 +36,18 @@ func (s *BuildStats) add(o BuildStats) {
 	s.Snapshots += o.Snapshots
 	s.Deltas += o.Deltas
 	s.Unchanged += o.Unchanged
+	s.Syncs += o.Syncs
 	s.Bytes += o.Bytes
 	s.SnapshotBytes += o.SnapshotBytes
 }
 
 // Update builds the coarse levels that are due, for every datastore, at T = the
-// datastore's horizon (live mode). Call it after each terrain Commit; it is cheap when
+// datastore's horizon (live mode), and refreshes the live latest of every coarse tile
+// whose z0 descendants changed. Call it after each terrain Commit; it is cheap when
 // nothing changed (O(z0 tiles) bookkeeping, no pixels read). Coarse answers are final
-// only below BuiltUpTo, which Update advances to the horizon it read.
+// only below BuiltUpTo, which Update advances to the horizon it read when its build
+// pass succeeds. A datastore whose pass fails does not stop the others; the next Update
+// retries it.
 func (p *Pyramid) Update(ctx context.Context) (BuildStats, error) {
 	return p.update(ctx, false)
 }
@@ -62,37 +68,49 @@ func (p *Pyramid) update(ctx context.Context, force bool) (BuildStats, error) {
 	if err != nil {
 		return total, err
 	}
+	var errs []error
 	for _, info := range infos {
 		if info.Tiles == 0 || info.Horizon == 0 {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
 		d, err := p.ensureDS(ctx, info.Key)
 		if err != nil {
-			return total, err
+			errs = append(errs, err)
+			continue
 		}
 		tiles, err := p.terrain.ListTiles(ctx, info.Key, 0)
 		if err != nil {
-			return total, err
+			errs = append(errs, err)
+			continue
 		}
 		for _, ti := range tiles {
 			if ti.Version > 0 {
 				p.propagate(d, ti.Tile, ti.LastT)
 			}
 		}
-		T, prev := info.Horizon, d.prevT
+		T, prev := info.Horizon, d.builtT
+		d.mu.Lock()
+		d.seenT = max(d.seenT, T)
+		d.mu.Unlock()
 		if prev == math.MinInt64 || prev >= T {
 			prev = T - 1 // first pass (or no progress): due only at an exact multiple
 		}
 		st, err := p.pass(ctx, d, T, prev, force)
-		d.mu.Lock()
-		d.prevT = max(d.prevT, T)
-		d.mu.Unlock()
 		total.add(st)
 		if err != nil {
-			return total, err
+			// Keep builtT: the levels due in this pass stay due for the next Update.
+			errs = append(errs, err)
+			continue
 		}
+		d.mu.Lock()
+		d.builtT = max(d.builtT, T)
+		d.mu.Unlock()
 	}
-	return total, nil
+	return total, errors.Join(errs...)
 }
 
 // Rebuild builds the coarse history of one datastore from its whole z0 history, as if
@@ -121,7 +139,7 @@ func (p *Pyramid) Rebuild(ctx context.Context, key core.DatastoreKey) (BuildStat
 		return total, err
 	}
 	for _, ct := range d.tiles {
-		if _, n, _, _ := ct.state(); n > 0 {
+		if ct.bn > 0 {
 			return total, fmt.Errorf("%w: %v", ErrAlreadyBuilt, key)
 		}
 	}
@@ -154,8 +172,13 @@ func (p *Pyramid) Rebuild(ctx context.Context, key core.DatastoreKey) (BuildStat
 			h.times[i] = pt.T
 			// Replay what Update after every window's commit would do: a dirty tile
 			// at level k is built at the first multiple of its interval at or after
-			// the change. Passes at those instants (below the horizon; the final
-			// flush covers the rest) give the same versions.
+			// the change, and a z0 tile's first version creates its coarse ancestors
+			// at once (tiles without versions are always due). Passes at those
+			// instants (below the horizon; the final flush covers the rest) give the
+			// same versions.
+			if i == 0 {
+				passSet[pt.T] = struct{}{}
+			}
 			for k := 1; k <= p.levels(); k++ {
 				iv := p.interval(k)
 				if k > 1 && iv == p.interval(k-1) {
@@ -200,15 +223,19 @@ func (p *Pyramid) Rebuild(ctx context.Context, key core.DatastoreKey) (BuildStat
 	}
 	advance(horizon)
 	st, err := p.pass(ctx, d, horizon, horizon-1, true)
-	d.mu.Lock()
-	d.prevT = max(d.prevT, horizon)
-	d.mu.Unlock()
 	total.add(st)
-	return total, err
+	if err != nil {
+		return total, err
+	}
+	d.mu.Lock()
+	d.builtT = max(d.builtT, horizon)
+	d.seenT = max(d.seenT, horizon)
+	d.mu.Unlock()
+	return total, nil
 }
 
 // propagate records that z0 tile has versions up to time lastT and marks every coarse
-// ancestor whose content may have changed as dirty.
+// ancestor whose content may have changed as dirty (and its live latest as changed).
 func (p *Pyramid) propagate(d *dsState, tile core.TileCoord, lastT core.TimeMs) {
 	if seen, ok := d.z0seen[tile]; ok && seen >= lastT {
 		return
@@ -220,15 +247,20 @@ func (p *Pyramid) propagate(d *dsState, tile core.TileCoord, lastT core.TimeMs) 
 		ct := d.tiles[a]
 		d.mu.RUnlock()
 		if ct == nil {
-			ct = &ctile{coord: a, descT: math.MinInt64, cleanT: math.MinInt64, firstT: 0, lastT: math.MinInt64}
+			ct = newTile(a)
 			d.mu.Lock()
 			d.tiles[a] = ct
 			d.mu.Unlock()
 		}
+		ct.mu.Lock()
 		if lastT > ct.descT {
 			ct.descT = lastT
+			d.liveSeq++
+			ct.liveSeq = d.liveSeq
 		}
-		if _, n, _, last := ct.state(); n == 0 || ct.descT > max(last, ct.cleanT) {
+		dirty := ct.bn == 0 || ct.descT > max(ct.blast, ct.cleanT)
+		ct.mu.Unlock()
+		if dirty {
 			d.dirty[a] = struct{}{}
 		}
 	}
@@ -237,42 +269,141 @@ func (p *Pyramid) propagate(d *dsState, tile core.TileCoord, lastT core.TimeMs) 
 // pass builds, at time T, every dirty tile of every level that is due: level k = -z is
 // due when a multiple of its interval lies in (prev, T], or always with force. Since
 // each interval is a multiple of the finer one, levels are due from k = 1 up to some k.
+// Tiles without any version are built at every pass once their children are current.
+// Each level's new versions are synced before they are published, and before the next
+// level reads them.
 func (p *Pyramid) pass(ctx context.Context, d *dsState, T, prev core.TimeMs, force bool) (BuildStats, error) {
 	if len(d.dirty) == 0 {
 		return BuildStats{}, nil
 	}
 	st := BuildStats{Passes: 1}
+	due := make([]bool, p.levels()+1)
 	for k := 1; k <= p.levels(); k++ {
 		iv := int64(p.interval(k))
-		if !force && core.FloorDiv(int64(T), iv) <= core.FloorDiv(int64(prev), iv) {
-			break
+		due[k] = force || core.FloorDiv(int64(T), iv) > core.FloorDiv(int64(prev), iv)
+	}
+	byLevel := make([][]*ctile, p.levels()+1)
+	d.mu.RLock()
+	for c := range d.dirty {
+		k := -int(c.Z)
+		if ct := d.tiles[c]; ct != nil && (due[k] || ct.bn == 0) {
+			byLevel[k] = append(byLevel[k], ct)
 		}
-		z := int8(-k)
-		var todo []core.TileCoord
-		for c := range d.dirty {
-			if c.Z == z {
-				todo = append(todo, c)
-			}
+	}
+	d.mu.RUnlock()
+	for k := 1; k <= p.levels(); k++ {
+		todo := byLevel[k]
+		if !due[k] {
+			// Only new tiles; their children must be current at T (they normally are:
+			// a new tile's children are new too and were built just before).
+			todo = slices.DeleteFunc(todo, func(ct *ctile) bool { return !p.childrenCurrent(d, ct.coord) })
 		}
-		slices.SortFunc(todo, func(a, b core.TileCoord) int {
-			if a.Y != b.Y {
-				return int(a.Y) - int(b.Y)
+		if len(todo) == 0 {
+			continue
+		}
+		slices.SortFunc(todo, func(a, b *ctile) int {
+			if a.coord.Y != b.coord.Y {
+				return int(a.coord.Y) - int(b.coord.Y)
 			}
-			return int(a.X) - int(b.X)
+			return int(a.coord.X) - int(b.coord.X)
 		})
-		for _, c := range todo {
-			if err := ctx.Err(); err != nil {
-				return st, err
+		var lv levelBuild
+		var err error
+		for _, ct := range todo {
+			if err = ctx.Err(); err != nil {
+				break
 			}
-			d.mu.RLock()
-			ct := d.tiles[c]
-			d.mu.RUnlock()
-			if err := p.buildTile(ctx, d, ct, T, &st); err != nil {
-				return st, fmt.Errorf("pyramid: build %v %v at %v: %w", d.key, c, T, err)
+			if err = p.buildTile(ctx, d, ct, T, &st, &lv); err != nil {
+				err = fmt.Errorf("pyramid: build %v %v at %v: %w", d.key, ct.coord, T, err)
+				break
 			}
+		}
+		if e := p.commitLevel(ctx, d, &lv, &st); err == nil && e != nil {
+			err = fmt.Errorf("pyramid: sync %v level %d at %v: %w", d.key, -k, T, e)
+		}
+		if err != nil {
+			return st, err
 		}
 	}
 	return st, nil
+}
+
+// childrenCurrent reports whether every coarse child of tile is built and published.
+func (p *Pyramid) childrenCurrent(d *dsState, tile core.TileCoord) bool {
+	if tile.Z == -1 {
+		return true
+	}
+	for _, c := range tile.Children() {
+		d.mu.RLock()
+		child := d.tiles[c]
+		d.mu.RUnlock()
+		if child == nil {
+			continue
+		}
+		if _, dirty := d.dirty[c]; dirty || child.bn != child.n {
+			return false
+		}
+	}
+	return true
+}
+
+// levelBuild collects the tiles of one level touched by a pass: their open series and
+// the newest image appended, published after the sync.
+type levelBuild struct {
+	entries []*levelEntry
+}
+
+type levelEntry struct {
+	ct *ctile
+	sr core.Series
+	im *core.TileImage // newest appended version's content, or nil
+	v  core.Version
+}
+
+func (lv *levelBuild) add(ct *ctile) *levelEntry {
+	e := &levelEntry{ct: ct}
+	lv.entries = append(lv.entries, e)
+	return e
+}
+
+// commitLevel syncs every series that has unpublished versions, then publishes them
+// (cache first, then the tile's version count), and closes every handle. A tile whose
+// sync fails stays dirty, so a later pass syncs and publishes it.
+func (p *Pyramid) commitLevel(ctx context.Context, d *dsState, lv *levelBuild, st *BuildStats) error {
+	var errs []error
+	for _, e := range lv.entries {
+		ct := e.ct
+		if ct.bn != ct.n {
+			err := func() error {
+				if e.sr == nil {
+					sr, err := p.series.Open(ctx, seriesName(d.id, ct.coord), true)
+					if err != nil {
+						return err
+					}
+					e.sr = sr
+				}
+				return e.sr.Sync()
+			}()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%v: %w", ct.coord, err))
+				d.dirty[ct.coord] = struct{}{}
+			} else {
+				st.Syncs++
+				if e.im != nil {
+					p.cache.Put(imgKey{d: d, tile: ct.coord, v: e.v}, e.im)
+				}
+				ct.mu.Lock()
+				ct.n, ct.firstT, ct.lastT = ct.bn, ct.bfirstT, ct.blast
+				ct.mu.Unlock()
+			}
+		}
+		if e.sr != nil {
+			if err := e.sr.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("%v: %w", ct.coord, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // z0At returns the committed z0 content of tile at time T, or nil if it holds nothing.
@@ -288,12 +419,41 @@ func (p *Pyramid) z0At(ctx context.Context, key core.DatastoreKey, tile core.Til
 }
 
 // buildTile computes a coarse tile's content at T from its children and appends a new
-// version if it changed.
-func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.TimeMs, st *BuildStats) error {
-	if _, n, _, lastT := ct.state(); n > 0 && T <= lastT {
+// version if it changed. The version is published by commitLevel after the sync.
+func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.TimeMs, st *BuildStats, lv *levelBuild) error {
+	var e *levelEntry
+	open := func() (core.Series, error) {
+		if e != nil && e.sr != nil {
+			return e.sr, nil
+		}
+		sr, err := p.series.Open(ctx, seriesName(d.id, ct.coord), true)
+		if err != nil {
+			return nil, err
+		}
+		if e == nil {
+			e = lv.add(ct)
+		}
+		e.sr = sr
+		if ct.suspect || sr.Len() != ct.bn {
+			if err := loadState(sr, ct); err != nil {
+				return nil, err
+			}
+			ct.suspect = false
+		}
+		return sr, nil
+	}
+	if ct.suspect {
+		if _, err := open(); err != nil {
+			return err
+		}
+	}
+	if ct.bn > 0 && T <= ct.blast {
 		// Already built for T (the z0 content at T is final), or T went backwards:
 		// nothing new can be said about this instant. The tile stays dirty if z0 holds
 		// newer versions (an early-flushed window) and is built at a later T.
+		if ct.bn != ct.n && e == nil {
+			lv.add(ct)
+		}
 		return nil
 	}
 	var kids [4]*core.TileImage
@@ -306,8 +466,8 @@ func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.T
 			child := d.tiles[c]
 			d.mu.RUnlock()
 			if child != nil {
-				if _, n, _, _ := child.state(); n > 0 {
-					kids[i], err = p.read(ctx, d, child, core.Version(n))
+				if n := child.view().n; n > 0 {
+					kids[i], err = p.read(ctx, d, c, nil, core.Version(n))
 				}
 			}
 		}
@@ -318,30 +478,38 @@ func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.T
 	next := downsample(kids)
 	st.Built++
 
-	sr, n, _, _ := ct.state()
 	var prev *core.TileImage
-	if n > 0 {
-		var err error
-		if prev, err = p.read(ctx, d, ct, core.Version(n)); err != nil {
-			return err
+	if ct.bn > 0 {
+		var ok bool
+		if prev, ok = p.cache.Get(imgKey{d: d, tile: ct.coord, v: core.Version(ct.bn)}); !ok {
+			sr, err := open()
+			if err != nil {
+				return err
+			}
+			if prev, err = p.read(ctx, d, ct.coord, sr, core.Version(ct.bn)); err != nil {
+				return err
+			}
 		}
 		if prev.Equal(next) {
+			ct.mu.Lock()
 			ct.cleanT = T
+			ct.mu.Unlock()
 			if ct.descT <= T {
 				delete(d.dirty, ct.coord)
+			}
+			if ct.bn != ct.n && e == nil {
+				lv.add(ct) // staged versions from a failed sync: publish them now
 			}
 			st.Unchanged++
 			return nil
 		}
 	}
-	if sr == nil {
-		var err error
-		if sr, err = p.series.Open(ctx, seriesName(d.id, ct.coord), true); err != nil {
-			return err
-		}
-		ct.mu.Lock()
-		ct.sr = sr
-		ct.mu.Unlock()
+	sr, err := open()
+	if err != nil {
+		return err
+	}
+	if ct.bn > 0 && T <= ct.blast {
+		return nil // the reload found versions at or after T
 	}
 
 	rec := core.Record{RecordMeta: core.RecordMeta{TStart: T, TLen: 0}}
@@ -364,10 +532,12 @@ func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.T
 	rec.Payload = payload
 	seq, err := sr.Append(ctx, rec)
 	if err != nil {
+		ct.suspect = true
 		return err
 	}
-	if seq != n {
-		return fmt.Errorf("series %s appended record %d, expected %d", seriesName(d.id, ct.coord), seq, n)
+	if seq != ct.bn {
+		ct.suspect = true
+		return fmt.Errorf("series %s appended record %d, expected %d", seriesName(d.id, ct.coord), seq, ct.bn)
 	}
 	if rec.Kind == core.RecordSnapshot {
 		ct.sinceBase, ct.deltaBytes, ct.baseBytes = 0, 0, int64(len(payload))
@@ -380,15 +550,12 @@ func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.T
 	}
 	st.Versions++
 	st.Bytes += int64(len(payload))
-	p.cache.Put(imgKey{d: d, tile: ct.coord, v: core.Version(n + 1)}, next)
-
-	ct.mu.Lock()
-	ct.n = n + 1
-	ct.lastT = T
-	if n == 0 {
-		ct.firstT = T
+	ct.bn++
+	ct.blast = T
+	if ct.bn == 1 {
+		ct.bfirstT = T
 	}
-	ct.mu.Unlock()
+	e.im, e.v = next, core.Version(ct.bn)
 	if ct.descT <= T {
 		delete(d.dirty, ct.coord)
 	}

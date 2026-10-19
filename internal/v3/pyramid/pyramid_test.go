@@ -156,7 +156,7 @@ func genHistory(seed int64, nWindows int) history {
 
 // replayLive applies the history window by window, committing every window and running
 // Update after each commit (a live server).
-func replayLive(t testing.TB, ter *memstore.Terrain, p *Pyramid, h history, from int) {
+func replayLive(t testing.TB, ter core.TerrainStore, p *Pyramid, h history, from int) {
 	ctx := context.Background()
 	for w := from; w < len(h.windows); w++ {
 		must[core.ApplyResult](t)(ter.Apply(ctx, h.windows[w]))
@@ -203,7 +203,7 @@ func expectAt(t testing.TB, ter core.TerrainStore, T core.TimeMs, minZ int8) map
 
 // checkVersions verifies every coarse version against the z0 content at its effective
 // time, VersionAt around each version, and the per-level spacing.
-func checkVersions(t *testing.T, ter *memstore.Terrain, p *Pyramid, minZ int8, intervals []core.TimeMs) int {
+func checkVersions(t *testing.T, ter core.TerrainStore, p *Pyramid, minZ int8, intervals []core.TimeMs) int {
 	t.Helper()
 	ctx := context.Background()
 	cache := map[core.TimeMs]map[core.TileCoord]*core.TileImage{}
@@ -334,14 +334,18 @@ func TestLiveMatchesZ0AtEveryVersion(t *testing.T) {
 func checkChains(t *testing.T, p *Pyramid, minZ int8, maxChain int) {
 	t.Helper()
 	if maxChain == 0 {
-		maxChain = 256
+		maxChain = 512
 	}
 	p.mu.RLock()
 	d := p.ds[ds]
 	p.mu.RUnlock()
 	snaps, deltas := 0, 0
 	for _, ct := range d.tiles {
-		sr, n, _, _ := ct.state()
+		n := ct.view().n
+		if n == 0 {
+			continue
+		}
+		sr := must[core.Series](t)(p.series.Open(context.Background(), seriesName(d.id, ct.coord), false))
 		run := 0
 		for s := uint64(0); s < n; s++ {
 			m := must[core.RecordMeta](t)(sr.Meta(s))
@@ -362,6 +366,7 @@ func checkChains(t *testing.T, p *Pyramid, minZ int8, maxChain int) {
 				t.Fatalf("%v: %d deltas after a snapshot", ct.coord, run)
 			}
 		}
+		sr.Close()
 	}
 	t.Logf("%d snapshots, %d deltas", snaps, deltas)
 	if deltas == 0 {

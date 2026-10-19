@@ -366,6 +366,25 @@ func TestRenderer(t *testing.T) {
 		t.Fatalf("live tile: %v %+v %+v", err, lh, lst)
 	}
 
+	// Coarse live tiles need a LiveSource; the reference oracle is not one.
+	if _, _, err := r.LiveTile(ctx, ds, core.TileCoord{Z: -1}, 1<<40, Identity); !errors.Is(err, core.ErrBadTile) {
+		t.Fatalf("coarse live tile without a live source err = %v", err)
+	}
+	lr, err := NewRenderer(liveOracle{pyr}, ter, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr.Close()
+	cl, cst, err := lr.LiveTile(ctx, ds, core.TileCoord{Z: -1}, 1<<40, Zstd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cim, err := wire.DecodeTile(decompress(t, cl), nil)
+	wantC, _ := pyr.ReadVersion(ctx, ds, core.TileCoord{Z: -1}, cst.Version)
+	if err != nil || !ch.Live || ch.Z != -1 || ch.Version != cst.Version || !cst.Live || !cim.Equal(wantC) {
+		t.Fatalf("coarse live tile: %v %+v %+v", err, ch, cst)
+	}
+
 	// PNG decodes to the same colours (alpha 0 for uncharted).
 	pngb, err := r.PNG(ctx, ds, tile, 2)
 	if err != nil {
@@ -519,4 +538,18 @@ func TestRendererHostile(t *testing.T) {
 	if r.CacheStats().Entries != 0 || len(r.flights) != 0 {
 		t.Fatal("errors left state behind")
 	}
+}
+
+// liveOracle adds a LiveSource to the reference pyramid: its live content is the
+// latest version, flagged live.
+type liveOracle struct{ core.TileSource }
+
+func (o liveOracle) ReadTile(ctx context.Context, ds core.DatastoreKey, tile core.TileCoord, t core.TimeMs, live bool) (*core.TileImage, core.TileState, error) {
+	st, err := o.VersionAt(ctx, ds, tile, t)
+	if err != nil {
+		return nil, st, err
+	}
+	im, err := o.ReadVersion(ctx, ds, tile, st.Version)
+	st.Live, st.LiveSeq = live, 1
+	return im, st, err
 }
