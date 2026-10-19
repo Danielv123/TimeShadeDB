@@ -620,7 +620,6 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
       // Possibly an instance crossing whose resume has not arrived: hold at the last position.
       extrapolate(tr, before, t, Math.min(horizon, s[k].t), s[k].t, out);
       out.mode = "hold";
-      out.moving = true;
       out.vx = 0;
       out.vy = 0;
     }
@@ -639,14 +638,12 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
     }
     // Never towards a gone: run on (bounded) until it.
     extrapolate(tr, k, t, Math.min(horizon, next.t), next.t, out);
-    out.moving = true;
     return out;
   }
   if (!linked(tr, k)) {
     // A data gap or an end switch: hold until the next sample (it is known, so running on
     // along the old velocity would only have to jump back).
     extrapolate(tr, k, t, -Infinity, s[k].t, out);
-    out.moving = true;
     return out;
   }
   interpolate(tr, k, k + 1, t, out, false);
@@ -663,7 +660,6 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
 function bridge(tr: Track, a: number, b: number, t: number, out: Head): void {
   interpolate(tr, a, b, t, out, motionConfig.bridge === "line");
   out.mode = "bridge";
-  out.moving = true;
 }
 
 function pushHermite(tr: Track, k: number, j: number, u0: number, poly: Polyline, step: number, t = NaN): void {

@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
 const { TileIntervals, openAt } = await import("./intervals.ts");
-const { OverlayFeed, MAX_VIEW_TILES } = await import("./feed.ts");
+const { OverlayFeed, MAX_VIEW_TILES, RETRY_MS } = await import("./feed.ts");
 const { iconIndex, recipeIcon } = await import("./icons.ts");
 
 const fixture = JSON.parse(readFileSync(new URL("../../fixtures/overlays_0_0.json", import.meta.url), "utf8"));
@@ -75,4 +75,41 @@ test("icon index maps virtual signals and finds recipe icons", () => {
   assert.equal(recipeIcon(idx, "water"), "fluid/water");
   assert.equal(recipeIcon(idx, "nothing"), undefined);
   assert.equal(recipeIcon(undefined, "water"), undefined);
+});
+
+test("the feed retries failed tiles after a backoff, also in history; missing tiles are answers", async () => {
+  const calls: string[] = [];
+  let clock = 0;
+  let down = true;
+  const src: any = {
+    async overlays(ds: string, x: number, y: number) {
+      calls.push(`${x},${y}`);
+      if (x !== 0) {
+        throw Object.assign(new Error("no tile"), { status: 404 });
+      }
+      if (down) {
+        throw new Error("network");
+      }
+      return fixture;
+    },
+  };
+  const feed = new OverlayFeed(src, "ds", ["tag"], () => {}, () => clock);
+  const kinds = new Set(["tag" as const]);
+  const view: [number, number, number, number] = [-300, -100, 100, 100];
+  const flush = () => new Promise(r => setTimeout(r, 0));
+  feed.query(view, T0 + 10_000, false, kinds);
+  await flush();
+  assert.equal(calls.length, 2);
+  clock += RETRY_MS / 2;
+  feed.query(view, T0 + 10_000, false, kinds);
+  assert.equal(calls.length, 2, "not before the backoff");
+  down = false;
+  clock += RETRY_MS;
+  feed.query(view, T0 + 10_000, false, kinds);
+  await flush();
+  assert.deepEqual(calls.slice(2), ["0,0"], "the failed tile is retried; the missing one is not (history)");
+  assert.deepEqual(feed.query(view, T0 + 10_000, false, kinds)!.map(t => t.text), ["21M"]);
+  clock += 3_600_000;
+  feed.query(view, T0 + 10_000, false, kinds);
+  assert.equal(calls.length, 3, "a loaded history tile stays cached");
 });

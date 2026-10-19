@@ -97,6 +97,13 @@ test("movers layer: history at the fixture time draws the train and spidertron",
   assert.ok(c.calls.includes("fill"), "something was drawn");
   assert.ok(redraws.n > 0);
   assert.equal(typeof movers.delay?.(), "number");
+  // Paused: the same time again draws the same frame and asks for no more.
+  const n = redraws.n;
+  movers.draw2d!(canvas(), frame(t, false, 1));
+  movers.draw2d!(canvas(), frame(t, false, 1));
+  assert.equal(redraws.n, n, "a paused history view stops animating");
+  movers.draw2d!(canvas(), frame(t + 16, false, 1));
+  assert.equal(redraws.n, n + 1, "playing on, the moving train asks for the next frame");
   movers.detach();
 });
 

@@ -22,6 +22,8 @@ export class MoverLayer implements MapLayer {
   private feed: MoverFeed | null = null;
   private delayEst: DelayEstimator | null = null;
   private shown: Shown[] = [];
+  /** frame.time of the last draw, to tell a paused history view from playback. */
+  private lastTime = NaN;
 
   attach(ctx: LayerContext): void {
     this.detach();
@@ -84,7 +86,11 @@ export class MoverLayer implements MapLayer {
     const n = drawMovers(ctx2d, projection(frame), shown);
     this.shown = shown;
     perfEvent("movers.frame", { movers: n, ms: Math.round((performance.now() - start) * 100) / 100 });
-    if (shown.some(m => m.moving)) {
+    // Keep animating only while time runs: a paused history view draws the same frame
+    // again, so it needs no more frames (the engine asks for one on the next time change).
+    const running = frame.live || frame.time !== this.lastTime;
+    this.lastTime = frame.time;
+    if (running && shown.some(m => m.moving)) {
       ctx.requestRedraw();
     }
   }

@@ -358,3 +358,27 @@ test("trim keeps a parked train's body across the handoff it arrived by (test da
     assert.ok(Math.hypot(after[i].x - before[i].x, after[i].y - before[i].y) < 1e-9, `carriage ${i} unchanged`);
   }
 });
+
+test("held movers are not moving, so a paused view stops asking for frames", () => {
+  // Parked across a data gap longer than a segment (not linked): held, static.
+  const parked = new T.Track("j1", meta);
+  parked.insert(T.makeSample(meta, 0, 10, 0, 0.25, T.F_STOP));
+  parked.insert(T.makeSample(meta, 600_000, 10, 0, 0.25, T.F_STOP));
+  const h = T.newHead();
+  T.headAt(parked, 100_000, Infinity, h);
+  assert.equal(h.visible, true);
+  assert.equal(h.moving, false, "a parked train across a gap is static");
+  // Running towards a gone without a resume: runs on until the cap, then holds.
+  const gone = straightTrack(4, 10, 500); // x 0..15, t 0..1500
+  gone.insert(T.makeSample(meta, 30_000, 15, 0, 0.25, T.F_GONE));
+  T.headAt(gone, 1600, Infinity, h);
+  assert.equal(h.moving, true, "still running on");
+  const x = h.x;
+  T.headAt(gone, 20_000, Infinity, h);
+  assert.equal(h.moving, false, "past the extrapolation cap the hold is static");
+  T.headAt(gone, 20_016, Infinity, h);
+  assert.ok(h.x >= x && h.moving === false);
+  // Interpolating between two different samples is moving.
+  T.headAt(straightTrack(4, 10, 500), 700, Infinity, h);
+  assert.equal(h.moving, true);
+});
