@@ -24,6 +24,8 @@ export class MoverLayer implements MapLayer {
   private shown: Shown[] = [];
   /** frame.time of the last draw, to tell a paused history view from playback. */
   private lastTime = NaN;
+  /** Timer for the next frame in live mode while nothing moves (wakeAt). */
+  private wake: ReturnType<typeof setTimeout> | null = null;
 
   attach(ctx: LayerContext): void {
     this.detach();
@@ -46,6 +48,10 @@ export class MoverLayer implements MapLayer {
   }
 
   detach(): void {
+    if (this.wake) {
+      clearTimeout(this.wake);
+      this.wake = null;
+    }
     this.feed?.stop();
     this.feed = null;
     this.delayEst = null;
@@ -88,11 +94,27 @@ export class MoverLayer implements MapLayer {
     perfEvent("movers.frame", { movers: n, ms: Math.round((performance.now() - start) * 100) / 100 });
     // Keep animating only while time runs: a paused history view draws the same frame
     // again, so it needs no more frames (the engine asks for one on the next time change).
+    // In live mode the delayed display time also has to reach samples that have already
+    // arrived (MoverView.nextT): without a frame then, a parked train would only start
+    // moving when the next sample arrives.
     const running = frame.live || frame.time !== this.lastTime;
     this.lastTime = frame.time;
     if (running && shown.some(m => m.moving)) {
       ctx.requestRedraw();
+    } else if (frame.live && Number.isFinite(this.view.nextT)) {
+      this.wakeAt(Math.max(0, this.view.nextT - t));
     }
+  }
+
+  /** Requests a frame in `ms` (display time runs at about real time in live mode). */
+  private wakeAt(ms: number): void {
+    if (this.wake) {
+      clearTimeout(this.wake);
+    }
+    this.wake = setTimeout(() => {
+      this.wake = null;
+      this.ctx?.requestRedraw();
+    }, Math.min(5000, ms + 5));
   }
 
   hitTest(x: number, y: number, frame: FrameState): LayerHit | null {

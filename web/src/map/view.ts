@@ -433,7 +433,23 @@ export class MapView {
 
   /** The displayed time. */
   displayTime(): TimeMs {
-    return this.live ? this.source.now() - this.liveDelay : this.time;
+    return this.live ? this.source.now() - this.liveDelayNow() : this.time;
+  }
+
+  /**
+   * How far live mode trails the data clock: the largest MapLayer.delay() of the enabled
+   * layers (the movers layer's adaptive delay, PLAN §4.8 step 1), or `liveDelayMs` when no
+   * layer reports one.
+   */
+  liveDelayNow(): number {
+    let d = -1;
+    for (const l of this.active) {
+      const v = l.delay?.();
+      if (v !== undefined && Number.isFinite(v) && v > d) {
+        d = v;
+      }
+    }
+    return d >= 0 ? d : this.liveDelay;
   }
 
   get isLive(): boolean {
@@ -668,6 +684,11 @@ export class MapView {
       this.markState();
     }
     const result = this.engine.frame(this.camera, this.vp);
+    const prev = this.lastResult;
+    if (!prev || prev.full !== result.full || prev.visible !== result.visible || prev.z !== result.z) {
+      // Loading progress is state too (the HUD would otherwise keep showing "loading").
+      this.markState();
+    }
     this.lastResult = result;
     this.engine.render(this.vp, result);
     if (this.pendingSubscribe && result.full === result.visible && result.visible > 0) {

@@ -4,6 +4,8 @@
 //        [--illisis <export root> --map gw-bc41437d~2E1 --surface nauvis --snapshots 4]
 //        [--synthetic WxH --versions n --step ms --changes chunks --coarse levels]
 //        [--shift-to-now] (move all times so the newest data is 30 s old)
+//        [--movers-db <v3 db>] (movers, instances and edges from `timeshadedb import-minimap --db`;
+//        history only, and not with --shift-to-now)
 //
 // Prints "listening on http://127.0.0.1:<port>" once ready. The live API is under
 // /api/v3/, the same data as a static export under /static/ (open
@@ -14,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { shiftDataset, syntheticDataset, type MockDataset } from "./dataset.ts";
 import { loadIllisisDataset } from "./illisis.ts";
 import { MockServer } from "./mockserver.ts";
+import { attachMoverDb } from "./moverdb.ts";
 
 export async function loadDataset(args: Map<string, string>): Promise<MockDataset> {
   const data = await loadRaw(args);
@@ -64,11 +67,16 @@ export function parseArgs(argv: string[]): Map<string, string> {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const data = await loadDataset(args);
+  const moverDb = args.get("movers-db") ? { dir: args.get("movers-db")! } : undefined;
+  if (moverDb) {
+    attachMoverDb(data, moverDb);
+  }
   const dist = resolve(fileURLToPath(new URL("../../../dist/", import.meta.url)));
   const server = await new MockServer(data, {
     staticDir: dist,
     latencyMs: Number(args.get("latency") ?? 0),
     gzip: args.get("no-gzip") !== "true",
+    moverDb,
   }).start(Number(args.get("port") ?? 0));
   console.log(`listening on ${server.url}`);
   const stop = (): void => {
