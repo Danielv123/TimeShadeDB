@@ -270,6 +270,14 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
 - `--pprof <addr>`, `--slow-log <duration>`, `--quiet`;
 - `--salvage-overlays`: open an overlay log damaged before its end, keeping it aside;
 - `--exit-on-stdin-close`: stop when the parent process goes away (the Clusterio sidecar).
+- `--clock data`: the map clock is the newest ingested `recv_ms` (seeded from the newest
+  data in the database) instead of the wall clock, for replaying recorded captures (a
+  backlog, a benchmark stream). The graces then default to 2 minutes, because replayed
+  bodies, often posted several at once, arrive out of order.
+
+The process sets a soft memory limit of 1.5 times `--mem-budget` plus 64 MiB (Go's
+`GOMEMLIMIT`, which takes precedence when set), so garbage collection works harder before
+the process grows past its budget.
 
 Interrupt or SIGTERM shuts down cleanly: the pyramid is flushed at the horizon and every
 store is closed. Coarse levels load lazily (in parallel, in the background), so the server
