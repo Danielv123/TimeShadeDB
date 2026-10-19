@@ -60,3 +60,24 @@ t.test("json: a move message carries every field", function()
 		t.expect_true(s:find(part, 1, true), "has " .. part .. " in " .. s)
 	end
 end)
+
+t.test("json: the chunk fast path gives what the generic encoder gives", function()
+	local d = "eJzt0TENAAAIA7Dh/aMRsBQ+E2j1Vg+GAAAAAAAAAAAA+w5Z3gAB"
+	for _, msg in ipairs({
+		{ type = "chunk", s = "nauvis", f = "player", x = -3, y = 31250, d = d },
+		{ type = "chunk", s = 'a "quoted" surface', f = "enemy", x = 0, y = -1 },
+		{ type = "chunk", s = "nauvis", f = "player", x = 5, y = 6, d = d, tick = 123456 },
+	}) do
+		local fast, generic = json.encode_chunk(msg), json.encode(msg)
+		t.expect_eq(#fast, #generic, "the same length: " .. fast)
+		local function fields(text)
+			local out = {}
+			for k, v in text:gmatch('"([%w_]+)":([^,{}]+)') do
+				out[#out + 1] = k .. "=" .. v
+			end
+			table.sort(out)
+			return table.concat(out, " ")
+		end
+		t.expect_eq(fields(fast), fields(generic), "the same fields")
+	end
+end)

@@ -160,4 +160,19 @@ function json.encode_move(msg)
 	return '{"type":"move","s":' .. str(msg.s) .. ',"m":[' .. concat(parts, ",") .. "]}"
 end
 
+local CHUNK = '{"type":"chunk","s":%s,"f":%s,"x":%d,"y":%d'
+
+--- The JSON text of a chunk message. d (helpers.encode_string's base64) needs no escaping, so it is not scanned for
+--- characters to escape as json.encode would; a chunk without d is a deletion.
+function json.encode_chunk(msg)
+	local s = format(CHUNK, str(msg.s), str(msg.f), msg.x, msg.y)
+	if msg.tick then
+		s = s .. ',"tick":' .. tostring_(msg.tick)
+	end
+	if msg.d then
+		return s .. ',"d":"' .. msg.d .. '"}'
+	end
+	return s .. "}"
+end
+
 return json

@@ -500,7 +500,7 @@ function runBench() {
 		+ `a resync at ${resyncTick}`);
 	const build = buildCapture(path.join(root, "build-bench"));
 	const cfg = { mode: "bench", trains, chunks: 50176, charted: Number(option("--charted", 20)), report_tick: ticks - 10,
-		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, micro: flag("--micro") ? 700 : false,
+		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, profile_start: warm, micro: flag("--micro") ? 700 : false,
 		chart_reads: Number(option("--chart-reads", 1)) };
 	const box = sandbox("bench", {
 		timeshade_capture: (dst) => copyTree(build.modDir, dst),
@@ -530,7 +530,7 @@ function runBench() {
 				`bench-${label}-${r}`);
 			if (enabled && r === 0) {
 				for (const m of res.stdout.matchAll(/TSTEST (?:prof|micro) (.*)/g)) {
-					note(`bench profile (ticks 1-${resyncTick - 1}): ${m[1].trim()}`);
+					note(`bench profile (ticks ${warm}-${resyncTick - 1}): ${m[1].trim()}`);
 				}
 			}
 			const rows = parseVerbose(res.stdout);

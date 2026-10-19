@@ -108,18 +108,48 @@ function core.key_surface(key)
 	return math.floor(key / K40)
 end
 
---- A FIFO: items at [head, tail].
-function core.queue()
+local floor = math.floor
+
+--- A key's surface index, force index and chunk x, y (exact: every step stays an integer below 2^53; integers on Lua
+--- 5.3+ too, through math.floor).
+function core.unkey(key)
+	local y = floor(key % K17)
+	local rest = floor(key / K17)
+	local x = rest % 131072
+	rest = floor(rest / 131072)
+	return floor(rest / 64), rest % 64, x - 65536, y - 65536
+end
+
+--- A FIFO: items at [head, tail]. With cap, a ring of cap slots instead: its indices stay in 1..cap, so a queue that
+--- never empties (a saturated chart queue) keeps its items in the table's array part instead of a hash part that grows
+--- with every push, and push refuses an item once cap wait.
+function core.queue(cap)
+	if cap then
+		return { head = 1, n = 0, cap = cap }
+	end
 	return { head = 1, tail = 0 }
 end
 
 function core.size(q)
+	if q.cap then
+		return q.n
+	end
 	return q.tail - q.head + 1
 end
 
---- Append item. With cap, refuse it (false) once cap items wait.
+--- Append item. With cap (a plain FIFO), refuse it (false) once cap items wait.
 function core.push(q, item, cap)
-	if cap and core.size(q) >= cap then
+	local rc = q.cap
+	if rc then
+		local n = q.n
+		if n >= rc then
+			return false
+		end
+		q[(q.head + n - 1) % rc + 1] = item
+		q.n = n + 1
+		return true
+	end
+	if cap and q.tail - q.head + 1 >= cap then
 		return false
 	end
 	q.tail = q.tail + 1
@@ -128,18 +158,34 @@ function core.push(q, item, cap)
 end
 
 function core.peek(q)
+	if q.cap and q.n == 0 then
+		return nil
+	end
 	return q[q.head]
 end
 
 function core.pop(q)
-	if q.head > q.tail then
+	local head = q.head
+	local rc = q.cap
+	if rc then
+		if q.n == 0 then
+			return nil
+		end
+		local item = q[head]
+		q[head] = nil
+		q.head, q.n = head % rc + 1, q.n - 1
+		return item
+	end
+	if head > q.tail then
 		return nil
 	end
-	local item = q[q.head]
-	q[q.head] = nil
-	q.head = q.head + 1
-	if q.head > q.tail then
+	local item = q[head]
+	q[head] = nil
+	head = head + 1
+	if head > q.tail then
 		q.head, q.tail = 1, 0
+	else
+		q.head = head
 	end
 	return item
 end
@@ -192,12 +238,15 @@ function core.cache_count(c)
 	return c.n + n
 end
 
--- Chart debounce. Event reads wait in d.queue (capped at core.CAP); forced reads (a resync's walk and its sentinel, a
--- deletion) in d.forced, which takes no cap, is read first and paces the walk, so a full event queue never stalls a
--- resync. A chunk read at tick t cools down until t + core.DEBOUNCE. A chunk charted while waiting in the queue
--- is not queued twice; one charted while cooling is marked dirty and queued when its cool-down ends. The cool-down list
--- is a FIFO, because every read adds now + DEBOUNCE with now never decreasing, so the state holds at most the chunks read
--- in the last DEBOUNCE ticks plus the queue (bounded by core.CAP).
+-- Chart debounce. A queued read is the chunk's key alone (a number in the game; core.unkey gives the surface, force and
+-- position back), so a busy map's queue of 20,000 reads holds no table per read for the garbage collector to walk.
+-- Event reads wait in d.queue, a ring of core.CAP slots; pushes past it are dropped and counted. Forced reads (a
+-- resync's walk and its sentinel, a deletion) wait in d.forced, which takes no cap, is read first and paces the walk, so a
+-- full event queue never stalls a resync. The resync's sentinel is the one table item, { resynced = walk number }.
+-- A chunk read at tick t cools down until t + core.DEBOUNCE. A chunk charted while waiting in the queue is not queued
+-- twice; one charted while cooling is marked dirty and queued when its cool-down ends. The cool-down list is a FIFO
+-- (keys in d.due, their end ticks in d.due_t), because every read adds now + DEBOUNCE with now never decreasing, so the
+-- state holds at most the chunks read in the last DEBOUNCE ticks plus the queue (bounded by core.CAP).
 --
 -- raw[key] keeps the raw chart of an event read while its chunk cools down, so the re-read at the end of the cool-down
 -- can skip helpers.encode_string when nothing changed (deflating 2 KiB is most of a read's cost). It is dropped when a
@@ -207,17 +256,17 @@ end
 -- defaults).
 
 function core.debounce()
-	return { queue = core.queue(), forced = core.queue(), pending = {}, cool = {}, dirty = {}, due = core.queue(), raw = {},
-		drops = 0 }
+	return { queue = core.queue(core.CAP), forced = core.queue(), pending = {}, cool = {}, dirty = {}, due = core.queue(),
+		due_t = core.queue(), raw = {}, drops = 0 }
 end
 
---- An on_chunk_charted for item ({ key, ... }). forced items (resync, deletion) skip the cool-down and the cap.
---- Returns "queued", "dirty", "waiting" (already queued) or "dropped".
-function core.charted(d, item, forced)
-	local key = item.key
+--- An on_chunk_charted for chunk key (any value but nil and false; a table is the resync's sentinel, forced only).
+--- forced pushes (resync, deletion) skip the cool-down and the cap. Returns "queued", "dirty", "waiting" (already
+--- queued) or "dropped".
+function core.charted(d, key, forced)
 	if forced then
-		core.push(d.forced, item)
-		if key then -- the resync's sentinel has none
+		core.push(d.forced, key)
+		if type(key) ~= "table" then
 			d.pending[key] = true
 			d.dirty[key] = nil
 		end
@@ -227,10 +276,10 @@ function core.charted(d, item, forced)
 		return "waiting"
 	end
 	if d.cool[key] then
-		d.dirty[key] = item
+		d.dirty[key] = true
 		return "dirty"
 	end
-	if core.push(d.queue, item, core.CAP) then
+	if core.push(d.queue, key) then
 		d.pending[key] = true
 		return "queued"
 	end
@@ -238,54 +287,56 @@ function core.charted(d, item, forced)
 	return "dropped"
 end
 
---- The next item to read at tick now, or nil: from d.forced first, or only from "forced" or "events" (d.queue). The
---- caller reads it; the chunk then cools down.
+--- The next key to read at tick now and whether it is forced, or nil: from d.forced first, or only from "forced" or
+--- "events" (d.queue). The caller reads it; the chunk then cools down. The sentinel comes back as it went in.
 function core.take(d, now, from)
-	local item
+	local key, forced
 	if from ~= "events" then
-		item = core.pop(d.forced)
+		key = core.pop(d.forced)
+		forced = key ~= nil
 	end
-	if item == nil and from ~= "forced" then
-		item = core.pop(d.queue)
+	if key == nil and from ~= "forced" then
+		key = core.pop(d.queue)
 	end
-	if item == nil then
+	if key == nil then
 		return nil
 	end
-	local key = item.key
-	if key then
+	if type(key) ~= "table" then
 		d.pending[key] = nil
 		if not d.cool[key] then
 			d.cool[key] = true
-			core.push(d.due, { key = key, t = now + core.DEBOUNCE })
+			core.push(d.due, key)
+			core.push(d.due_t, now + core.DEBOUNCE)
 		end
 	end
-	return item
+	return key, forced
 end
 
 --- End the cool-downs due at tick now; dirty chunks join the queue. Returns how many were queued.
 function core.cooled(d, now)
 	local n = 0
+	local due, due_t, cool, dirty, raw = d.due, d.due_t, d.cool, d.dirty, d.raw
 	while true do
-		local head = core.peek(d.due)
-		if not head or head.t > now then
+		local t = core.peek(due_t)
+		if not t or t > now then
 			return n
 		end
-		core.pop(d.due)
-		d.cool[head.key] = nil
-		local item = d.dirty[head.key]
-		if item then
-			d.dirty[head.key] = nil
+		core.pop(due_t)
+		local key = core.pop(due)
+		cool[key] = nil
+		if dirty[key] then
+			dirty[key] = nil
 			local long = core.size(d.queue) > core.RAW_QUEUE
-			if core.charted(d, item) == "queued" then
+			if core.charted(d, key) == "queued" then
 				n = n + 1
 				if long then
-					d.raw[head.key] = nil
+					raw[key] = nil
 				end
 			else
-				d.raw[head.key] = nil
+				raw[key] = nil
 			end
 		else
-			d.raw[head.key] = nil
+			raw[key] = nil
 		end
 	end
 end

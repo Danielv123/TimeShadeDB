@@ -125,17 +125,16 @@ function terrain.on_chunk_charted(st, e, forced)
 	end
 	local key = core.key(si, fi, p.x, p.y)
 	if not forced then
-		-- what core.charted would do without the item: most events of a busy map end here, and building the item table
-		-- for each costs more than the rest of the handler (a repeat of a dirty chunk would store an equal item)
+		-- what core.charted would do, inlined: most events of a busy map end here
 		if deb.pending[key] or deb.dirty[key] then
 			return
 		end
-		if not deb.cool[key] and core.size(deb.queue) >= core.CAP then
+		if not deb.cool[key] and deb.queue.n >= deb.queue.cap then
 			deb.drops = deb.drops + 1
 			return
 		end
 	end
-	core.charted(deb, { key = key, si = si, fi = fi, x = p.x, y = p.y, forced = forced }, forced)
+	core.charted(deb, key, forced)
 end
 
 --- A deleted chunk is read again for each captured force, and its nil chart sends a chunk message without d. Forced:
@@ -151,36 +150,37 @@ function terrain.on_chunk_deleted(st, e)
 	end
 end
 
---- Read one queued chunk. A forced item is sent though unchanged.
-local function read(st, item, r)
-	local force, surface = game.forces[item.fi], game.get_surface(item.si)
+--- Read one queued chunk. A forced read is sent though unchanged.
+local function read(st, key, forced, r)
+	local si, fi, x, y = core.unkey(key)
+	local force, surface = game.forces[fi], game.get_surface(si)
 	if not (force and surface) then
 		return -- a deleted surface's chunks are skipped
 	end
-	local pos = { x = item.x, y = item.y }
+	local pos = { x = x, y = y }
 	local chart = chart_of(force, surface, pos)
 	reads = reads + 1
-	if item.forced then
-		deb.raw[item.key] = nil
+	if forced then
+		deb.raw[key] = nil
 		if r then
 			overlays.chunk_resync(st, surface, force, pos, r)
 		end
 	else
 		-- the same raw chart as this chunk's last event read: unchanged, nothing to encode
-		local raw = deb.raw[item.key]
-		deb.raw[item.key] = chart
+		local raw = deb.raw[key]
+		deb.raw[key] = chart
 		if raw ~= nil and raw == chart then
 			skipped = skipped + 1
 			return
 		end
 	end
 	local d = chart and helpers.encode_string(chart) or false
-	if not item.forced and core.cache_get(cache, item.key) == d then
+	if not forced and core.cache_get(cache, key) == d then
 		return
 	end
-	core.cache_set(cache, item.key, d)
+	core.cache_set(cache, key, d)
 	sent = sent + 1
-	outbox.send{ type = "chunk", s = surface.name, f = force.name, x = item.x, y = item.y, d = d or nil }
+	outbox.send{ type = "chunk", s = surface.name, f = force.name, x = x, y = y, d = d or nil }
 end
 
 --- The per-tick step: end due cool-downs, then read up to core.CHARTS queued chunks (core.RESYNC_CHARTS while a resync
@@ -195,25 +195,25 @@ function terrain.step(st, tick, r)
 		forced = limit - 1
 	end
 	while n < forced do
-		local item = core.take(deb, tick, "forced")
-		if not item then
+		local key = core.take(deb, tick, "forced")
+		if not key then
 			break
 		end
-		if item.resynced then
-			if r and r.walk == item.resynced then
+		if type(key) == "table" then
+			if r and r.walk == key.resynced then
 				r.chunks_done = true
 			end
 		else
-			read(st, item, r)
+			read(st, key, true, r)
 			n = n + 1
 		end
 	end
 	while n < limit do
-		local item = core.take(deb, tick, "events")
-		if not item then
+		local key = core.take(deb, tick, "events")
+		if not key then
 			break
 		end
-		read(st, item, r)
+		read(st, key, false, r)
 		n = n + 1
 	end
 	return n
@@ -282,7 +282,7 @@ function terrain.walk(st, r)
 		if c == nil then
 			w.k = w.k + 1
 			if w.k > #w.list then
-				core.charted(deb, { resynced = w.id }, true)
+				core.charted(deb, { resynced = w.id }, true) -- the sentinel
 				walk = nil
 				return
 			end
@@ -296,8 +296,7 @@ function terrain.walk(st, r)
 				for fi in pairs(st.forces) do
 					local force = game.forces[fi]
 					if force and is_charted(force, s, pos) then
-						core.charted(deb, { key = core.key(s.index, fi, c.x, c.y), si = s.index, fi = fi, x = c.x,
-							y = c.y, forced = true }, true)
+						core.charted(deb, core.key(s.index, fi, c.x, c.y), true)
 						r.chunks, pushed = r.chunks + 1, pushed + 1
 					end
 				end

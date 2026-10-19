@@ -88,6 +88,23 @@ return function(capture)
 			capture.profile_totals = totals
 		end,
 		profile_report = function()
+			-- calibration: the same accumulation over 1,000 calls of one helpers.encode_string of a chart
+			local calib = { fn = function()
+				return helpers.encode_string(synthetic.chart(1, 2, 3))
+			end }
+			local total, p = helpers.create_profiler(true), helpers.create_profiler(true)
+			for _ = 1, 1000 do
+				p.restart()
+				calib.fn()
+				p.stop()
+				total.add(p)
+			end
+			local direct = helpers.create_profiler()
+			for _ = 1, 1000 do
+				calib.fn()
+			end
+			direct.stop()
+			log({ "", "TSTEST prof calibration: 1000 encode_string, accumulated ", total, ", one profiler ", direct })
 			for _, e in ipairs(capture.profile_totals or {}) do
 				log({ "", "TSTEST prof ", e.label, " calls ", e.n, " ", e.total })
 			end
@@ -230,7 +247,44 @@ return function(capture)
 						local _ = helpers.encode_string(chart)
 					end
 				end)
+				local d = helpers.encode_string(chart)
+				time("outbox.encode of a chunk message", function()
+					for _ = 1, n / 10 do
+						local _ = capture.outbox.encode{ type = "chunk", s = "ts-lab", f = "player", x = 1, y = 2, d = d }
+					end
+				end)
+				time("chart_of through the seam", function()
+					for i = 1, n / 10 do
+						local _ = capture.terrain.seam(f, s, { x = i % 200, y = 3 })
+					end
+				end)
 			end
+			-- the chart path as the bench runs it: n / 10 ticks of one queued read, then the flush
+			local st2 = storage.timeshade
+			time("terrain.step (one queued read) + outbox.flush", function()
+				for _ = 1, n / 10 do
+					capture.terrain.step(st2, game.tick, nil)
+					capture.outbox.flush(game.tick)
+				end
+			end)
+			local side = 224
+			local rng = 777
+			local lists = {}
+			for k = 1, n / 10 do
+				local list = {}
+				for i = 1, 20 do
+					rng = rng * 16807 % 2147483647
+					local c = rng % (side * side)
+					list[i] = { c % side, math.floor(c / side) }
+				end
+				lists[k] = list
+			end
+			time("remote_charted.fn of 20 random events (event tables built here)", function()
+				for k = 1, n / 10 do
+					capture.remote_charted.fn(s.name, "player", lists[k])
+				end
+			end)
+			log("TSTEST micro queue " .. capture.core.size(capture.terrain.state().debounce.queue))
 		end,
 		--- Time n synthetic chart builds plus helpers.encode_string and log it (a LuaProfiler prints to the log only).
 		read_cost = function(n)
