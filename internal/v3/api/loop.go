@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"time"
 
 	"timeshadedb/internal/v3/core"
@@ -24,6 +25,7 @@ func (s *Server) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-t.C:
 			s.Step(ctx)
+			s.releaseIfIdle()
 		case <-s.kick:
 			s.Step(ctx)
 		}
@@ -86,4 +88,19 @@ func (s *Server) checkPressure() {
 		default:
 		}
 	}
+}
+
+// releaseIfIdle returns freed memory to the operating system once after IdleRelease
+// without requests (Config.IdleRelease).
+func (s *Server) releaseIfIdle() {
+	if s.cfg.IdleRelease < 0 || s.released.Load() {
+		return
+	}
+	last := s.lastReq.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) < s.cfg.IdleRelease {
+		return
+	}
+	s.released.Store(true)
+	debug.FreeOSMemory()
+	s.metrics.idleReleases.Add(1)
 }

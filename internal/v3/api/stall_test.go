@@ -127,3 +127,30 @@ func TestIngestKicksCommitUnderPressure(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestIdleRelease: after IdleRelease without requests the loop returns memory to the OS
+// once, and again only after another request.
+func TestIdleRelease(t *testing.T) {
+	f := newFixture(t, fixtureOpt{cfg: func(c *Config) { c.IdleRelease = 20 * time.Millisecond }})
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 0 {
+		t.Fatalf("released before any request: %d", n)
+	}
+	f.get("/healthz")
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 0 {
+		t.Fatalf("released right after a request: %d", n)
+	}
+	time.Sleep(40 * time.Millisecond)
+	f.srv.releaseIfIdle()
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 1 {
+		t.Fatalf("releases after idle: %d, want 1", n)
+	}
+	f.get("/healthz")
+	time.Sleep(40 * time.Millisecond)
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 2 {
+		t.Fatalf("releases after a second idle period: %d, want 2", n)
+	}
+}
