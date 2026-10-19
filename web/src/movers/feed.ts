@@ -2,18 +2,36 @@
 // plus SSE `movers` events (or, for static exports, live.bin polled every live_ms); for a
 // historical time the day index, the newest keyframe at or before it and the windows from
 // there on. A generation counter drops results of a seek that was superseded, and arrival
-// lags of live rows feed the DelayEstimator.
+// lags of live rows feed the DelayEstimator. Day indexes are cached across seeks (open
+// days and failed fetches only for a while) and are fetched with their own abort signal,
+// so a superseded seek cannot leave a day cached as missing.
 
 import type { DataSource, DayIndex, LiveHandlers, TimeMs } from "../api/types";
 import { utcDay } from "../api/grid";
 import { decodeMoverWindow } from "../api/wire";
 import type { DelayEstimator } from "./clock";
-import type { MoverView } from "./view";
+import { KEEP_MS, type MoverView } from "./view";
 
 /** Window length of closed mover windows (FORMAT.md / core.MoverWindowLen). */
 export const WINDOW_MS = 300_000;
-/** History mode loads this far past the displayed time, so the next sample is known. */
+/** History mode loads at least this far past the displayed time, so the next sample is known. */
 export const LOOKAHEAD_MS = 60_000;
+/**
+ * During playback the feed loads ahead by this much real time at the current speed (at
+ * most MAX_AHEAD_MS of data), so fast playback does not outrun the network.
+ */
+export const PREFETCH_REAL_MS = 2_000;
+export const MAX_AHEAD_MS = 1_800_000;
+/**
+ * A forward jump of less than this past the loaded range extends it (keeping what is
+ * loaded) instead of seeking again: a seek loads from the hourly keyframe, so extending
+ * across less than the keyframe interval never fetches more.
+ */
+export const FORWARD_MS = 3_600_000;
+/** Open (non-final) day indexes are fetched again after this long (ms). */
+export const DAY_TTL_MS = 60_000;
+/** A day index that failed to load (missing day, network error) is retried after this long. */
+export const DAY_RETRY_MS = 10_000;
 /** Above this playback speed (data ms per real ms) movers are not loaded (1 h/s). */
 export const MAX_SPEED = 3600;
 /** History is trimmed at most once per this much data time. */
@@ -42,7 +60,13 @@ export class MoverFeed {
   private from = NaN;
   private to = NaN;
   private loading: Promise<void> | null = null;
-  private readonly days = new Map<string, Promise<DayIndex | null>>();
+  /** The time of the seek in flight (NaN when none), so redraws do not restart it. */
+  private seekT = NaN;
+  private readonly days = new Map<string, DayEntry>();
+  /** Aborts day index fetches; only stop() uses it (seeks share the cached indexes). */
+  private dayAbort = new AbortController();
+  /** perf() of the last live.bin fetch made for history (throttled to liveMs). */
+  private lastLiveFetch = -Infinity;
   /** Newest row time seen from live sources (rows newer than this count for lag stats). */
   private newest = -Infinity;
   private lastT = NaN;
@@ -135,12 +159,19 @@ export class MoverFeed {
 
   stop(): void {
     this.reset();
+    this.dayAbort.abort();
+    this.dayAbort = new AbortController();
+    this.days.clear();
   }
 
   private trim(t: number): void {
     if (Number.isNaN(this.lastTrim) || Math.abs(t - this.lastTrim) >= TRIM_EVERY_MS) {
       this.lastTrim = t;
       this.view.trim(t);
+      if (!this.live && !Number.isNaN(this.from)) {
+        // History before t - KEEP_MS is gone now: a seek back past it must load again.
+        this.from = Math.max(this.from, t - KEEP_MS);
+      }
     }
   }
 
@@ -157,7 +188,9 @@ export class MoverFeed {
     this.from = NaN;
     this.to = NaN;
     this.loading = null;
+    this.seekT = NaN;
     this.newest = -Infinity;
+    this.lastLiveFetch = -Infinity;
     this.view.clear();
   }
 
@@ -166,7 +199,9 @@ export class MoverFeed {
     void this.fetchLive(gen, false);
     if (this.source.subscribe) {
       const handlers: LiveHandlers = {
-        hello: () => void this.fetchLive(gen, true),
+        // A resync after a reconnect: its rows piled up during the outage, so their
+        // arrival lags say nothing about the steady-state delay (like the first payload).
+        hello: () => void this.fetchLive(gen, false),
         movers: e => {
           if (gen !== this.gen || e.sfc !== this.sfc) {
             return;
@@ -213,47 +248,84 @@ export class MoverFeed {
     }
   }
 
+  /** How far past the displayed time history is loaded, at the current playback speed. */
+  private lookahead(): number {
+    return Math.min(MAX_AHEAD_MS, Math.max(LOOKAHEAD_MS, this.speed * PREFETCH_REAL_MS));
+  }
+
   private history(t: TimeMs): void {
-    const covered = !Number.isNaN(this.from) && t >= this.from && t < this.to;
-    if (covered) {
+    if (!Number.isNaN(this.from) && t >= this.from && t < this.to + FORWARD_MS) {
+      // Inside the loaded range, or ahead of it (playback, a short forward jump): keep
+      // what is loaded and extend it contiguously from its end.
       this.trim(t);
-      if (t + LOOKAHEAD_MS > this.to && !this.loading) {
-        // Playing forward: append the next window.
-        this.loading = this.extend(this.gen, this.to, t + LOOKAHEAD_MS).finally(() => {
-          this.loading = null;
+      const target = t + this.lookahead();
+      if (target > this.to && !this.loading && this.liveDue()) {
+        const gen = this.gen;
+        this.loading = this.extend(gen, this.to, target).finally(() => {
+          if (gen === this.gen) {
+            this.loading = null;
+          }
         });
       }
       return;
     }
-    if (this.loading && !Number.isNaN(this.from) && t >= this.from && t < this.to + WINDOW_MS) {
+    if (this.loading && t === this.seekT) {
+      // The same seek again (ensure() runs every frame) while its day index loads.
       return;
     }
     // A seek: start over from the newest keyframe at or before t.
     this.reset();
     const gen = this.gen;
-    this.loading = this.seek(gen, t).finally(() => {
+    this.seekT = t;
+    this.loading = this.seek(gen, t, t + this.lookahead()).finally(() => {
       if (gen === this.gen) {
         this.loading = null;
+        this.seekT = NaN;
       }
     });
   }
 
-  private day(date: string): Promise<DayIndex | null> {
-    let p = this.days.get(date);
-    if (!p) {
-      p = this.source.moverDay(this.sfc, date, this.abort.signal).catch(() => null);
-      this.days.set(date, p);
-      // Open days change; forget them after a while.
-      void p.then(d => {
-        if (!d || !d.final) {
-          setTimeout(() => this.days.delete(date), 60_000);
-        }
-      });
-    }
-    return p;
+  /**
+   * Whether the loaded range may be extended now: once it reaches past the closed horizon
+   * every extension refetches live.bin, so that happens at most every liveMs.
+   */
+  private liveDue(): boolean {
+    return this.to <= this.closed() || this.perf() - this.lastLiveFetch >= this.liveMs;
   }
 
-  private async seek(gen: number, t: TimeMs): Promise<void> {
+  /**
+   * The day index for a UTC date, cached: final days for good, open days for DAY_TTL_MS,
+   * failures for DAY_RETRY_MS. An aborted fetch (stop) is never cached.
+   */
+  private day(date: string): Promise<DayIndex | null> {
+    const cached = this.days.get(date);
+    if (cached && cached.expires > this.perf()) {
+      return cached.p;
+    }
+    const entry: DayEntry = { p: Promise.resolve(null), expires: Infinity };
+    entry.p = this.source.moverDay(this.sfc, date, this.dayAbort.signal).then(
+      d => {
+        if (!d.final) {
+          entry.expires = this.perf() + DAY_TTL_MS;
+        }
+        return d;
+      },
+      err => {
+        if (isAbort(err)) {
+          if (this.days.get(date) === entry) {
+            this.days.delete(date);
+          }
+        } else {
+          entry.expires = this.perf() + DAY_RETRY_MS;
+        }
+        return null;
+      },
+    );
+    this.days.set(date, entry);
+    return entry.p;
+  }
+
+  private async seek(gen: number, t: TimeMs, target: number): Promise<void> {
     try {
       const today = await this.day(utcDay(t));
       let kf = today ? newestAtOrBefore(today.keyframes, t) : NaN;
@@ -274,7 +346,7 @@ export class MoverFeed {
         }
         this.view.addWindow(decodeMoverWindow(body));
       }
-      await this.extend(gen, start, t + LOOKAHEAD_MS);
+      await this.extend(gen, start, target);
     } catch (err) {
       if (gen === this.gen && !isAbort(err)) {
         this.events.error?.(err);
@@ -300,9 +372,10 @@ export class MoverFeed {
       }
     }
     const starts: number[] = [];
-    for (let s = first; s < to && s + WINDOW_MS <= horizon; s += WINDOW_MS) {
-      if (listed.has(s)) {
-        starts.push(s);
+    let end = first;
+    for (; end < to && end + WINDOW_MS <= horizon; end += WINDOW_MS) {
+      if (listed.has(end)) {
+        starts.push(end);
       }
     }
     try {
@@ -314,6 +387,7 @@ export class MoverFeed {
         this.view.addWindow(decodeMoverWindow(b));
       }
       if (to > horizon) {
+        this.lastLiveFetch = this.perf();
         const live = decodeMoverWindow(await this.source.moverLive(this.sfc, this.abort.signal));
         if (gen !== this.gen) {
           return;
@@ -321,7 +395,10 @@ export class MoverFeed {
         this.view.addWindow(live);
         this.to = Math.max(this.to, Math.min(to, live.start));
       } else {
-        this.to = Math.max(this.to, to);
+        // Whole windows were loaded (an unlisted window has no rows), so the range is
+        // complete to the end of the last one, and the next extension starts after it
+        // instead of fetching that window again.
+        this.to = Math.max(this.to, end);
       }
       this.events.changed();
     } catch (err) {
@@ -330,6 +407,12 @@ export class MoverFeed {
       }
     }
   }
+}
+
+interface DayEntry {
+  p: Promise<DayIndex | null>;
+  /** perf() time after which the index is fetched again (Infinity: final, or in flight). */
+  expires: number;
 }
 
 function rangeDays(from: number, to: number): string[] {

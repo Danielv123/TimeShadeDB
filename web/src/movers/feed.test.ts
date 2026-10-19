@@ -21,18 +21,24 @@ const T0 = 1791630000000;
 
 const tick = () => new Promise(r => setTimeout(r, 0));
 
-function fakeSource(opts: { subscribe?: boolean; gate?: Promise<void> } = {}) {
+function fakeSource(opts: { subscribe?: boolean; gate?: Promise<void>; dayDelay?: number } = {}) {
   const calls: string[] = [];
   let handlers: any = null;
   const src: any = {
     kind: opts.subscribe ? "server" : "static",
     now: () => T0 + 3_600_000 + 10_000,
-    async moverDay(sfc: string, date: string) {
+    moverDay(sfc: string, date: string, signal?: AbortSignal) {
       calls.push(`day ${date}`);
-      if (date !== "2026-10-10") {
-        throw new Error("404");
-      }
-      return json("movers_day.json");
+      // Answers after dayDelay ms and honours the abort signal like fetch does.
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => (date === "2026-10-10" ? resolve(json("movers_day.json")) : reject(new Error("404"))), opts.dayDelay ?? 0);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
     },
     async moverWindow(sfc: string, start: number) {
       calls.push(`window ${start - T0}`);
@@ -133,6 +139,7 @@ test("live with SSE: live payload, subscription, events counted for the delay", 
   emit().hello({ now: src.now(), horizon: {} });
   await tick();
   assert.equal(calls.filter(c => c === "live").length, 2, "resync after reconnect");
+  assert.equal(est.samples, 1, "rows of the resync payload piled up in the outage and do not count");
   feed.stop();
   assert.ok(calls.includes("unsubscribe"));
 });
@@ -162,4 +169,111 @@ test("very fast playback skips mover loading", async () => {
   assert.equal(feed.active, false);
   feed.stop();
   void calls;
+});
+
+const settle = async (n = 20) => {
+  for (let i = 0; i < n; i++) {
+    await new Promise(r => setTimeout(r, 2));
+  }
+};
+
+test("history: a seek that supersedes one with its day index in flight still loads", async () => {
+  const { src, calls } = fakeSource({ dayDelay: 50 });
+  const view = new MoverView();
+  let perf = 0;
+  const feed = new MoverFeed(src, SFC, view, new DelayEstimator(), { changed() {} }, () => HORIZON, 5000, () => perf);
+  feed.setTime(T0 + 3000, false); // the day index is in flight
+  perf += 1000; // a slow scrub step, not timelapse
+  feed.setTime(T0 + 200_000, false); // a second seek in the same day
+  for (let i = 0; i < 5; i++) {
+    feed.ensure(); // every frame while the day index loads
+    await tick();
+  }
+  await settle();
+  assert.equal(calls.filter(c => c === "day 2026-10-10").length, 1, "the in-flight index is shared");
+  assert.equal(calls.filter(c => c === "window 0").length, 1, "frames during the seek do not restart it");
+  assert.ok(calls.includes("window 0"), calls.join("; "));
+  assert.equal(view.size, 3);
+  feed.stop();
+});
+
+test("history: stop aborts day index fetches without caching them as missing", async () => {
+  const { src, calls } = fakeSource({ dayDelay: 20 });
+  const view = new MoverView();
+  const feed = new MoverFeed(src, SFC, view, new DelayEstimator(), { changed() {} }, () => HORIZON);
+  feed.setTime(T0 + 3000, false);
+  feed.stop();
+  feed.setTime(T0 + 3000, false);
+  await settle();
+  assert.equal(calls.filter(c => c === "day 2026-10-10").length, 2, calls.join("; "));
+  assert.equal(view.size, 3);
+  feed.stop();
+});
+
+test("history: after a trim, seeking back before the kept history loads again", async () => {
+  const { src, calls } = fakeSource();
+  const view = new MoverView();
+  let perf = 0;
+  const feed = new MoverFeed(src, SFC, view, new DelayEstimator(), { changed() {} }, () => HORIZON, 5000, () => perf);
+  feed.setTime(T0 + 3000, false);
+  await settle();
+  const fresh = view.frame(T0 + 3000, feed.horizon()).length;
+  assert.ok(fresh >= 2);
+  perf += 1000;
+  feed.setTime(T0 + 200_000, false); // plays on and trims history before T0 + 80 s
+  await settle();
+  const n = calls.length;
+  perf += 1000;
+  feed.setTime(T0 + 3000, false); // back before the kept history
+  await settle();
+  assert.ok(calls.slice(n).includes("window 0"), `refetched: ${calls.slice(n).join("; ")}`);
+  assert.equal(view.frame(T0 + 3000, feed.horizon()).length, fresh);
+  feed.stop();
+});
+
+test("history: fast playback extends the loaded range instead of seeking again", async () => {
+  const { src, calls } = fakeSource();
+  const view = new MoverView();
+  let perf = 0;
+  const feed = new MoverFeed(src, SFC, view, new DelayEstimator(), { changed() {} }, () => HORIZON, 5000, () => perf);
+  let t = T0 + 3000;
+  feed.setTime(t, false);
+  await settle();
+  for (let i = 0; i < 6; i++) {
+    perf += 100;
+    t += 300_000; // 3000x, below MAX_SPEED
+    feed.setTime(t, false);
+    assert.equal(feed.active, true);
+    await settle(3);
+    feed.ensure();
+    await settle(3);
+  }
+  assert.equal(calls.filter(c => c === "window 0").length, 1, calls.join("; "));
+  assert.equal(calls.filter(c => c.startsWith("keyframe")).length, 0, "no seek again (a seek past T0 + 1 h would load its keyframe)");
+  assert.ok(feed.horizon() > t, "loaded ahead of the displayed time");
+  feed.stop();
+});
+
+test("live: the resync payload after a reconnect does not count for the delay", async () => {
+  const { src, emit } = fakeSource({ subscribe: true });
+  const live = src.moverLive;
+  let first = true;
+  src.moverLive = async () => {
+    if (first) {
+      first = false;
+      throw new Error("offline"); // the first payload fails; the resync brings every row
+    }
+    return live();
+  };
+  const view = new MoverView();
+  const est = new DelayEstimator(2000);
+  const feed = new MoverFeed(src, SFC, view, est, { changed() {}, error() {} }, () => HORIZON);
+  feed.setTime(src.now() - 2000, true);
+  await tick();
+  emit().hello({ now: src.now(), horizon: {} });
+  await settle(5);
+  assert.ok(view.size > 0, "the resync loaded the movers");
+  assert.equal(est.samples, 0);
+  assert.equal((est as any).readyN, 0, "nor for readiness");
+  feed.stop();
 });
