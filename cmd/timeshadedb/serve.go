@@ -292,7 +292,7 @@ func (s *webServer) handleChunkTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	if z > 0 {
+	if !chunkTileInBounds(z, x, y) {
 		writeAPIError(w, http.StatusNotFound, "tile out of bounds")
 		return
 	}
@@ -301,7 +301,22 @@ func (s *webServer) handleChunkTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Read the latest tick before the tile: a tile below it is complete and can be
+	// cached for good; a tile at or past it may still change (B4).
+	latestTick, ok, err := s.db.ChunkDatastoreLatestTick(key)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "datastore not found")
+		return
+	}
 	img, err := s.chunkTileAtZoom(r.Context(), key, tick, z, x, y)
+	if errors.Is(err, timeshadedb.ErrDatastoreNotFound) {
+		writeAPIError(w, http.StatusNotFound, "datastore not found")
+		return
+	}
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -311,7 +326,11 @@ func (s *webServer) handleChunkTile(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writePNGResponse(w, buf.Bytes())
+	if tick < latestTick {
+		writePNGResponse(w, buf.Bytes())
+	} else {
+		writeMutablePNGResponse(w, buf.Bytes())
+	}
 }
 
 func (s *webServer) handleChunkIngest(w http.ResponseWriter, r *http.Request) {
@@ -378,12 +397,12 @@ func (s *webServer) tileAtZoom(ctx context.Context, ts time.Time, z, x, y int) (
 
 func (s *webServer) chunkTileAtZoom(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, z, x, y int) (*image.RGBA, error) {
 	if z == 0 {
-		return s.renderChunkTile(ctx, key, tick, int32(x), int32(y)), nil
+		return s.renderChunkTile(ctx, key, tick, int32(x), int32(y))
 	}
 	return s.downsampledChunkTileAt(ctx, key, tick, z, x, y)
 }
 
-func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, tileX, tileY int32) *image.RGBA {
+func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, tileX, tileY int32) (*image.RGBA, error) {
 	img := image.NewRGBA(image.Rect(0, 0, timeshadedb.TileSize, timeshadedb.TileSize))
 	for i := 3; i < len(img.Pix); i += 4 {
 		img.Pix[i] = 0xff
@@ -399,7 +418,7 @@ func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.Datasto
 	}
 	chunks, err := s.db.ChunksAt(ctx, key, tick, coords)
 	if err != nil {
-		return img
+		return nil, err
 	}
 	for cy := 0; cy < chunksPerTile; cy++ {
 		for cx := 0; cx < chunksPerTile; cx++ {
@@ -421,7 +440,7 @@ func (s *webServer) renderChunkTile(ctx context.Context, key timeshadedb.Datasto
 			}
 		}
 	}
-	return img
+	return img, nil
 }
 
 func (s *webServer) downsampledChunkTileAt(ctx context.Context, key timeshadedb.DatastoreKey, tick uint64, z, x, y int) (*image.RGBA, error) {
@@ -452,7 +471,7 @@ func (s *webServer) downsampledChunkTileAt(ctx context.Context, key timeshadedb.
 	}
 	chunks, err := s.db.ChunksAt(ctx, key, tick, coords)
 	if err != nil {
-		return img, nil
+		return nil, err
 	}
 	for outY := 0; outY < timeshadedb.TileSize; outY++ {
 		srcY := worldY0 + int64(outY)*scale + sampleOffset
@@ -680,6 +699,24 @@ func tileInZoomBounds(z, x, y int) bool {
 	return x >= 0 && int64(x) < cols && y >= 0 && int64(y) < rows
 }
 
+// chunkWorldLimit bounds chunk tile requests to world tile coordinates in
+// [-chunkWorldLimit, chunkWorldLimit). Factorio maps end at +-1,000,000 tiles, so this
+// leaves a 4x margin and keeps every chunk coordinate far inside int32.
+const chunkWorldLimit = 1 << 22
+
+// chunkTileInBounds reports whether a chunk tile lies inside the world limit. It
+// rejects positive zoom and zoom levels so coarse that one tile spans the whole limit.
+func chunkTileInBounds(z, x, y int) bool {
+	if z > 0 || z < -13 {
+		return false
+	}
+	lim := chunkWorldLimit / (timeshadedb.TileSize << uint(-z))
+	if lim < 1 {
+		return false
+	}
+	return x >= -lim && x < lim && y >= -lim && y < lim
+}
+
 func zoomScale(z int) (int64, error) {
 	if z > 0 {
 		return 0, fmt.Errorf("positive tile zoom %d has no native data", z)
@@ -747,6 +784,14 @@ func writePNGResponse(w http.ResponseWriter, data []byte) {
 	_, _ = w.Write(data)
 }
 
+// writeMutablePNGResponse serves a tile that may still change (its tick is at or past
+// the datastore's latest tick): browsers must revalidate before reuse.
+func writeMutablePNGResponse(w http.ResponseWriter, data []byte) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(data)
+}
+
 func writeAPIJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
@@ -756,6 +801,7 @@ func writeAPIJSON(w http.ResponseWriter, v any) {
 
 func writeAPIError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }

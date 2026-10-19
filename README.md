@@ -28,6 +28,26 @@ active if any step fails. Upgrades require space for another full copy and all
 other writers must be stopped. Previous and interrupted generations remain
 unselected for manual cleanup.
 
+## Moving a v2 chunk database to v3
+
+`timeshadedb migrate-v3` copies every datastore of a v2 chunk database into a v3
+terrain store (see `docs/v3/`), then compares both pixel by pixel at random ticks:
+
+```powershell
+timeshadedb migrate-v3 --from factorio.tshd --db v3db
+timeshadedb migrate-v3 --from factorio.tshd --dry-run --verify 20
+```
+
+v2 stores game ticks and v3 stores map-clock milliseconds. `--epoch auto` (the
+default) puts each savefile's latest tick at the time its `progress.json` was last
+written; pass `--epoch` as RFC 3339 or Unix milliseconds to choose it, and `--ups`
+if the game did not run at 60 UPS. The savefile UUID becomes the v3 map name unless
+`--map` is given. v3 keeps the net change per chunk and terrain window (`--window`,
+default 60s), so states that lasted less than a window are not carried over; at every
+window boundary the copy equals the v2 database. The source is opened read-only.
+`--dry-run` migrates into memory and writes nothing. Writing with `--db` needs a
+binary that includes the v3 terrain engine.
+
 ## Factorio export
 
 The `timeshadedb_exporter` mod writes Factorio export files under
