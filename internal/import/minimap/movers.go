@@ -436,6 +436,9 @@ const (
 	boundarySlack = 1000
 	// carriagePitch is the distance between carriage centres in tiles (end switches).
 	carriagePitch = 7
+	// endSwitchMaxDt bounds the time between the two samples of an end switch (s), the
+	// same window as trainJumps: a jump after a longer gap is a gap, not a flip.
+	endSwitchMaxDt = 3
 )
 
 func dist(a, b *srcRow) float64 { return math.Hypot(a.x-b.x, a.y-b.y) }
@@ -547,13 +550,17 @@ func retimeRun(rows []srcRow, i, j int, kind string, rep *MoverReport) {
 	if i > 0 {
 		lb = rows[i-1].t + 1
 	}
+	// A row that is not re-timed keeps its stamp, even when it equals the previous row's
+	// time: equal times stay equal, so the duplicate rule keeps the later arrival. Only
+	// a re-timed row is bounded by lb, so re-timing never reorders rows or creates a new
+	// equal time.
 	for k := i; k < j; k++ {
 		t := min(max(est[k-i], lb), stamp[k-i])
 		if t < stamp[k-i]-retimeMinShift && t >= stamp[k-i]-retimeMaxShift {
 			rows[k].t = t
 			rep.Retimed[kind]++
 		} else {
-			rows[k].t = max(stamp[k-i], lb)
+			rows[k].t = stamp[k-i]
 		}
 		lb = rows[k].t + 1
 	}
@@ -598,7 +605,8 @@ func backwardEstimate(rows []srcRow, i, j int, est []int64) bool {
 }
 
 // markEndSwitches flags train samples where the leading end flipped: a jump (as in
-// trainJumps) at low speed whose length matches the train's front-to-back distance.
+// trainJumps, 0 < dt <= 3 s) at low speed whose length matches the train's front-to-back
+// distance.
 func markEndSwitches(rows []srcRow, metas []core.MoverMeta, rep *MoverReport) {
 	prev := -1
 	for i := range rows {
@@ -612,7 +620,7 @@ func markEndSwitches(rows []srcRow, metas []core.MoverMeta, rep *MoverReport) {
 			n := metas[r.meta].Carriages
 			dt := float64(r.t-p.t) / 1000
 			d := dist(p, r)
-			if n >= 2 && dt > 0 && d > max(speed(r), speed(p))*dt+6 && min(speed(r), speed(p)) < 3 {
+			if n >= 2 && dt > 0 && dt <= endSwitchMaxDt && d > max(speed(r), speed(p))*dt+6 && min(speed(r), speed(p)) < 3 {
 				l := float64((n - 1) * carriagePitch)
 				if math.Abs(d-l) <= 0.3*l+2 {
 					r.flags |= rowEndSwitch

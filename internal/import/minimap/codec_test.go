@@ -276,3 +276,100 @@ func TestPickSnaps(t *testing.T) {
 		t.Fatalf("pickSnaps(1) = %v", got)
 	}
 }
+
+func TestFixJourneyEqualStampsStayEqual(t *testing.T) {
+	b := float64(rowBoundary)
+	// Two samples clamped to the same floor, neither of which can be re-timed (the
+	// estimates land within 50 ms of the stamp): they keep the stamp, and the duplicate
+	// rule keeps the later arrival instead of pushing it 1 ms later.
+	rows := trainRows(
+		[6]float64{299000, 0, 0, 10, 0, 0},
+		[6]float64{300001, 10, 0, 10, 0, b},
+		[6]float64{300001, 10.2, 0, 10, 0, b},
+	)
+	rep := newRep()
+	got := fixJourney(rows, trainMeta, rep)
+	if len(got) != 2 || got[0].t != 299000 || got[1].t != 300001 || got[1].x != 10.2 {
+		t.Fatalf("rows: %+v", got)
+	}
+	if rep.DupSamplesDropped != 1 || rep.Retimed["t"] != 0 {
+		t.Fatalf("report: %+v", rep)
+	}
+	// The same when the first estimate is too far back to trust (more than 5 s).
+	rows = trainRows(
+		[6]float64{1000, 0, 0, 10, 0, 0},
+		[6]float64{60001, 10, 0, 10, 0, b},
+		[6]float64{60001, 10.5, 0, 10, 0, b},
+	)
+	rep = newRep()
+	got = fixJourney(rows, trainMeta, rep)
+	if len(got) != 2 || got[1].t != 60001 || got[1].x != 10.5 || rep.DupSamplesDropped != 1 {
+		t.Fatalf("rows: %+v rep %+v", got, rep)
+	}
+}
+
+func TestFixJourneyEqualStampsOneRetimed(t *testing.T) {
+	b := float64(rowBoundary)
+	// The first clamped sample is re-timed (5 tiles at 10 tiles/s after the sample at
+	// 1000); the second one's estimate is within 50 ms of the stamp, so it keeps it.
+	rows := trainRows(
+		[6]float64{1000, 0, 0, 10, 0, 0},
+		[6]float64{3001, 5, 0, 10, 0, b},
+		[6]float64{3001, 19.8, 0, 10, 0, b},
+	)
+	rep := newRep()
+	got := fixJourney(rows, trainMeta, rep)
+	if len(got) != 3 || got[1].t != 1500 || got[2].t != 3001 {
+		t.Fatalf("rows: %+v", got)
+	}
+	if rep.Retimed["t"] != 1 || rep.DupSamplesDropped != 0 {
+		t.Fatalf("report: %+v", rep)
+	}
+}
+
+func TestFixJourneyNeverMovesLater(t *testing.T) {
+	b := float64(rowBoundary)
+	g := float64(rowGone | rowBoundary)
+	// A mix of clamped runs, gones and equal stamps: no row may end up later than its
+	// stamp, and the result stays sorted.
+	rows := trainRows(
+		[6]float64{1000, 0, 0, 10, 0, 0},
+		[6]float64{3001, 5, 0, 10, 0, b},
+		[6]float64{3001, 5, 0, 10, 0, b},
+		[6]float64{3001, 7, 0, 10, 0, b},
+		[6]float64{3001, 0, 0, 0, 0, g},
+		[6]float64{3001, 9, 0, 10, 0, b},
+		[6]float64{3001, 9.1, 0, 10, 0, b},
+		[6]float64{3100, 10, 0, 10, 0, 0},
+		[6]float64{6001, 30, 0, 10, 0, b},
+		[6]float64{6001, 30, 0, 10, 0, b},
+	)
+	stamps := map[float64]int64{}
+	for _, r := range rows {
+		stamps[r.x] = r.t
+	}
+	got := fixJourney(append([]srcRow{}, rows...), trainMeta, newRep())
+	for i, r := range got {
+		if r.flags&rowGone == 0 && r.t > stamps[r.x] {
+			t.Fatalf("row %d moved later: %+v (stamp %d)", i, r, stamps[r.x])
+		}
+		if i > 0 && got[i-1].t >= r.t {
+			t.Fatalf("rows not strictly increasing at %d: %+v", i, got)
+		}
+	}
+}
+
+func TestEndSwitchNotAfterGap(t *testing.T) {
+	meta := []core.MoverMeta{{ID: "1.2.3", Kind: core.KindTrain, Carriages: 5}}
+	// A stationary train that reappears a train length away after a long data gap is
+	// not an end switch.
+	rows := trainRows(
+		[6]float64{1000, 0, 0, 0, 0, 0},
+		[6]float64{601000, 28.5, 0, 0, 0, 0},
+	)
+	rep := newRep()
+	got := fixJourney(rows, meta, rep)
+	if rep.EndSwitches != 0 || got[1].flags&rowEndSwitch != 0 {
+		t.Fatalf("end switch flagged after a 600 s gap: %+v", got)
+	}
+}
