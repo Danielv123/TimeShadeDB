@@ -124,8 +124,16 @@ function terrain.on_chunk_charted(st, e, forced)
 		end
 	end
 	local key = core.key(si, fi, p.x, p.y)
-	if not forced and deb.pending[key] then
-		return
+	if not forced then
+		-- what core.charted would do without the item: most events of a busy map end here, and building the item table
+		-- for each costs more than the rest of the handler (a repeat of a dirty chunk would store an equal item)
+		if deb.pending[key] or deb.dirty[key] then
+			return
+		end
+		if not deb.cool[key] and core.size(deb.queue) >= core.CAP then
+			deb.drops = deb.drops + 1
+			return
+		end
 	end
 	core.charted(deb, { key = key, si = si, fi = fi, x = p.x, y = p.y, forced = forced }, forced)
 end

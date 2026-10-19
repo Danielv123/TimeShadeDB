@@ -119,7 +119,7 @@ start empty, which only changes what that peer would write.
 cd capture/test && npm ci
 npm test                          # unit tests: node run_unit.mjs (Lua 5.4 via wasmoon)
 node run_game.mjs                 # headless Factorio: standalone mod and Clusterio module
-node run_game.mjs --mode bench    # UPS benchmark (about 15 minutes)
+node run_game.mjs --mode bench    # UPS benchmark (about 8 minutes)
 go test ./capture/...             # (from the repo root) real game output decodes into core types
 ```
 
@@ -154,27 +154,39 @@ patched save loads it, with a stub Clusterio API):
 
 `run_game.mjs --mode bench` builds 100 rail loops (24 straight rails a side, so about 30%
 of the track is curve) with a 4-carriage train each, driven at 0.5 tiles/tick (108 km/h),
-and feeds 20 chart events a tick over a virtual map of 50,176 charted chunks (a quarter of
-them on 201 chunks that change every tick). It runs the same save with and without the mod,
-interleaved, three times each, and compares Factorio's `--benchmark-verbose` timings
-(`scriptUpdate + luaGarbageIncremental`) over ticks 600 to 3,600, then a resync.
+and feeds 20 chart events a tick over a virtual map of 50,176 charted chunks: a quarter on
+201 chunks that change every tick, the rest spread over the whole map, so almost every
+read finds a chart the capture has not sent yet (deflated and sent: 88 KB of output per
+game second). It runs the same save with and without the mod, interleaved, three times
+each; the run without loads a no-op stand-in for the capture's test interface, so the
+driver's remote calls cost the same in both. It compares Factorio's `--benchmark-verbose`
+timings over ticks 600 to 3,600, then a resync. It fails when the Lua delta
+(`scriptUpdate + luaGarbageIncremental`) or the whole-tick delta is over 0.3 ms/tick, and
+warns about the resync's cost, slow ticks and a baseline that moved between pairs (a busy
+machine).
 
-Measured on 2026-10-19, Factorio 2.1.19, Ryzen 9 9950X3D, Windows 11, on a machine
-shared with other build jobs (the baseline itself moved by about 25% between runs):
+Measured on 2026-10-19, Factorio 2.1.19, Ryzen 9 9950X3D, Windows 11, defaults (one chart
+read a tick), in a run where the baseline stayed within 4% across the three pairs:
 
-| | Capture cost (Lua ms/tick) |
+| | Capture cost (ms/tick) |
 |---|---|
-| Steady state, mean | 0.287 and 0.302 (two runs of the final code; 0.29 to 0.36 with the earlier 1-second write) |
-| Steady state, median | 0.237 and 0.247 |
-| During a resync (4 forced reads a tick) | about 0.48 |
-| Spikes | about 2 ms on the tick that writes the 2-second file buffer (`write_file`) |
+| Steady state, Lua, mean | 0.330 (pairs 0.328, 0.331, 0.330) |
+| Steady state, Lua, median | 0.271 |
+| Steady state, whole tick, mean | 0.384 |
+| During a resync (4 forced reads a tick) | 0.60 |
+| Slowest tick | 7.9 ms Lua (p99 2.1 ms) |
 
-These numbers include the test harness's own cost of feeding chart events through a remote
-interface (estimated 20 to 40 µs/tick). The budget (D9) is 0.3 ms/tick, so this worst case
-is at the budget, not clearly under it. Per operation (`run_game.mjs --mode bench --micro`):
-a queued chart event 0.4 to 0.8 µs, a new one 1.6 to 2.4 µs, a train read 4 µs,
-`helpers.encode_string` of a chart 22 µs, a 3-sample move message 13 µs to encode
-(`helpers.table_to_json`: 24 to 33 µs), one `helpers.write_file` call about 1 ms.
+The steady state is over the 0.3 ms budget (D9) in this scenario. One-run ablations show
+where it goes: the 100 trains alone (no chart events) cost 0.12; one chart event and one
+read a tick of a chart not yet sent add 0.09 to 0.11 (deflating 2 KiB with
+`helpers.encode_string` and sending it); the other 19 events a tick add about 0.11. With two
+chart reads a tick (the earlier default) the Lua mean was 0.44. A map whose charts mostly
+repeat what was sent costs less: an unchanged re-read skips the deflate (raw compare) or the
+send (cache hit). The earlier figure of 0.29 came from a chart generator that only reached
+about 1,000 chunks. Per operation (`run_game.mjs --mode bench --micro`): a queued chart
+event 0.4 to 0.8 µs, a new one 1.6 to 2.4 µs, a train read 4 µs, `helpers.encode_string`
+of a chart 22 µs, a 3-sample move message 13 µs to encode (`helpers.table_to_json`: 24 to
+33 µs).
 
 ## Licence
 
