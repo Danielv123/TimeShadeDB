@@ -63,6 +63,65 @@ func isEndSwitch(p, r *srcRow) bool {
 	return math.Abs(d-l) <= 0.3*l+2
 }
 
+// Universal Edges crossings without a gone row. A train that enters an edge runs on into
+// a buffer past the edge line (about 32 tiles on the test data) and stops there; the
+// instance on the other side places it near the line, so its next sample lies behind the
+// last one while it heads back towards it. The capture normally sends a gone for the
+// handoff; where it did not, the importer adds one (MoverReport.CrossingsInferred).
+// Trains only: a vehicle can turn around between two samples.
+const (
+	// crossingBand: both samples lie within this many tiles of the same edge line.
+	crossingBand = 64
+	// crossingMinJump: the backwards step is at least this long (tiles).
+	crossingMinJump = 8
+)
+
+// nearEdge reports whether (x, y) lies within crossingBand of the axis-aligned (or any)
+// edge segment e, measured from the segment.
+func nearEdge(e core.Quad, x, y float64) bool {
+	x1, y1, x2, y2 := e[0], e[1], e[2], e[3]
+	dx, dy := x2-x1, y2-y1
+	l2 := dx*dx + dy*dy
+	u := 0.0
+	if l2 > 0 {
+		u = math.Max(0, math.Min(1, ((x-x1)*dx+(y-y1)*dy)/l2))
+	}
+	return math.Hypot(x-(x1+u*dx), y-(y1+u*dy)) <= crossingBand
+}
+
+// isCrossing reports whether sample r, following sample p of the same journey with no
+// gone between them, is an edge crossing without a gone: r lies at least
+// crossingMinJump behind p (not ahead of p's own motion) and moves towards it, and both
+// lie near the same edge. An end switch moves away from the old head, and a train cannot
+// get behind its old position while heading towards it without driving past it, which
+// the capture would have sent. r's direction is its velocity, or when it reports none (a
+// train placed at rest), the step to next (the row after it, nil when unknown).
+func isCrossing(edges []core.Quad, p, r, next *srcRow) bool {
+	if len(edges) == 0 {
+		return false
+	}
+	dx, dy := r.x-p.x, r.y-p.y
+	if math.Hypot(dx, dy) < crossingMinJump || p.vx*dx+p.vy*dy > 0 {
+		return false // a step ahead of a moving p is not behind it
+	}
+	vx, vy := r.vx, r.vy
+	if vx == 0 && vy == 0 && next != nil && next.flags&rowGone == 0 {
+		vx, vy = next.x-r.x, next.y-r.y
+		if math.Hypot(vx, vy) < 0.5 {
+			return false
+		}
+	}
+	if vx*dx+vy*dy >= 0 {
+		return false
+	}
+	for _, e := range edges {
+		if nearEdge(e, p.x, p.y) && nearEdge(e, r.x, r.y) {
+			return true
+		}
+	}
+	return false
+}
+
 // journey is the streaming state of one journey on one surface.
 type journey struct {
 	id     string
@@ -118,6 +177,7 @@ func (h *outHeap) Pop() any {
 type moverSurface struct {
 	key      core.SurfaceKey
 	windowMs int64
+	edges    []core.Quad // Universal Edges segments of the surface (crossings)
 	rep      *MoverReport
 	metas    map[core.MoverMeta]*core.MoverMeta
 	journeys map[string]*journey
@@ -288,7 +348,13 @@ func (s *moverSurface) fixSegment(j *journey, cut int) {
 			}
 			continue
 		}
-		s.emit(j, r)
+		// The next row (when it is in this segment) gives r's direction for the edge
+		// crossing test when r itself reports no velocity.
+		var next *srcRow
+		if k+1 < len(buf) {
+			next = &buf[k+1]
+		}
+		s.emit(j, r, next)
 	}
 	j.ctx, j.hasCtx = buf[len(buf)-1], true
 	n := copy(j.pend, j.pend[cut:])
@@ -321,8 +387,8 @@ func (j *journey) sourceStep(r *srcRow, rep *MoverReport) {
 }
 
 // emit hands one fixed row to the output: end switches, handoff and jump counting,
-// flags and headings.
-func (s *moverSurface) emit(j *journey, r *srcRow) {
+// flags and headings. next is the journey's row after r when it is known (or nil).
+func (s *moverSurface) emit(j *journey, r *srcRow, next *srcRow) {
 	rep := s.rep
 	kind := r.meta.Kind
 	k := string(kind)
@@ -342,6 +408,13 @@ func (s *moverSurface) emit(j *journey, r *srcRow) {
 		o.flags |= core.FlagGone
 		s.push(o)
 		return
+	}
+	if r.flags&rowSeed == 0 && j.outPrevOK && kind == core.KindTrain &&
+		r.t-j.outPrev.t >= 2 && isCrossing(s.edges, &j.outPrev, r, next) {
+		// An edge crossing without a gone: add the gone just before r, so the store flags
+		// the handoff and viewers bridge it instead of drawing a jump back.
+		rep.CrossingsInferred++
+		s.emit(j, &srcRow{t: r.t - 1, meta: r.meta, flags: rowGone}, nil)
 	}
 	rep.Imported.Samples[k]++
 	for _, g := range j.gones {
@@ -460,7 +533,7 @@ func (s *moverSurface) keyframes(ctx context.Context, src *SourceSurface, M int6
 			}
 			row.meta = s.intern(meta)
 			row.flags |= rowSeed
-			s.emit(s.journey(meta.ID), &row)
+			s.emit(s.journey(meta.ID), &row, nil)
 			rep.KeyframeSeeded++
 		}
 	}
@@ -657,6 +730,7 @@ func importMovers(ctx context.Context, d *Dataset, opt *Options, store core.Move
 		st := &moverStream{key: src.Key, ch: make(chan []outSample, 2)}
 		streams[i] = st
 		s := newMoverSurface(src.Key, d.WindowMs, reports[i])
+		s.edges = d.edges(src.Key)
 		s.send = func(c []outSample) error {
 			select {
 			case st.ch <- c:

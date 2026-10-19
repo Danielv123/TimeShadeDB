@@ -228,6 +228,10 @@ type MoverReport struct {
 	// Handoffs are imported gones followed by a sample of the same journey within
 	// core.HandoffWindow (the store flags the same rows).
 	Handoffs int `json:"handoffs"`
+	// CrossingsInferred are gones the import added for Universal Edges crossings the
+	// source has no gone for: a train sample behind the previous one, heading
+	// back towards it, both near the same edge line (isCrossing). Each is a handoff.
+	CrossingsInferred int `json:"crossings_inferred"`
 	// TrainJumps counts consecutive train samples (0 < dt <= 3 s, no gone between)
 	// that moved more than max speed * dt + 6 tiles, before and after the fixes
 	// (research/scripts/jumps.py). After the fixes, end switches are not counted.
