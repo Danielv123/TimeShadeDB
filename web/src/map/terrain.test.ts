@@ -377,3 +377,47 @@ test("planning in a microtask on every redraw (as MapView does) aborts nothing t
   assert.deepEqual(events("tile.abort"), []);
   assert.equal(perf().counters.tilesAborted, 0);
 });
+
+test("a failing tiledelta falls back to the full tile", async () => {
+  const data = syntheticDataset({ bounds: [0, 0, 0, 0], versions: 3, coarse: 0 });
+  const server = await new MockServer(data, { noDeltas: true }).start();
+  servers.push(server);
+  const source = new StaticSource({ base: `${server.url}/static/` });
+  const catalog = await source.catalog();
+  const ds = catalog.maps[0].surfaces[0].datastores[0];
+  const renderer = new FakeRenderer();
+  const engine = new TerrainEngine({ source, renderer, loader: new DirectLoader() });
+  engines.push(engine);
+  const v = [...data.stores.values()][0].tiles.get(tk(0, 0, 0))!.versions;
+  const cam = { x: 0, y: 0, scale: 1 };
+  const vp = { width: 512, height: 512, dpr: 1 };
+  engine.setDatastore(catalog, ds);
+  engine.setTime(v[0].t);
+  await settle(engine, cam, vp);
+  server.clearLog();
+  engine.setTime(v[1].t);
+  const r = await settle(engine, cam, vp);
+  assert.equal(r.full, 1);
+  assert.equal(server.requests(/\/tiledelta\//).length, 1, "the delta was tried");
+  assert.equal(server.requests(/\/tile\/.*\/0\/0\/0\/2\.bin$/).length, 1, "then the full tile");
+  const want = v[1].pixels;
+  assert.ok(renderer.live().some(t => t.pixels.every((p, i) => p === want[i])), "a texture holds version 2");
+});
+
+test("switching between history and live keeps cached timelines and view answers", async () => {
+  const { engine, catalog, ds, server, data } = await setup({ bounds: [0, 0, 1, 0], versions: 3, coarse: 0 });
+  const v = [...data.stores.values()][0].tiles.get(tk(0, 0, 0))!.versions;
+  const cam = { x: 256, y: 0, scale: 1 };
+  const vp = { width: 1024, height: 512, dpr: 1 };
+  engine.setDatastore(catalog, ds);
+  await settle(engine, cam, vp);
+  engine.setTime(v[0].t);
+  await settle(engine, cam, vp);
+  engine.setTime("latest");
+  await settle(engine, cam, vp);
+  engine.setTime(v[1].t);
+  await settle(engine, cam, vp);
+  assert.equal(server.requests(/\/timeline\//).length, 1, "one timeline for the day");
+  // Back to live refreshes the view answers once (they may have moved meanwhile).
+  assert.equal(server.requests(/\/view\//).length, 2);
+});

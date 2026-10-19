@@ -39,6 +39,8 @@ export interface MockServerOptions {
   staticDir?: string;
   /** Extra files: path -> body (for fixture passthrough, e.g. movers). */
   files?: Map<string, { body: Uint8Array; type: string }>;
+  /** Answer every tiledelta request with 404 (an export without deltas). */
+  noDeltas?: boolean;
   /** Serve HTTP/2 over TLS (HTTP/1.1 is still accepted) with this key and certificate (PEM). */
   tls?: { key: string | Buffer; cert: string | Buffer };
 }
@@ -311,6 +313,9 @@ export class MockServer {
           return err(404, "not_found", "no tile");
         }
         const [from, to] = [Number(m[1]), Number(m[2])];
+        if (this.opts.noDeltas) {
+          return err(404, "not_found", "no deltas here");
+        }
         if (mode === "static" && to !== from + 1) {
           return err(404, "not_found", "static exports only have consecutive deltas");
         }

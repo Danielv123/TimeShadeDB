@@ -381,10 +381,15 @@ export class MapView {
       // The first hello only confirms the subscription; later ones follow a reconnect, after
       // which versions may have moved without events.
       let hellos = 0;
+      const every = Math.max(2000, this.catalog.live_ms || 5000);
       this.unsubscribe = this.source.subscribe(
         { ds: [ds.id], sfc: [] },
         {
           hello: () => {
+            if (this.pollTimer) {
+              clearInterval(this.pollTimer);
+              this.pollTimer = null;
+            }
             if (hellos++ > 0) {
               this.engine.refreshVersions();
             }
@@ -392,6 +397,12 @@ export class MapView {
           tile: (e: LiveTileEvent) => this.engine.applyLiveTile(e),
           horizon: () => void this.refreshCatalog(),
           catalog: () => void this.refreshCatalog(),
+          // While the stream is down (or a proxy buffers it), poll the versions instead.
+          error: () => {
+            if (!this.pollTimer && !this.destroyed) {
+              this.pollTimer = setInterval(() => this.engine.refreshVersions(), every);
+            }
+          },
         },
       );
     } else {

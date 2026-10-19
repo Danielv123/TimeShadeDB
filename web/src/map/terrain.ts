@@ -205,10 +205,7 @@ export class TerrainEngine {
     this.loader.setLut(null);
     this.palettePromise = null;
     this.paletteWanted = 0;
-    this.resolver?.dispose();
-    this.resolver = null;
-    this.timeline = null;
-    this.view = null;
+    this.disposeResolvers();
     this.bumpEpoch();
     if (ds) {
       this.makeResolver();
@@ -296,27 +293,43 @@ export class TerrainEngine {
   dispose(): void {
     this.gen++;
     this.scheduler.clear();
-    this.resolver?.dispose();
+    this.disposeResolvers();
     this.textures.clear();
     this.loader.dispose();
   }
 
-  private makeResolver(): void {
-    this.resolver?.dispose();
+  private disposeResolvers(): void {
+    this.timeline?.dispose();
+    this.view?.dispose();
     this.resolver = null;
     this.timeline = null;
     this.view = null;
+  }
+
+  /**
+   * Picks the resolver for the target. Both live as long as the datastore, so switching
+   * between history and live keeps the cached timelines and view answers.
+   */
+  private makeResolver(): void {
     const ds = this.ds;
     if (!ds) {
+      this.resolver = null;
       return;
     }
     const onChange = (): void => this.redraw();
+    if (!this.timeline) {
+      this.timeline = new TimelineVersions(this.source, ds, onChange, this.now);
+    }
+    this.timeline.setTarget(this.target);
     if (this.target === "latest" && this.source.view && this.source.kind === "server") {
-      this.view = new ViewVersions(this.source, ds, onChange, this.now);
+      if (!this.view) {
+        this.view = new ViewVersions(this.source, ds, onChange, this.now);
+      } else if (this.resolver !== this.view) {
+        // Back to live: answers may have moved while history was shown.
+        this.view.refresh();
+      }
       this.resolver = this.view;
     } else {
-      this.timeline = new TimelineVersions(this.source, ds, onChange, this.now);
-      this.timeline.setTarget(this.target);
       this.resolver = this.timeline;
     }
   }
@@ -673,7 +686,17 @@ export class TerrainEngine {
     try {
       if (this.useDeltas && z === 0 && want.version !== null) {
         const base = this.deltaBase(tk, want.version);
-        if (base && (await this.loadDelta(ds.id, base, want, x, y, signal, gen))) {
+        // A delta that fails (a static export without it, a server error) falls back to the
+        // full tile; only an abort ends the load.
+        const done = base
+          ? await this.loadDelta(ds.id, base, want, x, y, signal, gen).catch((err: unknown) => {
+              if ((err as Error)?.name === "AbortError") {
+                throw err;
+              }
+              return false;
+            })
+          : false;
+        if (done) {
           return;
         }
       }
