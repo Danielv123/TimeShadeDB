@@ -1,0 +1,307 @@
+package ingest
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/v3/core/memstore"
+)
+
+const base core.TimeMs = 1_792_000_000_000 // 2026-10-15
+
+type env struct {
+	V      int    `json:"v"`
+	Tick   int64  `json:"tick"`
+	Src    string `json:"src,omitempty"`
+	Map    string `json:"map,omitempty"`
+	Inst   int64  `json:"instance,omitempty"`
+	RecvMs int64  `json:"recv_ms,omitempty"`
+	Seq    *int64 `json:"seq,omitempty"`
+	Msgs   []any  `json:"msgs"`
+}
+
+func line(t testing.TB, e env) string {
+	t.Helper()
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b) + "\n"
+}
+
+func chart(v uint16) *core.ChunkPixels {
+	var px core.ChunkPixels
+	for i := range px {
+		px[i] = v
+	}
+	return &px
+}
+
+type fixture struct {
+	ter   *memstore.Terrain
+	mov   *memstore.Movers
+	ovl   *memstore.Overlays
+	maps  *Maps
+	in    *Ingester
+	now   core.TimeMs
+	notes *recNotifier
+}
+
+type recNotifier struct {
+	chunks, samples, maps int
+}
+
+func (r *recNotifier) ChunksApplied(u []core.ChunkUpdate)  { r.chunks += len(u) }
+func (r *recNotifier) SamplesApplied(s []core.MoverSample) { r.samples += len(s) }
+func (r *recNotifier) MapsChanged()                        { r.maps++ }
+
+func newFixture(t *testing.T, opt Options) *fixture {
+	t.Helper()
+	maps, err := OpenMaps(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fixture{ter: memstore.NewTerrain(), mov: memstore.NewMovers(), ovl: memstore.NewOverlays(), maps: maps, now: base + 10*core.Second, notes: &recNotifier{}}
+	opt.Clock = func() core.TimeMs { return f.now }
+	opt.Notifier = f.notes
+	f.in = New(Stores{Terrain: f.ter, Movers: f.mov, Overlays: f.ovl, Maps: maps}, opt)
+	return f
+}
+
+func (f *fixture) ingest(t *testing.T, body string) core.IngestResponse {
+	t.Helper()
+	resp, err := f.in.Ingest(context.Background(), strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestIngestMapsMessages(t *testing.T) {
+	f := newFixture(t, Options{})
+	ctx := context.Background()
+	d := core.EncodeChart(chart(0x1234))
+	h := 0.25
+	x, y := 10.5, -3.0
+	seq := int64(7)
+	body := line(t, env{V: 1, Tick: 600, Src: "clusterio:5", Map: "gw-a.1", Inst: 5, RecvMs: int64(base), Seq: &seq, Msgs: []any{
+		map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 1, "y": 2, "d": d},
+		map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 3, "y": 2},
+		map[string]any{"type": "move", "s": "nauvis", "m": []any{
+			map[string]any{"j": "5.1.7", "k": "t", "f": "player", "name": "locomotive", "x": 1.5, "y": 2.5, "h": h, "n": 2, "o": "LC", "stop": true,
+				"car": [][3]float64{{1.5, 2.5, 0.25}, {1.5, 9.5, 0.25}}},
+			map[string]any{"j": "p:bob", "k": "p", "f": "player", "name": "bob", "x": 4, "y": 4, "tick": 590},
+		}},
+		map[string]any{"type": "tag", "s": "nauvis", "f": "player", "n": 3, "x": x, "y": y, "icon": "item/iron-plate", "text": "hi"},
+		map[string]any{"type": "recipe", "s": "nauvis", "f": "player", "u": 99, "x": x, "y": y, "r": "gear", "q": "normal"},
+		map[string]any{"type": "map", "info": map[string]any{"key": "gw-a.1", "title": "A", "instances": []any{}}},
+		map[string]any{"type": "unknown-future-type", "x": 1},
+	}})
+	seq2 := int64(8)
+	body += line(t, env{V: 1, Tick: 660, Src: "clusterio:5", Map: "gw-a.1", Inst: 5, RecvMs: int64(base + 1000), Seq: &seq2, Msgs: []any{
+		map[string]any{"type": "move", "s": "nauvis", "m": []any{map[string]any{"j": "5.1.7", "gone": true}}},
+		map[string]any{"type": "tag", "s": "nauvis", "f": "player", "n": 3},
+	}})
+	resp := f.ingest(t, body)
+	if resp.Envelopes != 2 || resp.BadLines != 0 || len(resp.Errors) != 0 {
+		t.Fatalf("resp %+v", resp)
+	}
+	if resp.Chunks.Accepted != 2 || resp.Samples.Accepted != 3 || resp.Overlays.Accepted != 3 {
+		t.Fatalf("counts %+v", resp)
+	}
+	if resp.Seq == nil || *resp.Seq != 8 {
+		t.Fatalf("seq %v", resp.Seq)
+	}
+	if f.notes.chunks != 2 || f.notes.samples != 3 || f.notes.maps != 1 {
+		t.Fatalf("notes %+v", f.notes)
+	}
+	// Terrain: chunk (1,2) holds the chart, (3,2) was deleted, at the anchored time.
+	ds := core.DatastoreKey{Map: "gw-a.1", Surface: "nauvis", Force: "player"}
+	if err := f.ter.Commit(ctx, base+5*core.Minute); err != nil {
+		t.Fatal(err)
+	}
+	tile, block := core.ChunkCoord{X: 1, Y: 2}.Tile()
+	im, _, err := f.ter.ReadTile(ctx, ds, tile, base+5*core.Minute, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if px := im.Block(block); px[0] != 0x1234 {
+		t.Fatalf("pixel %x", px[0])
+	}
+	// Movers: tick 600 at recv base is the anchor; the player's tick 590 is 10 ticks
+	// (167 ms) earlier; the gone at tick 660 is 1 s later.
+	if err := f.mov.Commit(ctx, base+10*core.Minute); err != nil {
+		t.Fatal(err)
+	}
+	w, err := f.mov.Window(ctx, core.SurfaceKey{Map: "gw-a.1", Surface: "nauvis"}, core.WindowStart(base, core.MoverWindowLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]core.MoverRow{}
+	for _, r := range w.Rows {
+		got[w.Movers[r.Mover].ID] = append(got[w.Movers[r.Mover].ID], r)
+	}
+	tr := got["5.1.7"]
+	if len(tr) != 2 || tr[0].T != base || tr[0].Tick != 600 || tr[0].Flags&core.FlagStop == 0 || len(tr[0].Carriages) != 2 || tr[0].Orientation != 0.25 {
+		t.Fatalf("train rows %+v", tr)
+	}
+	if tr[1].Flags&core.FlagGone == 0 || tr[1].T != base+1000 {
+		t.Fatalf("gone row %+v", tr[1])
+	}
+	pl := got["p:bob"]
+	if len(pl) != 1 || pl[0].T != base-167 || pl[0].Flags&core.FlagNoHeading == 0 {
+		t.Fatalf("player rows %+v", pl)
+	}
+	// Overlays: the tag was opened and closed, keyed by instance.
+	ivs, err := f.ovl.Query(ctx, ds, core.OverlayQuery{Tile: core.TileAt(x, y, 0), T0: 0, T1: base + core.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tag *core.Interval
+	for i := range ivs {
+		if ivs[i].Kind == core.OverlayTag {
+			tag = &ivs[i]
+		}
+	}
+	if tag == nil || tag.Key != "5/3" || tag.Instance != 5 || tag.End != base+1000 || tag.Icon != "item/iron-plate" {
+		t.Fatalf("tag %+v (all %+v)", tag, ivs)
+	}
+	// Maps: stored in maps.json.
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(f.maps.path), "maps.json"))
+	if err != nil || !strings.Contains(string(b), `"title": "A"`) {
+		t.Fatalf("maps.json %s %v", b, err)
+	}
+	if again, _ := OpenMaps(filepath.Dir(f.maps.path)); len(again.list) != 1 {
+		t.Fatal("maps.json does not reload")
+	}
+}
+
+func TestIngestBadLines(t *testing.T) {
+	f := newFixture(t, Options{MaxLine: 300})
+	good := line(t, env{V: 1, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{}})
+	body := "not json\n" +
+		line(t, env{V: 2, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base)}) +
+		line(t, env{V: 1, Tick: 1, Map: "m", RecvMs: int64(base)}) +
+		`{"v":1,"tick":1,"src":"s","map":"m","recv_ms":1,"msgs":[]` + strings.Repeat(" ", 400) + "}\n" +
+		"\n" + good +
+		line(t, env{V: 1, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 1, "y": 1, "d": "!!"},
+			map[string]any{"type": "chunk", "s": "", "f": "player", "x": 1, "y": 1},
+		}}) +
+		strings.TrimSuffix(good, "\n") // last line without a newline
+	resp := f.ingest(t, body)
+	if resp.BadLines != 4 || resp.Envelopes != 3 {
+		t.Fatalf("resp %+v", resp)
+	}
+	if resp.Chunks.Invalid != 1 || resp.Chunks.Accepted != 0 {
+		t.Fatalf("chunks %+v", resp.Chunks)
+	}
+	if len(resp.Errors) != 6 {
+		t.Fatalf("errors %q", resp.Errors)
+	}
+	st := f.in.Stats()
+	if st.BadLines != 4 || st.BadMessages != 2 || st.Envelopes != 3 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestIngestClampsFutureTimes(t *testing.T) {
+	f := newFixture(t, Options{})
+	d := core.EncodeChart(chart(7))
+	// recv_ms an hour ahead of the server clock.
+	resp := f.ingest(t, line(t, env{V: 1, Tick: 60, Src: "s", Map: "m", RecvMs: int64(f.now + core.Hour), Msgs: []any{
+		map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 0, "y": 0, "d": d},
+	}}))
+	if resp.Chunks.Accepted != 1 || f.in.Stats().Clamped != 1 {
+		t.Fatalf("resp %+v stats %+v", resp, f.in.Stats())
+	}
+	infos, _ := f.ter.Datastores(context.Background())
+	if len(infos) != 1 || infos[0].LastT != f.now {
+		t.Fatalf("datastores %+v", infos)
+	}
+}
+
+func TestIngestFlushesInBatches(t *testing.T) {
+	f := newFixture(t, Options{FlushChunks: 10})
+	var sb strings.Builder
+	d := core.EncodeChart(chart(9))
+	for i := range 35 {
+		sb.WriteString(line(t, env{V: 1, Tick: int64(i), Src: "s", Map: "m", RecvMs: int64(base) + int64(i)*17, Msgs: []any{
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": i, "y": 0, "d": d},
+		}}))
+	}
+	resp := f.ingest(t, sb.String())
+	if resp.Chunks.Accepted != 35 || f.notes.chunks != 35 {
+		t.Fatalf("resp %+v notes %+v", resp, f.notes)
+	}
+}
+
+// overloadedTerrain refuses every batch.
+type overloadedTerrain struct{ *memstore.Terrain }
+
+func (overloadedTerrain) Apply(context.Context, []core.ChunkUpdate) (core.ApplyResult, error) {
+	return core.ApplyResult{}, fmt.Errorf("test: %w", core.ErrOverloaded)
+}
+
+func TestIngestOverloaded(t *testing.T) {
+	maps, _ := OpenMaps(t.TempDir())
+	in := New(Stores{Terrain: overloadedTerrain{memstore.NewTerrain()}, Movers: memstore.NewMovers(), Overlays: memstore.NewOverlays(), Maps: maps}, Options{})
+	_, err := in.Ingest(context.Background(), strings.NewReader(line(t, env{V: 1, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{
+		map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 0, "y": 0},
+	}})))
+	if !errors.Is(err, core.ErrOverloaded) {
+		t.Fatalf("err %v", err)
+	}
+	if in.Stats().Overloaded != 1 {
+		t.Fatal("overload not counted")
+	}
+}
+
+func TestIngestResyncEndsJourneys(t *testing.T) {
+	f := newFixture(t, Options{})
+	ctx := context.Background()
+	mv := func(j string) map[string]any {
+		return map[string]any{"j": j, "k": "v", "f": "player", "name": "car", "x": 1, "y": 1, "h": 0.5}
+	}
+	f.ingest(t, line(t, env{V: 1, Tick: 60, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{
+		map[string]any{"type": "move", "s": "nauvis", "m": []any{mv("1.1.v1"), mv("1.1.v2")}},
+	}}))
+	// A resync lists the surfaces, re-sends only v1 and ends: v2 gets a gone.
+	resp := f.ingest(t, line(t, env{V: 1, Tick: 120, Src: "s", Map: "m", RecvMs: int64(base + 1000), Msgs: []any{
+		map[string]any{"type": "surfaces", "list": []any{map[string]any{"name": "nauvis", "tile": true}}},
+		map[string]any{"type": "move", "s": "nauvis", "m": []any{mv("1.1.v1")}},
+		map[string]any{"type": "resynced", "trace": "t", "counts": map[string]int{"movers": 1}},
+	}}))
+	if resp.Samples.Accepted != 2 {
+		t.Fatalf("resp %+v", resp)
+	}
+	live, err := f.mov.Live(ctx, core.SurfaceKey{Map: "m", Surface: "nauvis"}, base+2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := false
+	for _, r := range live.Rows {
+		if live.Movers[r.Mover].ID == "1.1.v2" && r.Flags&core.FlagGone != 0 {
+			gone = true
+		}
+	}
+	if !gone {
+		t.Fatalf("v2 not ended: %+v", live.Rows)
+	}
+}
+
+func TestReadLineLimits(t *testing.T) {
+	f := newFixture(t, Options{MaxLine: 100})
+	body := strings.Repeat("x", 70000) + "\n" + line(t, env{V: 1, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{}})
+	resp := f.ingest(t, body)
+	if resp.BadLines != 1 || resp.Envelopes != 1 {
+		t.Fatalf("resp %+v", resp)
+	}
+}
