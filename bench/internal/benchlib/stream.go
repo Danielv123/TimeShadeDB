@@ -14,7 +14,7 @@ import (
 )
 
 // TSVReader reads chunk rows from a TimeShadeDB chunk TSV file in the 5-field form
-// research/scripts/to_stream.py writes:
+// `measure stream` (WriteIllisisStream) writes:
 //
 //	t \t surface \t cx,cy \t force \t hex(1024 x RGB565 little-endian)
 //
@@ -42,7 +42,7 @@ func OpenTSV(path, mapKey string) (*TSVReader, error) {
 }
 
 // MapKeyFromStreamFile returns "gw-bc41437d.1" for ".../gw-bc41437d~2E1.chunks.tsv"
-// (to_stream.py keeps the illisis escaped name in file names).
+// (stream files keep the illisis escaped name).
 func MapKeyFromStreamFile(path string) string {
 	base := filepath.Base(path)
 	for _, suf := range []string{".chunks.tsv", ".entities.tsv", ".tsv"} {

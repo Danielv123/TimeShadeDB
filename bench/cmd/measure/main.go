@@ -6,6 +6,8 @@
 //	    database size by category, B/chunk-hour (z0 and all terrain) and mover B/sample
 //	measure illisis -data <export root> [-surface gw-bc41437d~2E1/nauvis/player]
 //	    the same numbers for an illisis/minimap export (the test data), as a baseline
+//	measure stream -data <export root> -out <dir> [-coalesce 60000]
+//	    the chunk TSV stream (<map>.chunks.tsv) that ingestbench and soak replay
 package main
 
 import (
@@ -37,13 +39,15 @@ func main() {
 		cmdV3Disk(os.Args[2:])
 	case "illisis":
 		cmdIllisis(os.Args[2:])
+	case "stream":
+		cmdStream(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis [flags]")
+	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream [flags]")
 	os.Exit(2)
 }
 
@@ -83,7 +87,7 @@ func cmdRun(args []string) {
 	cmd := exec.Command(rest[0], rest[1:]...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	if err := benchlib.StartTied(cmd); err != nil {
 		benchlib.Fatal(err)
 	}
 	sampler := benchlib.SampleMemory(cmd.Process.Pid, 100*time.Millisecond)
@@ -112,7 +116,7 @@ func cmdV3Disk(args []string) {
 	ds := fs.String("ds", "gw-bc41437d~2E1.nauvis.player", "datastore id for the per-chunk-hour numbers")
 	chunks := fs.Float64("chunks", nauvisChunks, "charted chunks of that datastore")
 	hours := fs.Float64("hours", nauvisHours, "hours covered")
-	samples := fs.Float64("mover-samples", 0, "stored mover samples (for B/sample); 0 skips")
+	samples := fs.Float64("mover-samples", 0, "stored mover samples for B/sample (default: counted from the closed windows in the database)")
 	fs.Parse(args)
 	d, err := benchlib.MeasureV3Disk(*db)
 	if err != nil {
@@ -137,8 +141,26 @@ func cmdV3Disk(args []string) {
 	} else {
 		res.Note("datastore %s not found; B/chunk-hour skipped", *ds)
 	}
-	if *samples > 0 {
-		res.Set("disk.mover_b_per_sample", float64(d.Movers)/(*samples))
+	n := *samples
+	if n <= 0 {
+		rows, err := benchlib.CountV3MoverRows(*db)
+		if err != nil {
+			benchlib.Fatal(fmt.Errorf("counting mover samples: %w", err))
+		}
+		res.Set("disk.mover_windows", float64(rows.Windows))
+		res.Set("disk.mover_gones", float64(rows.Gones))
+		n = float64(rows.Samples)
+		if rows.Windows > 0 {
+			res.Note("mover samples counted from %d closed windows (keyframes not counted; open-window samples in the WAL are not counted)", rows.Windows)
+		}
+	}
+	res.Set("disk.mover_samples", n)
+	if n > 0 {
+		// Like the illisis figure, the numerator holds every mover file (windows,
+		// keyframes, day indexes) but not the WAL.
+		res.Set("disk.mover_b_per_sample", float64(d.Movers)/n)
+	} else if d.Movers > 0 {
+		res.Note("no closed mover windows found; mover B/sample skipped")
 	}
 	if err := res.Write(c.out); err != nil {
 		benchlib.Fatal(err)
@@ -185,4 +207,28 @@ func cmdIllisis(args []string) {
 	if err := res.Write(c.out); err != nil {
 		benchlib.Fatal(err)
 	}
+}
+
+func cmdStream(args []string) {
+	fs := flag.NewFlagSet("stream", flag.ExitOnError)
+	data := fs.String("data", "", "illisis export root (holds maps.json.gz)")
+	out := fs.String("out", "", "output directory for <map>.chunks.tsv")
+	coalesce := fs.Int64("coalesce", 60000, "window in ms: one row per changed chunk per window (0: every record, very large)")
+	mapKey := fs.String("map", "", "only this map (export key, e.g. gw-bc41437d~2E1)")
+	surface := fs.String("surface", "", "only this surface name")
+	dropEnemy := fs.Bool("drop-enemy", false, "ignore pixel writes of the enemy colour 0xF8C3")
+	fs.Parse(args)
+	if *data == "" || *out == "" {
+		benchlib.Fatal(fmt.Errorf("measure stream: -data and -out are required"))
+	}
+	start := time.Now()
+	files, err := benchlib.WriteIllisisStream(*data, *out, benchlib.StreamOptions{
+		CoalesceMs: *coalesce, Map: *mapKey, Surface: *surface, DropEnemy: *dropEnemy})
+	if err != nil {
+		benchlib.Fatal(err)
+	}
+	for _, f := range files {
+		fmt.Printf("%s: %d chunk rows -> %s\n", f.Map, f.Rows, f.Path)
+	}
+	fmt.Printf("stream written in %.1fs\n", time.Since(start).Seconds())
 }

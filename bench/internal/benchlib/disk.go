@@ -3,12 +3,18 @@ package benchlib
 import (
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/klauspost/compress/zstd"
+
+	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/v3/core/wire"
 )
 
 // V3Disk is the size of a v3 database by category (FORMAT.md 5).
@@ -80,6 +86,62 @@ func MeasureV3Disk(db string) (V3Disk, error) {
 		return nil
 	})
 	return d, err
+}
+
+// V3MoverRows counts the rows of the closed mover windows of a v3 database
+// (movers/<surface>/windows/**/*.mvw, FORMAT.md 5.5: one zstd frame holding an MVW3
+// body). Keyframes repeat rows that are already in windows and are not counted.
+type V3MoverRows struct {
+	Windows, Samples, Gones int64
+}
+
+// CountV3MoverRows decodes every closed mover window under db.
+func CountV3MoverRows(db string) (V3MoverRows, error) {
+	var c V3MoverRows
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		return c, err
+	}
+	defer dec.Close()
+	root := filepath.Join(db, "movers")
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return c, nil
+	}
+	err = filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if e.IsDir() || !strings.HasSuffix(p, ".mvw") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		if len(parts) < 3 || parts[1] != "windows" {
+			return nil
+		}
+		z, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		b, err := dec.DecodeAll(z, nil)
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		w, err := wire.DecodeMoverWindow(b, core.SurfaceKey{})
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		c.Windows++
+		for _, r := range w.Rows {
+			if r.Flags&core.FlagGone != 0 {
+				c.Gones++
+			} else {
+				c.Samples++
+			}
+		}
+		return nil
+	})
+	return c, err
 }
 
 // IllisisDisk is the size of an illisis/minimap static export (the test data) by

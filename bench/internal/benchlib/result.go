@@ -89,6 +89,12 @@ func (r *Result) Write(path string) error {
 		r.Seconds = time.Since(r.Started).Seconds()
 		r.finished = true
 	}
+	for k, v := range r.Params {
+		r.Params[k] = redactParam(v)
+	}
+	for i, n := range r.Notes {
+		r.Notes[i] = redactText(n)
+	}
 	r.Print()
 	if path == "" {
 		return nil
@@ -175,4 +181,91 @@ func DetectMachine() Machine {
 		}
 	})
 	return machine
+}
+
+// Result files are committed (bench/baselines), so local paths in them are shortened:
+// a path under a known root becomes "$NAME/rest", any other absolute path keeps only its
+// last element.
+var pathRoots = []struct{ env, name string }{
+	{"TSDB_TESTDATA", "$TSDB_TESTDATA"},
+	{"TSDB_STREAM", "$TSDB_STREAM"},
+	{"TSDB_WORK", "$TSDB_WORK"},
+}
+
+func redactParam(v any) any {
+	switch x := v.(type) {
+	case string:
+		if strings.ContainsAny(x, " \t") {
+			return redactText(x) // a command line
+		}
+		return RedactPath(x)
+	case []string:
+		out := make([]string, len(x))
+		for i, s := range x {
+			out[i] = RedactPath(s)
+		}
+		return out
+	}
+	return v
+}
+
+// RedactPath shortens an absolute local path (see pathRoots); other strings are kept.
+func RedactPath(p string) string {
+	if !looksAbs(p) {
+		return p
+	}
+	if r, ok := redactRooted(p); ok {
+		return r
+	}
+	return filepath.Base(p)
+}
+
+func looksAbs(p string) bool {
+	return p != "" && (filepath.IsAbs(p) || (len(p) > 2 && p[1] == ':' && (p[2] == '/' || p[2] == '\\')))
+}
+
+// redactRooted rewrites a path under a known root; ok is false for any other string.
+func redactRooted(p string) (string, bool) {
+	if !looksAbs(p) {
+		return p, false
+	}
+	norm := strings.ToLower(filepath.ToSlash(filepath.Clean(p)))
+	roots := make([]struct{ dir, name string }, 0, 5)
+	for _, r := range pathRoots {
+		if d := os.Getenv(r.env); d != "" {
+			roots = append(roots, struct{ dir, name string }{d, r.name})
+		}
+	}
+	roots = append(roots, struct{ dir, name string }{os.TempDir(), "$TMP"})
+	if h, err := os.UserHomeDir(); err == nil {
+		roots = append(roots, struct{ dir, name string }{h, "~"})
+	}
+	for _, r := range roots {
+		d := strings.ToLower(filepath.ToSlash(filepath.Clean(r.dir)))
+		if norm == d {
+			return r.name, true
+		}
+		if strings.HasPrefix(norm, d+"/") {
+			return r.name + filepath.ToSlash(filepath.Clean(p))[len(d):], true
+		}
+	}
+	return p, false
+}
+
+// redactText rewrites the words of a note or command line that are paths under a known
+// root (URL paths such as /api/v3/ingest are left alone).
+func redactText(s string) string {
+	words := strings.Fields(s)
+	changed := false
+	for i, w := range words {
+		trimmed := strings.TrimRight(w, ",;:)")
+		if r, ok := redactRooted(trimmed); ok {
+			words[i] = r + w[len(trimmed):]
+			changed = true
+		}
+	}
+	if !changed {
+		return s
+	}
+	return strings.Join(words, " ")
 }
