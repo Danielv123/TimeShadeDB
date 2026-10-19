@@ -161,15 +161,25 @@ export class Track {
     }
     let j = i;
     let walked = 0;
-    while (j > 0 && walked < reach && !isGone(s[j - 1])) {
-      walked += Math.hypot(s[j].x - s[j - 1].x, s[j].y - s[j - 1].y);
+    while (j > 0 && walked < reach) {
+      const p = s[j - 1];
+      if (isGone(p)) {
+        // A handoff: the body runs on across the bridge to the sample before the gone.
+        if (j >= 2 && !isGone(s[j - 2]) && s[j].t - p.t <= HANDOFF_MS) {
+          walked += Math.hypot(s[j].x - s[j - 2].x, s[j].y - s[j - 2].y);
+          j -= 2;
+          continue;
+        }
+        break;
+      }
+      walked += Math.hypot(s[j].x - p.x, s[j].y - p.y);
       j--;
     }
-    if (j > 0 && isGone(s[j - 1]) && j >= 2) {
-      // keep a handoff's bridge: the gone and the sample before it
-      j -= 2;
+    // One more sample, so the oldest kept segment's velocities still see their neighbours
+    // (trimming must not reshape the path the body lies on).
+    if (j > 0 && !isGone(s[j - 1])) {
+      j--;
     }
-    j = Math.max(0, j);
     let carIdx = -1;
     for (let k = j - 1; k >= 0 && this.withCars > 0; k--) {
       if (s[k].car) {
@@ -202,8 +212,11 @@ export class Track {
         rest.push(x);
       }
     }
-    this.s = kept.concat(rest);
-    this.version++;
+    const next = kept.concat(rest);
+    if (next.length !== s.length) {
+      this.s = next;
+      this.version++;
+    }
   }
 }
 
@@ -486,20 +499,66 @@ export function newHead(): Head {
 
 const tmp = new Float64Array(4);
 
+/** Strongest braking the extrapolation assumes (tiles/s^2). */
+export const MAX_BRAKING = 40;
+
+/**
+ * Braking of a train at its newest sample k (tiles/s^2, <= 0) and its speed at k, from the
+ * chord speeds of the two segments before it; [0, NaN] when it is not braking or that is
+ * not known. A chord speed is the mean over its segment, so the speed at k is the last
+ * chord speed plus half a segment of deceleration.
+ */
+function braking(tr: Track, k: number): [number, number] {
+  const s = tr.s;
+  if (tr.kind !== "t" || k < 2 || !linked(tr, k - 2) || !linked(tr, k - 1)) {
+    return [0, NaN];
+  }
+  const h0 = (s[k - 1].t - s[k - 2].t) / 1000;
+  const h1 = (s[k].t - s[k - 1].t) / 1000;
+  if (h0 <= 0 || h1 <= 0) {
+    return [0, NaN];
+  }
+  const c0 = Math.hypot(s[k - 1].x - s[k - 2].x, s[k - 1].y - s[k - 2].y) / h0;
+  const c1 = Math.hypot(s[k].x - s[k - 1].x, s[k].y - s[k - 1].y) / h1;
+  const a = Math.max(-MAX_BRAKING, (c1 - c0) / ((h0 + h1) / 2));
+  // Ignore speed noise: brake only on a clear drop (10% and 1 tile/s).
+  if (!(a < 0) || c0 - c1 < Math.max(1, 0.1 * c0)) {
+    return [0, NaN];
+  }
+  return [a, Math.max(0, c1 + (a * h1) / 2)];
+}
+
 function extrapolate(tr: Track, k: number, t: number, horizon: number, end: number, out: Head): void {
   const a = velocity(tr, k);
   // Inside the data horizon silence is confirmed up to the heartbeat; past it, at most EXTRAPOLATE_MS.
-  const cap = Math.min(HEARTBEAT_MS, Math.max(0, horizon - a.t) + EXTRAPOLATE_MS, end - a.t);
-  const dt = Math.max(0, Math.min(t - a.t, cap)) / 1000;
+  let cap = Math.min(HEARTBEAT_MS, Math.max(0, horizon - a.t) + EXTRAPOLATE_MS, end - a.t);
+  const sp = Math.hypot(a.vx, a.vy);
+  let dist: number;
+  let rate: number;
+  const [acc, v0] = sp > 0 ? braking(tr, k) : [0, NaN];
+  if (acc < 0) {
+    // A braking train runs on decelerating and stops, instead of running on at full speed
+    // (a missing stop sample then costs a few tiles, not the heartbeat x the speed).
+    cap = Math.min(cap, (1000 * v0) / -acc);
+    const dt = Math.max(0, Math.min(t - a.t, cap)) / 1000;
+    dist = v0 * dt + 0.5 * acc * dt * dt;
+    rate = v0 + acc * dt;
+  } else {
+    const dt = Math.max(0, Math.min(t - a.t, cap)) / 1000;
+    dist = sp * dt;
+    rate = sp;
+  }
+  const ux = sp > 0 ? a.vx / sp : 0;
+  const uy = sp > 0 ? a.vy / sp : 0;
   out.visible = true;
   out.k = k;
   out.to = -1;
   out.u = 0;
-  out.x = a.x + a.vx * dt;
-  out.y = a.y + a.vy * dt;
-  const moving = (a.vx !== 0 || a.vy !== 0) && t - a.t < cap;
-  out.vx = moving ? a.vx : 0;
-  out.vy = moving ? a.vy : 0;
+  out.x = a.x + ux * dist;
+  out.y = a.y + uy * dist;
+  const moving = sp > 0 && rate > 0 && t - a.t < cap;
+  out.vx = moving ? ux * rate : 0;
+  out.vy = moving ? uy * rate : 0;
   out.mode = moving ? "extrap" : "hold";
   out.moving = moving;
 }

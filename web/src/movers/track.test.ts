@@ -107,6 +107,48 @@ test("segments that would loop fall back to a straight line", () => {
   assert.ok(seg.length <= 1.5 * 2 + 1, `length ${seg.length}`);
 });
 
+test("the fallback curve neither overshoots its end nor races (braking train, test data)", () => {
+  // From the illisis test data (journey 1 on nauvis): 31 tiles/s into a segment that covers
+  // 17.9 tiles in 2.7 s and ends at 9.5 tiles/s, with a start tangent 0.56 degrees off the
+  // chord. v x dt tangents made the curve run past its end and back, and walking it by curve
+  // parameter drew the head at 57 tiles/s.
+  const seg = new G.Segment().build(0, 268.6875, -205, -31.274, 0.307, 0, 0, 2709, 250.8125, -205, -9.515, 0, 0, 0);
+  assert.equal(seg.kind, G.SEG_HERMITE);
+  assert.ok(seg.length < 17.875 + 0.05, `length ${seg.length}`);
+  const o = [0, 0, 0, 0];
+  let px = 268.6875;
+  for (let t = 50; t <= 2709; t += 50) {
+    seg.at(t, o);
+    assert.ok(o[0] <= px + 1e-9, `never backwards at ${t}`);
+    assert.ok(px - o[0] <= 33 * 0.05 + 1e-6, `at most the start speed at ${t}: ${(px - o[0]) / 0.05} tiles/s`);
+    assert.ok(Math.abs(o[1] + 205) < 0.1, `stays on the line at ${t}: y=${o[1]}`);
+    px = o[0];
+  }
+  seg.at(2709, o);
+  assert.ok(Math.hypot(o[0] - 250.8125, o[1] + 205) < 1e-6, "ends at b");
+});
+
+test("a braking train's extrapolation decelerates and stops", () => {
+  // Braking from 20 to 10 tiles/s, then no more samples (a lost stop sample).
+  const tr = new T.Track("j1", meta);
+  tr.insert(T.makeSample(meta, 0, 0, 0, 0.25));
+  tr.insert(T.makeSample(meta, 500, 10, 0, 0.25)); // 20 tiles/s
+  tr.insert(T.makeSample(meta, 1000, 17.5, 0, 0.25)); // 15
+  tr.insert(T.makeSample(meta, 1500, 22.5, 0, 0.25)); // 10: braking at 10 tiles/s^2, 7.5 tiles/s at the sample
+  const h = T.newHead();
+  T.headAt(tr, 1600, Infinity, h);
+  assert.equal(h.mode, "extrap");
+  assert.ok(h.x > 22.5 && h.x < 22.5 + 0.1 * 10, `slower than the last chord: ${h.x}`);
+  T.headAt(tr, 20_000, Infinity, h);
+  assert.equal(h.mode, "hold");
+  // v0 = 7.5, a = -10: stops after 0.75 s and 2.81 tiles (the old rule ran on 110 tiles)
+  assert.ok(Math.abs(h.x - (22.5 + (7.5 * 7.5) / 20)) < 1e-6, `stopped at ${h.x}`);
+  // a train at constant speed still runs on
+  const st = straightTrack(5, 10, 500);
+  T.headAt(st, 3000, Infinity, h);
+  assert.ok(Math.abs(h.x - 30) < 1e-6);
+});
+
 test("insert keeps time order and replaces equal times", () => {
   const tr = new T.Track("j1", meta);
   for (const t of [300, 100, 200, 100]) {
@@ -288,4 +330,31 @@ test("trim keeps the body's reach and drops parked heartbeats", () => {
   assert.ok(tr.s.length < before - 40, `trimmed ${before} -> ${tr.s.length}`);
   const first = tr.s[0];
   assert.ok(first.x <= 95 - 40, `history covers 40 tiles: first x=${first.x}`);
+});
+
+test("trim keeps a parked train's body across the handoff it arrived by (test data, journey 0)", () => {
+  // A train comes round a curve, crosses an instance edge (gone + resume 84 ms later) and
+  // parks just past it, sending heartbeats. Trimming used to stop at the gone and drop the
+  // curve, so the parked body turned straight off the rails.
+  const tr = circleTrack(30, 20, 3, 20); // quarter-ish circle, ends near (cos 1.9, sin 1.9) * 30
+  const last = tr.s[tr.s.length - 1];
+  tr.insert(T.makeSample(meta, last.t + 300, 0, 0, 0, T.F_GONE | T.F_HANDOFF));
+  const park = { x: last.x - 2, y: last.y + 1 };
+  for (let i = 0; i < 40; i++) {
+    tr.insert(T.makeSample(meta, last.t + 384 + i * 10_000, park.x, park.y, last.o, T.F_STOP));
+  }
+  const t = last.t + 384 + 39 * 10_000 + 5000;
+  const cars = (): { x: number; y: number }[] => {
+    const h = T.headAt(tr, t, Infinity, T.newHead());
+    const gaps = T.pitches(tr, h.k, []);
+    const poly = T.bodyPath(tr, h, t, gaps.reduce((a, b) => a + b, 0) + 4, new H.Polyline());
+    return T.placeCarriages(poly, h, "LCCCC", gaps, []);
+  };
+  const before = cars();
+  tr.trim(t - 120_000, 5 * 7 + 40);
+  assert.ok(tr.s.length < 40, `trimmed to ${tr.s.length}`);
+  const after = cars();
+  for (let i = 0; i < before.length; i++) {
+    assert.ok(Math.hypot(after[i].x - before[i].x, after[i].y - before[i].y) < 1e-9, `carriage ${i} unchanged`);
+  }
 });

@@ -3,8 +3,15 @@
 // a cubic cannot be straight for 60 tiles and then turn, so with accurate end tangents it
 // bulges off the straight. Where the end points and tangents allow it, the segment is
 // therefore a straight line followed by a circular arc (or an arc followed by a line);
-// otherwise it falls back to the cubic Hermite. Motion along the geometry is timed by a 1D
-// cubic Hermite of arc length with the samples' speeds as end slopes.
+// otherwise it falls back to a cubic Hermite curve. Motion along the geometry is timed by a
+// 1D cubic Hermite of arc length with the samples' speeds as end slopes.
+//
+// The fallback curve is geometric: its end tangents have the length that makes it a circular
+// arc when the turn is symmetric (the chord's length when straight), not v x dt
+// (timing is the 1D Hermite's job), and it is walked by arc length through a small length
+// table. With v x dt tangents a braking train's curve overshoots its end point and comes
+// back, and walking it by curve parameter races where the parameter speed is high: both
+// were measured as frame-to-frame jumps on the test data.
 //
 // Pure math, no imports besides hermite.ts.
 
@@ -22,6 +29,8 @@ const MIN_RADIUS = 3;
 const MAX_STRETCH = 1.5;
 /** Tangents within this angle (radians) count as parallel. */
 const PARALLEL = 1e-3;
+/** Sub-chords of the fallback curve's arc-length table. */
+const TABLE = 16;
 
 const tmp = new Float64Array(4);
 
@@ -77,11 +86,13 @@ export class Segment {
   private l0 = 0;
   private r = 0;
   private theta = 0;
-  // Hermite fallback velocities (tiles/s)
+  // Hermite fallback: end tangents as velocities over h (so hermite() sees chord-length
+  // tangents), and the cumulative arc length at u = i / TABLE.
   private hv0x = 0;
   private hv0y = 0;
   private hv1x = 0;
   private hv1y = 0;
+  private readonly cum = new Float64Array(TABLE + 1);
 
   /**
    * Builds the segment. (vax, vay) and (vbx, vby) are the samples' velocities (tiles/s);
@@ -99,10 +110,6 @@ export class Segment {
     this.p0y = ay;
     this.p1x = bx;
     this.p1y = by;
-    this.hv0x = vax;
-    this.hv0y = vay;
-    this.hv1x = vbx;
-    this.hv1y = vby;
     const cx = bx - ax;
     const cy = by - ay;
     const chord = Math.hypot(cx, cy);
@@ -143,7 +150,15 @@ export class Segment {
       this.length = pick.l0 + pick.r * Math.abs(pick.theta);
     } else {
       this.kind = SEG_HERMITE;
-      this.length = hermiteLength(this, 8);
+      // Tangent length of the cubic closest to a circular arc turning by the angle between
+      // the end tangents: 2 c tan(theta/4) / sin(theta/2), the chord c when straight.
+      const turn = Math.min(0.85 * Math.PI, Math.abs(Math.atan2(this.t0x * this.t1y - this.t0y * this.t1x, this.t0x * this.t1x + this.t0y * this.t1y)));
+      const m = turn > 1e-6 ? (2 * chord * Math.tan(turn / 4)) / Math.sin(turn / 2) : chord;
+      this.hv0x = (this.t0x * m) / this.h;
+      this.hv0y = (this.t0y * m) / this.h;
+      this.hv1x = (this.t1x * m) / this.h;
+      this.hv1y = (this.t1y * m) / this.h;
+      this.length = this.buildTable();
       if (this.length > MAX_STRETCH * chord + 1) {
         // Tangents that disagree with the chord make the cubic loop: go straight instead.
         this.kind = SEG_LINE;
@@ -200,7 +215,7 @@ export class Segment {
       return;
     }
     if (this.kind === SEG_HERMITE) {
-      const u = L > 0 ? Math.min(1, Math.max(0, s / L)) : 0;
+      const u = this.paramAt(s);
       hermite(this.p0x, this.p0y, this.hv0x, this.hv0y, this.p1x, this.p1y, this.hv1x, this.hv1y, this.h, u, tmp);
       const sp = Math.hypot(tmp[2], tmp[3]);
       out[0] = tmp[0];
@@ -250,6 +265,44 @@ export class Segment {
     out[3] = rev ? -uy : uy;
   }
 
+  /** Fills the fallback curve's arc-length table; returns its length. */
+  private buildTable(): number {
+    const cum = this.cum;
+    cum[0] = 0;
+    let px = this.p0x;
+    let py = this.p0y;
+    for (let i = 1; i <= TABLE; i++) {
+      hermite(this.p0x, this.p0y, this.hv0x, this.hv0y, this.p1x, this.p1y, this.hv1x, this.hv1y, this.h, i / TABLE, tmp);
+      cum[i] = cum[i - 1] + Math.hypot(tmp[0] - px, tmp[1] - py);
+      px = tmp[0];
+      py = tmp[1];
+    }
+    return cum[TABLE];
+  }
+
+  /** The fallback curve's parameter u at arc length s (linear within a table step). */
+  private paramAt(s: number): number {
+    const cum = this.cum;
+    if (!(s > 0)) {
+      return 0;
+    }
+    if (s >= cum[TABLE]) {
+      return 1;
+    }
+    let lo = 0;
+    let hi = TABLE;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (cum[mid] <= s) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+    }
+    const span = cum[hi] - cum[lo];
+    return (lo + (span > 0 ? (s - cum[lo]) / span : 0)) / TABLE;
+  }
+
   /** Position (out[0..1]) and velocity (out[2..3], tiles/s) at time t. */
   at(t: number, out: Float64Array | number[]): void {
     this.arcAt(t, tmp);
@@ -271,22 +324,4 @@ function unit(vx: number, vy: number, s: number, dx: number, dy: number, cx: num
     return [(sg * dx) / d, (sg * dy) / d];
   }
   return chord > 0 ? [cx / chord, cy / chord] : [1, 0];
-}
-
-function hermiteLength(seg: Segment, n: number): number {
-  // Hermite fallback length estimate from n chords (pointAt maps s to u via `length`, so
-  // evaluate with a provisional length of 1).
-  seg.length = 1;
-  let len = 0;
-  let px = NaN;
-  let py = NaN;
-  for (let i = 0; i <= n; i++) {
-    seg.pointAt(i / n, tmp);
-    if (i > 0) {
-      len += Math.hypot(tmp[0] - px, tmp[1] - py);
-    }
-    px = tmp[0];
-    py = tmp[1];
-  }
-  return len;
 }
