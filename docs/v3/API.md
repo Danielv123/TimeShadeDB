@@ -51,8 +51,10 @@ Status and body `{"error": "...", "code": "..."}` (`core.ErrorResponse`):
 | 400 | `bad_tile` | tile outside the grid or wrong level (`core.ErrBadTile`) |
 | 401 | `unauthorized` | missing or wrong token |
 | 404 | `not_found` | unknown datastore or surface, tile without data, version, window, keyframe or day that does not exist (`ErrUnknownDatastore`, `ErrNoTile`, `ErrNoVersion`) |
+| 405 | `bad_request` | wrong method for the route |
+| 408 | `timeout` | ingest body not received within the time limit |
 | 413 | `too_large` | ingest body over the cap |
-| 503 | `overloaded` | ingest backpressure (`core.ErrOverloaded`); `Retry-After` seconds given |
+| 503 | `overloaded` | ingest backpressure (`core.ErrOverloaded`), ingest bodies in flight over their budget, too many live clients; `Retry-After` seconds given |
 | 500 | `internal` | anything else |
 
 **Hostile requests** (PLAN.md §4.3 G2): parameter validation, the grid bound check and the
@@ -179,7 +181,8 @@ map-matches trains against them when present (PLAN.md §4.8 step 6).
 
 ### `GET live?ds=<id>&ds=<id>&sfc=<id>` (Server-Sent Events)
 
-Subscribes to datastores (tile events) and surfaces (mover events). Cache: none.
+Subscribes to datastores (tile events) and surfaces (mover events). GET only (other
+methods, HEAD included, get 405). Cache: none.
 Static: no; static viewers poll `catalog`, `timeline` and `live.bin` every `live_ms`.
 
 | event | data (JSON) |
@@ -187,14 +190,16 @@ Static: no; static viewers poll `catalog`, `timeline` and `live.bin` every `live
 | `hello` | `{"now": ms, "horizon": {"<ds or sfc id>": ms}}` sent first: the horizon of every subscribed datastore and surface that exists |
 | `tile` | `{"ds", "z", "x", "y", "v", "live"?, "ls"?, "now"}`: a version or live content changed |
 | `horizon` | `{"ds" or "sfc", "horizon", "now"}` after a commit |
-| `movers` | `{"sfc", "now", "movers": [MoverMeta], "rows": [[entry, t, tick or null, x, y, o, flags, carriages or null]]}` new samples, in arrival order; `entry` indexes this event's `movers`; `carriages` is `[[x, y, o], ...]` |
+| `movers` | `{"sfc", "now", "movers": [MoverMeta], "rows": [[entry, t, tick or null, x, y, o, flags, carriages or null]]}` new samples, in arrival order; `entry` indexes this event's `movers`; `carriages` is `[[x, y, o], ...]`. Rows the store counted as invalid, or as late by the surface horizon of the last commit, are left out; a row the store rejected under another bound (its clock skew limits) can still appear |
 | `catalog` | `{"now"}` the catalog changed; refetch it |
 
 A comment line (`: ping`) is sent every 15 s. Each client has a bounded buffer (default
 1 MiB); a client that falls behind is disconnected and must reconnect and resync from the
 regular routes. `Last-Event-ID` is not supported. The number of clients is bounded
 (default 64); beyond it the route answers 503 `overloaded`. Tile events for open-window
-changes are coalesced and sent about once a second (the commit loop period).
+changes are coalesced and sent about once a second (the commit loop period); version
+changes at every level are sent after the commit that made them. A client connected
+before the server's first commit step after start is not sent the existing tiles.
 
 ### `POST ingest`
 
@@ -210,11 +215,16 @@ message 256 KiB and move message 4,096 entries (the message is counted as a bad 
   4 MiB of chart text, 16,384 mover samples and 16,384 overlay events each), in order.
   Messages are decoded a window at a time (2,048 messages or 256 KiB), however many a
   line packs, so memory per request is bounded whatever the body size or shape.
+- The raw body is received in full before any of it is applied, under a time limit
+  (60 s; 408 `timeout` after it) and a budget for the bodies being received at once
+  (64 MiB; beyond it 503 `overloaded`), so a client that stalls mid-body never delays
+  other ingest requests.
 - 503 `overloaded` with `Retry-After` when a store refused a batch for backpressure (the
-  terrain open-window budget, the mover open-row limit). That batch and the rest of the
-  body were not applied; earlier batches of the same body were. The forwarder retries the
-  same body, which is safe because ingest is idempotent (below). A 413 for a body that
-  exceeds the cap only after decompression is handled the same way.
+  terrain open-window budget, the mover open-row limit). That batch may be partly applied
+  (its chunk updates can be stored before the mover store refuses its samples), the rest
+  of the body was not, and earlier batches of the same body were. The forwarder retries
+  the same body, which is safe because ingest is idempotent (below). A 413 for a body
+  that exceeds the cap only after decompression is handled the same way.
 - 415 for a `Content-Encoding` other than identity, gzip or zstd.
 - A message time more than 10 s after the server clock (a broken game clock or anchor) is
   clamped to the clock and counted (`tsdb_ingest_rejected_total{reason="clamped"}`).
@@ -275,14 +285,21 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
 - `--clock data`: the map clock is the newest ingested `recv_ms` (seeded from the newest
   data in the database) instead of the wall clock, for replaying recorded captures (a
   backlog, a benchmark stream). The graces then default to 2 minutes, because replayed
-  bodies, often posted several at once, arrive out of order.
+  bodies, often posted several at once, arrive out of order. One envelope moves the
+  clock at most 1 hour forward and never past the wall clock plus 10 s (such envelopes
+  count as `clamped`), so one bad `recv_ms` cannot push the map clock ahead for good;
+  after a longer gap in the data the clock catches up over a few envelopes, whose
+  message times are clamped meanwhile.
 
 The process sets a soft memory limit of 1.5 times `--mem-budget` plus 64 MiB (Go's
 `GOMEMLIMIT`, which takes precedence when set), so garbage collection works harder before
 the process grows past its budget.
 
-Interrupt or SIGTERM shuts down cleanly: the pyramid is flushed at the horizon and every
-store is closed. Coarse levels load lazily (in parallel, in the background), so the server
+Interrupt or SIGTERM shuts down cleanly: live streams are ended at once, requests in
+flight get up to 5 s (then their connections are closed), ingest requests in flight are
+waited for, the pyramid is flushed at the horizon and every store is closed. The
+`--slow-log` line names the request path without its query (which may hold the read
+token). Coarse levels load lazily (in parallel, in the background), so the server
 listens within tens of milliseconds whatever the history length; a read of a datastore
 that is not loaded yet waits only for that datastore.
 
