@@ -336,3 +336,37 @@ func TestTailerFiles(t *testing.T) {
 
 func itoa(v int32) string   { return strconv.FormatInt(int64(v), 10) }
 func itoa64(v int64) string { return strconv.FormatInt(v, 10) }
+
+func TestIconsCopiedAndServed(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "icons"), 0o755)
+	os.WriteFile(filepath.Join(root, "icons", "sheet.abc.png"), []byte("\x89PNG fake"), 0o644)
+	os.WriteFile(filepath.Join(root, "icons", "meta.abc.json"), []byte(`{"item":[]}`), 0o644)
+	db := filepath.Join(t.TempDir(), "db")
+	if err := copyV3Icons(db, root, &core.CatalogIcons{PNG: "icons/sheet.abc.png", JSON: "icons/meta.abc.json"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyV3Icons(db, root, &core.CatalogIcons{PNG: "icons/../x y.png", JSON: "icons/meta.abc.json"}); err == nil {
+		t.Fatal("bad icon name accepted")
+	}
+	base, _ := startServeV3(t, "--db", db)
+	var cat core.Catalog
+	getJSON(t, base+"/api/v3/catalog", &cat)
+	if cat.Icons == nil || cat.Icons.PNG != "icons/sheet.abc.png" || cat.Icons.JSON != "icons/meta.abc.json" {
+		t.Fatalf("icons %+v", cat.Icons)
+	}
+	res, err := http.Get(base + "/api/v3/" + cat.Icons.PNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != 200 || string(b) != "\x89PNG fake" || res.Header.Get("Content-Type") != "image/png" || !strings.Contains(res.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("icon: %d %q %v", res.StatusCode, b, res.Header)
+	}
+	for _, p := range []string{"icons/icons.json", "icons/..%2Fmaps.json", "icons/other.png"} {
+		if s := getStatus(t, base+"/api/v3/"+p); s != 404 {
+			t.Fatalf("%s: %d", p, s)
+		}
+	}
+}
