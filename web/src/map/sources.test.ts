@@ -188,3 +188,77 @@ test("server source: subscriptions share one event stream and get only their eve
     stopA();
   }
 });
+
+const waitFor = (f: () => boolean, ms = 3000) =>
+  new Promise<void>((resolve, reject) => {
+    const t0 = Date.now();
+    const tick = () => (f() ? resolve() : Date.now() - t0 > ms ? reject(new Error("timeout")) : setTimeout(tick, 10));
+    tick();
+  });
+
+test("server source: a throwing handler does not take the shared stream down for others", async () => {
+  const s = new ServerSource({ base: `${server.url}/api/v3/` });
+  server.clearLog();
+  const quiet = console.error;
+  console.error = () => {};
+  const a = { hello: 0, error: 0, tiles: 0 };
+  const b = { hello: 0, error: 0 };
+  const stopA = s.subscribe({ ds: [ds.id], sfc: [] }, { hello: () => a.hello++, error: () => a.error++, tile: () => a.tiles++ });
+  const stopB = s.subscribe({ ds: [], sfc: ["m.nauvis"] }, {
+    hello: () => b.hello++,
+    error: () => b.error++,
+    movers: () => {
+      throw new Error("malformed");
+    },
+  });
+  try {
+    await waitFor(() => a.hello === 1 && b.hello === 1);
+    server.pushEvent("movers", { sfc: "m.nauvis", now: data.now + 1, movers: [], rows: [] });
+    server.pushEvent("tile", { ds: ds.id, z: 0, x: 1, y: 0, v: 4, now: data.now + 1 });
+    await waitFor(() => a.tiles === 1 && b.hello === 2);
+    // B was told and resynced; A saw nothing of it; the stream stayed open.
+    assert.equal(b.error, 1);
+    assert.equal(a.error, 0);
+    assert.equal(a.hello, 1);
+    assert.equal(server.requests(/\/live\?/).length, 1);
+  } finally {
+    console.error = quiet;
+    stopB();
+    stopA();
+  }
+});
+
+test("server source: a subscriber the open stream already covers is told its state", async () => {
+  const s = new ServerSource({ base: `${server.url}/api/v3/` });
+  server.clearLog();
+  const a = { hello: 0, error: 0 };
+  const c = { hello: 0, error: 0 };
+  const d = { hello: 0, error: 0 };
+  const stopA = s.subscribe({ ds: [ds.id], sfc: [] }, { hello: () => a.hello++, error: () => a.error++ });
+  let stopC = () => {};
+  let stopD = () => {};
+  let release = () => {};
+  try {
+    await waitFor(() => a.hello === 1);
+    // Up: the last hello again, no new stream.
+    stopC = s.subscribe({ ds: [ds.id], sfc: [] }, { hello: () => c.hello++, error: () => c.error++ });
+    await waitFor(() => c.hello === 1);
+    assert.equal(server.requests(/\/live\?/).length, 1);
+    assert.equal(a.hello, 1);
+    // Down (the reconnect is held): an error, no hello.
+    release = server.hold(/\/live\?/);
+    server.dropStreams();
+    await waitFor(() => a.error === 1 && c.error === 1);
+    stopD = s.subscribe({ ds: [ds.id], sfc: [] }, { hello: () => d.hello++, error: () => d.error++ });
+    await waitFor(() => d.error === 1);
+    assert.equal(d.hello, 0);
+    // Back up: everyone gets the new hello.
+    release();
+    await waitFor(() => a.hello === 2 && c.hello === 2 && d.hello === 1, 5000);
+  } finally {
+    release();
+    stopD();
+    stopC();
+    stopA();
+  }
+});

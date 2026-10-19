@@ -142,6 +142,14 @@ export class MockServer {
     this.log.length = 0;
   }
 
+  /** Ends every open event stream (the clients see the stream end and reconnect). */
+  dropStreams(): void {
+    for (const c of this.sse) {
+      c.res.end();
+    }
+    this.sse.clear();
+  }
+
   /** Sends a live event to SSE clients subscribed to `ds`. */
   pushEvent(event: string, data: Record<string, unknown>, ds?: string): void {
     for (const c of this.sse) {
