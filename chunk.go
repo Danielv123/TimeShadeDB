@@ -997,8 +997,10 @@ func (db *DB) chunkStats() (*ChunkStats, error) {
 		db.chunkMu.Unlock()
 	}
 
+	// Chunk indexes grow under their tile lock, and ingest takes db.chunkMu while it
+	// holds tile locks, so the tiles are listed under db.chunkMu and read after it is
+	// released, one tile lock at a time.
 	db.chunkMu.RLock()
-	defer db.chunkMu.RUnlock()
 	stats := &ChunkStats{Format: FormatChunks, DatastoreCount: len(db.chunkDatastores)}
 	keys := make([]DatastoreKey, 0, len(db.chunkDatastores))
 	for key := range db.chunkDatastores {
@@ -1007,8 +1009,13 @@ func (db *DB) chunkStats() (*ChunkStats, error) {
 	sort.Slice(keys, func(i, j int) bool {
 		return compareDatastoreKeys(keys[i], keys[j]) < 0
 	})
-	for _, key := range keys {
-		dsStats := summarizeChunkDatastoreStats(db.chunkDatastores[key])
+	snaps := make([]chunkDatastoreSnapshot, len(keys))
+	for i, key := range keys {
+		snaps[i] = snapshotChunkDatastoreLocked(db.chunkDatastores[key])
+	}
+	db.chunkMu.RUnlock()
+	for _, snap := range snaps {
+		dsStats := summarizeChunkDatastoreStats(snap)
 		stats.ChunkCount += dsStats.ChunkCount
 		stats.TileShardCount += dsStats.TileShardCount
 		stats.SnapshotCount += dsStats.SnapshotCount
@@ -1037,7 +1044,32 @@ func (db *DB) chunkStats() (*ChunkStats, error) {
 	return stats, nil
 }
 
-func summarizeChunkDatastoreStats(ds *chunkDatastore) ChunkDatastoreStats {
+// chunkDatastoreSnapshot holds what summarizeChunkDatastoreStats needs from a
+// datastore, taken under db.chunkMu.
+type chunkDatastoreSnapshot struct {
+	key          DatastoreKey
+	latestTick   uint64
+	latestRowSeq uint64
+	tiles        []*chunkTileState
+}
+
+// snapshotChunkDatastoreLocked lists a datastore's tiles. Callers hold db.chunkMu.
+func snapshotChunkDatastoreLocked(ds *chunkDatastore) chunkDatastoreSnapshot {
+	out := chunkDatastoreSnapshot{
+		key:          ds.key,
+		latestTick:   ds.latestTick,
+		latestRowSeq: ds.latestRowSeq,
+		tiles:        make([]*chunkTileState, 0, len(ds.tiles)),
+	}
+	for _, ts := range ds.tiles {
+		out.tiles = append(out.tiles, ts)
+	}
+	return out
+}
+
+// summarizeChunkDatastoreStats reads each tile's chunks under that tile's read lock.
+// Callers must not hold db.chunkMu (see chunkStats).
+func summarizeChunkDatastoreStats(ds chunkDatastoreSnapshot) ChunkDatastoreStats {
 	out := ChunkDatastoreStats{
 		SavefileUUID: ds.key.SavefileUUID,
 		Surface:      ds.key.Surface,
@@ -1045,74 +1077,72 @@ func summarizeChunkDatastoreStats(ds *chunkDatastore) ChunkDatastoreStats {
 		LatestTick:   ds.latestTick,
 		LatestRowSeq: ds.latestRowSeq,
 	}
-	first := true
-	tileSet := map[chunkTileCoord]struct{}{}
-	var snapshotBytes uint64
-	var deltaBytes uint64
-	for coord, chunk := range ds.chunks {
-		tile := chunkTileCoordForChunk(coord)
-		tileSet[tile] = struct{}{}
-		if first {
-			out.MinChunkX = coord.X
-			out.MaxChunkX = coord.X
-			out.MinChunkY = coord.Y
-			out.MaxChunkY = coord.Y
-			out.MinTileX = tile.X
-			out.MaxTileX = tile.X
-			out.MinTileY = tile.Y
-			out.MaxTileY = tile.Y
-			first = false
-		} else {
-			if coord.X < out.MinChunkX {
-				out.MinChunkX = coord.X
-			}
-			if coord.X > out.MaxChunkX {
-				out.MaxChunkX = coord.X
-			}
-			if coord.Y < out.MinChunkY {
-				out.MinChunkY = coord.Y
-			}
-			if coord.Y > out.MaxChunkY {
-				out.MaxChunkY = coord.Y
-			}
-			if tile.X < out.MinTileX {
-				out.MinTileX = tile.X
-			}
-			if tile.X > out.MaxTileX {
-				out.MaxTileX = tile.X
-			}
-			if tile.Y < out.MinTileY {
-				out.MinTileY = tile.Y
-			}
-			if tile.Y > out.MaxTileY {
-				out.MaxTileY = tile.Y
-			}
+	acc := chunkStatsAcc{out: &out, first: true, tiles: map[chunkTileCoord]struct{}{}}
+	for _, ts := range ds.tiles {
+		ts.mu.RLock()
+		for coord, chunk := range ts.chunks {
+			acc.add(coord, chunk)
 		}
-		out.ChunkCount++
-		idx := chunk.statsIndex()
-		out.SnapshotCount += uint64(len(idx.snapshots))
-		out.DeltaFrameCount += uint64(len(idx.deltas))
-		for _, snap := range idx.snapshots {
-			snapshotBytes += uint64(snap.CompressedLen)
-			out.StoredPixelEvents += ChunkPixelCount
-		}
-		for _, delta := range idx.deltas {
-			deltaBytes += uint64(delta.CompressedLen)
-			out.StoredPixelEvents += uint64(delta.EventCount)
-		}
-		if replay := maxChunkReplayEvents(idx); replay > out.MaxReplayEventsBetweenSnaps {
-			out.MaxReplayEventsBetweenSnaps = replay
-		}
+		ts.mu.RUnlock()
 	}
-	out.TileShardCount = uint64(len(tileSet))
-	out.CompressedBytes = snapshotBytes + deltaBytes
+	out.TileShardCount = uint64(len(acc.tiles))
+	out.CompressedBytes = acc.snapshotBytes + acc.deltaBytes
 	if out.SnapshotCount > 0 {
-		out.AverageSnapshotBytes = snapshotBytes / out.SnapshotCount
+		out.AverageSnapshotBytes = acc.snapshotBytes / out.SnapshotCount
 	}
 	if out.DeltaFrameCount > 0 {
-		out.AverageDeltaFrameBytes = deltaBytes / out.DeltaFrameCount
+		out.AverageDeltaFrameBytes = acc.deltaBytes / out.DeltaFrameCount
 	}
 	return out
+}
+
+type chunkStatsAcc struct {
+	out           *ChunkDatastoreStats
+	first         bool
+	tiles         map[chunkTileCoord]struct{}
+	snapshotBytes uint64
+	deltaBytes    uint64
+}
+
+func (a *chunkStatsAcc) add(coord ChunkCoord, chunk *factorioChunkState) {
+	out := a.out
+	tile := chunkTileCoordForChunk(coord)
+	a.tiles[tile] = struct{}{}
+	if a.first {
+		out.MinChunkX = coord.X
+		out.MaxChunkX = coord.X
+		out.MinChunkY = coord.Y
+		out.MaxChunkY = coord.Y
+		out.MinTileX = tile.X
+		out.MaxTileX = tile.X
+		out.MinTileY = tile.Y
+		out.MaxTileY = tile.Y
+		a.first = false
+	} else {
+		out.MinChunkX = min(out.MinChunkX, coord.X)
+		out.MaxChunkX = max(out.MaxChunkX, coord.X)
+		out.MinChunkY = min(out.MinChunkY, coord.Y)
+		out.MaxChunkY = max(out.MaxChunkY, coord.Y)
+		out.MinTileX = min(out.MinTileX, tile.X)
+		out.MaxTileX = max(out.MaxTileX, tile.X)
+		out.MinTileY = min(out.MinTileY, tile.Y)
+		out.MaxTileY = max(out.MaxTileY, tile.Y)
+	}
+	out.ChunkCount++
+	idx := chunk.statsIndex()
+	out.SnapshotCount += uint64(len(idx.snapshots))
+	out.DeltaFrameCount += uint64(len(idx.deltas))
+	for _, snap := range idx.snapshots {
+		a.snapshotBytes += uint64(snap.CompressedLen)
+		out.StoredPixelEvents += ChunkPixelCount
+	}
+	for _, delta := range idx.deltas {
+		a.deltaBytes += uint64(delta.CompressedLen)
+		out.StoredPixelEvents += uint64(delta.EventCount)
+	}
+	if replay := maxChunkReplayEvents(idx); replay > out.MaxReplayEventsBetweenSnaps {
+		out.MaxReplayEventsBetweenSnaps = replay
+	}
 }
 
 // statsIndex is the index ChunkStats reports for a chunk: the tile index once the
@@ -2645,17 +2675,27 @@ func (db *DB) ChunkCoords(key DatastoreKey) ([]ChunkCoord, error) {
 	if err := db.ensureChunksLoaded(); err != nil {
 		return nil, err
 	}
+	// Index lengths are read under each tile's lock, after db.chunkMu is released
+	// (ingest takes db.chunkMu while it holds tile locks).
 	db.chunkMu.RLock()
-	defer db.chunkMu.RUnlock()
 	ds := db.chunkDatastores[key]
+	var snap chunkDatastoreSnapshot
+	if ds != nil {
+		snap = snapshotChunkDatastoreLocked(ds)
+	}
+	db.chunkMu.RUnlock()
 	if ds == nil {
 		return nil, fmt.Errorf("%w: %s/%s/%s", ErrDatastoreNotFound, key.SavefileUUID, key.Surface, key.Force)
 	}
-	out := make([]ChunkCoord, 0, len(ds.chunks))
-	for coord, chunk := range ds.chunks {
-		if chunk.legacy != nil || len(chunk.index.snapshots) > 0 || len(chunk.index.deltas) > 0 {
-			out = append(out, coord)
+	var out []ChunkCoord
+	for _, ts := range snap.tiles {
+		ts.mu.RLock()
+		for coord, chunk := range ts.chunks {
+			if chunk.legacy != nil || len(chunk.index.snapshots) > 0 || len(chunk.index.deltas) > 0 {
+				out = append(out, coord)
+			}
 		}
+		ts.mu.RUnlock()
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].X != out[j].X {
@@ -2678,9 +2718,11 @@ func (db *DB) ChunkDatastoreProgressTime(key DatastoreKey) (time.Time, error) {
 
 // ScanChunkHistory calls fn for every stored row of the datastore, oldest first:
 // rows are merged across chunks by (tick, row sequence), and each chunk's rows come
-// in the order they were written. History is read from disk frame by frame; memory
-// is one chunk state (2 KiB) plus one cursor per chunk. Rows written while the scan
-// runs may or may not be reported.
+// in the order they were written. History is read from disk frame by frame, but
+// every chunk that still has frames to report holds its own 2 KiB pixel state plus a
+// cursor, so peak memory is about 2 KiB per chunk of the datastore (15 MB for 7.5k
+// chunks, 400 MB for 200k). Rows written while the scan runs may or may not be
+// reported.
 func (db *DB) ScanChunkHistory(ctx context.Context, key DatastoreKey, fn func(ChunkHistoryRow) error) error {
 	if err := db.ensureChunksLoaded(); err != nil {
 		return err

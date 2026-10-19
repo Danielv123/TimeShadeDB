@@ -45,22 +45,33 @@ type Mismatch struct {
 	V3        uint16          `json:"v3"`
 }
 
+// ExtraTile is a v3 z0 tile that holds data although no v2 chunk lies inside it.
+type ExtraTile struct {
+	To   core.DatastoreKey `json:"to"`
+	Tile core.TileCoord    `json:"tile"`
+}
+
 // VerifyReport sums a verification.
 type VerifyReport struct {
 	Checks     []Check    `json:"checks"`
 	Mismatches []Mismatch `json:"mismatches,omitempty"`
 	BadPixels  int        `json:"bad_pixels"`
+	// ExtraTiles counts v3 tiles without any v2 chunk; the first MaxMismatches are
+	// listed in Extra.
+	ExtraTiles int         `json:"extra_tiles"`
+	Extra      []ExtraTile `json:"extra,omitempty"`
 }
 
-// OK reports whether every compared pixel matched.
-func (r VerifyReport) OK() bool { return r.BadPixels == 0 }
+// OK reports whether every compared pixel matched and v3 holds no extra tiles.
+func (r VerifyReport) OK() bool { return r.BadPixels == 0 && r.ExtraTiles == 0 }
 
 // Verify compares src and dst at random instants. For each datastore it picks random
 // ticks between the first and last stored tick (always including both), moves each
 // to the next window boundary T = WindowEnd(TimeOf(tick)), and compares every chunk
 // of every v3 tile that holds v2 data: v3 ReadTile at T (committed content only)
 // against v2 ChunksAt at the last tick before T. Blocks without a v2 chunk must be
-// uncharted in v3.
+// uncharted in v3, and every z0 tile v3 lists must contain a v2 chunk. Open windows
+// and live reads are not compared: Migrate commits everything it applies.
 func Verify(ctx context.Context, src *timeshadedb.DB, dst core.TerrainStore, opts Options, vopts VerifyOptions) (VerifyReport, error) {
 	var report VerifyReport
 	if opts.Clock == nil {
@@ -116,6 +127,19 @@ func Verify(ctx context.Context, src *timeshadedb.DB, dst core.TerrainStore, opt
 			}
 			return tileList[i].X < tileList[j].X
 		})
+		listed, err := dst.ListTiles(ctx, to, 0)
+		if err != nil && !errors.Is(err, core.ErrUnknownDatastore) {
+			return report, fmt.Errorf("verify %s: list tiles: %w", to.ID(), err)
+		}
+		for _, info := range listed {
+			if _, ok := tiles[info.Tile]; ok {
+				continue
+			}
+			report.ExtraTiles++
+			if len(report.Extra) < maxMismatches {
+				report.Extra = append(report.Extra, ExtraTile{To: to, Tile: info.Tile})
+			}
+		}
 		first, last, ok, err := src.ChunkTickRange(from)
 		if err != nil {
 			return report, err

@@ -227,6 +227,25 @@ func TestVerifyDetectsDifferences(t *testing.T) {
 	if report, err := Verify(ctx, src, dst, shifted, VerifyOptions{Samples: 5}); err != nil || report.OK() {
 		t.Fatalf("shifted clock: %v, ok=%v", err, report.OK())
 	}
+	// Data in a tile without any v2 chunk is reported, even though no compared pixel
+	// differs.
+	far := core.ChunkCoord{X: 4000, Y: -4000}
+	var px core.ChunkPixels
+	px[0] = 0xF800
+	if res, err := dst.Apply(ctx, []core.ChunkUpdate{{DS: key, Chunk: far, T: 1 << 41, Pixels: &px}}); err != nil || res.Accepted != 1 {
+		t.Fatalf("stray apply: %v %+v", err, res)
+	}
+	if err := dst.Commit(ctx, 1<<42); err != nil {
+		t.Fatal(err)
+	}
+	report, err = Verify(ctx, src, dst, opts, VerifyOptions{Samples: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	farTile, _ := far.Tile()
+	if report.OK() || report.BadPixels != 0 || report.ExtraTiles != 1 || len(report.Extra) != 1 || report.Extra[0].Tile != farTile {
+		t.Fatalf("extra tile not reported: bad=%d extra=%d %+v", report.BadPixels, report.ExtraTiles, report.Extra)
+	}
 }
 
 func TestMigrateRefusesCollisionsAndExistingDatastores(t *testing.T) {

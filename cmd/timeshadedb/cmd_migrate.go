@@ -147,8 +147,16 @@ func runMigrateV3(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := enc.Encode(out); err != nil {
 		return err
 	}
+	// Rows arrive in tick order and each datastore starts without a horizon, so a
+	// late row means the target dropped history.
+	if n := out.Migration.Applied.Late; n > 0 {
+		return fmt.Errorf("migrate-v3: the v3 store dropped %d rows as late", n)
+	}
+	if n := out.Migration.Applied.Invalid; n > 0 {
+		fmt.Fprintf(os.Stderr, "migrate-v3: warning: the v3 store rejected %d rows as invalid (out of the grid?)\n", n)
+	}
 	if out.Verify != nil && !out.Verify.OK() {
-		return fmt.Errorf("migrate-v3: verification found %d differing pixels", out.Verify.BadPixels)
+		return fmt.Errorf("migrate-v3: verification found %d differing pixels and %d extra tiles", out.Verify.BadPixels, out.Verify.ExtraTiles)
 	}
 	return nil
 }
