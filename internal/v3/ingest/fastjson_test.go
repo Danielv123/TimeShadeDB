@@ -88,6 +88,7 @@ var fastMsgCases = []struct {
 	{`{"type":"chunk","x":1,}`, false},
 	{`{"type":"rail","dir":256}`, false},
 	{`{"type":"rail","dir":-1}`, false},
+	{`{"dir":-0}`, false}, // found by FuzzFastJSON: encoding/json rejects -0 for uint8
 	{`{"type":"surfaces","list":[{"name":"nauvis","tile":true}],"created":true}`, false},
 	{`{"type":"move","m":[{"j":"1","car":[[1,2]]}]}`, false},
 	{`{"type":"move","m":[null]}`, false},
