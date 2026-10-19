@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"unsafe"
 
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/wire"
@@ -103,10 +104,20 @@ func encodePal16(h wire.TileHeader, im *core.TileImage, lut wire.LUT) ([]byte, e
 }
 
 func putU16s(dst []byte, vals []uint16) {
+	if nativeLittleEndian {
+		copy(dst, unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(vals))), 2*len(vals)))
+		return
+	}
 	for i, v := range vals {
 		binary.LittleEndian.PutUint16(dst[2*i:], v)
 	}
 }
+
+// nativeLittleEndian reports whether u16 slices are already in wire byte order.
+var nativeLittleEndian = func() bool {
+	x := uint16(1)
+	return *(*byte)(unsafe.Pointer(&x)) == 1
+}()
 
 // EncodeTileDelta encodes a TSD3 delta (z0), byte-identical to wire.EncodeTileDelta.
 // A colour missing from lut returns ErrColour.

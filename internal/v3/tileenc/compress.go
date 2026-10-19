@@ -88,6 +88,7 @@ func Negotiate(acceptEncoding string) Encoding {
 // Compressor compresses response bodies. It is safe for concurrent use.
 type Compressor struct {
 	zenc      *zstd.Encoder
+	zstdLevel zstd.EncoderLevel
 	gzipLevel int
 	gzPool    sync.Pool
 }
@@ -122,7 +123,7 @@ func NewCompressor(opt CompressorOptions) (*Compressor, error) {
 	if _, err := gzip.NewWriterLevel(io.Discard, opt.GzipLevel); err != nil {
 		return nil, err
 	}
-	return &Compressor{zenc: zenc, gzipLevel: opt.GzipLevel}, nil
+	return &Compressor{zenc: zenc, zstdLevel: opt.ZstdLevel, gzipLevel: opt.GzipLevel}, nil
 }
 
 // Compress returns raw encoded with e. For Identity it returns raw itself.

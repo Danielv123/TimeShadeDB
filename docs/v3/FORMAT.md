@@ -84,11 +84,20 @@ The full rules are on `core.TerrainStore`. In short:
    newest accepted update time of the datastore), a live read also applies the newest open
    update of each chunk. Live content has no version; it is served without caching.
 
-Coarse levels (z < 0, WP3) have their own versions per coarse tile: each snapshot the
-pyramid writes is the next version. Recommended schedule (tunable): write a snapshot of a
-coarse tile when a descendant changed and at least 5 min (z -1), 15 min (z -2) or 60 min
-(z <= -3) passed since its last snapshot, and always keep the latest state reachable. The
-reference oracle (`memstore.Pyramid`) snapshots at every change.
+Coarse levels (z < 0, WP3) have their own versions per coarse tile: each record the
+pyramid writes is the next version. Recommended schedule (tunable): write a version of a
+coarse tile when a descendant changed, at most once per aligned interval of 5 min (z -1),
+15 min (z -2) or 60 min (z <= -3), and always keep the latest state reachable. The
+reference oracle (`memstore.Pyramid`) writes a version at every change.
+
+As implemented in `internal/v3/pyramid` (WP3): a version is built for time T and its
+content is exactly the 2 x 2 average of the committed z0 content at T, so it is
+effective at T. The live server builds at T = the datastore horizon after each commit;
+a level is due when a multiple of its interval lies between the previous build pass and
+T (with a commit every window: when T is a multiple). Each interval is a multiple of the
+finer one, so when a tile is built every finer level is current at T. A flush (shutdown,
+import) builds every pending tile at the horizon. An offline rebuild of an imported
+history produces the same versions as a live server that committed every window.
 
 Immutability rule for every level: once the server has served anything, a new version may
 only become effective at or after the datastore horizon, so `VersionAt(t)` for t below the
@@ -215,10 +224,26 @@ is above 255.
 
 ### 5.4 Coarse snapshots (WP3)
 
-Kind 3 records in `pyramid/<z>/<x>_<y>` series: a zstd frame of 512 x 512 u16 RGB565 LE.
-`t_start` is the snapshot's effective time, `t_len` 0. Version n of a coarse tile is record
-n-1. (Tunable: WP3 may add delta records between snapshots; then versions count records
-that change content, as at z0.)
+Series `pyramid/<z>/<x>_<y>` (series name `<datastore id>/pyramid/<z>/<x>_<y>`, e.g.
+`gw-bc41437d~2E1.nauvis.player/pyramid/-2/0_-1`). Every record is one version: version n
+of a coarse tile is record n-1, `t_start` is its effective time and `t_len` is 0. Each
+record changes content (a build whose average equals the previous version writes
+nothing). Two kinds:
+
+- **Snapshot** (kind 3, flags 0): a zstd frame of 512 x 512 u16 RGB565 LE, row-major.
+  Record 0 is always a snapshot.
+- **Coarse delta** (kind 1, wide flag set): a zstd frame holding the pixels that differ
+  from the previous version, with the same layout as the terrain delta block (5.3) over
+  the coarse tile's 256 blocks of 32 x 32 pixels (block b covers pixels
+  `(32*(b & 15) + (p & 31), 32*(b >> 4) + (p >> 5))`), except that the n values are
+  u16 LE RGB565 colours, not palette indices.
+
+Snapshot rule (tunable; defaults measured on the illisis nauvis history): write a
+snapshot instead of a delta when more than half the pixels changed, after 256 deltas, or
+when the delta bytes since the last snapshot would exceed 16 times that snapshot. On the
+illisis nauvis history (7,483 chunks, 169 h) the pyramid z -1 to z -10 stored 2.49 MB,
+1.97 B per chunk-hour including record headers and index, with cold reads of any
+version at about 1 ms (`internal/v3/pyramid` TestIllisisHistory, TestIllisisTuning).
 
 ### 5.5 Mover windows on disk (WP4)
 

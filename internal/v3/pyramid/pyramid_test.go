@@ -300,6 +300,7 @@ func TestFullDepth(t *testing.T) {
 }
 
 func TestLiveMatchesZ0AtEveryVersion(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	for _, c := range []struct {
 		name string
@@ -310,6 +311,7 @@ func TestLiveMatchesZ0AtEveryVersion(t *testing.T) {
 		{"custom", Options{MinZ: -4, Intervals: []core.TimeMs{2 * W, 6 * W}, SnapshotRatio: 0.5}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			ter := memstore.NewTerrain()
 			p := newPyramid(t, ter, memstore.NewSeriesStore(), c.opt)
 			replayLive(t, ter, p, genHistory(5, 600), 0)
@@ -332,7 +334,7 @@ func TestLiveMatchesZ0AtEveryVersion(t *testing.T) {
 func checkChains(t *testing.T, p *Pyramid, minZ int8, maxChain int) {
 	t.Helper()
 	if maxChain == 0 {
-		maxChain = 128
+		maxChain = 256
 	}
 	p.mu.RLock()
 	d := p.ds[ds]
@@ -394,6 +396,9 @@ func TestImmutability(t *testing.T) {
 			}
 		}
 	}
+	if bt, ok := p.BuiltUpTo(ds); !ok || bt != horizon {
+		t.Fatalf("BuiltUpTo = %v %v, want %v", bt, ok, horizon)
+	}
 	replayLive(t, ter, p, h, half)
 	if _, err := p.Flush(ctx); err != nil {
 		t.Fatal(err)
@@ -412,6 +417,7 @@ func TestImmutability(t *testing.T) {
 // TestRebuildEqualsLive: an offline Rebuild of a finished history gives the same
 // versions (times and content) as Update after every commit plus a final Flush.
 func TestRebuildEqualsLive(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ter := memstore.NewTerrain()
 	opt := Options{MinZ: -5}
@@ -458,6 +464,7 @@ func TestRebuildEqualsLive(t *testing.T) {
 // TestReopen: a pyramid reopened over the same series resumes: same versions, same
 // keyframe state, and further builds stay correct.
 func TestReopen(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ter := memstore.NewTerrain()
 	ss := memstore.NewSeriesStore()
@@ -501,10 +508,10 @@ func TestErrors(t *testing.T) {
 		key  core.DatastoreKey
 		want error
 	}{
-		{core.TileCoord{Z: -5}, ds, core.ErrBadTile},                     // below MinZ
-		{core.TileCoord{Z: -1, X: 5000}, ds, core.ErrBadTile},            // outside the grid
-		{core.TileCoord{Z: 1}, ds, core.ErrBadTile},                      // z > 0
-		{core.TileCoord{Z: -1, X: 500, Y: 500}, ds, core.ErrNoTile},      // empty
+		{core.TileCoord{Z: -5}, ds, core.ErrBadTile},                // below MinZ
+		{core.TileCoord{Z: -1, X: 5000}, ds, core.ErrBadTile},       // outside the grid
+		{core.TileCoord{Z: 1}, ds, core.ErrBadTile},                 // z > 0
+		{core.TileCoord{Z: -1, X: 500, Y: 500}, ds, core.ErrNoTile}, // empty
 		{tile, core.DatastoreKey{Map: "a", Surface: "b", Force: "c"}, core.ErrUnknownDatastore},
 	} {
 		if _, err := p.VersionAt(ctx, c.key, c.tile, 0); !errors.Is(err, c.want) {

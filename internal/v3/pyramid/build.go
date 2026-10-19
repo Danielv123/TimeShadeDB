@@ -21,8 +21,10 @@ type BuildStats struct {
 	Snapshots int `json:"snapshots"`
 	Deltas    int `json:"deltas"`
 	Unchanged int `json:"unchanged"`
-	// Bytes is the payload bytes appended (excluding series headers and index).
-	Bytes int64 `json:"bytes"`
+	// Bytes is the payload bytes appended (excluding series headers and index);
+	// SnapshotBytes the part of it in snapshots.
+	Bytes         int64 `json:"bytes"`
+	SnapshotBytes int64 `json:"snapshot_bytes"`
 }
 
 func (s *BuildStats) add(o BuildStats) {
@@ -33,11 +35,13 @@ func (s *BuildStats) add(o BuildStats) {
 	s.Deltas += o.Deltas
 	s.Unchanged += o.Unchanged
 	s.Bytes += o.Bytes
+	s.SnapshotBytes += o.SnapshotBytes
 }
 
 // Update builds the coarse levels that are due, for every datastore, at T = the
 // datastore's horizon (live mode). Call it after each terrain Commit; it is cheap when
-// nothing changed (O(z0 tiles) bookkeeping, no pixels read).
+// nothing changed (O(z0 tiles) bookkeeping, no pixels read). Coarse answers are final
+// only below BuiltUpTo, which Update advances to the horizon it read.
 func (p *Pyramid) Update(ctx context.Context) (BuildStats, error) {
 	return p.update(ctx, false)
 }
@@ -79,8 +83,10 @@ func (p *Pyramid) update(ctx context.Context, force bool) (BuildStats, error) {
 		if prev == math.MinInt64 || prev >= T {
 			prev = T - 1 // first pass (or no progress): due only at an exact multiple
 		}
-		d.prevT = max(d.prevT, T)
 		st, err := p.pass(ctx, d, T, prev, force)
+		d.mu.Lock()
+		d.prevT = max(d.prevT, T)
+		d.mu.Unlock()
 		total.add(st)
 		if err != nil {
 			return total, err
@@ -194,7 +200,9 @@ func (p *Pyramid) Rebuild(ctx context.Context, key core.DatastoreKey) (BuildStat
 	}
 	advance(horizon)
 	st, err := p.pass(ctx, d, horizon, horizon-1, true)
+	d.mu.Lock()
 	d.prevT = max(d.prevT, horizon)
+	d.mu.Unlock()
 	total.add(st)
 	return total, err
 }
@@ -364,6 +372,7 @@ func (p *Pyramid) buildTile(ctx context.Context, d *dsState, ct *ctile, T core.T
 	if rec.Kind == core.RecordSnapshot {
 		ct.sinceBase, ct.deltaBytes, ct.baseBytes = 0, 0, int64(len(payload))
 		st.Snapshots++
+		st.SnapshotBytes += int64(len(payload))
 	} else {
 		ct.sinceBase++
 		ct.deltaBytes += int64(len(payload))

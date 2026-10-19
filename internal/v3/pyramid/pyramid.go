@@ -58,12 +58,16 @@ type Options struct {
 	Intervals []core.TimeMs
 	// CacheBytes bounds the decoded coarse image LRU (default 32 MiB; 512 KiB per image).
 	CacheBytes int64
-	// MaxChain caps the deltas between snapshots (default 128), bounding a cold read.
+	// MaxChain caps the deltas between snapshots (default 256), bounding a cold read.
 	MaxChain int
 	// SnapshotRatio: a snapshot replaces a delta when the delta bytes since the last
-	// snapshot would exceed this multiple of the snapshot's size (default 4).
+	// snapshot would exceed this multiple of the snapshot's size (default 16).
+	// Measured on the illisis nauvis history (TestIllisisTuning): ratio 4 / chain 128
+	// stored 2.95 B per chunk-hour, ratio 16 / chain 256 2.09, ratio 32 / chain 512
+	// 1.82, with cold historical reads at p95 1.2-1.6 ms.
 	SnapshotRatio float64
-	// ZstdLevel compresses record payloads (default zstd.SpeedDefault).
+	// ZstdLevel compresses record payloads (default zstd.SpeedBestCompression, about
+	// 6% smaller than SpeedDefault on coarse records; snapshots are rare).
 	ZstdLevel zstd.EncoderLevel
 }
 
@@ -107,9 +111,9 @@ type dsState struct {
 	tiles map[core.TileCoord]*ctile // every coarse tile known; readers skip n == 0
 
 	// Builder-only state (under Pyramid.buildMu).
-	z0seen   map[core.TileCoord]core.TimeMs // newest z0 version time propagated, per z0 tile
-	dirty    map[core.TileCoord]struct{}
-	prevT    core.TimeMs // time of the previous live pass (math.MinInt64: none yet)
+	z0seen map[core.TileCoord]core.TimeMs // newest z0 version time propagated, per z0 tile
+	dirty  map[core.TileCoord]struct{}
+	prevT  core.TimeMs // time of the previous live pass (math.MinInt64: none yet)
 }
 
 // ctile is one coarse tile.
@@ -158,13 +162,13 @@ func New(ctx context.Context, terrain Terrain, series core.SeriesStore, opt Opti
 		opt.CacheBytes = 32 << 20
 	}
 	if opt.MaxChain <= 0 {
-		opt.MaxChain = 128
+		opt.MaxChain = 256
 	}
 	if opt.SnapshotRatio <= 0 {
-		opt.SnapshotRatio = 4
+		opt.SnapshotRatio = 16
 	}
 	if opt.ZstdLevel == 0 {
-		opt.ZstdLevel = zstd.SpeedDefault
+		opt.ZstdLevel = zstd.SpeedBestCompression
 	}
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(opt.ZstdLevel), zstd.WithEncoderConcurrency(1),
 		zstd.WithWindowSize(1<<20), zstd.WithLowerEncoderMem(true))
@@ -246,12 +250,12 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 		return d, nil
 	}
 	d = &dsState{
-		key:      key,
-		id:       key.ID(),
-		tiles:    map[core.TileCoord]*ctile{},
-		z0seen:   map[core.TileCoord]core.TimeMs{},
-		dirty:    map[core.TileCoord]struct{}{},
-		prevT:    math.MinInt64,
+		key:    key,
+		id:     key.ID(),
+		tiles:  map[core.TileCoord]*ctile{},
+		z0seen: map[core.TileCoord]core.TimeMs{},
+		dirty:  map[core.TileCoord]struct{}{},
+		prevT:  math.MinInt64,
 	}
 	prefix := d.id + "/pyramid/"
 	names, err := p.series.List(ctx, prefix)
@@ -290,6 +294,7 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 				ct.deltaBytes += int64(m.Len)
 			}
 			ct.descT = ct.lastT
+			d.prevT = max(d.prevT, ct.lastT)
 		}
 		d.tiles[tile] = ct
 	}
@@ -506,6 +511,23 @@ func (p *Pyramid) ListTiles(ctx context.Context, key core.DatastoreKey, z int8) 
 		return int(a.Tile.X) - int(b.Tile.X)
 	})
 	return out, nil
+}
+
+// BuiltUpTo returns the time up to which the coarse levels of a datastore are final:
+// no build will add a coarse version effective before it, so VersionAt(t) for t below
+// it never changes. It is the last build pass (normally the horizon at the last Update)
+// and can lag the terrain horizon, so the API must use min(horizon, BuiltUpTo) when it
+// decides that a coarse answer is immutable. ok is false before anything was built.
+func (p *Pyramid) BuiltUpTo(key core.DatastoreKey) (t core.TimeMs, ok bool) {
+	p.mu.RLock()
+	d := p.ds[key]
+	p.mu.RUnlock()
+	if d == nil {
+		return 0, false
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.prevT, d.prevT != math.MinInt64
 }
 
 // CacheStats returns the decoded coarse image cache counters (exported by WP6 under

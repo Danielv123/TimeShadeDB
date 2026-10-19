@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/klauspost/compress/zstd"
+
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/wire"
 )
@@ -27,6 +29,11 @@ type Options struct {
 	CacheShards int
 	// Compressor configures zstd and gzip.
 	Compressor CompressorOptions
+	// CoarseZstdLevel is the zstd level for coarse (z < 0) tiles, whose RGB565 bodies
+	// are twice the size of paletted z0 bodies. Default zstd.SpeedFastest: on the
+	// worst-compressing nauvis z-1 tile it encodes in 1.85 ms against 2.7 ms at
+	// SpeedDefault, for 11% more bytes (BenchmarkRealEncode).
+	CoarseZstdLevel zstd.EncoderLevel
 }
 
 // DefaultCacheBytes is the default encoded-response cache budget.
@@ -69,6 +76,7 @@ type Renderer struct {
 	src     core.TileSource
 	terrain Terrain
 	comp    *Compressor
+	coarse  *Compressor // z < 0 tiles
 	cache   *LRU[cacheKey, []byte]
 
 	palMu sync.Mutex
@@ -102,10 +110,22 @@ func NewRenderer(src core.TileSource, terrain Terrain, opt Options) (*Renderer, 
 	if err != nil {
 		return nil, err
 	}
+	if opt.CoarseZstdLevel == 0 {
+		opt.CoarseZstdLevel = zstd.SpeedFastest
+	}
+	coarse := comp
+	if opt.CoarseZstdLevel != comp.zstdLevel {
+		co := opt.Compressor
+		co.ZstdLevel = opt.CoarseZstdLevel
+		if coarse, err = NewCompressor(co); err != nil {
+			return nil, err
+		}
+	}
 	return &Renderer{
 		src:     src,
 		terrain: terrain,
 		comp:    comp,
+		coarse:  coarse,
 		cache:   NewLRU[cacheKey, []byte](opt.CacheBytes, opt.CacheShards, func(b []byte) int64 { return int64(cap(b)) + 96 }),
 		pals:    map[core.DatastoreKey]*paletteLUT{},
 		flights: map[cacheKey]*flight{},
@@ -113,7 +133,12 @@ func NewRenderer(src core.TileSource, terrain Terrain, opt Options) (*Renderer, 
 }
 
 // Close releases the compressor.
-func (r *Renderer) Close() error { return r.comp.Close() }
+func (r *Renderer) Close() error {
+	if r.coarse != r.comp {
+		r.coarse.Close()
+	}
+	return r.comp.Close()
+}
 
 // Compress compresses an uncached body (for example a mutable JSON response).
 func (r *Renderer) Compress(enc Encoding, raw []byte) (Body, error) {
@@ -152,10 +177,19 @@ func (r *Renderer) cached(ctx context.Context, k cacheKey, build func(ctx contex
 
 	raw, err := build(context.WithoutCancel(ctx))
 	if err == nil {
-		f.data, err = r.comp.Compress(k.enc, raw)
+		c := r.comp
+		if k.kind == resTile && k.z < 0 {
+			c = r.coarse
+		}
+		f.data, err = c.Compress(k.enc, raw)
 	}
 	f.err = err
 	if err == nil {
+		if cap(f.data) > len(f.data)+len(f.data)/8+64 {
+			// Compressor outputs are allocated for the worst case; keep only what
+			// the cache accounts for.
+			f.data = append(make([]byte, 0, len(f.data)), f.data...)
+		}
 		r.cache.Put(k, f.data)
 	}
 	r.flightMu.Lock()
