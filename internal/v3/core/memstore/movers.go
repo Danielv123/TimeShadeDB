@@ -39,6 +39,10 @@ type moverSurface struct {
 	closed    map[core.TimeMs]*core.MoverWindow
 	keyframes map[core.TimeMs]*core.MoverWindow
 	arrivals  uint64
+
+	// byID lists each journey's rows sorted by T. It only speeds up handoff detection;
+	// the semantics are those of a scan over rows.
+	byID map[string][]*moverRow
 }
 
 // NewMovers returns an empty store.
@@ -65,6 +69,7 @@ func (m *Movers) Append(ctx context.Context, samples []core.MoverSample) (core.A
 				key:       s.Surface,
 				horizon:   noHorizon,
 				byIDT:     map[idT]*moverRow{},
+				byID:      map[string][]*moverRow{},
 				closed:    map[core.TimeMs]*core.MoverWindow{},
 				keyframes: map[core.TimeMs]*core.MoverWindow{},
 			}
@@ -84,6 +89,11 @@ func (m *Movers) Append(ctx context.Context, samples []core.MoverSample) (core.A
 			r := &moverRow{s: q, arrival: sf.arrivals}
 			sf.rows = append(sf.rows, r)
 			sf.byIDT[k] = r
+			list := append(sf.byID[k.id], r)
+			for i := len(list) - 1; i > 0 && list[i-1].s.T > r.s.T; i-- {
+				list[i-1], list[i] = list[i], list[i-1]
+			}
+			sf.byID[k.id] = list
 		}
 		if !sf.hasData || q.T < sf.first {
 			sf.first = q.T
@@ -123,9 +133,10 @@ func (m *Movers) Commit(ctx context.Context, upTo core.TimeMs) error {
 				if g.s.Flags&core.FlagGone == 0 {
 					continue
 				}
-				for _, r := range sf.rows {
-					if r.s.Meta.ID == g.s.Meta.ID && r.s.Flags&core.FlagGone == 0 &&
-						r.s.T > g.s.T && r.s.T <= g.s.T+core.HandoffWindow {
+				list := sf.byID[g.s.Meta.ID]
+				i := sort.Search(len(list), func(i int) bool { return list[i].s.T > g.s.T })
+				for ; i < len(list) && list[i].s.T <= g.s.T+core.HandoffWindow; i++ {
+					if list[i].s.Flags&core.FlagGone == 0 {
 						g.s.Flags |= core.FlagHandoff
 						break
 					}
