@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -350,4 +352,51 @@ func TestHostileTileRequests(t *testing.T) {
 	if per := elapsed / time.Duration(n); per > time.Millisecond {
 		t.Fatalf("mean %v per request", per)
 	}
+}
+
+// TestConcurrentServing reads every route while ingest, commits and live clients run
+// (meant for -race).
+func TestConcurrentServing(t *testing.T) {
+	f := newFixture(t, fixtureOpt{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s := openSSE(t, f.ts.URL+"/api/v3/live?ds="+dsID+"&sfc="+sfcID)
+	go func() {
+		for range s.events {
+		}
+	}()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ctx.Err() == nil; i++ {
+			now := f.clock() + core.TimeMs(i)*500
+			f.now.Store(int64(now))
+			f.in.Ingest(ctx, strings.NewReader(envLine(t, int64(60+30*i), now, chunkMsg(i%40, i%7, uint16(i)),
+				map[string]any{"type": "move", "s": "nauvis", "m": []any{map[string]any{"j": "1.2.v9", "k": "v", "f": "player", "name": "car", "x": i, "y": 4, "h": 0.5}}})))
+			f.srv.Step(ctx)
+		}
+	}()
+	paths := []string{"/api/v3/catalog", "/api/v3/view/" + dsID + "/0?bbox=-1,-1,3,3", "/api/v3/view/" + dsID + "/-1?bbox=-2,-2,2,2",
+		"/api/v3/tile/" + dsID + "/0/0/0/live.bin", "/api/v3/tile/" + dsID + "/-1/0/0/live.bin", "/api/v3/tile/" + dsID + "/0/0/0/1.bin",
+		"/api/v3/movers/" + sfcID + "/live.bin", "/api/v3/timeline/" + dsID + "/0/2026-10-16.json", "/metrics"}
+	for w := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := &http.Client{}
+			for i := w; ctx.Err() == nil; i++ {
+				res, err := c.Get(f.ts.URL + paths[i%len(paths)])
+				if err != nil {
+					continue
+				}
+				io.Copy(io.Discard, res.Body)
+				res.Body.Close()
+				if res.StatusCode >= 500 {
+					t.Errorf("%s: %d", paths[i%len(paths)], res.StatusCode)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
