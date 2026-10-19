@@ -457,6 +457,17 @@ func TestLegacyChunkHistoryStaysReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("read-only", ro, legacyProbes)
+	checkStats := func(label string, db *DB, snapshots, deltas uint64) {
+		t.Helper()
+		stats, err := db.ChunkStats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.ChunkCount != 2 || stats.SnapshotCount != snapshots || stats.DeltaFrameCount != deltas {
+			t.Fatalf("%s: stats chunks=%d snapshots=%d deltas=%d, want 2/%d/%d", label, stats.ChunkCount, stats.SnapshotCount, stats.DeltaFrameCount, snapshots, deltas)
+		}
+	}
+	checkStats("read-only", ro, 1, 4)
 	if latest, ok, err := ro.ChunkDatastoreLatestTick(key); err != nil || !ok || latest != 30 {
 		t.Fatalf("latest tick = %d %v %v, want 30", latest, ok, err)
 	}
@@ -490,6 +501,7 @@ func TestLegacyChunkHistoryStaysReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("reopened", reopened, afterWrite)
+	checkStats("reopened", reopened, 1, 2)
 	copyPath := filepath.Join(dir, "copy.tshd")
 	dst, err := Open(OpenOptions{Path: copyPath, Format: FormatChunks})
 	if err != nil {

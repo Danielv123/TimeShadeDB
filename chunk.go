@@ -1089,17 +1089,18 @@ func summarizeChunkDatastoreStats(ds *chunkDatastore) ChunkDatastoreStats {
 			}
 		}
 		out.ChunkCount++
-		out.SnapshotCount += uint64(len(chunk.index.snapshots))
-		out.DeltaFrameCount += uint64(len(chunk.index.deltas))
-		for _, snap := range chunk.index.snapshots {
+		idx := chunk.statsIndex()
+		out.SnapshotCount += uint64(len(idx.snapshots))
+		out.DeltaFrameCount += uint64(len(idx.deltas))
+		for _, snap := range idx.snapshots {
 			snapshotBytes += uint64(snap.CompressedLen)
 			out.StoredPixelEvents += ChunkPixelCount
 		}
-		for _, delta := range chunk.index.deltas {
+		for _, delta := range idx.deltas {
 			deltaBytes += uint64(delta.CompressedLen)
 			out.StoredPixelEvents += uint64(delta.EventCount)
 		}
-		if replay := maxChunkReplayEvents(chunk.index); replay > out.MaxReplayEventsBetweenSnaps {
+		if replay := maxChunkReplayEvents(idx); replay > out.MaxReplayEventsBetweenSnaps {
 			out.MaxReplayEventsBetweenSnaps = replay
 		}
 	}
@@ -1112,6 +1113,16 @@ func summarizeChunkDatastoreStats(ds *chunkDatastore) ChunkDatastoreStats {
 		out.AverageDeltaFrameBytes = deltaBytes / out.DeltaFrameCount
 	}
 	return out
+}
+
+// statsIndex is the index ChunkStats reports for a chunk: the tile index once the
+// chunk is tile-backed, otherwise its legacy per-chunk index (as before the event log
+// was removed, when the legacy index was the chunk's only index).
+func (chunk *factorioChunkState) statsIndex() chunkIndex {
+	if !chunk.tileBacked && chunk.legacy != nil {
+		return *chunk.legacy
+	}
+	return chunk.index
 }
 
 func maxChunkReplayEvents(idx chunkIndex) uint32 {
@@ -1724,9 +1735,6 @@ func (db *DB) loadLegacyChunkIndexFilesLocked(ds *chunkDatastore, dsDir string) 
 		if err != nil {
 			return false, err
 		}
-		if len(idx.snapshots) == 0 && len(idx.deltas) == 0 {
-			continue
-		}
 		chunk := ds.chunkLocked(coord)
 		chunk.legacy = &idx
 		loaded = true
@@ -1753,9 +1761,6 @@ func (db *DB) loadChunkTileIndexFilesLocked(ds *chunkDatastore, dsDir string) (b
 			return false, err
 		}
 		for coord, idx := range indexes {
-			if len(idx.snapshots) == 0 && len(idx.deltas) == 0 {
-				continue
-			}
 			chunk := ds.chunkLocked(coord)
 			chunk.index = idx
 			chunk.tileBacked = true
