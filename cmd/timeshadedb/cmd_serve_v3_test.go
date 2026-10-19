@@ -214,24 +214,37 @@ func TestTailIntoServeV3(t *testing.T) {
 	if !found {
 		t.Fatalf("no datastore with data: %+v", cat.Maps[0].Surfaces)
 	}
-	// Without the token, ingest is refused and tail keeps retrying; a cancelled tail
-	// stops cleanly.
-	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	// The state file kept the offsets: a second run posts nothing again.
+	out.Reset()
+	if err := runTail(context.Background(), &out, io.Discard, []string{"--dir", dir, "--url", base, "--token", "secret", "--map", "lab", "--once", "--quiet"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "posted 0 envelopes") {
+		t.Fatalf("restarted tail output %q", out.String())
+	}
+	// Without the token, ingest is refused: tail stops with an error instead of
+	// retrying forever, and keeps the file.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	os.WriteFile(filepath.Join(dir, "0000000003-0000001200.ndjson"), []byte(lines[0]+"\n"), 0o644)
-	if err := runTail(ctx, io.Discard, io.Discard, []string{"--dir", dir, "--url", base, "--map", "lab", "--quiet"}); err != nil {
-		t.Fatalf("cancelled tail: %v", err)
+	if err := runTail(ctx, io.Discard, io.Discard, []string{"--dir", dir, "--url", base, "--map", "lab", "--quiet"}); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("tail without a token: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "0000000002-0000000600.ndjson")); err != nil {
+	// 0002 was acknowledged in full and is no longer the newest file; 0003 stays.
+	if _, err := os.Stat(filepath.Join(dir, "0000000003-0000001200.ndjson")); err != nil {
 		t.Fatal("file deleted although ingest refused it")
 	}
 }
 
-// fakeIngest records posted envelopes; fail makes the next n posts answer 503.
+// fakeIngest records posted envelopes; fail makes the next n posts answer 503, codes
+// answers the next posts with these statuses, maxEnvs answers 413 to bodies with more
+// envelopes, and a body with an envelope of tick 666 gets 400.
 type fakeIngest struct {
-	mu   sync.Mutex
-	envs []map[string]any
-	fail int
+	mu      sync.Mutex
+	envs    []map[string]any
+	fail    int
+	codes   []int
+	maxEnvs int
 }
 
 func (f *fakeIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -243,20 +256,32 @@ func (f *fakeIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(503)
 		return
 	}
+	if len(f.codes) > 0 {
+		code := f.codes[0]
+		f.codes = f.codes[1:]
+		w.WriteHeader(code)
+		return
+	}
 	zr, err := gzip.NewReader(r.Body)
 	if err != nil {
 		w.WriteHeader(400)
 		return
 	}
+	var envs []map[string]any
 	sc := bufio.NewScanner(zr)
 	for sc.Scan() {
 		var m map[string]any
-		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+		if err := json.Unmarshal(sc.Bytes(), &m); err != nil || m["tick"] == 666.0 {
 			w.WriteHeader(400)
 			return
 		}
-		f.envs = append(f.envs, m)
+		envs = append(envs, m)
 	}
+	if f.maxEnvs > 0 && len(envs) > f.maxEnvs {
+		w.WriteHeader(413)
+		return
+	}
+	f.envs = append(f.envs, envs...)
 	io.WriteString(w, `{"envelopes":1,"bad_lines":0,"errors":[]}`)
 }
 
@@ -268,8 +293,9 @@ func TestTailerFiles(t *testing.T) {
 	var slept []time.Duration
 	tl := &tailer{dir: dir, url: ts.URL, src: "standalone:x", mapKey: "m", instance: 3, batchBytes: 1024,
 		client: ts.Client(), logf: func(string, ...any) {}, now: func() time.Time { return time.UnixMilli(5000) },
-		sleep:   func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil },
-		offsets: map[string]int64{}}
+		sleep:     func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil },
+		offsets:   map[string]*tailFile{},
+		statePath: filepath.Join(t.TempDir(), "state.json")}
 	ctx := context.Background()
 	write := func(name, s string) {
 		f, _ := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -331,6 +357,49 @@ func TestTailerFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "b.ndjson"), []byte(env(7)), 0o644)
 	if n, _ := tl.pass(ctx); n != 1 {
 		t.Fatalf("shrunk file: %d", n)
+	}
+
+	// A restarted tailer resumes from the state file: nothing is posted again.
+	write("b.ndjson", env(8))
+	restart := func() *tailer {
+		t2 := *tl
+		t2.offsets = map[string]*tailFile{}
+		if err := t2.loadState(); err != nil {
+			t.Fatal(err)
+		}
+		return &t2
+	}
+	tl = restart()
+	if n, err := tl.pass(ctx); err != nil || n != 1 {
+		t.Fatalf("pass after restart: %d %v", n, err)
+	}
+	tl = restart()
+	if n, _ := tl.pass(ctx); n != 0 {
+		t.Fatalf("restart re-posted %d envelopes", n)
+	}
+	// A file replaced under the same name (longer, different start) is read again.
+	os.WriteFile(filepath.Join(dir, "b.ndjson"), []byte(env(900)+env(901)+env(902)), 0o644)
+	tl = restart()
+	if n, _ := tl.pass(ctx); n != 3 {
+		t.Fatalf("replaced file: %d", n)
+	}
+
+	// Statuses: a batch over the cap is split, a line ingest refuses is skipped, and
+	// a wrong token stops the tailer.
+	before := len(fi.envs)
+	fi.maxEnvs = 2
+	write("b.ndjson", env(10)+env(11)+env(666)+env(12)+env(13))
+	if n, err := tl.pass(ctx); err != nil || n != 4 {
+		t.Fatalf("split and skip: %d %v", n, err)
+	}
+	if got := len(fi.envs) - before; got != 4 {
+		t.Fatalf("%d envelopes after split and skip", got)
+	}
+	fi.maxEnvs = 0
+	fi.codes = []int{401}
+	write("b.ndjson", env(14))
+	if _, err := tl.pass(ctx); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("401: %v", err)
 	}
 }
 

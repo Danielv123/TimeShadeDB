@@ -294,7 +294,13 @@ loses open-window updates until the chunk changes again or the next resync.
 `timeshadedb tail --dir <script-output>/timeshade --map <key> [--url ...] [--token ...]
 [--src standalone:<name>]` forwards a standalone game's files (PROTOCOL.md 2). It adds
 `src`, `map`, `instance`, `recv_ms` and an increasing `seq` to every line, posts gzip
-bodies of up to `--batch-bytes` (1 MiB), retries with backoff (honouring `Retry-After`),
-deletes a file once all of it was acknowledged and a newer file exists, and posts the
-newest file up to its last complete line without deleting it. `--once` forwards what is
-there and exits.
+bodies of up to `--batch-bytes` (1 MiB), deletes a file once all of it was acknowledged
+and a newer file exists, and posts the newest file up to its last complete line without
+deleting it. Network errors, 5xx and 429 are retried with backoff (honouring
+`Retry-After`); a 400 or 413 splits the batch, and a single line that is still refused is
+skipped and logged; any other status (401, 403, 404, 415) stops the tailer with an error.
+The acknowledged offsets are kept in a state file (`--state`, default
+`<dir>/timeshadedb-tail.state.json`, `-` for none) with a hash of each file's first
+KiB, so a restarted tailer does not post lines again; reposted lines would get a new
+`recv_ms` and stamp old data at the time of the repost. `--once` forwards what is there
+and exits.

@@ -47,7 +47,8 @@ Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not
   of it. A file is complete only once a newer file exists: a paused game (a headless server
   pauses with no players) stops writing without closing its file and appends to it again
   on resume, so a pause in growth is not the end of a file. The tailer may post the newest
-  file up to its last complete line (ending in `\n`), keeping the byte offset it posted to, but never
+  file up to its last complete line (ending in `\n`), keeping the byte offset it posted to
+  (`timeshadedb tail` keeps it in a state file, so a restart does not repost), but never
   deletes it.
 
 ## 3. Messages

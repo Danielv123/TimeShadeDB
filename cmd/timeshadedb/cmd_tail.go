@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -39,7 +40,9 @@ func cmdTail(ctx context.Context, args []string) error {
 // tailer forwards the capture files of the timeshade_capture mod (docs/v3/PROTOCOL.md 2):
 // it posts files in name order, adding the forwarder fields to every envelope, deletes a
 // file once ingest acknowledged all of it and a newer file exists, and posts the newest
-// file up to its last complete line without deleting it.
+// file up to its last complete line without deleting it. The acknowledged offsets are
+// kept in a state file, so a restarted tailer does not post lines again (with a new
+// recv_ms, which would stamp old chunk and mover data at the time of the repost).
 type tailer struct {
 	dir, url, token, src, mapKey string
 	instance                     int64
@@ -48,11 +51,86 @@ type tailer struct {
 	logf                         func(string, ...any)
 	now                          func() time.Time
 	sleep                        func(context.Context, time.Duration) error
+	// statePath is the state file ("" keeps offsets in memory only).
+	statePath string
 
-	// offsets holds the bytes already acknowledged per file name.
-	offsets map[string]int64
+	// offsets holds what was acknowledged per file name.
+	offsets map[string]*tailFile
 	seq     int64
 	posted  int64 // envelopes acknowledged
+}
+
+// tailFile is the state of one capture file: the bytes acknowledged, and a hash of its
+// first bytes, so a file replaced under the same name is not resumed mid-way.
+type tailFile struct {
+	Off     int64  `json:"off"`
+	HeadLen int    `json:"head_len"`
+	Head    string `json:"head"`
+	checked bool   // the head was compared with the file since the state was loaded
+}
+
+// tailHeadBytes is how much of a file's start the state hashes.
+const tailHeadBytes = 1024
+
+type tailState struct {
+	Version int                  `json:"version"`
+	Files   map[string]*tailFile `json:"files"`
+}
+
+// loadState reads the state file, if any.
+func (t *tailer) loadState() error {
+	if t.statePath == "" {
+		return nil
+	}
+	b, err := os.ReadFile(t.statePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var st tailState
+	if err := json.Unmarshal(b, &st); err != nil || st.Version != 1 {
+		t.logf("ignoring unreadable state file %s: %v", t.statePath, err)
+		return nil
+	}
+	for name, f := range st.Files {
+		if f != nil && f.Off > 0 && filepath.Base(name) == name {
+			t.offsets[name] = f
+		}
+	}
+	return nil
+}
+
+// saveState writes the state file atomically.
+func (t *tailer) saveState() error {
+	if t.statePath == "" {
+		return nil
+	}
+	b, err := json.Marshal(tailState{Version: 1, Files: t.offsets})
+	if err != nil {
+		return err
+	}
+	tmp := t.statePath + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, t.statePath)
+}
+
+// fileHead hashes the first n bytes of f.
+func fileHead(f *os.File, n int) (string, error) {
+	b := make([]byte, n)
+	got, err := f.ReadAt(b, 0)
+	if got < n {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return "", err
+	}
+	h := fnv.New64a()
+	h.Write(b)
+	return strconv.FormatUint(h.Sum64(), 16), nil
 }
 
 // pass forwards what the directory holds now. It returns the number of envelopes
@@ -75,6 +153,9 @@ func (t *tailer) pass(ctx context.Context) (int, error) {
 				return total, err
 			}
 			delete(t.offsets, name)
+			if err := t.saveState(); err != nil {
+				return total, err
+			}
 			t.logf("forwarded and deleted %s", name)
 		}
 	}
@@ -83,10 +164,15 @@ func (t *tailer) pass(ctx context.Context) (int, error) {
 	for _, n := range names {
 		keep[n] = true
 	}
+	forgot := false
 	for n := range t.offsets {
 		if !keep[n] {
 			delete(t.offsets, n)
+			forgot = true
 		}
+	}
+	if forgot {
+		return total, t.saveState()
 	}
 	return total, nil
 }
@@ -123,12 +209,26 @@ func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, er
 	if err != nil {
 		return 0, err
 	}
-	off := t.offsets[name]
-	if fi.Size() < off {
+	st := t.offsets[name]
+	if st == nil {
+		st = &tailFile{checked: true}
+	}
+	off := st.Off
+	switch {
+	case fi.Size() < off:
 		// The file was replaced (the same save loaded again): start over.
 		t.logf("%s shrank from %d to %d bytes; reading it again", name, off, fi.Size())
+		*st = tailFile{checked: true}
 		off = 0
+	case !st.checked && st.HeadLen > 0:
+		// Resuming from the state file: make sure it is still the same file.
+		if h, err := fileHead(f, st.HeadLen); err != nil || h != st.Head {
+			t.logf("%s changed since the state was saved; reading it again", name)
+			*st = tailFile{}
+			off = 0
+		}
 	}
+	st.checked = true
 	if fi.Size() == off {
 		return 0, nil
 	}
@@ -154,20 +254,63 @@ func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, er
 				cut = bytes.IndexByte(data, '\n') + 1 // one line longer than a batch
 			}
 		}
-		n, err := t.post(ctx, data[:cut])
+		n, err := t.postLines(ctx, data[:cut])
 		total += n
 		if err != nil {
 			return total, err
 		}
 		off += int64(cut)
-		t.offsets[name] = off
+		st.Off = off
+		if st.HeadLen < tailHeadBytes && off > int64(st.HeadLen) {
+			st.HeadLen = int(min(off, tailHeadBytes))
+			if st.Head, err = fileHead(f, st.HeadLen); err != nil {
+				return total, err
+			}
+		}
+		t.offsets[name] = st
+		if err := t.saveState(); err != nil {
+			return total, err
+		}
 		data = data[cut:]
 	}
 	return total, nil
 }
 
-// post sends one batch of envelope lines with the forwarder fields added, retrying
-// until ingest answers 200 or ctx ends.
+// statusError is a status other than 200 from ingest.
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("status %d: %s", e.code, e.msg) }
+
+// postLines posts lines; when ingest refuses the body itself (400, or 413 for a body
+// over its cap), it splits the batch, and skips, loudly, a single line it refuses.
+func (t *tailer) postLines(ctx context.Context, lines []byte) (int, error) {
+	n, err := t.post(ctx, lines)
+	var se *statusError
+	if err == nil || !errors.As(err, &se) || (se.code != http.StatusBadRequest && se.code != http.StatusRequestEntityTooLarge) {
+		return n, err
+	}
+	mid := bytes.IndexByte(lines[len(lines)/2:], '\n') + len(lines)/2 + 1
+	if mid >= len(lines) {
+		mid = bytes.IndexByte(lines, '\n') + 1
+	}
+	if mid <= 0 || mid >= len(lines) {
+		t.logf("ingest: skipping a line ingest refuses (%v): %.200s", se, lines)
+		return 0, nil
+	}
+	n1, err := t.postLines(ctx, lines[:mid])
+	if err != nil {
+		return n1, err
+	}
+	n2, err := t.postLines(ctx, lines[mid:])
+	return n1 + n2, err
+}
+
+// post sends one batch of envelope lines with the forwarder fields added. It retries
+// network errors, 5xx and 429 (honouring Retry-After) until ingest answers 200 or ctx
+// ends; any other status is returned as a *statusError.
 func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
 	recv := core.FromTime(t.now())
 	var body bytes.Buffer
@@ -209,6 +352,10 @@ func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
 		if ctx.Err() != nil {
 			return 0, ctx.Err()
 		}
+		var se *statusError
+		if errors.As(err, &se) && se.code != http.StatusTooManyRequests && se.code < 500 {
+			return 0, se
+		}
 		wait := backoff
 		if retry > 0 {
 			wait = retry
@@ -249,7 +396,7 @@ func (t *tailer) send(ctx context.Context, body []byte) (time.Duration, error) {
 	if s, err := strconv.Atoi(res.Header.Get("Retry-After")); err == nil && s > 0 {
 		retry = time.Duration(s) * time.Second
 	}
-	return retry, fmt.Errorf("status %d: %s", res.StatusCode, bytes.TrimSpace(b))
+	return retry, &statusError{res.StatusCode, string(bytes.TrimSpace(b))}
 }
 
 func jsonString(s string) string {
@@ -280,6 +427,7 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	poll := fs.Duration("poll", time.Second, "how often to look for new lines")
 	batch := fs.Int("batch-bytes", 1<<20, "largest request body before compression")
 	once := fs.Bool("once", false, "forward what is there now and exit")
+	state := fs.String("state", "", "file that keeps the acknowledged offsets across restarts (default <dir>/timeshadedb-tail.state.json; - for none)")
 	quiet := fs.Bool("quiet", false, "log only errors")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -312,11 +460,20 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 			}
 		}
 	}
+	switch *state {
+	case "":
+		*state = filepath.Join(*dir, "timeshadedb-tail.state.json")
+	case "-":
+		*state = ""
+	}
 	t := &tailer{
 		dir: *dir, url: target, token: *token, src: *src, mapKey: *mapKey, instance: *instance,
 		batchBytes: *batch, client: &http.Client{Timeout: 60 * time.Second}, logf: logf,
-		now: time.Now, sleep: sleepCtx, offsets: map[string]int64{},
+		now: time.Now, sleep: sleepCtx, offsets: map[string]*tailFile{}, statePath: *state,
 		seq: time.Now().UnixMilli() * 1000, // increasing across restarts
+	}
+	if err := t.loadState(); err != nil {
+		return fmt.Errorf("tail: state: %w", err)
 	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
