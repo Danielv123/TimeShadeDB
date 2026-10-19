@@ -26,5 +26,25 @@ func (c *DataClock) Observe(t core.TimeMs) {
 	}
 }
 
+// Advance moves the clock forward to t like Observe, but by at most maxJump past its
+// current value (when it has one) and never past wall+maxAhead (when maxAhead > 0). It
+// reports whether t was cut short. Ingest uses it for envelope recv_ms values, so one
+// bad line cannot move the map clock far ahead for good.
+func (c *DataClock) Advance(t, wall, maxAhead, maxJump core.TimeMs) (clamped bool) {
+	if maxAhead > 0 && t > wall+maxAhead {
+		t, clamped = wall+maxAhead, true
+	}
+	for {
+		cur := c.t.Load()
+		lim := t
+		if cur != 0 && maxJump > 0 && lim > core.TimeMs(cur)+maxJump {
+			lim = core.TimeMs(cur) + maxJump
+		}
+		if int64(lim) <= cur || c.t.CompareAndSwap(cur, int64(lim)) {
+			return clamped || lim < t
+		}
+	}
+}
+
 // Now returns the clock.
 func (c *DataClock) Now() core.TimeMs { return core.TimeMs(c.t.Load()) }

@@ -313,6 +313,7 @@ func TestDataClock(t *testing.T) {
 	if dc.Now() != 5 {
 		t.Fatalf("clock %d", dc.Now())
 	}
+	dc = &DataClock{} // empty database: the first envelope sets the clock
 	maps, _ := OpenMaps(t.TempDir())
 	ter := memstore.NewTerrain()
 	in := New(Stores{Terrain: ter, Movers: memstore.NewMovers(), Overlays: memstore.NewOverlays(), Maps: maps}, Options{Clock: dc.Now, DataClock: dc})
@@ -324,5 +325,37 @@ func TestDataClock(t *testing.T) {
 	}})))
 	if err != nil || resp.Chunks.Accepted != 1 || dc.Now() != old || in.Stats().Clamped != 0 {
 		t.Fatalf("resp %+v err %v clock %d", resp, err, dc.Now())
+	}
+}
+
+// TestDataClockBounded: one envelope with a far-future recv_ms moves the data clock by
+// at most MaxDataJump, and never past the wall clock plus MaxAhead.
+func TestDataClockBounded(t *testing.T) {
+	dc := &DataClock{}
+	if dc.Advance(1000, 5000, 10, 100) || dc.Now() != 1000 {
+		t.Fatalf("first advance: %d", dc.Now())
+	}
+	if !dc.Advance(9000, 1_000_000, 10, 100) || dc.Now() != 1100 {
+		t.Fatalf("jump not bounded: %d", dc.Now())
+	}
+	if !dc.Advance(1_000_000, 1150, 10, 1000) || dc.Now() != 1160 {
+		t.Fatalf("wall clock bound: %d", dc.Now())
+	}
+	if dc.Advance(500, 1150, 10, 1000) || dc.Now() != 1160 {
+		t.Fatalf("went backwards: %d", dc.Now())
+	}
+
+	dc = &DataClock{}
+	old := base - 30*core.Day
+	dc.Observe(old)
+	maps, _ := OpenMaps(t.TempDir())
+	in := New(Stores{Terrain: memstore.NewTerrain(), Movers: memstore.NewMovers(), Overlays: memstore.NewOverlays(), Maps: maps}, Options{Clock: dc.Now, DataClock: dc})
+	body := line(t, env{V: 1, Tick: 600, Src: "s", Map: "m", RecvMs: int64(base + 365*core.Day), Msgs: []any{}}) +
+		line(t, env{V: 1, Tick: 660, Src: "s", Map: "m", RecvMs: int64(old + core.Second), Msgs: []any{}})
+	if _, err := in.Ingest(context.Background(), strings.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	if dc.Now() != old+core.Hour || in.Stats().Clamped != 1 {
+		t.Fatalf("clock %d (old+%d), clamped %d", dc.Now(), dc.Now()-old, in.Stats().Clamped)
 	}
 }

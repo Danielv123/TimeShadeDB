@@ -200,14 +200,16 @@ changes are coalesced and sent about once a second (the commit loop period).
 
 Body: NDJSON capture envelopes (PROTOCOL.md), `Content-Type: application/x-ndjson`,
 optionally `Content-Encoding: gzip` or `zstd`. Auth: ingest token. Limits (flags, defaults):
-body 32 MiB after decompression (413), line 4 MiB (the line is counted in `bad_lines`).
+body 32 MiB after decompression (413), line 4 MiB (the line is counted in `bad_lines`),
+message 256 KiB and move message 4,096 entries (the message is counted as a bad message).
 
 - Lines that are not valid envelopes are skipped and counted; valid messages in other lines
   are applied. Unknown message types are ignored (forward compatibility).
 - 200 with `core.IngestResponse` (counts per kind, up to 10 error strings, highest `seq`).
-- The body is decoded as a stream and applied in batches (at most 2,048 chunk updates,
-  16,384 mover samples and 16,384 overlay events each), in order, so memory per request
-  is bounded whatever the body size.
+- The body is decoded as a stream and applied in batches (at most 2,048 chunk updates or
+  4 MiB of chart text, 16,384 mover samples and 16,384 overlay events each), in order.
+  Messages are decoded a window at a time (2,048 messages or 256 KiB), however many a
+  line packs, so memory per request is bounded whatever the body size or shape.
 - 503 `overloaded` with `Retry-After` when a store refused a batch for backpressure (the
   terrain open-window budget, the mover open-row limit). That batch and the rest of the
   body were not applied; earlier batches of the same body were. The forwarder retries the

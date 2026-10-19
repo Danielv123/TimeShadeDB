@@ -37,9 +37,12 @@ type Stores struct {
 // the ingest lock held, in application order; implementations must not block.
 type Notifier interface {
 	// ChunksApplied is called with every chunk update of a batch the terrain store took
-	// (updates it counted as late or invalid included; the store does not say which).
+	// (updates it counted as late or invalid included; the store does not say which, so
+	// the receiver should compare tile states rather than trust the updates).
 	ChunksApplied(updates []core.ChunkUpdate)
-	// SamplesApplied is called with the mover samples of a batch the mover store took.
+	// SamplesApplied is called with the mover samples of a batch the mover store took,
+	// again including the ones it counted as late or invalid: the receiver filters them
+	// by the store's rules (core.MoverStore) before showing them.
 	SamplesApplied(samples []core.MoverSample)
 	// MapsChanged is called when maps.json changed.
 	MapsChanged()
@@ -49,9 +52,13 @@ type Notifier interface {
 type Options struct {
 	// MaxLine bounds one NDJSON line (default 4 MiB, API.md 5); longer lines are bad lines.
 	MaxLine int
+	// MaxMessage bounds one message's JSON text (default 256 KiB); longer messages are
+	// bad messages. A move message holds at most MaxMoveEntries entries.
+	MaxMessage int
 	// FlushChunks, FlushSamples and FlushEvents bound the decoded values held before
 	// they are applied to the stores (defaults 2,048 chunk updates, 16,384 samples and
-	// 16,384 overlay events), which bounds ingest memory per request whatever the body.
+	// 16,384 overlay events). With the message bounds and the decode window they bound
+	// ingest memory per request whatever the body.
 	FlushChunks, FlushSamples, FlushEvents int
 	// MaxAhead: a message time more than this after the server clock is clamped to the
 	// clock (default 10 s; < 0 disables). A broken anchor or game clock would otherwise
@@ -59,9 +66,13 @@ type Options struct {
 	MaxAhead core.TimeMs
 	// Clock returns the server's map clock (default: wall clock).
 	Clock func() core.TimeMs
-	// DataClock, if set, observes every valid envelope's recv_ms before its messages are
-	// timed (pass DataClock.Now as Clock too, for a server replaying recorded captures).
-	DataClock *DataClock
+	// DataClock, if set, advances to every valid envelope's recv_ms before its messages
+	// are timed (pass DataClock.Now as Clock too, for a server replaying recorded
+	// captures). One envelope moves it at most MaxDataJump forward (default 1 h) and
+	// never past the wall clock plus MaxAhead, so a single bad recv_ms cannot push the
+	// map clock far ahead; such envelopes count as clamped.
+	DataClock   *DataClock
+	MaxDataJump core.TimeMs
 	// MaxSources bounds the clock anchors (default 4,096).
 	MaxSources int
 	// MaxJourneys bounds the tracked journeys per map (default 100,000), MaxMaps the maps
@@ -123,6 +134,12 @@ func (c *applyCounters) get() core.ApplyResult {
 func New(st Stores, opt Options) *Ingester {
 	if opt.MaxLine <= 0 {
 		opt.MaxLine = 4 << 20
+	}
+	if opt.MaxMessage <= 0 {
+		opt.MaxMessage = 256 << 10
+	}
+	if opt.MaxDataJump <= 0 {
+		opt.MaxDataJump = core.Hour
 	}
 	if opt.FlushChunks <= 0 {
 		opt.FlushChunks = 2048
@@ -234,18 +251,12 @@ func (b *batch) read(ctx context.Context, body io.Reader) error {
 			lineNo++
 			in.stats.bytes.Add(int64(len(line)))
 			seg.add(lineNo, line, tooLong)
+		} else {
+			seg.recycle(line)
 		}
 		if seg.full() || (eof && len(seg.lines) > 0) {
-			// Parse the segment's lines in parallel (no shared state), then apply them in
-			// order.
-			seg.parse(in.opt.Workers)
-			for i := range seg.lines {
-				b.apply(&seg.lines[i])
-				if b.full() {
-					if err := b.flush(); err != nil {
-						return err
-					}
-				}
+			if err := b.applySegment(seg); err != nil {
+				return err
 			}
 			seg.reset()
 		}
@@ -255,36 +266,140 @@ func (b *batch) read(ctx context.Context, body io.Reader) error {
 	}
 }
 
-// segment holds raw lines of a body that are parsed together.
-type segment struct {
-	lines []parsedLine
-	bytes int
-	pool  [][]byte // line buffers for reuse
+// applySegment parses the segment's envelopes in parallel, then decodes and applies
+// their messages in order, a window at a time: decoded messages, and everything queued
+// for the stores, stay bounded however many messages a line packs.
+func (b *batch) applySegment(seg *segment) error {
+	in := b.in
+	parallel(in.opt.Workers, len(seg.lines), 1, func(i int) { seg.lines[i].parseEnvelope() })
+	w := &b.win
+	for li := 0; li < len(seg.lines); {
+		w.items = w.items[:0]
+		size := 0
+		for li < len(seg.lines) && len(w.items) < windowMsgs && size < windowBytes {
+			l := &seg.lines[li]
+			if !l.begun {
+				l.begun = true
+				w.items = append(w.items, winItem{line: li, msg: -1})
+			}
+			raw, ok := l.it.next()
+			if !ok {
+				li++
+				continue
+			}
+			w.items = append(w.items, winItem{line: li, msg: l.nmsg, raw: raw})
+			l.nmsg++
+			size += len(raw)
+		}
+		if cap(w.msgs) < len(w.items) {
+			w.msgs = make([]wireMsg, len(w.items), max(len(w.items), windowMsgs+1))
+		}
+		msgs := w.msgs[:len(w.items)]
+		maxMsg := in.opt.MaxMessage
+		parallel(in.opt.Workers, len(w.items), 32, func(k int) {
+			if it := &w.items[k]; it.msg >= 0 {
+				msgs[k] = decodeMsg(it.raw, maxMsg)
+			}
+		})
+		for k := range w.items {
+			it := &w.items[k]
+			if it.msg < 0 {
+				b.beginLine(&seg.lines[it.line])
+			} else if b.cur.ok {
+				b.applyMsg(it.msg, &msgs[k])
+			}
+			msgs[k] = wireMsg{}
+			it.raw = nil
+			if b.full() {
+				if err := b.flush(); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	b.cur = lineState{}
+	return nil
 }
 
-// Segment bounds: lines parse in parallel in groups of up to this many lines or bytes.
+// Window bounds: messages are decoded in parallel in groups of up to this many messages
+// or bytes of message text.
 const (
-	segmentLines = 1024
-	segmentBytes = 8 << 20
+	windowMsgs  = 2048
+	windowBytes = 256 << 10
 )
 
-// parsedLine is one body line and, after parse, its envelope.
+// window is the reusable state of applySegment.
+type window struct {
+	items []winItem
+	msgs  []wireMsg
+}
+
+// winItem is a line start (msg < 0) or one message of a line.
+type winItem struct {
+	line, msg int
+	raw       []byte
+}
+
+// segment holds raw lines of a body that are parsed together.
+type segment struct {
+	lines   []parsedLine
+	bytes   int
+	pool    [][]byte // line buffers for reuse
+	poolCap int
+}
+
+// Segment bounds: envelopes parse in parallel in groups of up to this many lines or
+// bytes; line buffers up to poolBuf bytes are kept for reuse, up to poolBytes in all.
+const (
+	segmentLines = 1024
+	segmentBytes = 4 << 20
+	poolBuf      = 64 << 10
+	poolBytes    = 8 << 20
+)
+
+// parsedLine is one body line and, after parseEnvelope, its envelope header and an
+// iterator over its messages (spans of raw).
 type parsedLine struct {
 	no      int
 	raw     []byte
 	tooLong bool
-	env     core.Envelope
-	msgs    []wireMsg
+	blank   bool
+	env     envHeader
+	it      arrayIter
 	err     error // the line is not a valid envelope
+	begun   bool  // applySegment queued the line start
+	nmsg    int   // messages queued so far
+}
+
+// envHeader is core.Envelope without its messages, which are scanned separately.
+type envHeader struct {
+	V        int         `json:"v"`
+	Tick     int64       `json:"tick"`
+	Speed    float64     `json:"speed,omitempty"`
+	Src      string      `json:"src,omitempty"`
+	Map      string      `json:"map,omitempty"`
+	Instance int64       `json:"instance,omitempty"`
+	RecvMs   core.TimeMs `json:"recv_ms,omitempty"`
+	Seq      *int64      `json:"seq,omitempty"`
 }
 
 func (s *segment) next() []byte {
 	if n := len(s.pool); n > 0 {
 		b := s.pool[n-1][:0]
+		s.pool[n-1] = nil
 		s.pool = s.pool[:n-1]
+		s.poolCap -= cap(b)
 		return b
 	}
 	return make([]byte, 0, 4096)
+}
+
+// recycle keeps a line buffer for reuse if it is small and the pool has room.
+func (s *segment) recycle(b []byte) {
+	if c := cap(b); c > 0 && c <= poolBuf && s.poolCap+c <= poolBytes {
+		s.pool = append(s.pool, b)
+		s.poolCap += c
+	}
 }
 
 func (s *segment) add(no int, line []byte, tooLong bool) {
@@ -296,34 +411,10 @@ func (s *segment) full() bool { return len(s.lines) >= segmentLines || s.bytes >
 
 func (s *segment) reset() {
 	for i := range s.lines {
-		if cap(s.lines[i].raw) <= 1<<20 {
-			s.pool = append(s.pool, s.lines[i].raw)
-		}
+		s.recycle(s.lines[i].raw)
 		s.lines[i] = parsedLine{}
 	}
 	s.lines, s.bytes = s.lines[:0], 0
-}
-
-// parse decodes the segment in two parallel passes: the envelopes of every line, then
-// every message of every line (forwarders may pack hundreds of messages in one line).
-func (s *segment) parse(workers int) {
-	parallel(workers, len(s.lines), 1, func(i int) { s.lines[i].parseEnvelope() })
-	type ref struct{ line, msg int }
-	var refs []ref
-	for i := range s.lines {
-		l := &s.lines[i]
-		for j := range l.msgs {
-			refs = append(refs, ref{i, j})
-		}
-	}
-	parallel(workers, len(refs), 64, func(k int) {
-		r := refs[k]
-		l := &s.lines[r.line]
-		l.msgs[r.msg] = decodeMsg(l.env.Msgs[r.msg])
-	})
-	for i := range s.lines {
-		s.lines[i].env.Msgs = nil
-	}
 }
 
 // parallel runs fn(0..n-1) on up to workers goroutines, at least per items each.
@@ -366,7 +457,7 @@ type wireMsg struct {
 	Y       *float64            `json:"y"`
 	D       *string             `json:"d"`
 	Tick    *int64              `json:"tick"`
-	M       []core.MoveEntry    `json:"m"`
+	M       moveEntries         `json:"m"`
 	J       string              `json:"j"`
 	Trace   string              `json:"trace"`
 	N       int64               `json:"n"`
@@ -387,6 +478,23 @@ type wireMsg struct {
 	err     error
 }
 
+// MaxMoveEntries bounds the entries of one move message (the capture sends at most 3,
+// or 1 with carriages); a message with more is a bad message.
+const MaxMoveEntries = 4096
+
+// moveEntries decodes a move message's entries after counting them, so a hostile
+// message cannot make ingest allocate for millions of entries.
+type moveEntries []core.MoveEntry
+
+func (m *moveEntries) UnmarshalJSON(b []byte) error {
+	if i := skipWS(b, 0); i < len(b) && b[i] == '[' {
+		if n := countArray(b[i:], MaxMoveEntries); n > MaxMoveEntries {
+			return fmt.Errorf("move message with more than %d entries", MaxMoveEntries)
+		}
+	}
+	return json.Unmarshal(b, (*[]core.MoveEntry)(m))
+}
+
 func knownType(t string) bool {
 	switch t {
 	case core.MsgChunk, core.MsgMove, core.MsgAdopt, core.MsgTag, core.MsgRecipe, core.MsgRail,
@@ -396,14 +504,15 @@ func knownType(t string) bool {
 	return false
 }
 
-// parseEnvelope decodes the line's envelope and sizes its messages; the messages are
-// decoded by decodeMsg. It touches no shared state.
+// parseEnvelope decodes the line's envelope header and finds its messages, which
+// applySegment decodes a window at a time. It touches no shared state.
 func (l *parsedLine) parseEnvelope() {
 	if l.tooLong {
 		return
 	}
 	line := bytes.TrimSpace(l.raw)
 	if len(line) == 0 {
+		l.blank = true
 		return
 	}
 	env := &l.env
@@ -411,7 +520,16 @@ func (l *parsedLine) parseEnvelope() {
 		l.err = fmt.Errorf("not an envelope: %w", err)
 		return
 	}
+	// The line is valid JSON, so the scanner can find the messages without allocating.
+	msgs := findMember(line, "msgs")
 	switch {
+	case len(msgs) == 0 || string(msgs) == "null":
+		msgs = nil
+	case msgs[0] != '[':
+		l.err = errors.New("not an envelope: msgs is not an array")
+	}
+	switch {
+	case l.err != nil:
 	case env.V != core.ProtocolVersion:
 		l.err = fmt.Errorf("protocol version %d, want %d", env.V, core.ProtocolVersion)
 	case env.Src == "" || env.Map == "" || env.RecvMs == 0:
@@ -421,14 +539,17 @@ func (l *parsedLine) parseEnvelope() {
 	case env.Speed < 0 || env.Speed > 1000:
 		l.err = fmt.Errorf("bad speed %v", env.Speed)
 	}
-	if l.err != nil {
+	if l.err != nil || msgs == nil {
 		return
 	}
-	l.msgs = make([]wireMsg, len(env.Msgs))
+	l.it = newArrayIter(msgs)
 }
 
-// decodeMsg decodes one message.
-func decodeMsg(raw json.RawMessage) wireMsg {
+// decodeMsg decodes one message of at most maxBytes bytes.
+func decodeMsg(raw []byte, maxBytes int) wireMsg {
+	if len(raw) > maxBytes {
+		return wireMsg{err: fmt.Errorf("message of %d bytes, max %d", len(raw), maxBytes)}
+	}
 	var m wireMsg
 	if err := json.Unmarshal(raw, &m); err != nil {
 		var h core.MsgHeader
@@ -485,13 +606,31 @@ type batch struct {
 	chunks  []pendingChunk
 	samples []core.MoverSample
 	events  []core.OverlayEvent
+	// chartBytes is the text of the queued charts (bounded by maxChartBytes).
+	chartBytes int
 	// moves is scratch space for one move message.
 	moves []core.MoverSample
+	// win is applySegment's window, cur the envelope whose messages it applies.
+	win window
+	cur lineState
 }
+
+// lineState is the envelope being applied: its header, clock anchor and server time.
+type lineState struct {
+	ok     bool
+	env    *envHeader
+	anchor *movers.Anchor
+	now    core.TimeMs
+}
+
+// maxChartBytes bounds the chart text queued before a flush (a chart may be up to
+// 64 KiB, so FlushChunks alone would not bound it).
+const maxChartBytes = 4 << 20
 
 func (b *batch) full() bool {
 	o := &b.in.opt
-	return len(b.chunks) >= o.FlushChunks || len(b.samples) >= o.FlushSamples || len(b.events) >= o.FlushEvents
+	return len(b.chunks) >= o.FlushChunks || len(b.samples) >= o.FlushSamples || len(b.events) >= o.FlushEvents ||
+		b.chartBytes >= maxChartBytes
 }
 
 func (b *batch) addError(err error) {
@@ -506,13 +645,15 @@ func (b *batch) badLine(line int, err error) {
 	b.addError(fmt.Errorf("line %d: %w", line, err))
 }
 
-func (b *batch) badMessage(env *core.Envelope, i int, err error) {
+func (b *batch) badMessage(env *envHeader, i int, err error) {
 	b.in.stats.badMessages.Add(1)
 	b.addError(fmt.Errorf("src %q tick %d message %d: %w", env.Src, env.Tick, i, err))
 }
 
-// apply queues one parsed line's messages, updating the anchors and journeys.
-func (b *batch) apply(l *parsedLine) {
+// beginLine starts applying one parsed line: it counts bad lines, and for an envelope
+// updates the data clock and the source's clock anchor.
+func (b *batch) beginLine(l *parsedLine) {
+	b.cur = lineState{}
 	switch {
 	case l.tooLong:
 		b.badLine(l.no, fmt.Errorf("line longer than %d bytes", b.in.opt.MaxLine))
@@ -520,8 +661,8 @@ func (b *batch) apply(l *parsedLine) {
 	case l.err != nil:
 		b.badLine(l.no, l.err)
 		return
-	case l.msgs == nil && l.env.V == 0:
-		return // blank line
+	case l.blank:
+		return
 	}
 	env := &l.env
 	in := b.in
@@ -531,68 +672,73 @@ func (b *batch) apply(l *parsedLine) {
 		s := *env.Seq
 		b.resp.Seq = &s
 	}
-	if in.opt.DataClock != nil {
-		in.opt.DataClock.Observe(env.RecvMs)
+	if in.opt.DataClock != nil && in.opt.DataClock.Advance(env.RecvMs, WallClock(), in.opt.MaxAhead, in.opt.MaxDataJump) {
+		in.stats.clamped.Add(1)
 	}
-	anchor := in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed)
-	now := in.opt.Clock()
-	timeOf := func(tick *int64) core.TimeMs {
-		tk := env.Tick
-		if tick != nil {
-			tk = *tick
-		}
-		t := anchor.T(tk)
-		if in.opt.MaxAhead > 0 && t > now+in.opt.MaxAhead {
-			in.stats.clamped.Add(1)
-			t = now
-		}
-		return t
-	}
-	for i := range l.msgs {
-		m := &l.msgs[i]
-		if m.err != nil {
-			b.badMessage(env, i, m.err)
-			continue
-		}
-		var err error
-		switch m.Type {
-		case core.MsgChunk:
-			err = b.chunk(env, m, timeOf)
-		case core.MsgMove:
-			err = b.move(env, m, timeOf)
-		case core.MsgAdopt:
-			if m.J == "" {
-				err = errors.New("adopt without j")
-			} else {
-				b.journeys(env.Map).Adopt(env.Src, m.J)
-			}
-		case core.MsgTag, core.MsgRecipe, core.MsgRail:
-			err = b.overlay(env, m, timeOf(nil))
-		case core.MsgSurfaces:
-			if !m.Created {
-				// A resync starts by listing the surfaces (capture.resync): journeys the
-				// source does not re-send before "resynced" are ended there.
-				b.journeys(env.Map).Begin(env.Src)
-			}
-		case core.MsgResynced:
-			b.samples = b.journeys(env.Map).Resynced(env.Src, timeOf(nil), b.samples)
-			in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
-		case core.MsgTrace:
-			in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
-		case core.MsgMap:
-			if m.Info == nil {
-				err = errors.New("map message without info")
-			} else {
-				err = b.mapInfo(env, *m.Info)
-			}
-		default:
-			// Unknown types are ignored (forward compatibility).
-		}
-		if err != nil {
-			b.badMessage(env, i, err)
-		}
-	}
+	b.cur = lineState{ok: true, env: env, anchor: in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed), now: in.opt.Clock()}
+}
 
+// timeOf returns the map time of a tick of the current envelope (its own tick when nil),
+// clamped to MaxAhead after the server clock.
+func (b *batch) timeOf(tick *int64) core.TimeMs {
+	c := &b.cur
+	tk := c.env.Tick
+	if tick != nil {
+		tk = *tick
+	}
+	t := c.anchor.T(tk)
+	if ahead := b.in.opt.MaxAhead; ahead > 0 && t > c.now+ahead {
+		b.in.stats.clamped.Add(1)
+		t = c.now
+	}
+	return t
+}
+
+// applyMsg queues message i of the current envelope, updating the journeys.
+func (b *batch) applyMsg(i int, m *wireMsg) {
+	env := b.cur.env
+	in := b.in
+	if m.err != nil {
+		b.badMessage(env, i, m.err)
+		return
+	}
+	var err error
+	switch m.Type {
+	case core.MsgChunk:
+		err = b.chunk(env, m)
+	case core.MsgMove:
+		err = b.move(env, m)
+	case core.MsgAdopt:
+		if m.J == "" {
+			err = errors.New("adopt without j")
+		} else {
+			b.journeys(env.Map).Adopt(env.Src, m.J)
+		}
+	case core.MsgTag, core.MsgRecipe, core.MsgRail:
+		err = b.overlay(env, m, b.timeOf(nil))
+	case core.MsgSurfaces:
+		if !m.Created {
+			// A resync starts by listing the surfaces (capture.resync): journeys the
+			// source does not re-send before "resynced" are ended there.
+			b.journeys(env.Map).Begin(env.Src)
+		}
+	case core.MsgResynced:
+		b.samples = b.journeys(env.Map).Resynced(env.Src, b.timeOf(nil), b.samples)
+		in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
+	case core.MsgTrace:
+		in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
+	case core.MsgMap:
+		if m.Info == nil {
+			err = errors.New("map message without info")
+		} else {
+			err = b.mapInfo(env, *m.Info)
+		}
+	default:
+		// Unknown types are ignored (forward compatibility).
+	}
+	if err != nil {
+		b.badMessage(env, i, err)
+	}
 }
 
 func (b *batch) journeys(mapKey string) *movers.Journeys {
@@ -617,7 +763,7 @@ func (b *batch) journeys(mapKey string) *movers.Journeys {
 	return mj.js
 }
 
-func (b *batch) chunk(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.TimeMs) error {
+func (b *batch) chunk(env *envHeader, m *wireMsg) error {
 	ds := core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}
 	if err := ds.Validate(); err != nil {
 		return err
@@ -629,7 +775,7 @@ func (b *batch) chunk(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.T
 	if cx != math.Trunc(cx) || cy != math.Trunc(cy) || math.Abs(cx) > 1<<30 || math.Abs(cy) > 1<<30 {
 		return fmt.Errorf("bad chunk coordinates %v,%v", cx, cy)
 	}
-	pc := pendingChunk{u: core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: int32(cx), Y: int32(cy)}, T: timeOf(m.Tick)}}
+	pc := pendingChunk{u: core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: int32(cx), Y: int32(cy)}, T: b.timeOf(m.Tick)}}
 	if m.D == nil {
 		pc.u.Deleted = true
 	} else {
@@ -637,12 +783,13 @@ func (b *batch) chunk(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.T
 			return fmt.Errorf("chunk %v: chart of %d bytes", pc.u.Chunk, len(*m.D))
 		}
 		pc.d = *m.D
+		b.chartBytes += len(pc.d)
 	}
 	b.chunks = append(b.chunks, pc)
 	return nil
 }
 
-func (b *batch) move(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.TimeMs) error {
+func (b *batch) move(env *envHeader, m *wireMsg) error {
 	sfc := core.SurfaceKey{Map: env.Map, Surface: m.S}
 	if err := sfc.Validate(); err != nil {
 		return err
@@ -656,7 +803,7 @@ func (b *batch) move(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.Ti
 		if e.Tick != nil {
 			tick = *e.Tick
 		}
-		s := core.MoverSample{Surface: sfc, T: timeOf(e.Tick), Tick: tick}
+		s := core.MoverSample{Surface: sfc, T: b.timeOf(e.Tick), Tick: tick}
 		s.Meta.ID = e.J
 		if e.Gone {
 			s.Flags = core.FlagGone
@@ -688,7 +835,7 @@ func (b *batch) move(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.Ti
 	return nil
 }
 
-func (b *batch) overlay(env *core.Envelope, m *wireMsg, t core.TimeMs) error {
+func (b *batch) overlay(env *envHeader, m *wireMsg, t core.TimeMs) error {
 	ev := core.OverlayEvent{T: t, DS: core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}}
 	if err := ev.DS.Validate(); err != nil {
 		return err
@@ -725,7 +872,7 @@ func (b *batch) overlay(env *core.Envelope, m *wireMsg, t core.TimeMs) error {
 	return nil
 }
 
-func (b *batch) mapInfo(env *core.Envelope, info core.MapInfo) error {
+func (b *batch) mapInfo(env *envHeader, info core.MapInfo) error {
 	if info.Key == "" {
 		info.Key = env.Map
 	}
@@ -756,7 +903,8 @@ func (b *batch) flush() error {
 	var job applyJob
 	if len(b.chunks) > 0 {
 		job.updates = b.decodeCharts()
-		b.chunks = b.chunks[:0]
+		clear(b.chunks)
+		b.chunks, b.chartBytes = b.chunks[:0], 0
 	}
 	job.samples, b.samples = b.samples, nil
 	job.events, b.events = b.events, nil
@@ -871,8 +1019,18 @@ func (a *applier) apply(job applyJob) error {
 func (b *batch) decodeCharts() []core.ChunkUpdate {
 	pcs := b.chunks
 	errs := make([]error, len(pcs))
-	// One slab for the batch's pixels; the terrain store copies them.
-	slab := make([]core.ChunkPixels, len(pcs))
+	// One slab for the pixels of the batch's charts (deleted chunks have none); the
+	// terrain store copies them.
+	slot := make([]int32, len(pcs))
+	charts := 0
+	for i := range pcs {
+		slot[i] = -1
+		if !pcs[i].u.Deleted {
+			slot[i] = int32(charts)
+			charts++
+		}
+	}
+	slab := make([]core.ChunkPixels, charts)
 	workers := min(b.in.opt.Workers, max(1, len(pcs)/64))
 	var next atomic.Int64
 	var wg sync.WaitGroup
@@ -888,7 +1046,7 @@ func (b *batch) decodeCharts() []core.ChunkUpdate {
 				if pcs[i].u.Deleted {
 					continue
 				}
-				errs[i] = decodeChart(pcs[i].d, &slab[i])
+				errs[i] = decodeChart(pcs[i].d, &slab[slot[i]])
 			}
 		}()
 	}
@@ -903,7 +1061,9 @@ func (b *batch) decodeCharts() []core.ChunkUpdate {
 			continue
 		}
 		u := pcs[i].u
-		u.Pixels = &slab[i]
+		if slot[i] >= 0 {
+			u.Pixels = &slab[slot[i]]
+		}
 		out = append(out, u)
 	}
 	return out
