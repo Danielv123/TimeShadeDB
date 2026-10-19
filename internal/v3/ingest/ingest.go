@@ -442,11 +442,11 @@ type parsedLine struct {
 	borrowed bool // raw is a slice of the caller's body, not a pooled buffer
 	tooLong  bool
 	blank    bool
-	env     envHeader
-	it      arrayIter
-	err     error // the line is not a valid envelope
-	begun   bool  // applySegment queued the line start
-	nmsg    int   // messages queued so far
+	env      envHeader
+	it       arrayIter
+	err      error // the line is not a valid envelope
+	begun    bool  // applySegment queued the line start
+	nmsg     int   // messages queued so far
 }
 
 // envHeader is core.Envelope without its messages, which are scanned separately.
