@@ -89,6 +89,13 @@ export interface MapLayer {
   drawGL?(gl: WebGL2RenderingContext, frame: FrameState): void;
   /** Object under a screen point, for tooltips and selection. */
   hitTest?(x: number, y: number, frame: FrameState): LayerHit | null;
+  /**
+   * How many ms the displayed live time should trail the data clock for this layer (the
+   * movers layer's adaptive delay, PLAN.md §4.8 step 1). The engine uses the largest value
+   * over the enabled layers for FrameState.time in live mode. Optional; layers draw
+   * correctly either way (the movers layer also clamps its own time).
+   */
+  delay?(): number;
 }
 
 /** An entry in the layer list (web/src/layers/index.ts). */
