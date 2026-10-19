@@ -6,11 +6,16 @@ import (
 	"sort"
 
 	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/v3/core/wire"
 )
 
 // storedFlags are the core.MoverFlags bits a store keeps. Bits 6 and 7 are wire-only or
 // reserved (docs/v3/FORMAT.md "MVW3"), so they are cleared on Append.
 const storedFlags = core.FlagStop | core.FlagGone | core.FlagHandoff | core.FlagEndSwitch | core.FlagNoTick | core.FlagNoHeading
+
+// MaxCarriages is the most carriages one sample may carry (wire.MaxCarriages, which the
+// MVW3 decoder enforces); samples with more are Invalid.
+const MaxCarriages = wire.MaxCarriages
 
 // carriage is a quantized core.Carriage (positions in 1/16 tile, orientation in u16 units).
 type carriage struct {
@@ -59,7 +64,7 @@ func quantOrient(o float64) uint16 {
 }
 
 // makeRow quantizes s exactly as core.MoverSample.Quantized does. It reports false for
-// coordinates outside the representable range. FlagHandoff is cleared (stores assign
+// coordinates outside the representable range and for more than MaxCarriages carriages. FlagHandoff is cleared (stores assign
 // it at commit) and the tick of a no-tick sample is dropped (the wire format has no
 // place for it).
 func makeRow(s *core.MoverSample, meta *core.MoverMeta, seq uint64) (row, bool) {
@@ -77,6 +82,9 @@ func makeRow(s *core.MoverSample, meta *core.MoverMeta, seq uint64) (row, bool) 
 		return r, false
 	}
 	r.o = quantOrient(s.Orientation)
+	if len(s.Carriages) > MaxCarriages {
+		return r, false
+	}
 	if len(s.Carriages) > 0 {
 		r.car = make([]carriage, len(s.Carriages))
 		for i, c := range s.Carriages {

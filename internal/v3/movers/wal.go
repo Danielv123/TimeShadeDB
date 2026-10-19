@@ -28,14 +28,21 @@ import (
 //	'S' uvarint meta number, varint t, varint tick, varint x, varint y, uvarint o,
 //	    byte flags, uvarint n, n x (varint cx, varint cy, uvarint co)
 //
-// Meta numbers are local to the file. At every commit that closes a window the log is
-// rewritten (tmp + rename) with only the rows still open, so its size is bounded by the
-// open windows. Replay stops at the first torn or corrupt frame and truncates there.
+// Meta numbers are local to the file and never reused within it. At every commit that
+// closes a window the log is rewritten (tmp + rename) with only the rows still open, so
+// its size is bounded by the open windows. The rewrite's numbering takes effect only
+// once the rename has succeeded, and numbers defined by a failed append are forgotten,
+// so the numbering in memory always matches the file being appended to. A batch is
+// split into frames of about walFrameTarget payload bytes, written with one write call.
+// Replay stops at the first torn frame (bad length or CRC) and truncates there; a frame
+// with a valid CRC that does not decode is skipped as a whole (its meta definitions too).
 
 const (
 	walRecMeta   = 'M'
 	walRecSample = 'S'
 	walMaxFrame  = 64 << 20
+	// walFrameTarget is the payload size after which a batch continues in a new frame.
+	walFrameTarget = 1 << 20
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -61,6 +68,7 @@ type wal struct {
 	interval time.Duration // 0: fsync every frame; > 0: group commit; < 0: never
 	dirty    bool
 	err      error // sticky write error
+	skipped  int   // frames with a valid CRC that did not decode at replay
 }
 
 // walEntry is one row to log with its surface.
@@ -98,7 +106,7 @@ func (w *wal) replay(fn func(sfc core.SurfaceKey, r row)) error {
 			break
 		}
 		if err := decodeWALFrame(payload, metas, ptrs, fn); err != nil {
-			break
+			w.skipped++
 		}
 		off += 8 + n
 	}
@@ -130,6 +138,16 @@ func decodeWALFrame(p []byte, metas map[uint64]walMetaJSON, ptrs map[uint64]*cor
 		r   row
 	}
 	var rows []pending
+	// Meta definitions take effect only when the whole frame decodes.
+	newMetas := map[uint64]walMetaJSON{}
+	newPtrs := map[uint64]*core.MoverMeta{}
+	lookup := func(id uint64) (walMetaJSON, *core.MoverMeta, bool) {
+		if m, ok := newMetas[id]; ok {
+			return m, newPtrs[id], true
+		}
+		m, ok := metas[id]
+		return m, ptrs[id], ok
+	}
 	for r.off < len(r.b) && r.err == nil {
 		switch r.byte() {
 		case walRecMeta:
@@ -143,16 +161,16 @@ func decodeWALFrame(p []byte, metas map[uint64]walMetaJSON, ptrs map[uint64]*cor
 				return err
 			}
 			r.off += n
-			metas[id] = m
+			newMetas[id] = m
 			mm := m.M
-			ptrs[id] = &mm
+			newPtrs[id] = &mm
 		case walRecSample:
 			id := r.uvarint()
-			m, ok := metas[id]
+			m, p, ok := lookup(id)
 			if !ok {
 				return fmt.Errorf("wal: sample references unknown meta %d", id)
 			}
-			x := row{meta: ptrs[id]}
+			x := row{meta: p}
 			x.t = core.TimeMs(r.varint())
 			x.tick = r.varint()
 			x.x = int32(r.varint())
@@ -160,7 +178,7 @@ func decodeWALFrame(p []byte, metas map[uint64]walMetaJSON, ptrs map[uint64]*cor
 			x.o = uint16(r.uvarint())
 			x.flags = core.MoverFlags(r.byte()) & storedFlags
 			nc := int(r.uvarint())
-			if nc > 10000 {
+			if nc > MaxCarriages || nc > len(r.b)-r.off {
 				return fmt.Errorf("wal: %d carriages", nc)
 			}
 			if nc > 0 {
@@ -177,43 +195,59 @@ func decodeWALFrame(p []byte, metas map[uint64]walMetaJSON, ptrs map[uint64]*cor
 	if r.err != nil {
 		return r.err
 	}
+	for id, m := range newMetas {
+		metas[id], ptrs[id] = m, newPtrs[id]
+	}
 	for _, p := range rows {
 		fn(p.sfc, p.r)
 	}
 	return nil
 }
 
-// encode appends the records for entries to w.buf, defining metas as needed.
-func (w *wal) encode(entries []walEntry) {
+// encodeEntries appends the records of entries to buf, defining metas as needed in ids
+// (numbering from *next) and recording every key it defines in *added. buf ends with an
+// open frame that starts at frameStart (an 8-byte header placeholder and the payload so
+// far); once that payload passes walFrameTarget the frame is closed and a new one
+// started. It returns buf and the start of the last, still open, frame.
+func encodeEntries(buf []byte, frameStart int, entries []walEntry, ids map[walMetaKey]uint64, next *uint64, added *[]walMetaKey) ([]byte, int) {
 	for _, e := range entries {
+		if len(buf)-frameStart-8 >= walFrameTarget {
+			frame(buf[frameStart:])
+			frameStart = len(buf)
+			buf = append(buf, make([]byte, 8)...)
+		}
 		k := walMetaKey{e.sfc, *e.r.meta}
-		id, ok := w.metaIDs[k]
+		id, ok := ids[k]
 		if !ok {
-			id = w.nextID
-			w.nextID++
-			w.metaIDs[k] = id
+			id = *next
+			*next++
+			ids[k] = id
+			if added != nil {
+				*added = append(*added, k)
+			}
 			js, _ := json.Marshal(walMetaJSON{S: e.sfc, M: *e.r.meta})
-			w.buf = append(w.buf, walRecMeta)
-			w.buf = binary.AppendUvarint(w.buf, id)
-			w.buf = binary.AppendUvarint(w.buf, uint64(len(js)))
-			w.buf = append(w.buf, js...)
+			buf = append(buf, walRecMeta)
+			buf = binary.AppendUvarint(buf, id)
+			buf = binary.AppendUvarint(buf, uint64(len(js)))
+			buf = append(buf, js...)
 		}
 		r := e.r
-		w.buf = append(w.buf, walRecSample)
-		w.buf = binary.AppendUvarint(w.buf, id)
-		w.buf = binary.AppendVarint(w.buf, int64(r.t))
-		w.buf = binary.AppendVarint(w.buf, r.tick)
-		w.buf = binary.AppendVarint(w.buf, int64(r.x))
-		w.buf = binary.AppendVarint(w.buf, int64(r.y))
-		w.buf = binary.AppendUvarint(w.buf, uint64(r.o))
-		w.buf = append(w.buf, byte(r.flags))
-		w.buf = binary.AppendUvarint(w.buf, uint64(len(r.car)))
+		buf = append(buf, walRecSample)
+		buf = binary.AppendUvarint(buf, id)
+		buf = binary.AppendVarint(buf, int64(r.t))
+		buf = binary.AppendVarint(buf, r.tick)
+		buf = binary.AppendVarint(buf, int64(r.x))
+		buf = binary.AppendVarint(buf, int64(r.y))
+		buf = binary.AppendUvarint(buf, uint64(r.o))
+		buf = append(buf, byte(r.flags))
+		buf = binary.AppendUvarint(buf, uint64(len(r.car)))
 		for _, c := range r.car {
-			w.buf = binary.AppendVarint(w.buf, int64(c.x))
-			w.buf = binary.AppendVarint(w.buf, int64(c.y))
-			w.buf = binary.AppendUvarint(w.buf, uint64(c.o))
+			buf = binary.AppendVarint(buf, int64(c.x))
+			buf = binary.AppendVarint(buf, int64(c.y))
+			buf = binary.AppendUvarint(buf, uint64(c.o))
 		}
 	}
+	return buf, frameStart
 }
 
 // frame fills in the 8-byte frame header at the start of buf and returns buf.
@@ -224,7 +258,15 @@ func frame(buf []byte) []byte {
 	return buf
 }
 
-// append logs entries as one frame.
+// check returns the sticky write error, so callers can test it before changing memory.
+func (w *wal) check() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
+}
+
+// append logs entries with one write call (one frame per walFrameTarget bytes). If the
+// write fails, the meta numbers it defined are forgotten again.
 func (w *wal) append(entries []walEntry) error {
 	if len(entries) == 0 {
 		return nil
@@ -234,17 +276,22 @@ func (w *wal) append(entries []walEntry) error {
 	if w.err != nil {
 		return w.err
 	}
-	w.buf = append(w.buf[:0], make([]byte, 8)...)
-	w.encode(entries)
-	if len(w.buf)-8 > walMaxFrame {
-		return fmt.Errorf("wal: batch of %d bytes exceeds the frame limit", len(w.buf)-8)
-	}
-	if _, err := w.f.Write(frame(w.buf)); err != nil {
+	next := w.nextID
+	var added []walMetaKey
+	buf := append(w.buf[:0], make([]byte, 8)...)
+	buf, frameStart := encodeEntries(buf, 0, entries, w.metaIDs, &next, &added)
+	frame(buf[frameStart:])
+	w.buf = buf
+	if _, err := w.f.Write(buf); err != nil {
+		for _, k := range added {
+			delete(w.metaIDs, k)
+		}
 		w.err = err
 		return err
 	}
-	w.size += int64(len(w.buf))
-	if w.buf = w.buf[:0]; cap(w.buf) > 1<<20 {
+	w.nextID = next
+	w.size += int64(len(buf))
+	if w.buf = w.buf[:0]; cap(w.buf) > 4<<20 {
 		w.buf = nil
 	}
 	w.dirty = true
@@ -275,36 +322,43 @@ func (w *wal) sync() error {
 	return w.syncLocked()
 }
 
-// rewrite replaces the log with a new one holding only entries.
+// rewrite replaces the log with a new one holding only entries. The new meta numbering
+// replaces the old one only after the rename succeeded: on a failure before that the old
+// log stays in use with its numbering (and later appends stay consistent with it); a
+// failure after closing the old log is sticky.
 func (w *wal) rewrite(entries []walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.err != nil {
 		return w.err
 	}
-	w.metaIDs = map[walMetaKey]uint64{}
-	w.nextID = 1
-	w.buf = append(w.buf[:0], make([]byte, 8)...)
+	ids := map[walMetaKey]uint64{}
+	next := uint64(1)
 	var out []byte
-	// Split into frames of bounded size.
-	for i := 0; i < len(entries); i += 4096 {
-		j := min(i+4096, len(entries))
-		w.encode(entries[i:j])
-		out = append(out, frame(w.buf)...)
-		w.buf = append(w.buf[:0], make([]byte, 8)...)
+	if len(entries) > 0 {
+		var frameStart int
+		out, frameStart = encodeEntries(make([]byte, 8, 8+len(entries)*24), 0, entries, ids, &next, nil)
+		frame(out[frameStart:])
 	}
-	w.buf = w.buf[:0]
+	sync := w.interval >= 0
 	tmp := w.path + ".tmp"
-	if err := writeFileSync(tmp, out, w.interval >= 0); err != nil {
+	if err := writeFileSync(tmp, out, sync); err != nil {
 		return err
 	}
 	if err := w.f.Close(); err != nil {
 		w.err = err
+		os.Remove(tmp)
 		return err
 	}
 	if err := renameRetry(tmp, w.path); err != nil {
 		w.err = err
 		return err
+	}
+	if sync {
+		if err := syncDir(filepath.Dir(w.path)); err != nil {
+			w.err = err
+			return err
+		}
 	}
 	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
@@ -312,6 +366,7 @@ func (w *wal) rewrite(entries []walEntry) error {
 		return err
 	}
 	w.f, w.size, w.dirty = f, int64(len(out)), false
+	w.metaIDs, w.nextID = ids, next
 	return nil
 }
 

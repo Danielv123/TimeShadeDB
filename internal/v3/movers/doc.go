@@ -33,6 +33,30 @@
 // a window whose journey resumes in the next one are closed before the resume arrives
 // (TestTraceHandoffsStreaming).
 //
+// Append validates the whole batch and writes it to the WAL before it changes memory:
+// a failed WAL write applies nothing. A Commit builds the new live state on copies and
+// installs it with the horizon only after meta.json is written, so a failed Commit
+// changes nothing in memory and can be retried. A failed WAL rewrite leaves the old log
+// and its meta numbering in use. Outside Windows every rename is followed by an fsync of
+// its directory (unless SyncInterval < 0), so meta.json's new horizon is durable before
+// the WAL rewrite drops the rows it closed.
+//
+// # Input bounds
+//
+// Samples with more than MaxCarriages carriages or with coordinates outside int32 units
+// are Invalid. Samples more than Options.MaxAhead after the reference clock (the latest
+// Commit upTo, or Options.Clock) are Invalid, and samples more than Options.MaxBehind
+// before it on a surface without a horizon are Late; open rows accepted before any
+// reference existed are dropped by the first Commit (Stats.Ahead, Stats.Behind). This
+// keeps a broken clock from holding MaxOpenRows forever, or from making one Commit write
+// a keyframe for every hour since a sample near 1970. Bulk importers that stream one
+// surface after another, or whose batches jump ahead of their commits, must pass
+// MaxAhead: -1 and MaxBehind: -1. WP6 should still clamp T to its own clock, and should
+// commit once at start (or set Clock) so the reference exists before ingest resumes.
+// After a long downtime the first Commit still writes a keyframe per surface for every
+// hour of the gap (FORMAT.md 5.5 has a keyframe at every hour; skipping empty ones would
+// be a contract change).
+//
 // # Memory
 //
 // No history is held in memory. Per surface the store keeps the open rows (bounded
@@ -40,13 +64,28 @@
 // closed rows of the last core.LiveTrail before the horizon (Options.MaxTrailRows) and
 // the last row of every live journey (Options.MaxLiveMovers), from which keyframes and
 // Live are built. Opening rebuilds these from the newest keyframe, the windows after it
-// and the WAL; nothing older is read.
+// and the WAL; nothing older is read. A window or keyframe that does not decode is
+// logged, counted (Stats.Corrupt) and skipped there, so one damaged file cannot stop
+// the store opening; Window and Keyframe return an error for it.
+//
+// MaxTrailRows and MaxLiveMovers are per surface, so the worst case grows with the
+// number of surfaces; they are not yet derived from a global --mem-budget (WP6/WP11).
+// During a Commit the store briefly holds about 2-3 times the open rows of the surface
+// being committed (the sorted and deduplicated row pointers, the rows that stay open,
+// the MoverRow arrays and the encoded window bodies) plus a copy of its live map.
+//
+// Open rows span up to one 5-minute window plus the commit grace (about 315 s), so in
+// real time the sustained ingest rate is bounded by MaxOpenRows / 315 s: about 3,300
+// samples/s at the default of 1,048,576 rows (75 MB). The store-level throughput in
+// bench_test.go (500k+ samples/s) is measured with map time running far faster than
+// real time; a server expecting more live samples must raise MaxOpenRows (from its
+// memory budget) accordingly.
 //
 // # Reads
 //
 // Window and Keyframe decode the files; Day reads the index; Live(now) is served from
 // memory when now is at or after the horizon, and otherwise rebuilt from the keyframe
-// before now - core.LiveTrail and the windows up to now.
+// before now - core.LiveTrail and the windows up to now (skipping damaged files).
 //
 // # Journeys and clock anchors
 //

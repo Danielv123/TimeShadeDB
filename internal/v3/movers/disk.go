@@ -59,16 +59,63 @@ func (s *surface) dayPath(date string) string {
 }
 
 // writeFileAtomic writes data to path through a temporary file and a rename, creating
-// the directory. With sync set the file is fsynced before the rename.
+// the directory. With sync set the file is fsynced before the rename and, outside
+// Windows, its directory after it (and the parents of directories it created), so a
+// later rename (the WAL rewrite after meta.json) cannot reach the disk first.
 func writeFileAtomic(path string, data []byte, sync bool) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := mkdirAll(dir, sync); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
 	if err := writeFileSync(tmp, data, sync); err != nil {
 		return err
 	}
-	return renameRetry(tmp, path)
+	if err := renameRetry(tmp, path); err != nil {
+		return err
+	}
+	if sync {
+		return syncDir(dir)
+	}
+	return nil
+}
+
+// mkdirAll is os.MkdirAll that, with sync set, fsyncs the parent of every directory it
+// creates.
+func mkdirAll(dir string, sync bool) error {
+	if _, err := os.Stat(dir); err == nil {
+		return nil
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		if err := mkdirAll(parent, sync); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	if sync {
+		return syncDir(parent)
+	}
+	return nil
+}
+
+// syncDir fsyncs a directory so the renames and creations in it are durable. Windows
+// cannot open a directory for fsync, and NTFS journals renames, so it is a no-op there.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // writeFileSync creates or truncates path and writes data, fsyncing when sync is set.

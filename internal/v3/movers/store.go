@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"timeshadedb/internal/v3/core"
@@ -43,9 +46,38 @@ type Options struct {
 	// gone; default 131,072). Beyond it the journeys with the oldest last row are
 	// forgotten, as if they had a gone: they are left out of keyframes and Live.
 	MaxLiveMovers int
+	// MaxAhead bounds how far after the reference clock a sample may be (default 1
+	// hour; < 0 disables). The reference is the later of the latest Commit upTo (at
+	// Open: the newest horizon) and Clock(). Append counts later samples as Invalid
+	// (Stats.Ahead), and Commit drops open rows beyond it that were accepted while there
+	// was no reference yet. Without the bound a sample from a broken clock would stay
+	// open forever and hold MaxOpenRows.
+	MaxAhead core.TimeMs
+	// MaxBehind bounds how far before the reference clock a sample may be on a surface
+	// that has no horizon yet (default 1 day; < 0 disables). Append counts older
+	// samples as Late (Stats.Behind), and Commit drops such open rows, so a new surface
+	// cannot start years back and make one Commit write a keyframe for every hour since.
+	// Surfaces with a horizon reject everything before it anyway. Bulk imports that
+	// load one surface after another must disable it.
+	MaxBehind core.TimeMs
+	// Clock, if set, returns the map clock (the server's wall clock in ms). It provides
+	// the MaxAhead/MaxBehind reference before the first Commit after Open.
+	Clock func() core.TimeMs
+	// Logf receives warnings about damaged files skipped at Open or in Live and about
+	// WAL frames skipped at replay (default log.Printf).
+	Logf func(format string, args ...any)
 }
 
 func (o *Options) defaults() {
+	if o.MaxAhead == 0 {
+		o.MaxAhead = core.Hour
+	}
+	if o.MaxBehind == 0 {
+		o.MaxBehind = core.Day
+	}
+	if o.Logf == nil {
+		o.Logf = log.Printf
+	}
 	if o.MaxOpenRows <= 0 {
 		o.MaxOpenRows = 1 << 20
 	}
@@ -71,6 +103,13 @@ type Store struct {
 	seq      uint64
 	wal      *wal
 	stats    Stats
+	// upTo is the latest Commit upTo (at Open, the newest horizon); hasUpTo is false
+	// until either exists.
+	upTo    core.TimeMs
+	hasUpTo bool
+	// corrupt counts damaged window and keyframe files skipped (Live updates it without
+	// the write lock).
+	corrupt atomic.Int64
 
 	stop chan struct{}
 	done chan struct{}
@@ -88,6 +127,14 @@ type Stats struct {
 	TrailRows               int   // gauge
 	LiveMovers              int   // gauge
 	Evicted                 int64 // live journeys forgotten by MaxLiveMovers
+	// Ahead and Behind count samples outside Options.MaxAhead/MaxBehind, rejected by
+	// Append (as Invalid and Late) or dropped from the open rows by Commit.
+	Ahead, Behind int64
+	// Corrupt counts window and keyframe files that did not decode and were skipped
+	// while rebuilding live state (Open, and Live before the horizon).
+	Corrupt int64
+	// WALSkipped counts WAL frames with a valid CRC that did not decode at Open.
+	WALSkipped int64
 }
 
 // surface is the per-surface state.
@@ -153,6 +200,9 @@ func Open(db string, opts Options) (*Store, error) {
 		}
 		if s != nil {
 			m.sfc[key] = s
+			if s.hasHorizon && (!m.hasUpTo || s.horizon > m.upTo) {
+				m.upTo, m.hasUpTo = s.horizon, true
+			}
 		}
 	}
 	if !opts.NoWAL {
@@ -181,6 +231,10 @@ func Open(db string, opts Options) (*Store, error) {
 		})
 		if err != nil {
 			return nil, fmt.Errorf("movers: wal: %w", err)
+		}
+		if w.skipped > 0 {
+			m.stats.WALSkipped = int64(w.skipped)
+			opts.Logf("movers: wal: skipped %d frames that did not decode", w.skipped)
 		}
 		m.wal = w
 		if opts.SyncInterval > 0 {
@@ -237,7 +291,20 @@ func (s *surface) observe(t core.TimeMs) {
 	s.hasData = true
 }
 
-// Append implements core.MoverStore.
+// ref returns the reference clock of Options.MaxAhead and MaxBehind.
+func (m *Store) ref() (core.TimeMs, bool) {
+	t, ok := m.upTo, m.hasUpTo
+	if m.opts.Clock != nil {
+		if c := m.opts.Clock(); !ok || c > t {
+			t, ok = c, true
+		}
+	}
+	return t, ok
+}
+
+// Append implements core.MoverStore. The batch is checked and logged to the WAL before
+// anything changes in memory: when the WAL write fails nothing is applied and the
+// result is zero.
 func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.ApplyResult, error) {
 	var res core.ApplyResult
 	m.mu.Lock()
@@ -245,13 +312,19 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 	if m.closed {
 		return res, core.ErrClosed
 	}
-	if m.openRows+len(samples) > m.opts.MaxOpenRows {
-		return res, fmt.Errorf("%w (%d open, batch %d, limit %d)", ErrOverloaded, m.openRows, len(samples), m.opts.MaxOpenRows)
-	}
-	var logged []walEntry
 	if m.wal != nil {
-		logged = make([]walEntry, 0, len(samples))
+		if err := m.wal.check(); err != nil {
+			return res, fmt.Errorf("movers: wal: %w", err)
+		}
 	}
+	ref, hasRef := m.ref()
+	var ahead, behind int64
+	type pending struct {
+		s   *surface // nil: created when the batch is applied
+		key core.SurfaceKey
+		r   row
+	}
+	accepted := make([]pending, 0, len(samples))
 	for i := range samples {
 		smp := &samples[i]
 		if smp.Surface.Validate() != nil || smp.Meta.ID == "" || !smp.Meta.Kind.Valid() {
@@ -263,33 +336,57 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 			res.Late++
 			continue
 		}
-		r, ok := makeRow(smp, nil, m.seq+1)
+		if hasRef && m.opts.MaxAhead >= 0 && smp.T > ref+m.opts.MaxAhead {
+			res.Invalid++
+			ahead++
+			continue
+		}
+		if hasRef && m.opts.MaxBehind >= 0 && (s == nil || !s.hasHorizon) && smp.T < ref-m.opts.MaxBehind {
+			res.Late++
+			behind++
+			continue
+		}
+		r, ok := makeRow(smp, &smp.Meta, 0)
 		if !ok {
 			res.Invalid++
 			continue
 		}
-		if s == nil {
-			s = m.newSurface(smp.Surface)
-			m.sfc[smp.Surface] = s
+		accepted = append(accepted, pending{s: s, key: smp.Surface, r: r})
+	}
+	if m.openRows+len(accepted) > m.opts.MaxOpenRows {
+		return core.ApplyResult{}, fmt.Errorf("%w (%d open, batch %d, limit %d)", ErrOverloaded, m.openRows, len(accepted), m.opts.MaxOpenRows)
+	}
+	if m.wal != nil && len(accepted) > 0 {
+		logged := make([]walEntry, len(accepted))
+		for i := range accepted {
+			logged[i] = walEntry{sfc: accepted[i].key, r: &accepted[i].r}
 		}
-		m.seq++
-		r.meta = s.intern(&smp.Meta)
-		s.open = append(s.open, r)
-		s.observe(r.t)
-		m.openRows++
-		res.Accepted++
-		if m.wal != nil {
-			logged = append(logged, walEntry{sfc: s.key, r: &s.open[len(s.open)-1]})
+		if err := m.wal.append(logged); err != nil {
+			return core.ApplyResult{}, fmt.Errorf("movers: wal: %w", err)
 		}
 	}
+	for i := range accepted {
+		p := &accepted[i]
+		s := p.s
+		if s == nil {
+			if s = m.sfc[p.key]; s == nil {
+				s = m.newSurface(p.key)
+				m.sfc[p.key] = s
+			}
+		}
+		m.seq++
+		p.r.seq = m.seq
+		p.r.meta = s.intern(p.r.meta)
+		s.open = append(s.open, p.r)
+		s.observe(p.r.t)
+	}
+	m.openRows += len(accepted)
+	res.Accepted = len(accepted)
 	m.stats.Accepted += int64(res.Accepted)
 	m.stats.Late += int64(res.Late)
 	m.stats.Invalid += int64(res.Invalid)
-	if m.wal != nil {
-		if err := m.wal.append(logged); err != nil {
-			return res, fmt.Errorf("movers: wal: %w", err)
-		}
-	}
+	m.stats.Ahead += ahead
+	m.stats.Behind += behind
 	return res, nil
 }
 
@@ -301,12 +398,15 @@ func (m *Store) Commit(ctx context.Context, upTo core.TimeMs) error {
 		return core.ErrClosed
 	}
 	newH := core.WindowStart(upTo, core.MoverWindowLen)
-	changed := false
+	if !m.hasUpTo || upTo > m.upTo {
+		m.upTo, m.hasUpTo = upTo, true
+	}
 	keys := make([]core.SurfaceKey, 0, len(m.sfc))
 	for k := range m.sfc {
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i].ID() < keys[j].ID() })
+	changed := m.dropOutOfRange(keys)
 	for _, k := range keys {
 		s := m.sfc[k]
 		if s.hasHorizon && newH <= s.horizon {
@@ -334,11 +434,55 @@ func (m *Store) Commit(ctx context.Context, upTo core.TimeMs) error {
 	return nil
 }
 
+// dropOutOfRange removes open rows outside Options.MaxAhead/MaxBehind of the reference
+// clock. Append rejects such samples once a reference exists, so this only finds rows
+// accepted before the first Commit (or Clock) of a fresh store. It reports whether it
+// removed any.
+func (m *Store) dropOutOfRange(keys []core.SurfaceKey) bool {
+	ref, ok := m.ref()
+	if !ok {
+		return false
+	}
+	dropped := false
+	for _, k := range keys {
+		s := m.sfc[k]
+		keep := s.open[:0]
+		for _, r := range s.open {
+			switch {
+			case m.opts.MaxAhead >= 0 && r.t > ref+m.opts.MaxAhead:
+				m.stats.Ahead++
+			case m.opts.MaxBehind >= 0 && !s.hasHorizon && r.t < ref-m.opts.MaxBehind:
+				m.stats.Behind++
+			default:
+				keep = append(keep, r)
+			}
+		}
+		if n := len(s.open) - len(keep); n > 0 {
+			clear(s.open[len(keep):])
+			s.open = keep
+			m.openRows -= n
+			dropped = true
+			if !s.hasHorizon {
+				// first and last came from the open rows alone.
+				s.hasData = false
+				for i := range s.open {
+					s.observe(s.open[i].t)
+				}
+			}
+		}
+	}
+	return dropped
+}
+
 // commitSurface closes the windows of s that end at or before newH and returns the
-// number of open rows it removed.
+// number of open rows it removed. The new live state and trail are built on copies and
+// installed, with the new horizon, only once meta.json is written: after a failure the
+// surface is unchanged and the Commit can be retried (files already written are written
+// again with the same or newer content).
 func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	sync := m.opts.SyncInterval >= 0
 	before := len(s.open)
+	live := maps.Clone(s.live)
 	// Dedupe the open rows: for equal (journey, t) the last arrival wins.
 	ptrs := make([]*row, len(s.open))
 	for i := range s.open {
@@ -387,7 +531,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	touched := map[string]bool{}
 	emitKeyframes := func(upTo core.TimeMs) error {
 		for ; h <= newH && h <= upTo; h += core.MoverKeyframeEvery {
-			if err := m.writeKeyframe(s, h, sync); err != nil {
+			if err := m.writeKeyframe(s, h, live, sync); err != nil {
 				return err
 			}
 			touched[core.UTCDay(h)] = true
@@ -432,7 +576,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 			day.Windows[i] = ref
 		}
 		touched[core.UTCDay(ws)] = true
-		s.advance(rows)
+		advance(live, rows)
 		closedRows = append(closedRows, rows...)
 	}
 	if err := emitKeyframes(newH); err != nil {
@@ -440,7 +584,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	}
 	// Trail: closed rows with t > newH - LiveTrail.
 	cut := newH - core.LiveTrail
-	trail := s.trail[:0]
+	trail := make([]*row, 0, len(s.trail)+len(closedRows))
 	for _, r := range s.trail {
 		if r.t > cut {
 			trail = append(trail, r)
@@ -456,18 +600,19 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	if len(trail) > m.opts.MaxTrailRows {
 		trail = append([]*row(nil), trail[len(trail)-m.opts.MaxTrailRows:]...)
 	}
-	s.trail = trail
-	m.evictLive(s)
+	evicted := m.evictLive(live)
 	// Day indexes, then the surface meta (the horizon) last.
 	for d := range touched {
 		if err := s.writeDay(d, sync); err != nil {
 			return 0, err
 		}
 	}
-	s.hasHorizon, s.horizon = true, newH
-	if err := s.writeMeta(sync); err != nil {
+	if err := s.writeMeta(true, newH, sync); err != nil {
 		return 0, err
 	}
+	s.hasHorizon, s.horizon = true, newH
+	s.live, s.trail = live, trail
+	m.stats.Evicted += evicted
 	s.open = keep
 	// Drop cached day indexes that can no longer change.
 	today := core.UTCDay(newH)
@@ -480,25 +625,27 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	return before - len(keep), nil
 }
 
-// advance applies closed rows to the live map. Rows of one journey must come in t
-// order, and after every row applied earlier.
-func (s *surface) advance(rows []*row) {
+// advance applies closed rows to a live map. Rows of one journey must come in t order,
+// and after every row applied earlier.
+func advance(live map[string]*row, rows []*row) {
 	for _, r := range rows {
 		if r.gone() {
-			delete(s.live, r.meta.ID)
+			delete(live, r.meta.ID)
 			continue
 		}
 		c := *r
-		s.live[r.meta.ID] = &c
+		live[r.meta.ID] = &c
 	}
 }
 
-func (m *Store) evictLive(s *surface) {
-	if len(s.live) <= m.opts.MaxLiveMovers {
-		return
+// evictLive applies Options.MaxLiveMovers to a live map and returns how many journeys
+// it forgot.
+func (m *Store) evictLive(live map[string]*row) int64 {
+	if len(live) <= m.opts.MaxLiveMovers {
+		return 0
 	}
-	all := make([]*row, 0, len(s.live))
-	for _, r := range s.live {
+	all := make([]*row, 0, len(live))
+	for _, r := range live {
 		all = append(all, r)
 	}
 	sort.Slice(all, func(i, j int) bool {
@@ -507,10 +654,11 @@ func (m *Store) evictLive(s *surface) {
 		}
 		return all[i].meta.ID < all[j].meta.ID
 	})
-	for _, r := range all[:len(all)-m.opts.MaxLiveMovers] {
-		delete(s.live, r.meta.ID)
-		m.stats.Evicted++
+	n := len(all) - m.opts.MaxLiveMovers
+	for _, r := range all[:n] {
+		delete(live, r.meta.ID)
 	}
+	return int64(n)
 }
 
 // reintern rebuilds the meta table from the rows still referenced, so it stays bounded.
@@ -533,9 +681,9 @@ func (s *surface) reintern() {
 	s.metas = metas
 }
 
-func (m *Store) writeKeyframe(s *surface, h core.TimeMs, sync bool) error {
-	rows := make([]*row, 0, len(s.live))
-	for _, r := range s.live {
+func (m *Store) writeKeyframe(s *surface, h core.TimeMs, live map[string]*row, sync bool) error {
+	rows := make([]*row, 0, len(live))
+	for _, r := range live {
 		rows = append(rows, r)
 	}
 	w := buildWindow(s.key, core.WindowKeyframe, h, 0, rows)
@@ -617,10 +765,12 @@ func (s *surface) writeDay(date string, sync bool) error {
 	return nil
 }
 
-func (s *surface) writeMeta(sync bool) error {
+// writeMeta writes meta.json with the given horizon; the caller sets the surface's
+// fields once it succeeded.
+func (s *surface) writeMeta(hasHorizon bool, horizon core.TimeMs, sync bool) error {
 	sm := surfaceMeta{Key: s.key, FormatVersion: FormatVersion}
-	if s.hasHorizon {
-		h := s.horizon
+	if hasHorizon {
+		h := horizon
 		sm.Horizon = &h
 	}
 	if s.hasData {
@@ -680,6 +830,10 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 		if errors.Is(err, core.ErrNoVersion) {
 			continue
 		}
+		if errors.Is(err, errUndecodable) {
+			m.damaged(s.keyframePath(h), err)
+			continue // an older keyframe and more windows rebuild the state
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -704,6 +858,10 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 		if errors.Is(err, core.ErrNoVersion) {
 			continue
 		}
+		if errors.Is(err, errUndecodable) {
+			m.damaged(s.windowPath(ws), err)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -718,15 +876,24 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 		}
 		if ws >= from {
 			sort.SliceStable(rows, func(i, j int) bool { return rows[i].t < rows[j].t })
-			s.advance(rows)
+			advance(s.live, rows)
 		}
 	}
 	sort.SliceStable(s.trail, func(i, j int) bool { return s.trail[i].t < s.trail[j].t })
 	if len(s.trail) > m.opts.MaxTrailRows {
 		s.trail = s.trail[len(s.trail)-m.opts.MaxTrailRows:]
 	}
-	m.evictLive(s)
+	m.stats.Evicted += m.evictLive(s.live)
 	return s, nil
+}
+
+// errUndecodable marks a window or keyframe file that exists but does not decode.
+var errUndecodable = errors.New("undecodable mover window file")
+
+// damaged logs and counts a window or keyframe file skipped because it does not decode.
+func (m *Store) damaged(path string, err error) {
+	m.corrupt.Add(1)
+	m.opts.Logf("movers: skipping damaged file %s: %v", path, err)
 }
 
 // hasWindow reports whether the day index lists window ws (reading it if needed). When
@@ -750,16 +917,14 @@ func validDay(d string) bool {
 	return err == nil && core.UTCDay(t) == d
 }
 
+// readWindow reads and decodes a window or keyframe file. A missing file is
+// core.ErrNoVersion; a file that does not decode wraps errUndecodable.
 func (s *surface) readWindow(path string) (*core.MoverWindow, error) {
 	b, err := readWindowFile(path)
 	if err != nil {
 		return nil, err
 	}
-	body, err := decodeWindowFile(b)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
-	}
-	return wire.DecodeMoverWindow(body, s.key)
+	return decodeFile(b, s.key)
 }
 
 func (m *Store) surface(sfc core.SurfaceKey) (*surface, error) {
@@ -869,9 +1034,13 @@ func (m *Store) KeyframeFile(ctx context.Context, sfc core.SurfaceKey, t core.Ti
 func decodeFile(b []byte, sfc core.SurfaceKey) (*core.MoverWindow, error) {
 	body, err := decodeWindowFile(b)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errUndecodable, err)
 	}
-	return wire.DecodeMoverWindow(body, sfc)
+	w, err := wire.DecodeMoverWindow(body, sfc)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errUndecodable, err)
+	}
+	return w, nil
 }
 
 // Window implements core.MoverStore.
@@ -973,7 +1142,8 @@ func (s *surface) liveFromDisk(m *Store, now, first core.TimeMs, hasData bool) (
 			}
 			w, err := decodeFile(b, s.key)
 			if err != nil {
-				return nil, err
+				m.damaged(s.keyframePath(kf), err)
+				continue
 			}
 			for i := range w.Rows {
 				r := rowFromCore(&w.Movers[w.Rows[i].Mover], &w.Rows[i])
@@ -994,7 +1164,8 @@ func (s *surface) liveFromDisk(m *Store, now, first core.TimeMs, hasData bool) (
 			}
 			w, err := decodeFile(b, s.key)
 			if err != nil {
-				return nil, err
+				m.damaged(s.windowPath(ws), err)
+				continue
 			}
 			for i := range w.Rows {
 				if w.Rows[i].T > now {
@@ -1030,6 +1201,7 @@ func (m *Store) Stats() Stats {
 	defer m.mu.RUnlock()
 	st := m.stats
 	st.OpenRows = m.openRows
+	st.Corrupt = m.corrupt.Load()
 	for _, s := range m.sfc {
 		st.TrailRows += len(s.trail)
 		st.LiveMovers += len(s.live)

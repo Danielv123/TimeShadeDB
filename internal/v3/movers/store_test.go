@@ -217,7 +217,7 @@ func TestDifferential(t *testing.T) {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
 			dir := t.TempDir()
-			opts := Options{SyncInterval: -1}
+			opts := Options{SyncInterval: -1, MaxAhead: -1, MaxBehind: -1} // memstore has no clock bounds
 			a, err := Open(dir, opts)
 			if err != nil {
 				t.Fatal(err)

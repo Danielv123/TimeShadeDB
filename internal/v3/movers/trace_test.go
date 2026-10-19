@@ -230,7 +230,7 @@ func TestTraceHandoffsBulk(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			trace := readTrace(t, path)
 			wantH, wantE := expectedHandoffs(trace)
-			m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true})
+			m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true, MaxBehind: -1})
 			defer m.Close()
 			res, err := m.Append(ctx, traceSamples(trace, traceMeta(name)))
 			if err != nil || res.Accepted != len(trace) {
@@ -346,7 +346,7 @@ func TestTraceJourneysTwoSources(t *testing.T) {
 			if len(out) != len(samples) {
 				t.Fatalf("journeys emitted %d samples, want %d", len(out), len(samples))
 			}
-			m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true})
+			m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true, MaxBehind: -1})
 			defer m.Close()
 			if _, err := m.Append(ctx, out); err != nil {
 				t.Fatal(err)
@@ -413,7 +413,7 @@ func TestTraceHandoffsFull(t *testing.T) {
 		file := map[string]string{"train": "trace_train_660604.txt", "constructron": "trace_constructron.txt"}[name]
 		trace := readTrace(t, filepath.Join(dir, file))
 		wantH, wantE := expectedHandoffs(trace)
-		m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true})
+		m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true, MaxBehind: -1})
 		if _, err := m.Append(ctx, traceSamples(trace, traceMeta(name))); err != nil {
 			t.Fatal(err)
 		}
