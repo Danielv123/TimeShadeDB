@@ -136,16 +136,18 @@ test("a braking train's extrapolation decelerates and stops", () => {
   tr.insert(T.makeSample(meta, 1000, 17.5, 0, 0.25)); // 15
   tr.insert(T.makeSample(meta, 1500, 22.5, 0, 0.25)); // 10: braking at 10 tiles/s^2, 7.5 tiles/s at the sample
   const h = T.newHead();
-  T.headAt(tr, 1600, Infinity, h);
+  // Data known complete up to 10 s past the last sample (silence inside the heartbeat).
+  const known = 1500 + 10_000;
+  T.headAt(tr, 1600, known, h);
   assert.equal(h.mode, "extrap");
   assert.ok(h.x > 22.5 && h.x < 22.5 + 0.1 * 10, `slower than the last chord: ${h.x}`);
-  T.headAt(tr, 20_000, Infinity, h);
+  T.headAt(tr, 10_000, known, h);
   assert.equal(h.mode, "hold");
   // v0 = 7.5, a = -10: stops after 0.75 s and 2.81 tiles (the old rule ran on 110 tiles)
   assert.ok(Math.abs(h.x - (22.5 + (7.5 * 7.5) / 20)) < 1e-6, `stopped at ${h.x}`);
   // a train at constant speed still runs on
   const st = straightTrack(5, 10, 500);
-  T.headAt(st, 3000, Infinity, h);
+  T.headAt(st, 3000, 2000 + 10_000, h);
   assert.ok(Math.abs(h.x - 30) < 1e-6);
 });
 
@@ -177,15 +179,52 @@ test("the head passes through samples and follows a circle between them", () => 
 test("extrapolation runs on inside the data horizon and stops 1 s past it", () => {
   const tr = straightTrack(5, 10, 500); // last sample at t=2000, x=20
   const h = T.newHead();
-  T.headAt(tr, 4000, Infinity, h);
+  const known = 2000 + T.HEARTBEAT_MS; // silent up to the heartbeat: still on its line
+  T.headAt(tr, 4000, known, h);
   assert.equal(h.mode, "extrap");
   assert.ok(Math.abs(h.x - 40) < 1e-6, `runs on: ${h.x}`);
-  T.headAt(tr, 20000, Infinity, h);
+  T.headAt(tr, 20000, known, h);
   assert.ok(Math.abs(h.x - (20 + 10 * T.HEARTBEAT_MS / 1000)) < 1e-6, "at most the heartbeat");
   assert.equal(h.mode, "hold");
   // data known only up to t=2500: at most 1 s past it
   T.headAt(tr, 9000, 2500, h);
   assert.ok(Math.abs(h.x - (20 + 10 * 1.5)) < 1e-6, `capped: ${h.x}`);
+  // the heartbeat is known missed (or the data ends: history, every row known): the data
+  // stopped, so the mover stays at its last known position
+  T.headAt(tr, 4000, 2000 + T.HEARTBEAT_MS + T.EXTRAPOLATE_MS + 1, h);
+  assert.equal(h.mode, "hold");
+  assert.ok(Math.abs(h.x - 20) < 1e-9, `held at the last sample: ${h.x}`);
+  T.headAt(tr, 4000, Infinity, h);
+  assert.ok(Math.abs(h.x - 20) < 1e-9);
+});
+
+test("extrapolation follows the curve it is in, for at most motionConfig.extrapTurn, and the body follows it", () => {
+  // Radius 30, 20 tiles/s, a sample every 3 tiles; the last at arc 33 (phi = 1.1) and t = 2650.
+  const R = 30;
+  const tr = circleTrack(R, 20, 3, 12);
+  const lastPhi = 33 / R;
+  const h = T.newHead();
+  // 0.3 s on: 6 more tiles of the circle
+  T.headAt(tr, 2950, 8000, h);
+  assert.equal(h.mode, "extrap");
+  assert.ok(Math.abs(Math.hypot(h.x, h.y) - R) < 0.3, `stays on the circle: r=${Math.hypot(h.x, h.y)}`);
+  assert.ok(Math.atan2(h.y, h.x) > lastPhi + 0.15, "moved on along it");
+  // the turn stops after motionConfig.extrapTurn: straight on from there
+  T.headAt(tr, 6000, 8000, h);
+  const dir = Math.atan2(h.vy, h.vx);
+  const start = Math.atan2(Math.cos(lastPhi), -Math.sin(lastPhi));
+  const turned = Math.abs(Math.atan2(Math.sin(dir - start), Math.cos(dir - start)));
+  assert.ok(Math.abs(turned - T.motionConfig.extrapTurn) < 0.1, `turned ${turned}`);
+  // the body lies on the arc behind the head, not on its chord
+  T.headAt(tr, 2950, 8000, h);
+  const poly = T.bodyPath(tr, h, 2950, 20, new H.Polyline());
+  for (let i = 0; i < poly.size; i++) {
+    assert.ok(Math.abs(Math.hypot(poly.xs[i], poly.ys[i]) - R) < 0.35, `body point ${i} r=${Math.hypot(poly.xs[i], poly.ys[i])}`);
+  }
+  // on a straight it stays straight
+  const st = straightTrack(5, 10, 500);
+  T.headAt(st, 3000, 9000, h);
+  assert.ok(Math.abs(h.y) < 1e-9 && Math.abs(h.x - 30) < 1e-6);
 });
 
 test("never towards a gone; hidden after an end, held while a handoff may follow", () => {

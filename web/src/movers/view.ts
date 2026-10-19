@@ -33,8 +33,19 @@ export const CORRECTION_MS = 400;
 export const CORRECTION_RATE = 15;
 /** ...unless that would take longer than this. */
 export const MAX_CORRECTION_MS = 2000;
-/** A correction larger than this is a teleport and is not blended. */
+/** A correction larger than this is a teleport and is not blended... */
 export const MAX_CORRECTION = 30;
+/**
+ * ...except an overrun: the drawn mover ran ahead along its own heading (it extrapolated
+ * through a stop or a slowdown that no sample announced). Up to this size it is not blended
+ * back in time but used up by the mover's own progress: the drawn mover waits on its track
+ * until the true position catches up, so it neither jumps back nor slides backwards.
+ */
+export const MAX_OVERRUN = 150;
+/** An overrun points within acos(this) of the true head's direction of travel. */
+export const OVERRUN_COS = 0.5;
+/** An overrun still unused after this long fades at CORRECTION_RATE (at once while the true head stands still). */
+export const OVERRUN_WAIT_MS = 6000;
 /** Samples older than this behind the displayed time are dropped (body history needs less). */
 export const KEEP_MS = 120_000;
 
@@ -77,6 +88,17 @@ interface RenderState {
   ct: number;
   /** Duration of the current blend (ms). */
   cd: number;
+  /**
+   * Overrun mode (MAX_OVERRUN): the correction weight `cw` drops by the true head's progress
+   * along the unit vector (cux, cuy) over the correction length `cl`, from the true head
+   * position (cpx, cpy) of the previous frame. Off when cl is 0.
+   */
+  cl: number;
+  cw: number;
+  cux: number;
+  cuy: number;
+  cpx: number;
+  cpy: number;
 }
 
 export interface FrameOptions {
@@ -97,6 +119,13 @@ export class MoverView {
   private readonly out: Shown[] = [];
   /** Time of the last frame, to tell a continuous frame from a seek. */
   private lastFrameT = NaN;
+  /**
+   * Set by `frame`: the earliest sample time after the frame's time over all tracks
+   * (Infinity when none). A frame at or after it can differ even where nothing is moving
+   * now: in live mode samples arrive before the delayed display time reaches them (a parked
+   * train about to start, a mover about to appear).
+   */
+  nextT = Infinity;
 
   get size(): number {
     return this.tracks.size;
@@ -195,7 +224,15 @@ export class MoverView {
     this.lastFrameT = t;
     const b = opts.bounds;
     const bodies = opts.bodies !== false;
+    this.nextT = Infinity;
     for (const [id, tr] of this.tracks) {
+      const last = tr.s[tr.s.length - 1];
+      if (last && last.t > t) {
+        const nx = tr.s[tr.find(t) + 1];
+        if (nx && nx.t < this.nextT) {
+          this.nextT = nx.t;
+        }
+      }
       let st = this.states.get(id);
       if (!st) {
         st = newState(tr);
@@ -214,9 +251,10 @@ export class MoverView {
         st.cx = 0;
         st.cy = 0;
         st.cc.length = 0;
+        st.cl = 0;
       }
       st.version = tr.version;
-      const w = weight(st, t);
+      const w = weight(st, t, head);
       const x = head.x + st.cx * w;
       const y = head.y + st.cy * w;
       st.lastT = t;
@@ -282,6 +320,7 @@ export class MoverView {
     const before = headAt(tr, st.lastT, horizon, scratchHead);
     st.ct = st.lastT;
     st.cc.length = 0;
+    st.cl = 0;
     if (!before.visible) {
       st.cx = 0;
       st.cy = 0;
@@ -289,7 +328,25 @@ export class MoverView {
     }
     st.cx = st.lastX - before.x;
     st.cy = st.lastY - before.y;
-    let max = Math.hypot(st.cx, st.cy);
+    const len = Math.hypot(st.cx, st.cy);
+    let max = len;
+    // An overrun: the drawn head is ahead of the true one along the direction of travel.
+    let hx = before.vx;
+    let hy = before.vy;
+    if (Math.hypot(hx, hy) < 1e-3) {
+      hx = st.shown.hx;
+      hy = st.shown.hy;
+    }
+    const hl = Math.hypot(hx, hy);
+    const overrun = len >= 1 && len <= MAX_OVERRUN && hl > 0 && (st.cx * hx + st.cy * hy) / (len * hl) > OVERRUN_COS;
+    if (overrun) {
+      st.cl = len;
+      st.cw = 1;
+      st.cux = st.cx / len;
+      st.cuy = st.cy / len;
+      st.cpx = before.x;
+      st.cpy = before.y;
+    }
     if (train && st.lastCars.length > 0) {
       const meta = tr.s[before.k]?.meta ?? tr.meta;
       buildBody(tr, before, st.lastT, meta, scratchPoly, scratchGaps, scratchCars);
@@ -302,10 +359,11 @@ export class MoverView {
         }
       }
     }
-    if (max <= 0.02 || max >= MAX_CORRECTION) {
+    if (max <= 0.02 || (max >= MAX_CORRECTION && (!overrun || max > MAX_OVERRUN))) {
       st.cx = 0;
       st.cy = 0;
       st.cc.length = 0;
+      st.cl = 0;
     }
     st.cd = Math.min(MAX_CORRECTION_MS, Math.max(CORRECTION_MS, (1000 * max) / CORRECTION_RATE));
   }
@@ -343,9 +401,28 @@ function sameBody(key: number[], version: number, head: Head): boolean {
   return key.length === 5 && key[0] === version && key[1] === head.k && key[2] === head.x && key[3] === head.y && key[4] === head.u;
 }
 
-function weight(st: RenderState, t: number): number {
+function weight(st: RenderState, t: number, head: Head): number {
   if (st.cx === 0 && st.cy === 0 && st.cc.length === 0) {
     return 0;
+  }
+  if (st.cl > 0) {
+    // Overrun: used up by the true head's forward progress, then (after a wait) at CORRECTION_RATE.
+    const progress = (head.x - st.cpx) * st.cux + (head.y - st.cpy) * st.cuy;
+    st.cpx = head.x;
+    st.cpy = head.y;
+    let w = st.cw - Math.max(0, progress) / st.cl;
+    // A true head that does not move will not use it up: fade it at once.
+    if ((!head.moving || t - st.ct > OVERRUN_WAIT_MS) && t > st.lastT) {
+      w -= ((t - st.lastT) / 1000) * CORRECTION_RATE / st.cl;
+    }
+    st.cw = Math.min(1, Math.max(0, w));
+    if (st.cw === 0) {
+      st.cx = 0;
+      st.cy = 0;
+      st.cc.length = 0;
+      st.cl = 0;
+    }
+    return st.cw;
   }
   return Math.max(0, 1 - (t - st.ct) / st.cd);
 }
@@ -369,5 +446,11 @@ function newState(tr: Track): RenderState {
     cc: [],
     ct: 0,
     cd: CORRECTION_MS,
+    cl: 0,
+    cw: 0,
+    cux: 0,
+    cuy: 0,
+    cpx: 0,
+    cpy: 0,
   };
 }

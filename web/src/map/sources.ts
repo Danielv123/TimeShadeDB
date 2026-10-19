@@ -225,16 +225,72 @@ export class ServerSource extends HttpSource implements UrlSource {
   }
 
   /**
-   * Subscribes to live events over Server-Sent Events, parsed from a fetch stream so the
+   * Live events (API.md 5) over Server-Sent Events, parsed from a fetch stream so the
    * bearer header works. Reconnects with backoff; `hello` is delivered again after each
-   * reconnect, so callers resync there.
+   * reconnect, so callers resync there. Every subscription shares one event stream for
+   * the union of their topics (a stream holds a connection for good, one of six per host
+   * on HTTP/1.1): a change of the subscriber set reopens it after SUBSCRIBE_SETTLE_MS, and
+   * the new stream's `hello` reaches every subscriber, which resyncs as after a reconnect.
+   * Tile events go to the subscribers of their datastore, mover events to those of their
+   * surface, everything else to all.
    */
   subscribe(topics: { ds: string[]; sfc: string[] }, handlers: LiveHandlers): () => void {
-    const q = [...topics.ds.map(d => `ds=${enc(d)}`), ...topics.sfc.map(s => `sfc=${enc(s)}`)];
-    const path = `live?${q.join("&")}`;
+    const sub = { ds: new Set(topics.ds), sfc: new Set(topics.sfc), handlers };
+    this.subs.add(sub);
+    this.restartLive();
+    return () => {
+      if (this.subs.delete(sub)) {
+        this.restartLive();
+      }
+    };
+  }
+
+  private readonly subs = new Set<{ ds: Set<string>; sfc: Set<string>; handlers: LiveHandlers }>();
+  private liveStop: (() => void) | null = null;
+  private liveKey = "";
+  private liveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Reopens the shared stream for the current subscribers (debounced). */
+  private restartLive(): void {
+    if (this.liveTimer) {
+      clearTimeout(this.liveTimer);
+    }
+    this.liveTimer = setTimeout(() => {
+      this.liveTimer = null;
+      const ds = new Set<string>();
+      const sfc = new Set<string>();
+      for (const s of this.subs) {
+        s.ds.forEach(d => ds.add(d));
+        s.sfc.forEach(x => sfc.add(x));
+      }
+      const q = [...[...ds].sort().map(d => `ds=${enc(d)}`), ...[...sfc].sort().map(x => `sfc=${enc(x)}`)];
+      const key = q.join("&");
+      if (key === this.liveKey && this.liveStop) {
+        return;
+      }
+      this.liveStop?.();
+      this.liveStop = null;
+      this.liveKey = key;
+      if (q.length > 0) {
+        this.liveStop = this.openLive(`live?${key}`);
+      }
+    }, this.subs.size > 0 ? SUBSCRIBE_SETTLE_MS : 0);
+  }
+
+  private openLive(path: string): () => void {
     let stopped = false;
     let ctrl: AbortController | null = null;
     let backoff = 500;
+    const each = (f: (h: LiveHandlers) => void): void => {
+      for (const s of [...this.subs]) {
+        f(s.handlers);
+      }
+    };
+    const dispatch = (event: string, data: string): void => {
+      for (const s of [...this.subs]) {
+        dispatchLive(event, data, s.handlers, this.clock, s);
+      }
+    };
     const loop = async (): Promise<void> => {
       while (!stopped) {
         ctrl = new AbortController();
@@ -244,15 +300,19 @@ export class ServerSource extends HttpSource implements UrlSource {
             throw new Error("live: no body");
           }
           backoff = 500;
-          await readEvents(res.body, (event, data) => dispatchLive(event, data, handlers, this.clock));
+          await readEvents(res.body, (event, data) => {
+            if (!stopped) {
+              dispatch(event, data);
+            }
+          });
           if (!stopped) {
-            handlers.error?.(new Error("live: stream ended"));
+            each(h => h.error?.(new Error("live: stream ended")));
           }
         } catch (err) {
           if (stopped) {
             return;
           }
-          handlers.error?.(err);
+          each(h => h.error?.(err));
         }
         if (stopped) {
           return;
@@ -269,7 +329,10 @@ export class ServerSource extends HttpSource implements UrlSource {
   }
 }
 
-function dispatchLive(event: string, data: string, h: LiveHandlers, clock: DataClock): void {
+/** Subscriptions within this long of each other share the first stream opening. */
+export const SUBSCRIBE_SETTLE_MS = 50;
+
+function dispatchLive(event: string, data: string, h: LiveHandlers, clock: DataClock, topics?: { ds: Set<string>; sfc: Set<string> }): void {
   let msg: Record<string, unknown>;
   try {
     msg = JSON.parse(data) as Record<string, unknown>;
@@ -284,13 +347,17 @@ function dispatchLive(event: string, data: string, h: LiveHandlers, clock: DataC
       h.hello?.(msg as never);
       break;
     case "tile":
-      h.tile?.(msg as never);
+      if (!topics || topics.ds.has(msg.ds as string)) {
+        h.tile?.(msg as never);
+      }
       break;
     case "horizon":
       h.horizon?.(msg as never);
       break;
     case "movers":
-      h.movers?.(msg as never);
+      if (!topics || topics.sfc.has(msg.sfc as string)) {
+        h.movers?.(msg as never);
+      }
       break;
     case "catalog":
       h.catalog?.(msg as never);

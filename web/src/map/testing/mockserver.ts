@@ -180,6 +180,7 @@ export class MockServer {
     }
     const r = this.route(rel, u.searchParams, mode, req, res);
     if (r === "sse") {
+      this.log.push({ path: path + u.search, t: performance.now(), status: 200, bytes: 0 });
       return;
     }
     const { status, body, type, cache, key } = r;

@@ -33,6 +33,8 @@ export const EXTRAPOLATE_MS = 1_000;
  * time means "still on the line" for at most about this long.
  */
 export const HEARTBEAT_MS = 11_000;
+/** Curvatures above 1 / this (tiles) are not believed for extrapolation (tighter than any rail curve). */
+export const MIN_RADIUS = 10;
 /** Joint distance / 2: a carriage's bogies sit this far from its centre (vanilla 4 / 2). */
 export const BOGIE = 2;
 /** Default distance between carriage centres: joint 4 + connection 3. */
@@ -53,9 +55,16 @@ export interface MotionConfig {
   geometry: "rail" | "hermite";
   /** Handoff bridges: "line" is a straight blend in time; "hermite" uses both sides' velocities. */
   bridge: "line" | "hermite";
+  /**
+   * Largest turn (radians) an extrapolation follows the newest curvature for, then straight;
+   * 0 extrapolates straight. 15 degrees measured best on the test data (live snaps 22 straight,
+   * 15 at 15 degrees, 16 at 22.5, 18 at 30: past a curve's exit a long turn runs off the
+   * other side).
+   */
+  extrapTurn: number;
 }
 
-export const motionConfig: MotionConfig = { tangent: "blend", geometry: "rail", bridge: "line" };
+export const motionConfig: MotionConfig = { tangent: "blend", geometry: "rail", bridge: "line", extrapTurn: Math.PI / 12 };
 
 /** One stored row of a journey. */
 export interface Sample {
@@ -491,10 +500,63 @@ export interface Head {
   to: number;
   /** The drawn position still changes as t advances. */
   moving: boolean;
+  /**
+   * Extrapolation path ("extrap"/"hold" past sample k): distance run from it (tiles), start
+   * heading (radians, atan2(vy, vx)) and curvature (1/tiles, 0 = straight). The body follows
+   * this path back to the sample.
+   */
+  ed: number;
+  eth: number;
+  ek: number;
 }
 
 export function newHead(): Head {
-  return { visible: false, x: 0, y: 0, vx: 0, vy: 0, k: -1, mode: "hidden", u: 0, to: -1, moving: false };
+  return { visible: false, x: 0, y: 0, vx: 0, vy: 0, k: -1, mode: "hidden", u: 0, to: -1, moving: false, ed: 0, eth: 0, ek: 0 };
+}
+
+/**
+ * Point and heading at distance `d` along an extrapolation path from (x0, y0): an arc of
+ * curvature `k` from heading `th`, straight on once it turned motionConfig.extrapTurn.
+ * out = [x, y, heading].
+ */
+export function extrapPoint(x0: number, y0: number, th: number, k: number, d: number, out: Float64Array): Float64Array {
+  if (k === 0 || d <= 0) {
+    out[0] = x0 + Math.cos(th) * d;
+    out[1] = y0 + Math.sin(th) * d;
+    out[2] = th;
+    return out;
+  }
+  const arc = Math.min(d, motionConfig.extrapTurn / Math.abs(k));
+  const th1 = th + k * arc;
+  let x = x0 + (Math.sin(th1) - Math.sin(th)) / k;
+  let y = y0 + (Math.cos(th) - Math.cos(th1)) / k;
+  if (d > arc) {
+    x += Math.cos(th1) * (d - arc);
+    y += Math.sin(th1) * (d - arc);
+  }
+  out[0] = x;
+  out[1] = y;
+  out[2] = th1;
+  return out;
+}
+
+/** Curvature (1/tiles) at the newest sample k from the turn of the velocity since k-1; 0 when straight or unknown. */
+function curvature(tr: Track, k: number): number {
+  if (k < 1 || !linked(tr, k - 1)) {
+    return 0;
+  }
+  const p = velocity(tr, k - 1);
+  const a = velocity(tr, k);
+  const ds = Math.hypot(a.x - p.x, a.y - p.y);
+  if (ds < 0.5 || (p.vx === 0 && p.vy === 0) || (a.vx === 0 && a.vy === 0)) {
+    return 0;
+  }
+  const turn = Math.atan2(p.vx * a.vy - p.vy * a.vx, p.vx * a.vx + p.vy * a.vy);
+  // Below about 1.5 degrees between samples it is noise on a straight.
+  if (Math.abs(turn) < 0.025) {
+    return 0;
+  }
+  return Math.max(-1 / MIN_RADIUS, Math.min(1 / MIN_RADIUS, turn / ds));
 }
 
 const tmp = new Float64Array(4);
@@ -528,10 +590,19 @@ function braking(tr: Track, k: number): [number, number] {
   return [a, Math.max(0, c1 + (a * h1) / 2)];
 }
 
+const ep = new Float64Array(3);
+
 function extrapolate(tr: Track, k: number, t: number, horizon: number, end: number, out: Head): void {
   const a = velocity(tr, k);
   // Inside the data horizon silence is confirmed up to the heartbeat; past it, at most EXTRAPOLATE_MS.
   let cap = Math.min(HEARTBEAT_MS, Math.max(0, horizon - a.t) + EXTRAPOLATE_MS, end - a.t);
+  if (end === Infinity && horizon - a.t > HEARTBEAT_MS + EXTRAPOLATE_MS) {
+    // The heartbeat is known missed (no sample within it, and none after): the data stopped
+    // (an instance went down without a gone, or the journey's data ends here), so the last
+    // sample is the last known position. Running on would leave the mover a heartbeat's
+    // run away from its track until the next sample, minutes later.
+    cap = 0;
+  }
   const sp = Math.hypot(a.vx, a.vy);
   let dist: number;
   let rate: number;
@@ -548,17 +619,21 @@ function extrapolate(tr: Track, k: number, t: number, horizon: number, end: numb
     dist = sp * dt;
     rate = sp;
   }
-  const ux = sp > 0 ? a.vx / sp : 0;
-  const uy = sp > 0 ? a.vy / sp : 0;
+  const th = sp > 0 ? Math.atan2(a.vy, a.vx) : 0;
+  const kappa = sp > 0 && dist > 0 && motionConfig.extrapTurn > 0 ? curvature(tr, k) : 0;
+  extrapPoint(a.x, a.y, th, kappa, dist, ep);
   out.visible = true;
   out.k = k;
   out.to = -1;
   out.u = 0;
-  out.x = a.x + ux * dist;
-  out.y = a.y + uy * dist;
+  out.x = ep[0];
+  out.y = ep[1];
+  out.ed = dist;
+  out.eth = th;
+  out.ek = kappa;
   const moving = sp > 0 && rate > 0 && t - a.t < cap;
-  out.vx = moving ? ux * rate : 0;
-  out.vy = moving ? uy * rate : 0;
+  out.vx = moving ? Math.cos(ep[2]) * rate : 0;
+  out.vy = moving ? Math.sin(ep[2]) * rate : 0;
   out.mode = moving ? "extrap" : "hold";
   out.moving = moving;
 }
@@ -602,6 +677,8 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
   out.visible = false;
   out.mode = "hidden";
   out.moving = false;
+  out.ed = 0;
+  out.ek = 0;
   let k = tr.find(t);
   if (k < 0) {
     return out;
@@ -742,6 +819,14 @@ export function bodyPath(tr: Track, head: Head, t: number, length: number, poly:
   } else if (head.mode === "bridge") {
     poly.push(s[j].x, s[j].y);
   } else {
+    if (head.ek !== 0 && head.ed > step) {
+      // Back along the extrapolated arc to the sample.
+      const n = Math.ceil(head.ed / step);
+      for (let i = 1; i < n; i++) {
+        extrapPoint(s[j].x, s[j].y, head.eth, head.ek, head.ed * (1 - i / n), ep);
+        poly.push(ep[0], ep[1]);
+      }
+    }
     poly.push(s[j].x, s[j].y);
   }
   while (poly.length < length) {

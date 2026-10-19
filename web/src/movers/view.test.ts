@@ -133,6 +133,35 @@ test("a large correction blends no faster than CORRECTION_RATE", () => {
   assert.ok(steps >= 7, `blended over ${steps} frames`);
 });
 
+test("an overrun waits on the track for the true position instead of snapping or sliding back", () => {
+  const v = new MoverView();
+  for (let i = 0; i < 6; i++) {
+    v.add(meta, T.makeSample(meta, i * 500, i * 20, 0, 0.25)); // 40 tiles/s east
+  }
+  let px = 0;
+  for (let t = 2500; t <= 4000; t += 100) {
+    px = v.frame(t, 4100)[0].x; // extrapolated to x = 160 at t=4000
+  }
+  assert.ok(px > 150, `ran on: ${px}`);
+  // It actually slowed down hard: 10 tiles/s from x = 105 (a 45-tile overrun, over MAX_CORRECTION).
+  for (let i = 1; i <= 20; i++) {
+    v.add(meta, T.makeSample(meta, 2500 + i * 500, 100 + i * 5, 0, 0.25));
+  }
+  let caught = NaN;
+  for (let t = 4100; t <= 14_000; t += 100) {
+    const m = v.frame(t, 15_000)[0];
+    assert.ok(m.x >= px - 1e-9, `never backwards at ${t}: ${m.x} < ${px}`);
+    assert.ok(m.x - px <= 10 * 0.1 + 1e-6, `no faster than the train at ${t}`);
+    assert.ok(Math.abs(m.y) < 1e-9, "stays on its line");
+    const h = T.headAt(v.tracks.get("j1")!, t, 15_000, T.newHead());
+    if (Number.isNaN(caught) && Math.abs(m.x - h.x) < 1e-9) {
+      caught = t;
+    }
+    px = m.x;
+  }
+  assert.ok(!Number.isNaN(caught), "follows the data again once caught up");
+});
+
 test("a seek does not blend", () => {
   const v = new MoverView();
   for (let i = 0; i < 6; i++) {

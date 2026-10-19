@@ -3,7 +3,7 @@
 //
 // usage (from web/): node src/movers/eval/train_eval.mjs <trains.jsonl> <rail_mask.bin>
 //          [--surface nauvis] [--limit N] [--no-clamp-fix] [--skip-loo] [--skip-render]
-//          [--modes history,live] [--json out.json]
+//          [--modes history,live] [--extrap-turn radians] [--json out.json]
 // Inputs are research outputs (out/trains.jsonl from movers_stats.py --dump-trains, and
 // rail_mask.py); they are read as data only.
 import "./ts-resolve.mjs";
@@ -22,6 +22,9 @@ if (!trainsPath || !maskPath) {
   process.exit(2);
 }
 const surface = opt("--surface", "nauvis");
+if (opt("--extrap-turn") !== undefined) {
+  motionConfig.extrapTurn = Number(opt("--extrap-turn"));
+}
 const limit = Number(opt("--limit", "0"));
 let journeys = readFileSync(trainsPath, "utf8").trim().split("\n").map(parseJourney).filter(j => j.surface === surface);
 if (limit > 0) {

@@ -152,3 +152,39 @@ test("server source: live events over the fetch-based SSE client", async () => {
   stop();
   assert.deepEqual(got, [`hello ${ds.horizon}`, "tile 1,0 v4"]);
 });
+
+test("server source: subscriptions share one event stream and get only their events", async () => {
+  const s = new ServerSource({ base: `${server.url}/api/v3/` });
+  server.clearLog();
+  const tiles: string[] = [];
+  const movers: string[] = [];
+  let hellos = 0;
+  const wait = (f: () => boolean) =>
+    new Promise<void>((resolve, reject) => {
+      const t0 = Date.now();
+      const tick = () => (f() ? resolve() : Date.now() - t0 > 3000 ? reject(new Error("timeout")) : setTimeout(tick, 10));
+      tick();
+    });
+  const stopA = s.subscribe({ ds: [ds.id], sfc: [] }, { hello: () => hellos++, tile: e => tiles.push(`a ${e.x}`), movers: () => movers.push("a") });
+  let stopB = s.subscribe({ ds: [], sfc: ["m.nauvis"] }, { hello: () => hellos++, tile: e => tiles.push(`b ${e.x}`), movers: e => movers.push(`b ${e.sfc}`) });
+  try {
+    await wait(() => hellos === 2);
+    const opened = server.requests(/\/live\?/);
+    assert.equal(opened.length, 1, "one stream for both");
+    assert.match(opened[0].path, /ds=.*&sfc=m\.nauvis/);
+    server.pushEvent("tile", { ds: ds.id, z: 0, x: 1, y: 0, v: 4, now: data.now + 1 });
+    server.pushEvent("tile", { ds: "other.ds.player", z: 0, x: 2, y: 0, v: 1, now: data.now + 1 });
+    server.pushEvent("movers", { sfc: "m.nauvis", now: data.now + 1, movers: [], rows: [] });
+    await wait(() => tiles.length === 1 && movers.length === 1);
+    assert.deepEqual(tiles, ["a 1"]);
+    assert.deepEqual(movers, ["b m.nauvis"]);
+    // Dropping a subscriber reopens the stream for the rest.
+    stopB();
+    stopB = () => {};
+    await wait(() => server.requests(/\/live\?/).length === 2 && hellos === 3);
+    assert.doesNotMatch(server.requests(/\/live\?/)[1].path, /sfc=/);
+  } finally {
+    stopB();
+    stopA();
+  }
+});
