@@ -72,6 +72,49 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    time, but keep enough path for the body (train length + 40 tiles), across handoff
    bridges, plus one sample more so the oldest kept segment keeps its shape. (Stopping at
    the handoff turned parked trains' bodies straight off the rails after a minute.)
+10. **Redraws.** The layer asks the engine for another frame only while a shown mover's
+   drawn position still changes and time runs (live, or a history time that changed since
+   the last frame). Held movers (parked across a gap, held before a gone, past the
+   extrapolation cap) are not moving, so a paused history view draws once and stops.
+
+## Departures from PLAN §4.8
+
+Measured on the test data (see Results) and kept on purpose; they still need recording in
+PLAN.md / STATUS.md, and WP9 should confirm the capture side of the first one.
+
+1. **Extrapolation inside the data horizon runs to the heartbeat (11 s), not 1 s.** Past
+   the horizon the cap is still 1 s. This assumes the capture's emit rule (PROTOCOL.md:
+   chord error 0.25 tile, orientation about 2 degrees, 600-tick heartbeat) means silence
+   implies the mover is on its predicted straight line. If WP9's rule predicts anything
+   else (dead reckoning along a curve, or a longer heartbeat), `HEARTBEAT_MS` in
+   `track.ts` must follow it. Braking trains decelerate to a stop instead.
+2. **The live delay adds a readiness term**: max(p99 lag + 0.5 s, p95 readiness + 0.25 s
+   capped at 6 s), about 2.4 s on the test data where the plan's rule gives about 1.7 s.
+   It cuts live jumps from 233 to 93.
+3. **Segments are line+arc (or arc+line) with a geometric Hermite fallback walked by arc
+   length**, not a Hermite with v x dt tangents. Leave-one-out p90 0.57 against 0.60, and
+   history jumps 5 against 61.
+
+## Loading (feed.ts)
+
+- **History.** A seek loads the day index, the newest keyframe at or before the time and
+  every window from it to the time plus a lookahead (API.md 3). Windows between the
+  keyframe and the time cannot be skipped: a gone row in a skipped window would leave the
+  mover drawn from its keyframe row. The lookahead is 60 s, or 2 s of real time at the
+  playback speed (at most 30 min). Moving forward by less than an hour past the loaded
+  range extends it contiguously instead of seeking again (a seek would load as much from
+  its keyframe), so fast playback falls behind at worst but never clears the view and
+  refetches. The range ends on window boundaries, so an extension does not fetch the last
+  window again. Once the range reaches past the closed horizon, `live.bin` is refetched
+  at most every `live_ms`.
+- **Trimming in history** moves the start of the loaded range up to the kept history
+  (drawn time minus 2 minutes), so seeking back past it is a real seek.
+- **Day indexes** are cached across seeks: final days for good, open days for 60 s,
+  failures for 10 s. They are fetched with their own abort signal, which only `stop()`
+  uses, so a superseded seek shares the in-flight index instead of caching it as missing.
+  There are no timers.
+- **Live.** The first payload and the resync after a reconnect (`hello`) do not count for
+  the delay statistics: their rows piled up while nobody was listening.
 
 ## Evaluating
 

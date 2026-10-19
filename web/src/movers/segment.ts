@@ -197,7 +197,7 @@ export class Segment {
 
   /**
    * Position and unit tangent at arc length s into out[0..3]. For the Hermite fallback, s
-   * maps linearly to the curve parameter.
+   * maps to the curve parameter through the arc-length table (paramAt).
    */
   pointAt(s: number, out: Float64Array | number[]): void {
     const L = this.length;

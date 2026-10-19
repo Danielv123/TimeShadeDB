@@ -2,6 +2,11 @@
 // instance bounds and (debug) rail entities. Tags and recipes follow illisis-minimap
 // web/layers.ts (zoom thresholds, icon then text, text outlined so it reads on any
 // terrain). Game text reaches the page only through fillText/strokeText.
+//
+// label, mark and the tag and recipe drawing are ported from illisis-minimap web/layers.ts
+// at 91a6461. Copyright (c) illisis-minimap contributors. Licensed under the Blue Oak Model
+// License 1.0.0 (https://blueoakcouncil.org/license/1.0.0); keep this notice. Changed here:
+// intervals come from the v3 overlay feed and the layers implement the MapLayer contract.
 
 import type { Interval, IntervalKind, TimeMs } from "../api/types";
 import type { FrameState, IconAtlas, LayerContext, MapLayer } from "../map/layer";
