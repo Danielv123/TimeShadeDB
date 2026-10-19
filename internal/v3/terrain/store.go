@@ -71,7 +71,8 @@ type Options struct {
 	// Level is the zstd level for terrain records (default zstd.SpeedDefault).
 	Level zstd.EncoderLevel
 	// KeyframeFactor: a keyframe is written when the delta bytes since the last base
-	// reach KeyframeFactor times its size (default 2; FORMAT.md 5.3).
+	// reach KeyframeFactor times its size (default 4, tuned on the test-data replay;
+	// FORMAT.md 5.3).
 	KeyframeFactor float64
 	// MaxChain caps the records between keyframes (default 256).
 	MaxChain int
@@ -112,7 +113,7 @@ func (o *Options) defaults() {
 		o.Level = zstd.SpeedDefault
 	}
 	if o.KeyframeFactor <= 0 {
-		o.KeyframeFactor = 2
+		o.KeyframeFactor = 4
 	}
 	if o.MaxChain <= 0 {
 		o.MaxChain = 256
@@ -802,6 +803,11 @@ func (b byStart) Swap(i, j int) {
 // the tile lock.
 func (s *Store) commitTile(d *dsState, ct *closingTile) (err error) {
 	tl := ct.tl
+	if commitTileHook != nil {
+		if err := commitTileHook(tl.name); err != nil {
+			return err
+		}
+	}
 	h, err := s.series.OpenSeries(tl.name, true)
 	if err != nil {
 		return err
@@ -915,6 +921,10 @@ func (s *Store) commitTile(d *dsState, ct *closingTile) (err error) {
 	}
 	return nil
 }
+
+// commitTileHook, if set (tests only), runs before each tile of a commit; an error
+// aborts that tile as an I/O error would.
+var commitTileHook func(name string) error
 
 // syncer fsyncs the WALs every SyncInterval (group commit).
 func (s *Store) syncer() {

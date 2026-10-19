@@ -101,7 +101,7 @@ type entry struct {
 }
 
 func (e *entry) tEnd() core.TimeMs { return e.tStart + core.TimeMs(e.tLen) }
-func (e *entry) end() int64       { return e.off + HeaderSize + int64(e.plen) }
+func (e *entry) end() int64        { return e.off + HeaderSize + int64(e.plen) }
 
 func (e *entry) meta(seq uint64) core.RecordMeta {
 	return core.RecordMeta{Seq: seq, TStart: e.tStart, TLen: e.tLen, Kind: e.kind, Flags: e.flags, Len: int(e.plen)}
