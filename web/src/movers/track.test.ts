@@ -198,33 +198,67 @@ test("extrapolation runs on inside the data horizon and stops 1 s past it", () =
   assert.ok(Math.abs(h.x - 20) < 1e-9);
 });
 
-test("extrapolation follows the curve it is in, for at most motionConfig.extrapTurn, and the body follows it", () => {
-  // Radius 30, 20 tiles/s, a sample every 3 tiles; the last at arc 33 (phi = 1.1) and t = 2650.
+test("extrapolation past the data horizon follows the curve it is in, for at most motionConfig.extrapTurn, and the body follows it", () => {
+  // Radius 30, 20 tiles/s, a sample every 3 tiles; the last at arc 33 (phi = 1.1) and t = 2650,
+  // which is also the data horizon: everything after it is past the horizon.
   const R = 30;
   const tr = circleTrack(R, 20, 3, 12);
   const lastPhi = 33 / R;
+  const horizon = 2650;
   const h = T.newHead();
   // 0.3 s on: 6 more tiles of the circle
-  T.headAt(tr, 2950, 8000, h);
+  T.headAt(tr, 2950, horizon, h);
   assert.equal(h.mode, "extrap");
   assert.ok(Math.abs(Math.hypot(h.x, h.y) - R) < 0.3, `stays on the circle: r=${Math.hypot(h.x, h.y)}`);
   assert.ok(Math.atan2(h.y, h.x) > lastPhi + 0.15, "moved on along it");
-  // the turn stops after motionConfig.extrapTurn: straight on from there
-  T.headAt(tr, 6000, 8000, h);
+  // the turn stops after motionConfig.extrapTurn: straight on from there (19 tiles on)
+  T.headAt(tr, 3600, horizon, h);
+  assert.equal(h.mode, "extrap");
   const dir = Math.atan2(h.vy, h.vx);
   const start = Math.atan2(Math.cos(lastPhi), -Math.sin(lastPhi));
   const turned = Math.abs(Math.atan2(Math.sin(dir - start), Math.cos(dir - start)));
   assert.ok(Math.abs(turned - T.motionConfig.extrapTurn) < 0.1, `turned ${turned}`);
   // the body lies on the arc behind the head, not on its chord
-  T.headAt(tr, 2950, 8000, h);
+  T.headAt(tr, 2950, horizon, h);
   const poly = T.bodyPath(tr, h, 2950, 20, new H.Polyline());
   for (let i = 0; i < poly.size; i++) {
     assert.ok(Math.abs(Math.hypot(poly.xs[i], poly.ys[i]) - R) < 0.35, `body point ${i} r=${Math.hypot(poly.xs[i], poly.ys[i])}`);
   }
   // on a straight it stays straight
   const st = straightTrack(5, 10, 500);
-  T.headAt(st, 3000, 9000, h);
+  T.headAt(st, 3000, 2000, h);
   assert.ok(Math.abs(h.y) < 1e-9 && Math.abs(h.x - 30) < 1e-6);
+});
+
+test("inside the data horizon the extrapolation runs straight; the curve starts at the horizon", () => {
+  const R = 30;
+  const tr = circleTrack(R, 20, 3, 12);
+  const h = T.newHead();
+  T.headAt(tr, 2660, 3000, h);
+  const start = Math.atan2(h.vy, h.vx);
+  // silence confirmed up to t = 3000 (the capture would have sent a turn): straight to there
+  T.headAt(tr, 2950, 3000, h);
+  assert.ok(Math.abs(Math.atan2(h.vy, h.vx) - start) < 1e-9, "no turn inside the horizon");
+  const lead = T.newHead();
+  T.headAt(tr, 3000, 3000, lead);
+  // past it, the curve starts from the straight's end, and the body follows both
+  T.headAt(tr, 3300, 3000, h);
+  const turned = Math.atan2(Math.sin(Math.atan2(h.vy, h.vx) - start), Math.cos(Math.atan2(h.vy, h.vx) - start));
+  assert.ok(Math.abs(turned) > 0.1, `turns past the horizon: ${turned}`);
+  const poly = T.bodyPath(tr, h, 3300, 20, new H.Polyline());
+  let nearLead = Infinity;
+  for (let i = 0; i < poly.size; i++) {
+    nearLead = Math.min(nearLead, Math.hypot(poly.xs[i] - lead.x, poly.ys[i] - lead.y));
+  }
+  assert.ok(nearLead < 0.3, `the body passes the straight's end: ${nearLead}`);
+  // the evaluator's switch turns inside the horizon too
+  T.motionConfig.extrapTurnInside = true;
+  try {
+    T.headAt(tr, 2950, 3000, h);
+    assert.ok(Math.abs(Math.hypot(h.x, h.y) - R) < 0.3, "on the circle");
+  } finally {
+    T.motionConfig.extrapTurnInside = false;
+  }
 });
 
 test("never towards a gone; hidden after an end, held while a handoff may follow", () => {

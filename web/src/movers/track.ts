@@ -56,15 +56,24 @@ export interface MotionConfig {
   /** Handoff bridges: "line" is a straight blend in time; "hermite" uses both sides' velocities. */
   bridge: "line" | "hermite";
   /**
-   * Largest turn (radians) an extrapolation follows the newest curvature for, then straight;
-   * 0 extrapolates straight. 15 degrees measured best on the test data (live snaps 22 straight,
-   * 15 at 15 degrees, 16 at 22.5, 18 at 30: past a curve's exit a long turn runs off the
-   * other side).
+   * Largest turn (radians) an extrapolation past the data horizon follows the newest
+   * curvature for, then straight; 0 extrapolates straight. With the turn inside the horizon
+   * too, 15 degrees measured best on the test data (WP8 live snaps 22 straight, 15 at 15
+   * degrees, 16 at 22.5, 18 at 30: past a curve's exit a long turn runs off the other side).
    */
   extrapTurn: number;
+  /**
+   * Whether the extrapolation inside the data horizon follows the curve too (default false:
+   * only the run past the horizon does). The capture emits on about 2 degrees of turn, so
+   * silence inside the horizon means a straight run. Turning there saved 7 of 22 WP8 live
+   * snaps on the test data, but nearly doubled the carriages off the rails while moving at
+   * lookahead 0 in the WP11 evaluator (5.2% -> 9.9% on 10 journeys): trains turned on past a
+   * curve's exit.
+   */
+  extrapTurnInside: boolean;
 }
 
-export const motionConfig: MotionConfig = { tangent: "blend", geometry: "rail", bridge: "line", extrapTurn: Math.PI / 12 };
+export const motionConfig: MotionConfig = { tangent: "blend", geometry: "rail", bridge: "line", extrapTurn: Math.PI / 12, extrapTurnInside: false };
 
 /** One stored row of a journey. */
 export interface Sample {
@@ -502,29 +511,36 @@ export interface Head {
   moving: boolean;
   /**
    * Extrapolation path ("extrap"/"hold" past sample k): distance run from it (tiles), start
-   * heading (radians, atan2(vy, vx)) and curvature (1/tiles, 0 = straight). The body follows
+   * heading (radians, atan2(vy, vx)), curvature (1/tiles, 0 = straight) and the straight
+   * lead before the curve starts (tiles: the run up to the data horizon). The body follows
    * this path back to the sample.
    */
   ed: number;
   eth: number;
   ek: number;
+  el: number;
 }
 
 export function newHead(): Head {
-  return { visible: false, x: 0, y: 0, vx: 0, vy: 0, k: -1, mode: "hidden", u: 0, to: -1, moving: false, ed: 0, eth: 0, ek: 0 };
+  return { visible: false, x: 0, y: 0, vx: 0, vy: 0, k: -1, mode: "hidden", u: 0, to: -1, moving: false, ed: 0, eth: 0, ek: 0, el: 0 };
 }
 
 /**
- * Point and heading at distance `d` along an extrapolation path from (x0, y0): an arc of
- * curvature `k` from heading `th`, straight on once it turned motionConfig.extrapTurn.
- * out = [x, y, heading].
+ * Point and heading at distance `d` along an extrapolation path from (x0, y0) at heading
+ * `th`: straight for `lead` tiles, then an arc of curvature `k`, straight on once it turned
+ * motionConfig.extrapTurn. out = [x, y, heading].
  */
-export function extrapPoint(x0: number, y0: number, th: number, k: number, d: number, out: Float64Array): Float64Array {
-  if (k === 0 || d <= 0) {
+export function extrapPoint(x0: number, y0: number, th: number, k: number, d: number, out: Float64Array, lead = 0): Float64Array {
+  if (k === 0 || d <= lead) {
     out[0] = x0 + Math.cos(th) * d;
     out[1] = y0 + Math.sin(th) * d;
     out[2] = th;
     return out;
+  }
+  if (lead > 0) {
+    x0 += Math.cos(th) * lead;
+    y0 += Math.sin(th) * lead;
+    d -= lead;
   }
   const arc = Math.min(d, motionConfig.extrapTurn / Math.abs(k));
   const th1 = th + k * arc;
@@ -540,7 +556,13 @@ export function extrapPoint(x0: number, y0: number, th: number, k: number, d: nu
   return out;
 }
 
-/** Curvature (1/tiles) at the newest sample k from the turn of the velocity since k-1; 0 when straight or unknown. */
+/**
+ * Curvature (1/tiles) at the newest sample k: the end curvature of the segment from k-1
+ * (line+arc: the arc's; a line, or an arc followed by a line: 0); 0 when straight or unknown.
+ * Not the mean turn per tile since k-1: for the common straight-curve-straight pair the
+ * train is on a straight again, and a small mean curvature over a long chord would turn the
+ * extrapolation off it gradually for tens of tiles.
+ */
 function curvature(tr: Track, k: number): number {
   if (k < 1 || !linked(tr, k - 1)) {
     return 0;
@@ -556,7 +578,7 @@ function curvature(tr: Track, k: number): number {
   if (Math.abs(turn) < 0.025) {
     return 0;
   }
-  return Math.max(-1 / MIN_RADIUS, Math.min(1 / MIN_RADIUS, turn / ds));
+  return Math.max(-1 / MIN_RADIUS, Math.min(1 / MIN_RADIUS, segment(tr, k - 1).endCurvature()));
 }
 
 const tmp = new Float64Array(4);
@@ -604,24 +626,24 @@ function extrapolate(tr: Track, k: number, t: number, horizon: number, end: numb
     cap = 0;
   }
   const sp = Math.hypot(a.vx, a.vy);
-  let dist: number;
-  let rate: number;
   const [acc, v0] = sp > 0 ? braking(tr, k) : [0, NaN];
   if (acc < 0) {
     // A braking train runs on decelerating and stops, instead of running on at full speed
     // (a missing stop sample then costs a few tiles, not the heartbeat x the speed).
     cap = Math.min(cap, (1000 * v0) / -acc);
-    const dt = Math.max(0, Math.min(t - a.t, cap)) / 1000;
-    dist = v0 * dt + 0.5 * acc * dt * dt;
-    rate = v0 + acc * dt;
-  } else {
-    const dt = Math.max(0, Math.min(t - a.t, cap)) / 1000;
-    dist = sp * dt;
-    rate = sp;
   }
+  // Distance run by time tt, and the speed then.
+  const run = (tt: number): [number, number] => {
+    const dt = Math.max(0, Math.min(tt - a.t, cap)) / 1000;
+    return acc < 0 ? [v0 * dt + 0.5 * acc * dt * dt, v0 + acc * dt] : [sp * dt, sp];
+  };
+  const [dist, rate] = run(t);
   const th = sp > 0 ? Math.atan2(a.vy, a.vx) : 0;
   const kappa = sp > 0 && dist > 0 && motionConfig.extrapTurn > 0 ? curvature(tr, k) : 0;
-  extrapPoint(a.x, a.y, th, kappa, dist, ep);
+  // Inside the data horizon silence means the mover kept to its line (the capture emits on
+  // a turn of about 2 degrees): only the run past the horizon follows the curve.
+  const lead = kappa !== 0 && !motionConfig.extrapTurnInside ? run(Math.min(t, horizon))[0] : 0;
+  extrapPoint(a.x, a.y, th, kappa, dist, ep, lead);
   out.visible = true;
   out.k = k;
   out.to = -1;
@@ -631,6 +653,7 @@ function extrapolate(tr: Track, k: number, t: number, horizon: number, end: numb
   out.ed = dist;
   out.eth = th;
   out.ek = kappa;
+  out.el = lead;
   const moving = sp > 0 && rate > 0 && t - a.t < cap;
   out.vx = moving ? Math.cos(ep[2]) * rate : 0;
   out.vy = moving ? Math.sin(ep[2]) * rate : 0;
@@ -679,6 +702,7 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
   out.moving = false;
   out.ed = 0;
   out.ek = 0;
+  out.el = 0;
   let k = tr.find(t);
   if (k < 0) {
     return out;
@@ -819,11 +843,11 @@ export function bodyPath(tr: Track, head: Head, t: number, length: number, poly:
   } else if (head.mode === "bridge") {
     poly.push(s[j].x, s[j].y);
   } else {
-    if (head.ek !== 0 && head.ed > step) {
+    if (head.ek !== 0 && head.ed > head.el + step) {
       // Back along the extrapolated arc to the sample.
       const n = Math.ceil(head.ed / step);
       for (let i = 1; i < n; i++) {
-        extrapPoint(s[j].x, s[j].y, head.eth, head.ek, head.ed * (1 - i / n), ep);
+        extrapPoint(s[j].x, s[j].y, head.eth, head.ek, head.ed * (1 - i / n), ep, head.el);
         poly.push(ep[0], ep[1]);
       }
     }

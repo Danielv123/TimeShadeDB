@@ -162,6 +162,58 @@ test("an overrun waits on the track for the true position instead of snapping or
   assert.ok(!Number.isNaN(caught), "follows the data again once caught up");
 });
 
+test("an overrun wait ends when the true head turns away; the rest blends without a jump", () => {
+  const v = new MoverView();
+  for (let i = 0; i < 6; i++) {
+    v.add(meta, T.makeSample(meta, i * 500, i * 20, 0, 0.25)); // 40 tiles/s east
+  }
+  let prev = v.frame(2500, 4100)[0];
+  for (let t = 2600; t <= 4000; t += 100) {
+    prev = v.frame(t, 4100)[0]; // extrapolated to x = 160 at t=4000
+  }
+  // It slowed to 10 tiles/s and turned north at x = 120, short of the drawn point.
+  const rows: [number, number, number][] = [[3000, 105, 0], [3500, 110, 0], [4000, 115, 0], [4500, 120, 0]];
+  for (let i = 1; i <= 12; i++) {
+    rows.push([4500 + i * 500, 120, i * 5]);
+  }
+  for (const [t, x, y] of rows) {
+    v.add(meta, T.makeSample(meta, t, x, y, y > 0 ? 0 : 0.25));
+  }
+  let settled = NaN;
+  for (let t = 4100; t <= 10_000; t += 100) {
+    const m = v.frame(t, 11_000)[0];
+    const step = Math.hypot(m.x - prev.x, m.y - prev.y);
+    assert.ok(step <= 1 + (CORRECTION_RATE * 100) / 1000 + 0.05, `no jump at ${t}: ${step}`);
+    const h = T.headAt(v.tracks.get("j1")!, t, 11_000, T.newHead());
+    if (Number.isNaN(settled) && Math.hypot(m.x - h.x, m.y - h.y) < 1e-9) {
+      settled = t;
+    }
+    prev = m;
+  }
+  assert.ok(!Number.isNaN(settled), "follows the data again");
+});
+
+test("an overrun ahead of a stopped train slides back along its line at CORRECTION_RATE", () => {
+  const v = new MoverView();
+  for (let i = 0; i < 6; i++) {
+    v.add(meta, T.makeSample(meta, i * 500, i * 20, 0, 0.25)); // 40 tiles/s east
+  }
+  let prev = v.frame(2500, 4100)[0];
+  for (let t = 2600; t <= 4000; t += 100) {
+    prev = v.frame(t, 4100)[0];
+  }
+  // It stopped at x = 110: a 50-tile overrun (over MAX_CORRECTION, so no ordinary blend).
+  v.add(meta, T.makeSample(meta, 3000, 110, 0, 0.25, T.F_STOP));
+  v.add(meta, T.makeSample(meta, 6000, 110, 0, 0.25, T.F_STOP));
+  for (let t = 4100; t <= 9000; t += 100) {
+    const m = v.frame(t, 9000)[0];
+    assert.ok(Math.abs(m.y) < 1e-9, "on its line");
+    assert.ok(prev.x - m.x <= (CORRECTION_RATE * 100) / 1000 + 1e-6 && m.x <= prev.x + 1e-9, `slides back at ${t}: ${prev.x} -> ${m.x}`);
+    prev = m;
+  }
+  assert.ok(Math.abs(prev.x - 110) < 1e-9, `settles: ${prev.x}`);
+});
+
 test("a seek does not blend", () => {
   const v = new MoverView();
   for (let i = 0; i < 6; i++) {
