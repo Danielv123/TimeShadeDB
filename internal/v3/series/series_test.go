@@ -365,3 +365,29 @@ func killChild() {
 		}
 	}
 }
+
+func TestIdleIndexBytesBound(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, Options{MaxOpen: 1000, MaxIdleIndexBytes: 64 * entrySize * 3, NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for i := 0; i < 10; i++ {
+		s, err := st.OpenSeries(fmt.Sprintf("t/%d", i), true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendN(t, s, 0, 60)
+		s.Close()
+	}
+	stats := st.Stats()
+	if stats.IdleIndexBytes > 64*entrySize*3 || stats.Idle > 3 {
+		t.Fatalf("idle index memory not bounded: %+v", stats)
+	}
+	for i := 0; i < 10; i++ {
+		s, _ := st.OpenSeries(fmt.Sprintf("t/%d", i), false)
+		checkPrefix(t, s, 60)
+		s.Close()
+	}
+}

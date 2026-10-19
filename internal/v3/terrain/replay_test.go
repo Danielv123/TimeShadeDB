@@ -59,6 +59,7 @@ type replayReport struct {
 	ChunkHours    float64           `json:"chunk_hours"`
 	BytesPerCH    float64           `json:"bytes_per_chunk_hour"`
 	StartupMs     float64           `json:"startup_ms"`
+	StartupMs2    float64           `json:"startup_ms_second_open"`
 	StartupTiles  int               `json:"startup_tiles"`
 	HeapAfterOpen uint64            `json:"heap_after_open_bytes"`
 	Reads         map[string]latRep `json:"reads"`
@@ -288,6 +289,14 @@ func TestReplayTestdata(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep.StartupMs = float64(hrSince(t0).Microseconds()) / 1000
+	// A second open shows the steady-state cost (the first open after writing the
+	// files has been seen to be much slower on Windows).
+	s.Close()
+	t0 = hrNow()
+	if s, err = Open(dir, Options{OpenWindowBytes: -1}); err != nil {
+		t.Fatal(err)
+	}
+	rep.StartupMs2 = float64(hrSince(t0).Microseconds()) / 1000
 	runtime.GC()
 	runtime.ReadMemStats(&ms)
 	rep.HeapAfterOpen = ms.HeapAlloc

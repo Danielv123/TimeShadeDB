@@ -164,6 +164,9 @@ func (f *file) recover(rep *RecoveryReport) error {
 		}
 		entries[i].deltas = deltas
 	}
+	if cap(entries) > len(entries)+len(entries)/4+16 {
+		entries = append(make([]entry, 0, len(entries)+16), entries...)
+	}
 	f.entries = entries
 	f.size = pos
 	f.written = n

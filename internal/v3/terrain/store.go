@@ -72,6 +72,8 @@ type Options struct {
 	// MaxOpenSeries bounds the idle series (indexes and file handles) kept open
 	// (default 256).
 	MaxOpenSeries int
+	// MaxIndexBytes bounds the memory of idle series indexes (default 32 MiB).
+	MaxIndexBytes int64
 	// SyncInterval is the WAL group-commit interval (default 1 s).
 	SyncInterval time.Duration
 	// NoSync skips every fsync (tests, bulk imports that can be redone).
@@ -93,13 +95,14 @@ type Options struct {
 }
 
 // SplitBudget returns options with a total memory budget split between the decoded
-// cache (half), open windows (a quarter) and series indexes (the rest, as a count).
-// Callers that also run an encoded-response cache should pass only this store's share.
+// cache (half), open windows (a quarter) and idle series indexes (an eighth). The rest
+// covers encoders, the palettes and per-tile summaries. Callers that also run an
+// encoded-response cache should pass only this store's share.
 func SplitBudget(total int64) Options {
 	return Options{
 		DecodedCacheBytes: total / 2,
 		OpenWindowBytes:   total / 4,
-		MaxOpenSeries:     int(max(64, total/4/(64<<10))),
+		MaxIndexBytes:     total / 8,
 	}
 }
 
@@ -249,8 +252,9 @@ func Open(dir string, opt Options) (*Store, error) {
 		return nil, err
 	}
 	ss, err := series.Open(filepath.Join(dir, "datastores"), series.Options{
-		MaxOpen: opt.MaxOpenSeries,
-		NoSync:  opt.NoSync,
+		MaxOpen:           opt.MaxOpenSeries,
+		MaxIdleIndexBytes: opt.MaxIndexBytes,
+		NoSync:            opt.NoSync,
 		OnRecover: func(name string, rep series.RecoveryReport) {
 			opt.Logf("terrain: recovered series %s: %+v", name, rep)
 		},

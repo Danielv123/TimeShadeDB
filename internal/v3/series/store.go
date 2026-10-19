@@ -20,6 +20,9 @@ type Options struct {
 	// MaxOpen is the number of idle series kept open (files and index in memory).
 	// Series in use by a handle are never closed. Default 256.
 	MaxOpen int
+	// MaxIdleIndexBytes bounds the memory of the indexes of idle open series
+	// (40 bytes per record). Default 32 MiB. Series in use are not counted.
+	MaxIdleIndexBytes int64
 	// NoSync skips fsync (tests and bulk imports that can be redone). Records are still
 	// written in the same order.
 	NoSync bool
@@ -37,6 +40,8 @@ type Store struct {
 	closed bool
 	files  map[string]*file
 	idle   lruList // files with refs == 0, most recently used first
+	// idleBytes is the index memory of the idle files.
+	idleBytes int64
 
 	opens, evictions atomic.Uint64
 }
@@ -47,6 +52,9 @@ var _ core.SeriesStore = (*Store)(nil)
 func Open(dir string, opt Options) (*Store, error) {
 	if opt.MaxOpen <= 0 {
 		opt.MaxOpen = 256
+	}
+	if opt.MaxIdleIndexBytes <= 0 {
+		opt.MaxIdleIndexBytes = 32 << 20
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -100,6 +108,7 @@ func (s *Store) OpenSeries(name string, create bool) (*Series, error) {
 	if f := s.files[name]; f != nil {
 		f.refs++
 		if f.lru != nil {
+			s.idleBytes -= f.lru.bytes
 			s.idle.remove(f.lru)
 			f.lru = nil
 		}
@@ -153,8 +162,13 @@ func (s *Store) release(f *file) {
 		return
 	}
 	f.lru = s.idle.pushFront(f)
-	for s.idle.len > s.opt.MaxOpen {
+	f.mu.RLock()
+	f.lru.bytes = int64(cap(f.entries)) * entrySize
+	f.mu.RUnlock()
+	s.idleBytes += f.lru.bytes
+	for s.idle.len > s.opt.MaxOpen || (s.idleBytes > s.opt.MaxIdleIndexBytes && s.idle.len > 0) {
 		old := s.idle.back()
+		s.idleBytes -= old.bytes
 		s.idle.remove(old.f.lru)
 		old.f.lru = nil
 		delete(s.files, old.f.name)
@@ -241,6 +255,7 @@ func (s *Store) Close() error {
 	files := s.files
 	s.files = map[string]*file{}
 	s.idle = lruList{}
+	s.idleBytes = 0
 	s.mu.Unlock()
 	var first error
 	for _, f := range files {
@@ -257,18 +272,19 @@ func (s *Store) Close() error {
 
 // Stats describe the store's open series.
 type Stats struct {
-	Open       int    // series open (in use or idle)
-	Idle       int    // idle series kept open
-	IndexBytes int64  // memory held by the open indexes
-	Opens      uint64 // series loads from disk
-	Evictions  uint64 // idle series closed to stay within MaxOpen
+	Open           int    // series open (in use or idle)
+	Idle           int    // idle series kept open
+	IndexBytes     int64  // memory held by the open indexes
+	IdleIndexBytes int64  // part of IndexBytes held by idle series
+	Opens          uint64 // series loads from disk
+	Evictions      uint64 // idle series closed to stay within MaxOpen
 }
 
 // Stats returns current counters.
 func (s *Store) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := Stats{Open: len(s.files), Idle: s.idle.len, Opens: s.opens.Load(), Evictions: s.evictions.Load()}
+	st := Stats{Open: len(s.files), Idle: s.idle.len, IdleIndexBytes: s.idleBytes, Opens: s.opens.Load(), Evictions: s.evictions.Load()}
 	for _, f := range s.files {
 		select {
 		case <-f.ready:
@@ -287,6 +303,7 @@ const entrySize = 40
 // lruList is a small intrusive doubly linked list.
 type lruNode struct {
 	f          *file
+	bytes      int64 // index memory when the file went idle
 	prev, next *lruNode
 }
 
