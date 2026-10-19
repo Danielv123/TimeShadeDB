@@ -93,9 +93,10 @@ never stands in for the imported one.
   updates in 0.4% of the chunks (Zipf inside that hot set; small groups of pixels toggling
   to enemy red and back), full chunk states as a capture sends them, and 25 trains on
   closed loops sampled every 300 ms.
-- **synth10x**: ten time-shifted replays of the testdata stream in one database (startup on
-  a 10x history of the nauvis terrain stream; about 10 MB for v3, so smaller than the
-  imported database, which also holds movers, overlays and every surface).
+- **synth10x**: for v3, ten copies of the imported database under suffixed map keys
+  (`measure replicate`: ten times its datastores, tiles, movers, overlays and bytes,
+  184 MiB), started three times (`measure startup`). For v2 (baseline), ten time-shifted
+  replays of the testdata stream in one database.
 - **soak**: the synthetic workload at 100x (v3: with trains).
 - **attack**: random tile URLs against the testdata database.
 

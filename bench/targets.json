@@ -22,7 +22,7 @@
     {"id": "hostile_latency", "group": "Hostile requests", "title": "Hostile request latency p99", "tool": "attack", "scenario": "attack", "metric": "attack.latency_ms.p99", "op": "<", "value": 1, "unit": "ms", "plan_baseline": "0.21 s CPU per request"},
 
     {"id": "startup_imported", "group": "Startup", "title": "Startup on the imported test data", "tool": "tilebench", "scenario": "testdata", "metric": "startup.ms", "op": "<=", "value": 1000, "unit": "ms", "plan_baseline": "38 ms per MB on disk"},
-    {"id": "startup_synth10x", "group": "Startup", "title": "Startup on a 10x synthetic database", "tool": "ingestbench", "scenario": "synth10x", "metric": "startup.ms", "op": "<=", "value": 2000, "unit": "ms", "plan_baseline": "38 ms per MB on disk"},
+    {"id": "startup_synth10x", "group": "Startup", "title": "Startup on a 10x synthetic database", "tool": "measure-startup|ingestbench", "scenario": "synth10x", "metric": "startup.ms", "op": "<=", "value": 2000, "unit": "ms", "plan_baseline": "38 ms per MB on disk"},
 
     {"id": "tile_cached", "group": "Server tiles", "title": "z0 tile from cache, p50", "tool": "tilebench", "scenario": "testdata", "metric": "tile.z0_latest_warm_ms.p50", "op": "<=", "value": 1, "unit": "ms", "plan_baseline": "16.5 ms latest"},
     {"id": "tile_hist", "group": "Server tiles", "title": "z0 tile, cold historical, p95", "tool": "tilebench", "scenario": "testdata", "metric": "tile.z0_hist_cold_ms.p95", "op": "<=", "value": 15, "unit": "ms", "plan_baseline": "30 ms historical"},

@@ -357,7 +357,17 @@ func (r *runner) candidate() {
 		return r.run("ingest", r.tool("ingestbench"), append(srvArgs("v3", "v3", bin, "testdata-stream", r.out("v3", "ingest-testdata-stream")),
 			"-work", filepath.Join(c.work, "db"), "-input", files, "-surface", surface)...)
 	})
-	r.step("synth10x", func() error { return r.tenfold("v3", "v3", bin) })
+	r.step("synth10x", func() error {
+		// Ten copies of the imported database under suffixed map keys: ten times its
+		// datastores, tiles, history and bytes (startup is O(tiles) by design, so a longer
+		// history of the same tiles would not test it), then the median of three starts.
+		db := r.freshDB("v3-10x")
+		if err := r.run("synth10x", r.tool("measure"), "replicate", "-db", imported, "-out", db, "-n", "10"); err != nil {
+			return err
+		}
+		return r.run("synth10x", r.tool("measure"), "startup", "-server-bin", bin, "-db", db, "-restarts", "3",
+			"-label", "v3", "-target", "v3", "-scenario", "synth10x", "-out", r.out("v3", "startup-synth10x"))
+	})
 	r.step("attack", func() error {
 		return r.run("attack", r.tool("attack"), append(srvArgs("v3", "v3", bin, "attack", r.out("v3", "attack")),
 			"-db", imported, "-n", strconv.Itoa(c.attackN))...)

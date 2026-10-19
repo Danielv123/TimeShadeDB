@@ -14,6 +14,10 @@
 //	measure movers -db <v3 db> [-surface gw-bc41437d~2E1.nauvis] -out journeys.json
 //	    the train journeys stored in a v3 database, for the train evaluator's
 //	    --journeys-json (the imported, re-timed rows instead of the illisis windows)
+//	measure replicate -db <v3 db> -out <new db> [-n 10]
+//	    a database of n copies of a v3 database under suffixed map keys (the 10x database)
+//	measure startup -server-bin <timeshadedb> -db <v3 db> [-restarts 3]
+//	    median time from process start until serve-v3 answers (startup.ms)
 package main
 
 import (
@@ -57,13 +61,17 @@ func main() {
 		cmdCapture(os.Args[2:])
 	case "movers":
 		cmdMovers(os.Args[2:])
+	case "replicate":
+		cmdReplicate(os.Args[2:])
+	case "startup":
+		cmdStartup(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream|capture|movers [flags]")
+	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream|capture|movers|replicate|startup [flags]")
 	os.Exit(2)
 }
 
