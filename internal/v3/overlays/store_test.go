@@ -366,6 +366,12 @@ func TestRailsScale(t *testing.T) {
 	if total != n-n/10 || st.CacheBytes > 4<<20 {
 		t.Fatalf("total %d, stats %+v", total, st)
 	}
+	// Stats.IndexBytes must be a usable estimate of that heap.
+	heap, est := int64(ms1.HeapAlloc)-int64(ms0.HeapAlloc), o.Stats().IndexBytes
+	t.Logf("IndexBytes estimate %.1f MB against %.1f MB of heap after reopen", float64(est)/1e6, float64(heap)/1e6)
+	if est < heap/2 || est > heap*2 {
+		t.Errorf("IndexBytes %d is not within 2x of the heap after reopen (%d)", est, heap)
+	}
 	t.Logf("NoSync (no fsync per Apply); TestRailsApplyFsync measures the fsync cost")
 	t.Logf("%d rails: apply %v (%.0f events/s), heap after reopen %.1f MB (%.0f B per open interval), 1681 tile queries %v (%.0f µs each, cache %d KB), reopen %v",
 		n, apply.Round(time.Millisecond), float64(n)/apply.Seconds(), float64(int64(ms1.HeapAlloc)-int64(ms0.HeapAlloc))/1e6,
