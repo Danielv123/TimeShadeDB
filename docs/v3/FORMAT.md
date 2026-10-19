@@ -351,10 +351,8 @@ Row flags (`core.MoverFlags`; bit 6 exists only on the wire):
 | 7 | reserved | 0 |
 
 Positions: a train's x, y is its leading carriage centre; carriages list every carriage from
-the leading end. Orientation is Factorio's (0 north, 0.25 east); a train's points in its
-direction of travel: the leading carriage's own orientation in live capture (PROTOCOL.md
-3.1), from the second carriage to the first in imported illisis data. Velocity is not
-stored: viewers derive it from neighbouring
+the leading end. Orientation is Factorio's (0 north, 0.25 east); a train's points from the
+second carriage to the first. Velocity is not stored: viewers derive it from neighbouring
 rows (with ticks when present: `ticks / (60 * speed)` seconds).
 
 Measured on a synthetic train track (1,000 samples, 250-350 ms apart): 8.1 B/sample raw,

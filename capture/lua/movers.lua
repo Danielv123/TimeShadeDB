@@ -73,6 +73,8 @@ local function shape(m, tr)
 	m.o, m.cf, m.cb = table.concat(kinds), first and hex(first), last and hex(last)
 	local f, b = cars[1], cars[#cars]
 	m.ef, m.eb = f, b
+	-- the carriage behind each end, for the heading (nil for a single carriage)
+	m.sf, m.sb = cars[2], #cars > 1 and cars[#cars - 1] or nil
 	m.nf, m.nb, m.hf, m.hb = f.name, b.name, f.is_headed_to_trains_front, b.is_headed_to_trains_front
 	m.force, m.n = f.force.name, #cars
 end
@@ -97,27 +99,37 @@ local function mint(st, ref, kind, key, t)
 	return j
 end
 
---- Journey j's gone, if it was ever sampled, then forget it.
+--- Journey j's gone, if it was ever sampled and the capture is configured, then forget it. Unconfigured (before a
+--- Clusterio boot's config, or with the standalone mod turned off) only the storage side runs: a gone queued then would
+--- be flushed much later under a wrong envelope tick.
 function movers.gone(st, j)
 	st.fast[j] = nil
 	local m = st.movers[j]
 	if not m then
 		return
 	end
-	if m.s then
+	if m.s and st.configured then
 		outbox.move(m.s, { j = j, gone = true })
 	end
 	core.forget(st, j)
 end
 
 --- What a train looks like now: its leading carriage (front_stock while running forwards), position, surface and
---- heading: that carriage's orientation in the direction of travel (half a turn on when it faces the other way).
---- m must be shaped.
+--- heading: from the carriage behind it towards it (PROTOCOL.md 3.1, as in illisis); a single carriage's own
+--- orientation in the direction of travel. m must be shaped.
 local function train_view(m, r, fwd)
 	local e = fwd and m.ef or m.eb
-	local headed = fwd and m.hf or m.hb
-	local h = core.round(e.orientation + ((headed == fwd) and 0 or 0.5), 3) % 1
-	return e, e.position, e.surface_index, h
+	local pos = e.position
+	local second = fwd and m.sf or m.sb
+	local h
+	if second then
+		local sp = second.position
+		h = core.heading(pos.x, pos.y, sp.x, sp.y)
+	else
+		local headed = fwd and m.hf or m.hb
+		h = core.heading(pos.x, pos.y, nil, nil, e.orientation, headed ~= fwd)
+	end
+	return e, pos, e.surface_index, h
 end
 
 --- The fields every sample of mover m carries. Trains take the leading carriage's name and the force from the shape;
@@ -158,7 +170,7 @@ local function poll(st, j, t, how)
 	if m.kind == "t" then
 		local speed = r.speed
 		local fwd = core.forward(m.fwd, speed)
-		if not (m.o and m.ef and m.ef.valid and m.eb and m.eb.valid) then
+		if not (m.o and m.ef and m.ef.valid and m.eb and m.eb.valid and (m.sf == nil or m.sf.valid)) then
 			shape(m, r)
 		end
 		-- a moving train is read again when it has gone core.STEP tiles; at rest it leaves the wheel

@@ -14,14 +14,15 @@ core.PROTOCOL = 1 -- the envelope's v
 
 -- Terrain.
 core.CAP = 20000 -- chart reads waiting; event pushes past this are dropped and counted; resync pushes are exempt
-core.CHARTS = 2 -- chart reads a tick
+core.CHARTS = 1 -- chart reads a tick (60 a second; the UPS benchmark's heaviest cost, see capture/README.md)
 core.DEBOUNCE = 600 -- ticks from one read of a chunk to the next (a chunk charted again sooner waits)
 core.CACHE = 16384 -- last sent charts kept (deflated); a miss only re-sends an unchanged chart
 core.RESYNC_READS = 64 -- chunk positions the resync walk reads a tick
 core.RESYNC_CHUNKS = 16 -- the walk stops for the tick once this many charted chunks are queued
-core.RESYNC_QUEUE = 64 -- the walk waits while this many chart reads are queued, so the queue stays short
+core.RESYNC_QUEUE = 64 -- the walk waits while this many forced reads are queued, so the forced queue stays short
 core.RESYNC_CHARTS = 4 -- chart reads a tick while a resync runs (50,000 chunks in about 210 s)
 core.MACHINES = 8 -- resync machines and rails sent a tick
+core.RAW_QUEUE = 256 -- a chunk re-queued behind this many reads drops its raw chart (see core.debounce)
 
 -- Movers.
 core.WALK = 8 -- movers polled a tick
@@ -191,17 +192,23 @@ function core.cache_count(c)
 	return c.n + n
 end
 
--- Chart debounce. A chunk read at tick t cools down until t + core.DEBOUNCE. A chunk charted while waiting in the queue
+-- Chart debounce. Event reads wait in d.queue (capped at core.CAP); forced reads (a resync's walk and its sentinel, a
+-- deletion) in d.forced, which takes no cap, is read first and paces the walk, so a full event queue never stalls a
+-- resync. A chunk read at tick t cools down until t + core.DEBOUNCE. A chunk charted while waiting in the queue
 -- is not queued twice; one charted while cooling is marked dirty and queued when its cool-down ends. The cool-down list
 -- is a FIFO, because every read adds now + DEBOUNCE with now never decreasing, so the state holds at most the chunks read
 -- in the last DEBOUNCE ticks plus the queue (bounded by core.CAP).
 --
 -- raw[key] keeps the raw chart of an event read while its chunk cools down, so the re-read at the end of the cool-down
 -- can skip helpers.encode_string when nothing changed (deflating 2 KiB is most of a read's cost). It is dropped when a
--- cool-down ends with no new event, so it holds at most core.CHARTS x core.DEBOUNCE charts (2.4 MiB at the defaults).
+-- cool-down ends with no new event, and when the chunk is re-queued behind more than core.RAW_QUEUE reads (a long
+-- queue would keep a chart per queued chunk). Event reads set it, at most max(core.CHARTS, core.RESYNC_CHARTS) a tick,
+-- so it holds at most max(CHARTS, RESYNC_CHARTS) x DEBOUNCE + RAW_QUEUE + 1 charts (2,657 x 2 KiB, 5.2 MiB, at the
+-- defaults).
 
 function core.debounce()
-	return { queue = core.queue(), pending = {}, cool = {}, dirty = {}, due = core.queue(), raw = {}, drops = 0 }
+	return { queue = core.queue(), forced = core.queue(), pending = {}, cool = {}, dirty = {}, due = core.queue(), raw = {},
+		drops = 0 }
 end
 
 --- An on_chunk_charted for item ({ key, ... }). forced items (resync, deletion) skip the cool-down and the cap.
@@ -209,7 +216,7 @@ end
 function core.charted(d, item, forced)
 	local key = item.key
 	if forced then
-		core.push(d.queue, item)
+		core.push(d.forced, item)
 		if key then -- the resync's sentinel has none
 			d.pending[key] = true
 			d.dirty[key] = nil
@@ -231,9 +238,16 @@ function core.charted(d, item, forced)
 	return "dropped"
 end
 
---- The next item to read at tick now, or nil. The caller reads it; the chunk then cools down.
-function core.take(d, now)
-	local item = core.pop(d.queue)
+--- The next item to read at tick now, or nil: from d.forced first, or only from "forced" or "events" (d.queue). The
+--- caller reads it; the chunk then cools down.
+function core.take(d, now, from)
+	local item
+	if from ~= "events" then
+		item = core.pop(d.forced)
+	end
+	if item == nil and from ~= "forced" then
+		item = core.pop(d.queue)
+	end
 	if item == nil then
 		return nil
 	end
@@ -261,8 +275,12 @@ function core.cooled(d, now)
 		local item = d.dirty[head.key]
 		if item then
 			d.dirty[head.key] = nil
+			local long = core.size(d.queue) > core.RAW_QUEUE
 			if core.charted(d, item) == "queued" then
 				n = n + 1
+				if long then
+					d.raw[head.key] = nil
+				end
 			else
 				d.raw[head.key] = nil
 			end
@@ -390,7 +408,7 @@ function core.train_read(m, r)
 		if m.moving then
 			why = "stop"
 		elseif r.t - e.t >= core.HEARTBEAT then
-			why = "heartbeat"
+			why = "heartbeat" -- only for a caller that reads a parked train: the movers step does not (PROTOCOL.md 3.1)
 		end
 	elseif m.fwd ~= nil and r.fwd ~= m.fwd then
 		why = "es" -- also when it starts off the other way after a stop

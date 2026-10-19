@@ -45,14 +45,17 @@ build output and is not committed.
    --src standalone:<name> --map <key>` next to it. It posts complete files and deletes them.
 
 Map settings (runtime, per save): capture on or off, chart debounce (600 ticks), chart reads
-per tick (2), sent-chart cache size (16,384 chunks), rail layer (off), extra forces to
+per tick (1), sent-chart cache size (16,384 chunks), rail layer (off), extra forces to
 capture (forces with a player are always captured). `/timeshade stats` prints counters,
 `/timeshade resync` resends everything. Remote interface `timeshade_capture`: `resync`,
 `stats`.
 
-Files: one every 60 s of game time or 4 MiB; lines are buffered and appended every 2 s, so
-up to 2 s are lost if the game exits. In multiplayer only the server writes. Run one game
-per user-data directory at a time: every save writes to the same `script-output`.
+Files: one every 60 s of game time or 4 MiB, and a new one at every load; lines are
+buffered and appended every 2 s, so up to 2 s are lost if the game exits. A paused game
+(a headless server with no players) appends to its current file again on resume, so a file
+is complete only once a newer one exists (PROTOCOL.md 2). In multiplayer only the server
+writes. Run one game per user-data directory at a time: every save writes to the same
+`script-output`.
 
 ## Clusterio use
 
@@ -78,15 +81,22 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   tick for 2,000 ticks was sent 6 times (2 of them forced by resyncs).
 - The last sent charts are kept deflated in two generations of 8,192 (an approximate LRU,
   about 380 bytes each), not one 2 KiB string per chunk forever. The raw chart of a chunk
-  that is cooling down is kept too (at most chart reads x debounce = 1,200), so an
-  unchanged re-read skips the deflate.
+  that is cooling down is kept too, so an unchanged re-read skips the deflate. It is
+  dropped when the cool-down ends with no new chart, or when the chunk is re-queued behind
+  more than 256 reads, so at most max(chart reads, resync reads) x debounce + 257 = 2,657
+  charts (5.2 MiB) are held.
+- Forced reads (a resync, a deleted chunk) wait in their own queue, read first and not
+  capped; while a resync runs one of its 4 reads a tick goes to chart events whenever any
+  wait, so neither starves the other.
 - Trains: every sample carries its read tick (the envelope's, or its own `tick` for a chord
   vertex sent one read late). A sample is sent when a read is off the chord from the last
   sample by more than 0.25 tile (or 1 tile off its time-interpolated place), when the
   heading turned more than 2 degrees, when 16 reads are buffered, or on the 600-tick
   heartbeat. `car` (every carriage's position and orientation) comes with first sight,
-  stop, start, end switch (`es`), a changed train and resyncs. `h` is the leading carriage's
-  orientation in the direction of travel. No `vx`/`vy`.
+  stop, start, end switch (`es`), a changed train and resyncs. `h` points from the
+  carriage behind the leading one towards it, as in illisis (a single carriage: its own
+  orientation in the direction of travel). A parked train is not polled: after its stop
+  sample it is sent again only by a resync or when it moves. No `vx`/`vy`.
 - Vehicles keep their heading; players are sent by dead reckoning as before.
 - Recipe and rail removals come from the mined and died events, so nothing new is registered
   for them.
@@ -130,6 +140,9 @@ patched save loads it, with a stub Clusterio API):
   0.5 tiles of the true position at every tick (measured 0.20 to 0.30), `car` comes with first sight, stops and the
   end switch (and starts at the new leading carriage after it), kinds flip from `LCC` to
   `ccl`, a destroyed train sends one `gone`;
+- a third train under a schedule (automatic mode, a temporary stop on a rail): its
+  `LuaTrain.path` is a `LuaRailPath` (`size`, `current`, `total_distance`,
+  `travelled_distance`, `rails`) while it drives, and its samples follow its line;
 - a car's samples carry heading and kind; recipes open and close; the rail layer sends
   three built rails and one removal;
 - the 2.0 API used: `LuaTrain.front_end`/`back_end` (`LuaRailEnd`), `path` (nil in manual

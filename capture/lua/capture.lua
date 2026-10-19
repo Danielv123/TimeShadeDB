@@ -27,14 +27,23 @@ local resync = nil -- the running resync: { trace, chunks, movers, tags, machine
 -- Tunables a config may set. Only output-side ones: the mover rules stay fixed, so every peer runs the same ones.
 local TUNABLES = { debounce = "DEBOUNCE", charts = "CHARTS", cache = "CACHE", resync_charts = "RESYNC_CHARTS" }
 
+local DEFAULTS = {}
+for _, const in pairs(TUNABLES) do
+	DEFAULTS[const] = core[const]
+end
+
+--- Each tunable from cfg, else its default: the effective settings depend on the last config only, so a server and a
+--- client that loaded its save agree.
 local function apply(cfg)
 	for key, const in pairs(TUNABLES) do
 		local v = cfg and cfg[key]
 		if type(v) == "number" and v >= 1 and v == math.floor(v) then
 			core[const] = v
+		else
+			core[const] = DEFAULTS[const]
 		end
 	end
-	terrain.configure{ cache = cfg and cfg.cache }
+	terrain.configure{ cache = core.CACHE }
 end
 
 --- host: { sink = function(line, tick), instance = function() -> id, on_tick = function(st, e)?, players = fn? }.
@@ -109,6 +118,10 @@ function capture.config(c)
 	if not st.seeded then
 		movers.seed(st, game.tick)
 	end
+	-- the integrations found, at each config (as illisis does)
+	if capture.ue then
+		outbox.send{ type = "trace", op = "timeshade.integration", phase = "universal_edges", level = "info" }
+	end
 	if tile then
 		outbox.send{ type = "trace", op = "timeshade.integration", phase = "gridworld", level = "info", world = tile.world,
 			surface = tile.surface }
@@ -159,6 +172,7 @@ end
 function capture.on_tick(e)
 	local st = storage.timeshade
 	if not (st and st.configured) then
+		outbox.clear() -- whatever a handler queued while unconfigured is never sent
 		return
 	end
 	if host.on_tick then
@@ -250,6 +264,7 @@ function capture.stats()
 		raw = raw + 1
 	end
 	return { reads = t.reads, sent = t.sent, skipped = t.skipped, raw = raw, queued = core.size(t.debounce.queue),
+		forced = core.size(t.debounce.forced),
 		drops = t.debounce.drops,
 		cached = core.cache_count(t.cache), lines = lines, bytes = bytes, oversize = outbox.oversize(), movers = nm,
 		resyncing = resync and resync.trace or nil }

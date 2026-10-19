@@ -100,8 +100,10 @@ function sandbox(name, mods, config) {
 	return { dir, write, modsDir, config: path.join(dir, "config.ini"), list };
 }
 
+/** Enable or disable mods: setEnabled(box, name, enabled) or setEnabled(box, { name: enabled, ... }). */
 function setEnabled(box, modName, enabled) {
-	const list = box.list.map(m => m.name === modName ? { ...m, enabled } : m);
+	const want = typeof modName === "string" ? { [modName]: enabled } : modName;
+	const list = box.list.map(m => m.name in want ? { ...m, enabled: want[m.name] } : m);
 	fs.writeFileSync(path.join(box.modsDir, "mod-list.json"), JSON.stringify({ mods: list }, null, "\t"));
 }
 
@@ -363,6 +365,17 @@ function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
 	check(c.loop_closed, `${label}: the loop built through get_rail_extensions closed`);
 	note(`${label}: rail planner used ${JSON.stringify(c.loop_rails)}; train B ran over ${JSON.stringify(results.b_rails)}`);
 	note(`${label}: train API: ${JSON.stringify(c.train)}`);
+	// train C under a schedule: LuaTrain.path is a LuaRailPath while it drives; the capture follows it like any train
+	const p160 = c.path_auto_160 ?? {}, p400 = c.path_auto_400 ?? {};
+	check(c.schedule_set === "LuaTrain.schedule", `${label}: schedule set through LuaTrain.schedule (${c.schedule_set})`);
+	check(p160.path === "LuaRailPath" && p160.size > 0 && p160.total > 0,
+		`${label}: a scheduled train's path is a LuaRailPath: ${JSON.stringify(p160)}`);
+	note(`${label}: LuaTrain.path in automatic mode at tick 160 ${JSON.stringify(p160)}, at 400 ${JSON.stringify(p400)}`);
+	const cJ = entries(msgs, e => results.c_id && e.j && e.j.endsWith(`.${results.c_id}`) && e.k === "t"
+		&& e.x !== undefined);
+	check(cJ.length >= 2 && cJ.every(e => Math.abs(e.y - 201) < 0.5) && cJ.some(e => e.x > 150),
+		`${label}: the scheduled train's samples follow its line at y = 201 (${cJ.length} samples, last x `
+		+ `${cJ.at(-1)?.x}; it ended at x ${results.c_x})`);
 	note(`${label}: rail types: ${Object.keys(c.rail_types).sort().join(", ")}`);
 	if (results.lua_kb) {
 		note(`${label}: Lua memory of the capture's state at the end: ${results.lua_kb.toFixed(0)} KiB (stats ${JSON.stringify(results.stats)})`);
@@ -488,7 +501,7 @@ function runBench() {
 	const build = buildCapture(path.join(root, "build-bench"));
 	const cfg = { mode: "bench", trains, chunks: 50176, charted: Number(option("--charted", 20)), report_tick: ticks - 10,
 		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, micro: flag("--micro") ? 700 : false,
-		chart_reads: Number(option("--chart-reads", 2)) };
+		chart_reads: Number(option("--chart-reads", 1)) };
 	const box = sandbox("bench", {
 		timeshade_capture: (dst) => copyTree(build.modDir, dst),
 		timeshade_capture_testdriver: (dst) => {
@@ -497,17 +510,22 @@ function runBench() {
 				fs.copyFileSync(path.join(here, "game", f), path.join(dst, f));
 			}
 		},
+		// the baseline's stand-in for the capture's test interface: the driver's remote calls cost the same in both runs
+		timeshade_capture_null: (dst) => copyTree(path.join(here, "game", "nullcapture"), dst),
 	}, cfg);
 	fs.rmSync(path.join(box.modsDir, "timeshade_capture", "config.lua"));
+	fs.rmSync(path.join(box.modsDir, "timeshade_capture_null", "config.lua"));
 	const save = path.join(box.dir, "bench.zip");
+	setEnabled(box, { timeshade_capture_null: false }); // both define the test interface
 	run(box, ["--create", save], "create");
 	const runs = Number(option("--runs", 3));
 	const result = {};
 	// interleaved (without, with, without, with, ...) so a burst of load on the machine hits both alike
 	const per = { without: [], with: [] };
+	const pairs = [];
 	for (let r = 0; r < runs; r++) {
 		for (const [label, enabled] of [["without", false], ["with", true]]) {
-			setEnabled(box, "timeshade_capture", enabled);
+			setEnabled(box, { timeshade_capture: enabled, timeshade_capture_null: !enabled });
 			const res = run(box, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
 				`bench-${label}-${r}`);
 			if (enabled && r === 0) {
@@ -519,8 +537,24 @@ function runBench() {
 			if (!check(rows && rows.length > warm, `bench ${label}: verbose timings parsed`)) {
 				return;
 			}
-			per[label].push(...rows.filter(x => x.tick >= warm));
+			const kept = rows.filter(x => x.tick >= warm);
+			per[label].push(...kept);
+			pairs[r] = { ...pairs[r], [label]: kept.filter(x => x.tick < resyncTick) };
 		}
+	}
+	// each interleaved pair alone: a baseline that moves between pairs means other jobs shared the machine
+	const meanOf = (rows, f) => rows.reduce((n, x) => n + f(x), 0) / rows.length;
+	const baselines = [];
+	for (const [r, p] of pairs.entries()) {
+		const lua = (x) => (x.script + x.gc) / 1e6;
+		const base = meanOf(p.without, x => x.whole / 1e6);
+		baselines.push(base);
+		note(`bench pair ${r}: capture Lua cost ${(meanOf(p.with, lua) - meanOf(p.without, lua)).toFixed(4)} ms/tick `
+			+ `(baseline Lua ${meanOf(p.without, lua).toFixed(4)} ms, whole tick ${base.toFixed(4)} ms)`);
+	}
+	if (Math.max(...baselines) > 1.2 * Math.min(...baselines)) {
+		note(`WARN bench: the baseline's whole tick moved from ${Math.min(...baselines).toFixed(3)} to `
+			+ `${Math.max(...baselines).toFixed(3)} ms between pairs: the machine was busy, the costs are inflated`);
 	}
 	for (const label of ["without", "with"]) {
 		const steady = per[label].filter(x => x.tick < resyncTick);
@@ -554,7 +588,21 @@ function runBench() {
 	const deltaResync = result.with.resyncLua.mean - result.without.resyncLua.mean;
 	note(`bench: during a resync (400 ticks from tick ${resyncTick}): Lua ${fmt(result.with.resyncLua)} with, `
 		+ `${fmt(result.without.resyncLua)} without; capture costs ${deltaResync.toFixed(4)} ms/tick`);
-	check(delta <= 0.3, `bench: capture Lua cost ${delta.toFixed(4)} ms/tick within the 0.3 ms budget`);
+	// The budget (PLAN D9) is for the steady state; both measures of it must hold. A resync is a transient (start and
+	// reconnect, about 3.5 min per 50,000 chunks): reported against the budget, not failed.
+	const BUDGET = 0.3;
+	check(delta <= BUDGET, `bench: capture Lua cost ${delta.toFixed(4)} ms/tick within the ${BUDGET} ms budget`);
+	check(deltaWhole <= BUDGET, `bench: capture whole-tick cost ${deltaWhole.toFixed(4)} ms/tick within the ${BUDGET} ms `
+		+ `budget`);
+	if (deltaResync > BUDGET) {
+		note(`WARN bench: a resync costs ${deltaResync.toFixed(4)} ms/tick while it runs, over the ${BUDGET} ms steady-state `
+			+ `budget`);
+	}
+	const spikes = result.with.lua.max - result.without.lua.p50;
+	if (spikes > 1) {
+		note(`WARN bench: the slowest tick with the capture takes ${result.with.lua.max.toFixed(3)} ms of Lua time `
+			+ `(p99 ${result.with.lua.p99.toFixed(3)} ms): the file writes (the standalone mod writes its buffer every 2 s)`);
+	}
 }
 
 gameVersion = version();

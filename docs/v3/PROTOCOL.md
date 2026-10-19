@@ -43,8 +43,13 @@ Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not
   multiplayer only the server writes (`for_player = 0`). Loading the same save twice can
   reuse a name and append to that file. `timeshadedb
   tail --dir <script-output>/timeshade --url ... --token ... --src standalone:<name> --map
-  <key>` posts complete files in order and deletes each file once ingest returned 200
-  (files are complete once a newer file exists or after 10 s without growth).
+  <key>` posts files in name order and deletes each file once ingest returned 200 for all
+  of it. A file is complete only once a newer file exists: a paused game (a headless server
+  pauses with no players) stops writing without closing its file and appends to it again
+  on resume, so a pause in growth is not the end of a file. The tailer may post the newest
+  file up to its last complete line (`
+`), keeping the byte offset it posted to, but never
+  deletes it.
 
 ## 3. Messages
 
@@ -77,10 +82,10 @@ Gone: `{j, gone: true, tick?}`.
 | `k` | `t` train, `v` vehicle, `p` player |
 | `f`, `name` | force; leading carriage or vehicle prototype, or player name |
 | `x`, `y` | tiles; a train's leading carriage centre |
-| `h` | orientation 0..1 (0 north, 0.25 east), 3 decimals; trains: the leading carriage's orientation in the direction of travel (the tangent of its body, half a turn on when it faces backwards). Absent: unknown. |
+| `h` | orientation 0..1 (0 north, 0.25 east); trains: second carriage towards the first (a single carriage: its orientation in the direction of travel). Absent: unknown. |
 | `n`, `o`, `c` | train carriage count; kinds from the leading end (`L` loco, `C` cargo, `F` fluid, `A` artillery, lower case faces back; vehicles `S` spidertron or `C` car); colour `rrggbb` |
 | `tick` | the game tick of the read, when it is not the envelope's: a train's chord vertex is sent one read late |
-| `stop` | at rest (also on the 600-tick heartbeat of a parked train) |
+| `stop` | at rest. A parked train is not read again until it moves: after its stop sample it sends only resync samples |
 | `es` | the leading end switched at this sample (also when a stopped train starts off the other way); the sample before it is the old leading end's last read |
 | `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, on stop, on start, at end switches, after the train changed (join, split) and in resyncs |
 | `vx`, `vy` | legacy (illisis), ignored |
@@ -142,10 +147,11 @@ These are protocol-level requirements; the Lua is WP9's.
   two generations of 8,192 charts, an approximate LRU).
 - Resync on start and reconnect: every charted chunk in the clip, every live mover with
   `car`, every tag and recipe. The walk of charted chunks keeps pace with the chart reads
-  (4 a tick while a resync runs), so 50,000 chunks take about 3.5 minutes.
+  (4 a tick while a resync runs, one of them kept for chart events while any wait), so
+  50,000 chunks take 3.5 to 4.6 minutes.
 - Trains: emit when the chord error since the last sample exceeds 0.25 tile, when the
-  orientation changed by more than about 2 degrees, or on a 600-tick heartbeat; always send
-  the tick; send `car` on stop, start, end switch and resync; set `es` on end switches.
+  orientation changed by more than about 2 degrees, or on a 600-tick heartbeat while
+  moving; always send the tick; send `car` on stop, start, end switch and resync; set `es` on end switches.
 - Vehicles and players: emit when off the dead-reckoned position by more than 1 tile or on
   the heartbeat; send `h` for vehicles too.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for

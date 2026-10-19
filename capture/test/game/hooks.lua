@@ -76,6 +76,15 @@ return function(capture)
 			wrap(capture.movers, "step", "movers.step")
 			wrap(capture.outbox, "flush", "outbox.flush (JSON, cut, file buffer)")
 			wrap(capture.remote_charted, "fn", "charted remote (20 events)")
+			-- the standalone mod's file writes, through a stand-in for the global helpers (every other field passes)
+			local real = helpers
+			local writes = { write_file = function(...)
+				return real.write_file(...)
+			end }
+			wrap(writes, "write_file", "helpers.write_file (the mod's file buffer)")
+			helpers = setmetatable(writes, { __index = function(_, k)
+				return real[k]
+			end })
 			capture.profile_totals = totals
 		end,
 		profile_report = function()

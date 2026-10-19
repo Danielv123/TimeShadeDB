@@ -139,11 +139,14 @@ function T.init(cfg)
 	checks.loop_closed, checks.loop_rails = closed, used
 	local a = scenario.train(s, "LCC", 30, 1)
 	local b = scenario.train(s, "LC", 25, 101)
+	-- train C, under a schedule (automatic mode) on its own line at y = 201: LuaTrain.path is read while it drives
+	scenario.build(s, { 1, 201 }, { { 4, 149 } }, false)
+	local c = scenario.train(s, "LC", 30, 201)
 	local car = s.create_entity{ name = "car", position = { 0, -40 }, direction = defines.direction.east, force = "player" }
 	car.get_fuel_inventory().insert{ name = "coal", count = 10 }
 	local asm = s.create_entity{ name = "assembling-machine-1", position = { 10.5, -60.5 }, force = "player",
 		recipe = "iron-gear-wheel" }
-	storage.t = { a = a, b = b, car = car, asm = asm, checks = checks, truth = {}, b_rails = {} }
+	storage.t = { a = a, b = b, c = c, car = car, asm = asm, checks = checks, truth = {}, b_rails = {} }
 	-- 2.0 train API checks
 	checks.train = {
 		front_end = a.front_end and a.front_end.object_name, back_end = a.back_end and a.back_end.object_name,
@@ -160,6 +163,11 @@ function T.init(cfg)
 		end)(),
 	}
 	out("init done: loop closed " .. tostring(closed) .. ", rails " .. serpent.line(used))
+end
+
+--- The straight rail centred at (x, y) on the lab surface.
+local function s_rail(x, y)
+	return game.get_surface(SURFACE).find_entities_filtered{ name = "straight-rail", position = { x, y }, radius = 1 }[1]
 end
 
 local function speed(tr, v)
@@ -212,6 +220,29 @@ function T.tick(api, cfg, t)
 	if t >= 100 and t <= 400 and g.car.valid then
 		g.car.speed = 0.2
 	end
+	-- train C: a schedule to a temporary stop on the rail at x = 251, then automatic mode; its path is read while it
+	-- drives (PLAN 4.8 item 6 needs LuaTrain.path for map matching; the capture itself does not read it)
+	if t == 100 and g.c.valid then
+		local rail = s_rail(251, 201)
+		local ok, err = pcall(function()
+			g.c.schedule = { current = 1, records = { { rail = rail, temporary = true,
+				wait_conditions = { { type = "time", compare_type = "or", ticks = 6000 } } } } }
+		end)
+		g.checks.schedule_set = ok and "LuaTrain.schedule" or tostring(err)
+		g.c.manual_mode = false
+	elseif (t == 160 or t == 400) and g.c.valid then
+		local ok, res = pcall(function()
+			local p = g.c.path
+			if p == nil then
+				return { path = "nil", state = g.c.state, speed = g.c.speed }
+			end
+			local rails = p.rails
+			return { path = p.object_name, size = p.size, current = p.current, total = p.total_distance,
+				travelled = p.travelled_distance, is_front = p.is_front, rail1 = rails[1] and rails[1].name,
+				state = g.c.state, speed = g.c.speed }
+		end)
+		g.checks["path_auto_" .. t] = ok and res or { error = tostring(res) }
+	end
 	-- the truth: both ends of both trains every tick
 	for _, name in ipairs({ "a", "b" }) do
 		local tr = g[name]
@@ -252,7 +283,8 @@ function T.tick(api, cfg, t)
 		write("truth.tsv", table.concat(g.truth, "\n") .. (#g.truth > 0 and "\n" or ""), true)
 		g.truth = {}
 		local res = { checks = g.checks, b_rails = g.b_rails, removed_rail = g.removed_rail, asm2 = g.asm2,
-			a_id = g.a.valid and g.a.id, car_unit = g.car.unit_number, asm_unit = g.asm.valid and g.asm.unit_number,
+			a_id = g.a.valid and g.a.id, c_id = g.c.valid and g.c.id, c_x = g.c.valid and g.c.front_stock.position.x,
+			car_unit = g.car.unit_number, asm_unit = g.asm.valid and g.asm.unit_number,
 			b_gone_id = g.b_gone_id }
 		if api.stats then
 			res.stats = api.stats()
@@ -316,11 +348,12 @@ function B.tick(api, cfg, t)
 		end
 	end
 	if api.charted and g.side then
-		-- cfg.charted chart events a tick: a fixed set of 201 flickering chunks and random others (an LCG, the same on
-		-- every run)
+		-- cfg.charted chart events a tick: a fixed set of 201 flickering chunks and random others over the whole area
+		-- (Park-Miller, the same on every run; its products stay below 2^46, exact in doubles: an LCG with a 2^31 modulus
+		-- and a 2^30 multiplier is not, and visited only about 1,000 distinct chunks)
 		local list = {}
 		for i = 1, (cfg.charted or 20) do
-			g.rng = (g.rng * 1103515245 + 12345) % 2147483648
+			g.rng = g.rng * 16807 % 2147483647
 			local k = g.rng % (g.side * g.side)
 			if i % 4 == 0 then
 				local j = g.rng % 201

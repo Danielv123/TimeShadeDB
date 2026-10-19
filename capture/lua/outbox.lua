@@ -85,6 +85,13 @@ function outbox.flush(tick, speed)
 	end
 end
 
+--- Drop the queued messages, keeping the counters: the capture is not configured, so nothing may be sent.
+function outbox.clear()
+	if #queue > 0 then
+		queue, moves = {}, {}
+	end
+end
+
 --- Drop everything queued (tests).
 function outbox.reset()
 	queue, moves, oversize, lines_out, bytes_out = {}, {}, 0, 0, 0

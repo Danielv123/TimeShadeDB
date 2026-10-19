@@ -87,9 +87,8 @@ type MoverSample struct {
 	// X, Y is the position in tiles: a train's leading carriage centre, a vehicle's or
 	// player's position.
 	X, Y float64
-	// Orientation is the Factorio orientation in [0, 1): 0 north, 0.25 east. Trains: the
-	// direction of travel (live capture: the leading carriage's orientation; imported
-	// illisis data: from the second carriage towards the leading one).
+	// Orientation is the Factorio orientation in [0, 1): 0 north, 0.25 east. Trains:
+	// from the second carriage towards the leading one.
 	Orientation float64
 	Flags       MoverFlags
 	// Carriages, when present, lists every carriage from the leading end (WP9 sends them

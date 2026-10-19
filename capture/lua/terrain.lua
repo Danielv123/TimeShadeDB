@@ -19,6 +19,7 @@ local terrain = {}
 local deb = core.debounce()
 local cache = core.cache(core.CACHE)
 local walk = nil -- the running resync's walk, see terrain.resync
+local walks = 0 -- resyncs started since load: each walk and its sentinel carry their own number, not the trace
 local reads, sent, skipped = 0, 0, 0
 
 --- seam(force, surface, position) -> chart or nil, or nil for the engine. Headless servers never chart, so the game
@@ -39,9 +40,9 @@ local function is_charted(force, surface, pos)
 	return force.is_chunk_charted(surface, pos)
 end
 
---- Size the last-sent cache (entries). Drops what it held.
+--- Size the last-sent cache (entries). A new size drops what it held; the same size keeps it.
 function terrain.configure(cfg)
-	if cfg.cache then
+	if cfg.cache and core.cache(cfg.cache).half ~= cache.half then
 		cache = core.cache(cfg.cache)
 	end
 end
@@ -71,6 +72,14 @@ function terrain.refresh_forces(st)
 	st.forces = forces
 end
 
+-- Surface names and planets by index, for the clip (only read with a gridworld tile). Cleared whenever a surface is
+-- created, deleted, renamed or imported.
+local surface_info = {}
+
+function terrain.forget_surfaces()
+	surface_info = {}
+end
+
 --- A deleted surface's index can be reused, so the next surface must not inherit its last-sent charts.
 function terrain.on_surface_deleted(e)
 	surface_info = {}
@@ -86,14 +95,6 @@ function terrain.on_surface_deleted(e)
 			core.cache_del(cache, key)
 		end
 	end
-end
-
--- Surface names and planets by index, for the clip (only read with a gridworld tile). Cleared whenever a surface is
--- created, deleted, renamed or imported.
-local surface_info = {}
-
-function terrain.forget_surfaces()
-	surface_info = {}
 end
 
 --- on_chunk_charted: a captured chunk of a captured force joins the queue through the debounce. A forced push (a
@@ -175,24 +176,37 @@ local function read(st, item, r)
 end
 
 --- The per-tick step: end due cool-downs, then read up to core.CHARTS queued chunks (core.RESYNC_CHARTS while a resync
---- runs). The resync's sentinel marks its chunks done. Returns the number of reads.
+--- runs), forced ones first. While a resync runs the event queue keeps one of those reads whenever it is not empty, so
+--- neither starves the other. The resync's sentinel marks its chunks done. Returns the number of reads.
 function terrain.step(st, tick, r)
 	core.cooled(deb, tick)
 	local n = 0
 	local limit = r and math.max(core.CHARTS, core.RESYNC_CHARTS) or core.CHARTS
-	while n < limit do
-		local item = core.take(deb, tick)
+	local forced = limit
+	if r and limit > 1 and core.size(deb.queue) > 0 then
+		forced = limit - 1
+	end
+	while n < forced do
+		local item = core.take(deb, tick, "forced")
 		if not item then
 			break
 		end
 		if item.resynced then
-			if r and r.trace == item.resynced then
+			if r and r.walk == item.resynced then
 				r.chunks_done = true
 			end
 		else
 			read(st, item, r)
 			n = n + 1
 		end
+	end
+	while n < limit do
+		local item = core.take(deb, tick, "events")
+		if not item then
+			break
+		end
+		read(st, item, r)
+		n = n + 1
 	end
 	return n
 end
@@ -221,13 +235,16 @@ function terrain.on_surface_created(st, e)
 end
 
 --- Start the resync's walk of every charted captured chunk, pushed forced and past the cap, then a sentinel. A newer
---- resync replaces one still running. It writes no storage, so it can start on one peer only.
+--- resync replaces one still running; it gets a new walk number (r.walk), so an older walk's sentinel still queued
+--- cannot end it, even when both resyncs share a trace. It writes no storage, so it can start on one peer only.
 function terrain.resync(st, r)
 	local list = {}
 	for _, s in pairs(game.surfaces) do
 		list[#list + 1] = s.index
 	end
-	walk = { list = list, k = 0, trace = r.trace }
+	walks = walks + 1
+	r.walk = walks
+	walk = { list = list, k = 0, id = walks }
 end
 
 --- Advance the walk: at most core.RESYNC_READS chunk positions a tick, stopping once core.RESYNC_CHUNKS charted chunks
@@ -235,11 +252,11 @@ end
 --- iterator, kept across ticks.
 function terrain.walk(st, r)
 	local w = walk
-	if not (w and r and w.trace == r.trace) then
+	if not (w and r and w.id == r.walk) then
 		return
 	end
-	if core.size(deb.queue) >= core.RESYNC_QUEUE then
-		return -- the reads catch up first: a walk ahead of them would only grow the queue
+	if core.size(deb.forced) >= core.RESYNC_QUEUE then
+		return -- the reads catch up first: a walk ahead of them would only grow the forced queue
 	end
 	local positions, pushed = 0, 0
 	while positions < core.RESYNC_READS and pushed < core.RESYNC_CHUNKS do
@@ -257,7 +274,7 @@ function terrain.walk(st, r)
 		if c == nil then
 			w.k = w.k + 1
 			if w.k > #w.list then
-				core.charted(deb, { resynced = r.trace }, true)
+				core.charted(deb, { resynced = w.id }, true)
 				walk = nil
 				return
 			end

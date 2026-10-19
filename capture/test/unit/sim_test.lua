@@ -96,13 +96,13 @@ t.test("terrain: a charted chunk is read and sent with d; an unchanged re-chart 
 	fake.chart(s, f, 1, 0, chart(2))
 	charted(capture, s, 0, 0)
 	charted(capture, s, 1, 0)
-	run(capture, 1, 1)
+	run(capture, 1, 2)
 	local chunks = of_type(log, "chunk")
-	t.expect_eq(#chunks, 2, "two chunks (CHARTS = 2 a tick)")
+	t.expect_eq(#chunks, 2, "two chunks in two ticks (CHARTS = 1 a tick)")
 	t.expect_same({ chunks[1].s, chunks[1].f, chunks[1].x, chunks[1].y, chunks[1].d }, { "nauvis", "player", 0, 0,
 		helpers.encode_string(chart(1)) })
 	charted(capture, s, 0, 0) -- cooling since the read at 1: read again at 601, unchanged
-	run(capture, 2, 1300)
+	run(capture, 3, 1300)
 	t.expect_eq(capture.terrain.state().reads, 3, "the re-chart was read when its cool-down ended")
 	t.expect_eq(#of_type(log, "chunk"), 2, "unchanged: nothing sent")
 	fake.chart(s, f, 0, 0, chart(3))
@@ -138,11 +138,11 @@ t.test("terrain: a deleted chunk is sent without d; another surface's chunk is k
 	fake.chart(lab, f, 0, 0, chart(1))
 	charted(capture, s, 0, 0)
 	charted(capture, lab, 0, 0)
-	run(capture, 1, 1)
+	run(capture, 1, 2)
 	t.expect_eq(#of_type(log, "chunk"), 2, "the same chart on two surfaces: both sent")
 	fake.chart(s, f, 0, 0, nil)
 	fire(capture, "on_chunk_deleted", { surface_index = s.index, positions = { { x = 0, y = 0 } } })
-	run(capture, 2, 2)
+	run(capture, 3, 3)
 	local chunks = of_type(log, "chunk")
 	t.expect_eq(#chunks, 3)
 	t.expect_true(chunks[3].d == nil and chunks[3].x == 0 and chunks[3].s == "nauvis", "deleted: no d")
@@ -190,7 +190,7 @@ t.test("terrain: the last-sent cache stays bounded with 200,000 charted chunks",
 	log.msgs = {}
 	collectgarbage("collect")
 	local full = collectgarbage("count")
-	capture.terrain.configure{ cache = core.CACHE }
+	capture.terrain.configure{ cache = 2 } -- a new size drops the cache
 	collectgarbage("collect")
 	local held = full - collectgarbage("count")
 	-- an unbounded cache would hold all 200,000 charts: about 200,000 / entries_ times as much
@@ -435,7 +435,7 @@ t.test("resync: the walk keeps pace with the reads; the queue stays short with 1
 	for tick = 1, 5000 do
 		game.tick = tick
 		capture.on_tick({ tick = tick })
-		peak = math.max(peak, core.size(capture.terrain.state().debounce.queue))
+		peak = math.max(peak, core.size(capture.terrain.state().debounce.forced))
 		log.msgs, log.lines = {}, {}
 		ticks = tick
 		if not capture.resyncing() then
@@ -482,4 +482,239 @@ t.test("terrain: an unchanged re-read at the end of a cool-down skips encode_str
 	-- a quiet chunk's raw chart is dropped when its cool-down ends
 	run(capture, 6701, 8000)
 	t.expect_eq(next(capture.terrain.state().debounce.raw), nil, "no raw chart left")
+end)
+
+t.test("terrain: total Lua memory stays bounded at the default chart rate with 200,000 charted chunks (G16)", function()
+	local capture, world, log = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	local core = capture.core
+	-- charts made on read, distinct per chunk, about 300 bytes deflated (as real ones): nothing outside the capture
+	-- holds them
+	f.get_chunk_chart = function(_, pos)
+		return string.rep("x", 290) .. pos.x .. "," .. pos.y
+	end
+	collectgarbage("collect")
+	local before = collectgarbage("count")
+	local n = 0
+	-- 2,000 new chunks a tick for 100 ticks: far past the queue's cap
+	run(capture, 1, 100, function()
+		for _ = 1, 2000 do
+			n = n + 1
+			charted(capture, s, n % 500, math.floor(n / 500))
+		end
+		log.msgs, log.lines = {}, {}
+	end)
+	collectgarbage("collect")
+	local peak = collectgarbage("count") - before
+	local d = capture.terrain.state().debounce
+	t.expect_eq(core.size(d.queue) + capture.terrain.state().reads + d.drops, 200000, "every event queued, read or dropped")
+	t.expect_true(core.size(d.queue) <= core.CAP, "queue " .. core.size(d.queue))
+	local drops = d.drops
+	-- read the queue empty, then let the last cool-downs end
+	local tick = 100
+	while core.size(capture.terrain.state().debounce.queue) > 0 do
+		tick = tick + 1
+		run(capture, tick, tick)
+		log.msgs, log.lines = {}, {}
+	end
+	run(capture, tick + 1, tick + 1 + core.DEBOUNCE, function()
+		log.msgs, log.lines = {}, {}
+	end)
+	log.msgs, log.lines = {}, {}
+	d = nil
+	collectgarbage("collect")
+	local final = collectgarbage("count") - before
+	local st = capture.terrain.state()
+	t.expect_true(core.cache_count(st.cache) <= core.CACHE, "cache entries " .. core.cache_count(st.cache))
+	t.expect_eq(next(st.debounce.raw), nil, "no raw chart left")
+	t.expect_eq(next(st.debounce.pending), nil, "nothing pending")
+	-- unbounded, the queue alone would hold 200,000 items and the cache 200,000 charts (over 60 MiB)
+	t.expect_true(peak < 12 * 1024, string.format("Lua memory +%.1f MiB with the queue full", peak / 1024))
+	t.expect_true(final < 12 * 1024, string.format("Lua memory +%.1f MiB once read", final / 1024))
+	print(string.format("    default rate: Lua memory +%.1f MiB with the queue full (%d queued, %d dropped), +%.1f MiB "
+		.. "once read (%d cached); Lua 5.4 in wasm", peak / 1024, core.CAP, drops, final / 1024,
+		core.cache_count(st.cache)))
+end)
+
+t.test("terrain: a chunk re-queued behind a long queue drops its raw chart", function()
+	local capture, world, log = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	local core = capture.core
+	local key = core.key(s.index, f.index, 0, 0)
+	fake.chart(s, f, 0, 0, chart(1))
+	charted(capture, s, 0, 0)
+	run(capture, 1, 1)
+	t.expect_true(capture.terrain.state().debounce.raw[key] ~= nil, "raw kept while cooling")
+	charted(capture, s, 0, 0) -- dirty: re-queued when the cool-down ends at 601
+	-- 2,000 other chunks: 1,198 are read by tick 600, so about 800 wait when (0, 0) is re-queued
+	for i = 1, 2000 do
+		fake.chart(s, f, i, 1, chart(i))
+		charted(capture, s, i, 1)
+	end
+	run(capture, 2, 601)
+	local d = capture.terrain.state().debounce
+	t.expect_true(core.size(d.queue) > core.RAW_QUEUE, "a long queue: " .. core.size(d.queue))
+	t.expect_true(d.pending[key], "(0, 0) re-queued")
+	t.expect_eq(d.raw[key], nil, "its raw chart dropped")
+end)
+
+t.test("resync: a resync restarted with the same trace is not ended by the old walk's sentinel", function()
+	local capture, world, log = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	for x = 0, 9 do
+		for y = 0, 9 do
+			fake.chart(s, f, x, y, chart(x * 10 + y))
+		end
+	end
+	capture.resync("start-1")
+	local tick = 0
+	-- until the first walk has queued its sentinel, with reads still waiting before it
+	while capture.terrain.state().walk do
+		tick = tick + 1
+		run(capture, tick, tick)
+	end
+	t.expect_true(capture.core.size(capture.terrain.state().debounce.forced) > 0, "the old sentinel is still queued")
+	local from = #of_type(log, "chunk")
+	capture.resync("start-1")
+	for _ = 1, 400 do
+		tick = tick + 1
+		run(capture, tick, tick)
+		if not capture.resyncing() then
+			break
+		end
+	end
+	local done = of_type(log, "resynced")
+	t.expect_eq(#done, 1, "one resynced: the replaced resync sends none")
+	t.expect_eq(done[1].counts.chunks, 100, "the second walk pushed every chunk")
+	local seen = {}
+	for i, m in ipairs(of_type(log, "chunk")) do
+		if i > from and m.__tick <= done[1].__tick then
+			seen[m.x .. "," .. m.y] = true
+		end
+	end
+	local nseen = 0
+	for _ in pairs(seen) do
+		nseen = nseen + 1
+	end
+	t.expect_eq(nseen, 100, "every chunk sent again before resynced")
+end)
+
+t.test("outbox: nothing queued while unconfigured is sent later; storage still forgets", function()
+	local capture, world, log = boot()
+	local s = world.surfaces.nauvis
+	local tr = fake.train(s, "LC", fake.path_lc(5000, 12), 100)
+	local alice = fake.player("alice", s, 0, 0)
+	run(capture, 1, 100, function()
+		tr.speed = 1
+		fake.place(tr, tr.pos + 1)
+		alice.physical_position = { x = game.tick * 0.1, y = 0 }
+	end)
+	local st = storage.timeshade
+	local j = st.by_train[tr.id]
+	t.expect_true(j and st.movers[j].s, "the train was sampled")
+	t.expect_true(st.movers["p:alice"] and st.movers["p:alice"].s, "the player was sampled")
+	local sent = #log.msgs
+	st.configured = false -- the standalone mod's setting turned off
+	tr.valid = false
+	fire(capture, "on_object_destroyed", { registration_number = st.movers[j].reg })
+	fire(capture, "on_player_left_game", { player_index = alice.index })
+	run(capture, 101, 200)
+	t.expect_eq(st.movers[j], nil, "the journey is forgotten")
+	t.expect_eq(capture.outbox.pending(), 0, "nothing queued")
+	st.configured = true
+	run(capture, 201, 201)
+	for i = sent + 1, #log.msgs do
+		local m = log.msgs[i]
+		t.expect_true(m.type ~= "move", "no move message after re-enabling: " .. json.encode(m))
+	end
+end)
+
+t.test("config: tunables a later config omits return to their defaults; Universal Edges is traced", function()
+	local capture = boot{ debounce = 100, charts = 3 }
+	local core = capture.core
+	t.expect_eq(core.DEBOUNCE, 100)
+	t.expect_eq(core.CHARTS, 3)
+	capture.config{ forces = { "player" } }
+	t.expect_eq(core.DEBOUNCE, 600, "debounce back to its default")
+	t.expect_eq(core.CHARTS, 1, "charts back to its default")
+	capture.on_load()
+	t.expect_eq(core.DEBOUNCE, 600, "on_load agrees")
+	local capture2, _, log2 = boot()
+	capture2.ue = { api_version = 1 }
+	capture2.config{ forces = { "player" } }
+	run(capture2, 1, 1)
+	local traces = of_type(log2, "trace")
+	t.expect_true(#traces == 1 and traces[1].op == "timeshade.integration" and traces[1].phase == "universal_edges",
+		"the integration trace")
+	capture2.ue = nil
+end)
+
+t.test("trains: h points from the carriage behind the leading one towards it", function()
+	local capture, world, log = boot()
+	local s = world.surfaces.nauvis
+	local tr = fake.train(s, "LCC", fake.path_lc(60, 12), 20)
+	run(capture, 1, 300, function()
+		tr.speed = 0.5
+		fake.place(tr, tr.pos + 0.5)
+	end)
+	local checked = 0
+	for _, e in ipairs(entries(log, storage.timeshade.by_train[tr.id])) do
+		if e.car then
+			local a, b = e.car[1], e.car[2]
+			local want = capture.core.heading(a[1], a[2], b[1], b[2])
+			t.expect_true(capture.core.turn(e.h, want) < 0.002, string.format("h %.3f, chord %.3f", e.h, want))
+			checked = checked + 1
+		end
+	end
+	t.expect_true(checked >= 1, "samples with car")
+end)
+
+t.test("globals: the capture writes no global variable", function()
+	local capture, world = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	setmetatable(_G, { __newindex = function(_, k)
+		error("global written: " .. tostring(k), 2)
+	end })
+	local ok, err = pcall(function()
+		fake.chart(s, f, 0, 0, chart(1))
+		charted(capture, s, 0, 0)
+		fire(capture, "on_surface_created", { surface_index = s.index })
+		fire(capture, "on_surface_deleted", { surface_index = 99 })
+		capture.resync("g")
+		run(capture, 1, 50)
+	end)
+	setmetatable(_G, nil)
+	t.expect_true(ok, tostring(err))
+end)
+
+t.test("resync: a full event queue neither stalls the resync nor is starved by it", function()
+	local capture, world, log = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	local core = capture.core
+	for x = 0, 19 do
+		for y = 0, 19 do
+			fake.chart(s, f, x, y, chart(x * 20 + y))
+		end
+	end
+	-- 3,000 other chunks charted by events: the event queue never empties while the resync runs
+	for i = 1, 3000 do
+		fake.chart(s, f, 1000 + i, 0, chart(i))
+		charted(capture, s, 1000 + i, 0)
+	end
+	capture.resync("busy")
+	local ticks, event_reads = 0, 0
+	for tick = 1, 2000 do
+		local before = core.size(capture.terrain.state().debounce.queue)
+		run(capture, tick, tick)
+		event_reads = event_reads + before - core.size(capture.terrain.state().debounce.queue)
+		log.msgs, log.lines = {}, {}
+		ticks = tick
+		if not capture.resyncing() then
+			break
+		end
+	end
+	t.expect_eq(capture.resyncing(), nil, "the resync finished")
+	-- the walk finds all 3,400 charted chunks: 3,400 forced reads at 3 a tick, the events one a tick
+	t.expect_true(ticks <= 3400 / (core.RESYNC_CHARTS - 1) + 30, "in " .. ticks .. " ticks")
+	t.expect_true(event_reads >= ticks - 30, "event reads went on: " .. event_reads .. " in " .. ticks .. " ticks")
 end)

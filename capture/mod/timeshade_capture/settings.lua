@@ -20,7 +20,7 @@ data:extend({
 		type = "int-setting",
 		name = "timeshade-capture-chart-reads",
 		setting_type = "runtime-global",
-		default_value = 2,
+		default_value = 1,
 		minimum_value = 1,
 		maximum_value = 64,
 		order = "c",
