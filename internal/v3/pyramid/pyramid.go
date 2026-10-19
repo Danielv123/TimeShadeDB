@@ -311,6 +311,59 @@ func loadState(sr core.Series, ct *ctile) error {
 	return nil
 }
 
+// loadOpenWorkers bounds the series ensureDS opens at once.
+const loadOpenWorkers = 16
+
+// loadTiles runs loadState for every tile, opening and closing its series, with up to
+// loadOpenWorkers at a time. It returns the first error.
+func (p *Pyramid) loadTiles(ctx context.Context, tiles []*ctile, names []string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		first   error
+	)
+	fail := func(err error) {
+		errOnce.Do(func() { first = err; cancel() })
+	}
+	jobs := make(chan int)
+	for w := 0; w < min(loadOpenWorkers, len(tiles)); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				sr, err := p.series.Open(ctx, names[i], false)
+				if err != nil {
+					fail(fmt.Errorf("pyramid: open %s: %w", names[i], err))
+					continue
+				}
+				err = loadState(sr, tiles[i])
+				if e := sr.Close(); err == nil {
+					err = e
+				}
+				if err != nil {
+					fail(fmt.Errorf("pyramid: load %s: %w", names[i], err))
+				}
+			}
+		}()
+	}
+feed:
+	for i := range tiles {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break feed
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if first != nil {
+		return first
+	}
+	return ctx.Err()
+}
+
 // newTile returns an empty coarse tile.
 func newTile(c core.TileCoord) *ctile {
 	return &ctile{coord: c, lastT: math.MinInt64, blast: math.MinInt64, descT: math.MinInt64, cleanT: math.MinInt64}
@@ -340,30 +393,30 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 	if err != nil {
 		return nil, err
 	}
+	var tiles []*ctile
+	var tileNames []string
 	for _, name := range names {
 		tile, ok := parseSeriesName(prefix, name)
 		if !ok || tile.Z < p.opt.MinZ {
 			continue
 		}
-		sr, err := p.series.Open(ctx, name, false)
-		if err != nil {
-			return nil, fmt.Errorf("pyramid: open %s: %w", name, err)
-		}
-		ct := newTile(tile)
-		err = loadState(sr, ct)
-		if e := sr.Close(); err == nil {
-			err = e
-		}
-		if err != nil {
-			return nil, fmt.Errorf("pyramid: load %s: %w", name, err)
-		}
+		tiles = append(tiles, newTile(tile))
+		tileNames = append(tileNames, name)
+	}
+	// Opening a series is mostly waiting on the file system (index read, last record
+	// check), and much slower on Windows while files are fresh from a bulk write, so
+	// the series of a datastore are loaded in parallel.
+	if err := p.loadTiles(ctx, tiles, tileNames); err != nil {
+		return nil, err
+	}
+	for _, ct := range tiles {
 		// Records found at open were synced by the store or survived its recovery.
 		ct.n, ct.firstT, ct.lastT = ct.bn, ct.bfirstT, ct.blast
 		if ct.n > 0 {
 			ct.descT = ct.lastT
 			d.builtT = max(d.builtT, ct.lastT)
 		}
-		d.tiles[tile] = ct
+		d.tiles[ct.coord] = ct
 	}
 	d.seenT = d.builtT
 	p.mu.Lock()
