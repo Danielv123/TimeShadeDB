@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -115,6 +116,9 @@ type Pyramid struct {
 	buildMu sync.Mutex
 	// loading holds a channel per datastore being loaded by ensureDS, closed when done.
 	loading map[core.DatastoreKey]chan struct{}
+	// lazyErr remembers a deferred datastore whose load failed, so reads return the
+	// error until the retry time instead of scanning its series on every request.
+	lazyErr map[core.DatastoreKey]lazyFailure
 }
 
 var _ core.TileSource = (*Pyramid)(nil)
@@ -259,6 +263,35 @@ func New(ctx context.Context, terrain Terrain, series core.SeriesStore, opt Opti
 	return p, nil
 }
 
+// lazyFailure is a failed load of a deferred datastore.
+type lazyFailure struct {
+	err   error
+	until time.Time
+}
+
+// lazyRetry is how long a failed deferred load is remembered.
+const lazyRetry = 10 * time.Second
+
+// loadDeferred loads a deferred datastore, remembering a failure for lazyRetry.
+func (p *Pyramid) loadDeferred(ctx context.Context, key core.DatastoreKey) (*dsState, error) {
+	p.mu.RLock()
+	f, failed := p.lazyErr[key]
+	p.mu.RUnlock()
+	if failed && time.Now().Before(f.until) {
+		return nil, f.err
+	}
+	d, err := p.ensureDS(ctx, key)
+	if err != nil && ctx.Err() == nil && !errors.Is(err, core.ErrClosed) {
+		p.mu.Lock()
+		if p.lazyErr == nil {
+			p.lazyErr = map[core.DatastoreKey]lazyFailure{}
+		}
+		p.lazyErr[key] = lazyFailure{err: err, until: time.Now().Add(lazyRetry)}
+		p.mu.Unlock()
+	}
+	return d, err
+}
+
 // Preload loads every datastore New deferred (Options.Lazy). It is safe to run while
 // the pyramid serves; reads of a datastore not loaded yet load it themselves.
 func (p *Pyramid) Preload(ctx context.Context) error {
@@ -277,7 +310,7 @@ func (p *Pyramid) Preload(ctx context.Context) error {
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			_, errs[i] = p.ensureDS(ctx, k)
+			_, errs[i] = p.loadDeferred(ctx, k)
 		}()
 	}
 	wg.Wait()
@@ -298,7 +331,7 @@ func (p *Pyramid) getDS(key core.DatastoreKey) (*dsState, bool, error) {
 	if d != nil || !deferred {
 		return d, false, nil
 	}
-	d, err := p.ensureDS(context.Background(), key)
+	d, err := p.loadDeferred(context.Background(), key)
 	return d, false, err
 }
 
@@ -485,6 +518,7 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 		return nil, core.ErrClosed
 	}
 	delete(p.lazy, key)
+	delete(p.lazyErr, key)
 	if cur := p.ds[key]; cur != nil {
 		return cur, nil
 	}
