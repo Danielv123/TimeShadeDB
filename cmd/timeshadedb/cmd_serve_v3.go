@@ -149,9 +149,10 @@ func (v *v3Server) Close() error {
 }
 
 // openV3Server opens every store under o.db and builds the API server. The memory
-// budget is split (PLAN.md §4.3): to the terrain store 1/8 for decoded tiles, 3/32 for
-// open windows (Apply refuses batches beyond it: 1/16 was too little for the synthetic
-// soak at 100x) and 3/64 for idle indexes; 1/8 to the encoded-response cache, 1/16 to decoded coarse images, 1/32 to overlay caches
+// budget is split (PLAN.md §4.3): to the terrain store 3/32 for decoded tiles, 1/8 for
+// open windows (Apply refuses batches beyond it, counting every update of a batch as a
+// new open chunk: 1/16 was too little for the synthetic soak at 100x and 3/32 for the
+// test data's 60 s stream) and 3/64 for idle indexes; 1/8 to the encoded-response cache, 1/16 to decoded coarse images, 1/32 to overlay caches
 // and an eighth bounds the mover open rows (held only while a burst outruns the commit
 // loop). The rest of the budget is the working memory of ingest and reads, the encoders
 // and the collector's headroom: with full caches the live heap measured about 190 MiB
@@ -175,7 +176,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		refClock = dataClock.Seen
 	}
 
-	topt := terrain.Options{DecodedCacheBytes: o.memBudget / 8, OpenWindowBytes: o.memBudget * 3 / 32, MaxIndexBytes: o.memBudget * 3 / 64}
+	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64}
 	topt.Window = core.TimeMs(o.window.Milliseconds())
 	// Each commit worker holds decoded tiles and an encoder; bound them for memory.
 	topt.Workers = min(runtime.GOMAXPROCS(0), 8)
