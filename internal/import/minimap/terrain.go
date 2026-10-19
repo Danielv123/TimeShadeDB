@@ -75,14 +75,17 @@ type TerrainReport struct {
 	Windows int         `json:"windows"`
 	FirstT  core.TimeMs `json:"first"`
 	LastT   core.TimeMs `json:"last"`
-	Errors  []string    `json:"errors,omitempty"`
-	windows map[core.TimeMs]struct{}
-	mu      sync.Mutex
+	// ErrorCount files failed to read or decode; Errors lists the first 20.
+	ErrorCount int      `json:"error_count"`
+	Errors     []string `json:"errors,omitempty"`
+	windows    map[core.TimeMs]struct{}
+	mu         sync.Mutex
 }
 
 func (r *TerrainReport) addErr(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.ErrorCount++
 	if len(r.Errors) < 20 {
 		r.Errors = append(r.Errors, err.Error())
 	}

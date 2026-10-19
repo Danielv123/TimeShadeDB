@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -343,8 +344,7 @@ func pickSnaps(snaps []int64, n int) []int64 {
 	return out
 }
 
-// MoverVerify is the read-back check of one surface: the store's closed windows
-// counted the same way as MoverReport.Imported.
+// MoverVerify checks one surface's movers in the store against the illisis source.
 type MoverVerify struct {
 	Surface string `json:"surface"`
 	// Stored counts every row of every closed window.
@@ -352,14 +352,48 @@ type MoverVerify struct {
 	Handoffs  int         `json:"handoffs"`
 	Keyframes int         `json:"keyframes"`
 	Windows   int         `json:"windows"`
-	// Match is true when Stored and Handoffs equal the import report's Imported and
-	// Handoffs.
+	// CountsMatch is true when Stored and Handoffs equal the import report's Imported
+	// and Handoffs.
+	CountsMatch bool `json:"counts_match"`
+
+	// The source comparison decodes every window file again and looks each source row
+	// up in the store, independently of the import's fixes and report.
+	//
+	// SourceRows were decoded. SourceDups of them are followed, in their journey's time
+	// order, by a row with the same stamp and have no stored row before that stamp: the
+	// duplicate rule dropped them.
+	SourceRows int `json:"source_rows"`
+	SourceDups int `json:"source_dups"`
+	// Matched source rows have a stored row of the same journey, both gones or both
+	// samples, with T in [stamp - 5 s, stamp] and X, Y within 1/16 tile.
+	// MatchedRetimed of them were stored with T before the stamp (the clamp fix).
+	Matched        int `json:"matched"`
+	MatchedRetimed int `json:"matched_retimed"`
+	// Missing source rows (not duplicates) have no stored row.
+	Missing int `json:"missing"`
+	// Extra stored rows match no source row; they must be the keyframe seeds.
+	Extra int `json:"extra"`
+	// FlagErrors are matched stored rows without FlagNoTick, player or vehicle samples
+	// without FlagNoHeading, and train samples whose orientation is not the source
+	// heading.
+	FlagErrors int      `json:"flag_errors"`
+	Examples   []string `json:"examples,omitempty"`
+	// Match is true when the counts match and the source comparison agrees with the
+	// import report: no missing rows, Extra equal to the seeds, SourceDups equal to the
+	// dropped duplicates, MatchedRetimed equal to the re-timed samples and gones, and
+	// no flag errors.
 	Match bool `json:"match"`
 }
 
-// VerifyMovers reads every closed window back from the store and compares the counts
-// with the import report.
-func VerifyMovers(ctx context.Context, rep *Report, store core.MoverStore) ([]MoverVerify, error) {
+func (v *MoverVerify) example(format string, args ...any) {
+	if len(v.Examples) < 10 {
+		v.Examples = append(v.Examples, fmt.Sprintf(format, args...))
+	}
+}
+
+// VerifyMovers reads every closed window back from the store, compares the counts with
+// the import report, and compares the stored rows with the source rows of d.
+func VerifyMovers(ctx context.Context, d *Dataset, rep *Report, store core.MoverStore) ([]MoverVerify, error) {
 	infos, err := store.Surfaces(ctx)
 	if err != nil {
 		return nil, err
@@ -367,6 +401,10 @@ func VerifyMovers(ctx context.Context, rep *Report, store core.MoverStore) ([]Mo
 	byID := map[string]core.SurfaceInfo{}
 	for _, in := range infos {
 		byID[in.ID] = in
+	}
+	srcs := map[string]*SourceSurface{}
+	for _, src := range d.Surfaces {
+		srcs[src.Key.ID()] = src
 	}
 	var out []MoverVerify
 	for _, mr := range rep.Movers {
@@ -409,10 +447,217 @@ func VerifyMovers(ctx context.Context, rep *Report, store core.MoverStore) ([]Mo
 				v.Stored.Journeys[string(k)]++
 			}
 		}
-		v.Match = countsEqual(v.Stored, mr.Imported) && v.Handoffs == mr.Handoffs
+		v.CountsMatch = countsEqual(v.Stored, mr.Imported) && v.Handoffs == mr.Handoffs
+		src := srcs[mr.Surface]
+		if src == nil {
+			return out, fmt.Errorf("minimap: surface %s is not in the dataset", mr.Surface)
+		}
+		if err := compareMoverSource(ctx, src, store, &v); err != nil {
+			return out, err
+		}
+		v.Extra = sum(v.Stored.Samples) + sum(v.Stored.Gones) - v.Matched
+		retimed := sum(mr.Retimed) + mr.RetimedGones
+		v.Match = v.CountsMatch && v.Missing == 0 && v.FlagErrors == 0 && v.Extra == mr.KeyframeSeeded &&
+			v.SourceDups == mr.DupSamplesDropped+mr.DupGonesDropped && v.MatchedRetimed == retimed
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+func sum(m map[string]int) int {
+	n := 0
+	for _, v := range m {
+		n += v
+	}
+	return n
+}
+
+// storedWindow is one closed store window indexed by journey for the source comparison.
+type storedWindow struct {
+	win  *core.MoverWindow
+	byID map[string][]int
+	used []bool
+}
+
+// compareMoverSource decodes src's window files in order and looks every source row up
+// in the store. It holds only the store windows around the watermark and the source
+// rows of each journey that are not complete yet, so its memory does not grow with the
+// history either.
+func compareMoverSource(ctx context.Context, src *SourceSurface, store core.MoverStore, v *MoverVerify) error {
+	ctx, cancel := context.WithCancel(ctx)
+	pool := newDecodePool(runtime.GOMAXPROCS(0))
+	defer pool.close()
+	defer cancel()
+	futs := pool.prefetch(ctx, src, runtime.GOMAXPROCS(0))
+
+	cache := map[core.TimeMs]*storedWindow{}
+	load := func(start core.TimeMs) (*storedWindow, error) {
+		if w, ok := cache[start]; ok {
+			return w, nil
+		}
+		w := &storedWindow{byID: map[string][]int{}}
+		win, err := store.Window(ctx, src.Key, start)
+		switch {
+		case errors.Is(err, core.ErrNoVersion):
+		case err != nil:
+			return nil, err
+		default:
+			w.win = win
+			w.used = make([]bool, len(win.Rows))
+			for i, r := range win.Rows {
+				id := win.Movers[r.Mover].ID
+				w.byID[id] = append(w.byID[id], i)
+			}
+		}
+		cache[start] = w
+		return w, nil
+	}
+	const tol = 1.0 / core.PosUnits
+	// check looks r up in the store. With earlier set, r is followed by a row with the
+	// same stamp: it survives the duplicate rule only if it was re-timed, so only stored
+	// rows before the stamp match it, and no match means it was dropped.
+	check := func(r *srcRow, earlier bool) error {
+		id := r.meta.ID
+		lo, hi := core.TimeMs(r.t-retimeMaxShift), core.TimeMs(r.t)
+		if earlier {
+			hi--
+		}
+		gone := r.flags&rowGone != 0
+		var best *storedWindow
+		bestI := -1
+		for ws := core.WindowStart(lo, core.MoverWindowLen); ws <= hi; ws += core.MoverWindowLen {
+			w, err := load(ws)
+			if err != nil {
+				return err
+			}
+			for _, i := range w.byID[id] {
+				row := &w.win.Rows[i]
+				if w.used[i] || row.T < lo || row.T > hi || (row.Flags&core.FlagGone != 0) != gone {
+					continue
+				}
+				if !gone && (math.Abs(row.X-r.x) > tol || math.Abs(row.Y-r.y) > tol) {
+					continue
+				}
+				if bestI < 0 || row.T == hi {
+					best, bestI = w, i
+				}
+			}
+		}
+		if bestI < 0 && earlier {
+			v.SourceDups++
+			return nil
+		}
+		if bestI < 0 {
+			v.Missing++
+			v.example("missing: %s t=%d gone=%v x=%.3f y=%.3f", id, r.t, gone, r.x, r.y)
+			return nil
+		}
+		best.used[bestI] = true
+		row := &best.win.Rows[bestI]
+		v.Matched++
+		if row.T != core.TimeMs(r.t) {
+			v.MatchedRetimed++
+		}
+		bad := row.Flags&core.FlagNoTick == 0
+		if !gone {
+			switch r.meta.Kind {
+			case core.KindPlayer, core.KindVehicle:
+				bad = bad || row.Flags&core.FlagNoHeading == 0
+			case core.KindTrain:
+				if r.flags&rowHasH != 0 {
+					bad = bad || core.QuantizeOrientation(r.h) != core.QuantizeOrientation(row.Orientation)
+				}
+			}
+		}
+		if bad {
+			v.FlagErrors++
+			v.example("flags: %s t=%d stored %+v", id, r.t, *row)
+		}
+		return nil
+	}
+
+	metas := map[core.MoverMeta]*core.MoverMeta{}
+	pend := map[string][]srcRow{}
+	var order []string // journeys in first-seen order, for a deterministic check order
+	// settle checks every journey's rows before the watermark M: they are complete, and
+	// a row with the same stamp as the last of them would be before M too.
+	settle := func(M int64) error {
+		for _, id := range order {
+			rows := pend[id]
+			n := 0
+			for n < len(rows) && rows[n].t < M {
+				n++
+			}
+			// Rows with equal stamps: the last one always survives (it keeps its stamp or
+			// is re-timed); check it first, then the earlier ones.
+			for k := 0; k < n; {
+				g := k + 1
+				for g < n && rows[g].t == rows[k].t {
+					g++
+				}
+				for i := g - 1; i >= k; i-- {
+					if err := check(&rows[i], i < g-1); err != nil {
+						return err
+					}
+				}
+				k = g
+			}
+			m := copy(rows, rows[n:])
+			pend[id] = rows[:m]
+		}
+		// Store windows that end more than retimeMaxShift before M are not needed again.
+		for start := range cache {
+			if int64(start+core.MoverWindowLen) < M-retimeMaxShift {
+				delete(cache, start)
+			}
+		}
+		return nil
+	}
+	for _, name := range src.Windows {
+		var f chan decodedWindow
+		var ok bool
+		select {
+		case f, ok = <-futs:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if !ok {
+			return ctx.Err()
+		}
+		dw := <-f
+		if err := settle(name); err != nil {
+			return err
+		}
+		if dw.err != nil {
+			continue
+		}
+		local := make([]*core.MoverMeta, len(dw.metas))
+		for i, m := range dw.metas {
+			if dw.metaOK[i] {
+				p, ok := metas[m]
+				if !ok {
+					p = &m
+					metas[m] = p
+				}
+				local[i] = p
+			}
+		}
+		for k, r := range dw.rows {
+			r.meta = local[dw.mi[k]]
+			v.SourceRows++
+			id := r.meta.ID
+			rows, seen := pend[id]
+			if !seen {
+				order = append(order, id)
+			}
+			i := sort.Search(len(rows), func(i int) bool { return rows[i].t > r.t })
+			rows = append(rows, srcRow{})
+			copy(rows[i+1:], rows[i:])
+			rows[i] = r
+			pend[id] = rows
+		}
+	}
+	return settle(math.MaxInt64)
 }
 
 func countsEqual(a, b MoverCounts) bool {

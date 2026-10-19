@@ -105,7 +105,7 @@ type decodedWindow struct {
 	metaOK  []bool
 	rows    []srcRow // meta is nil; mi holds the window-local mover index
 	mi      []int32
-	first   int64    // the file's time (its earliest row)
+	first   int64 // the file's time (its earliest row)
 	last    int64
 	invalid int
 	err     error
@@ -237,10 +237,13 @@ type MoverReport struct {
 	Imported MoverCounts `json:"imported"`
 	FirstT   core.TimeMs `json:"first"`
 	LastT    core.TimeMs `json:"last"`
-	Errors   []string    `json:"errors,omitempty"`
+	// ErrorCount files failed to read or decode; Errors lists the first 20.
+	ErrorCount int      `json:"error_count"`
+	Errors     []string `json:"errors,omitempty"`
 }
 
 func (r *MoverReport) addErr(err error) {
+	r.ErrorCount++
 	if len(r.Errors) < 20 {
 		r.Errors = append(r.Errors, err.Error())
 	}
@@ -457,4 +460,3 @@ func headingFromVelocity(vx, vy float64) float64 {
 	}
 	return o
 }
-

@@ -154,7 +154,7 @@ func TestVerifyTerrainDetectsDifferences(t *testing.T) {
 
 func TestImportMovers(t *testing.T) {
 	ctx := context.Background()
-	exp, _, rep, s := importSynthetic(t, 0)
+	exp, d, rep, s := importSynthetic(t, 0)
 	if len(rep.Movers) != 1 {
 		t.Fatalf("mover reports: %+v", rep.Movers)
 	}
@@ -188,12 +188,13 @@ func TestImportMovers(t *testing.T) {
 		t.Fatalf("mover apply: %+v", rep.MoverApply)
 	}
 
-	mv, err := minimap.VerifyMovers(ctx, rep, s.m)
+	mv, err := minimap.VerifyMovers(ctx, d, rep, s.m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(mv) != 1 || !mv[0].Match {
-		t.Fatalf("mover read-back: %+v vs %+v", mv, mr.Imported)
+	if len(mv) != 1 || !mv[0].Match || mv[0].SourceRows != 18 || mv[0].Matched != 17 || mv[0].MatchedRetimed != 2 ||
+		mv[0].SourceDups != 1 || mv[0].Extra != 1 || mv[0].Missing != 0 {
+		t.Fatalf("mover verify: %+v vs %+v", mv, mr.Imported)
 	}
 
 	// Look at the stored rows.
@@ -321,7 +322,8 @@ func TestImportReportsCorruptFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Terrain[0].Errors) != 1 || len(rep.Movers[0].Errors) != 1 {
+	if len(rep.Terrain[0].Errors) != 1 || len(rep.Movers[0].Errors) != 1 || rep.Terrain[0].ErrorCount != 1 ||
+		rep.Movers[0].ErrorCount != 1 || rep.FileErrors() != 2 {
 		t.Fatalf("errors not reported: terrain %v movers %v", rep.Terrain[0].Errors, rep.Movers[0].Errors)
 	}
 	tv, err := minimap.VerifyTerrain(context.Background(), d, s.t, minimap.Options{}, minimap.VerifyOptions{})
@@ -330,5 +332,43 @@ func TestImportReportsCorruptFiles(t *testing.T) {
 	}
 	if tv.OK() {
 		t.Fatal("verify passed with a corrupt change file")
+	}
+}
+
+// shiftingMovers moves one sample by a tile on its way into the store, keeping every
+// count the same.
+type shiftingMovers struct {
+	*memstore.Movers
+	id string
+	t  core.TimeMs
+}
+
+func (s shiftingMovers) Append(ctx context.Context, samples []core.MoverSample) (core.ApplyResult, error) {
+	for i := range samples {
+		if samples[i].Meta.ID == s.id && samples[i].T == s.t {
+			samples[i].X++
+		}
+	}
+	return s.Movers.Append(ctx, samples)
+}
+
+func TestVerifyMoversDetectsDifferences(t *testing.T) {
+	ctx := context.Background()
+	exp := minimaptest.Write(t, t.TempDir())
+	d, err := minimap.Open(exp.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := shiftingMovers{memstore.NewMovers(), exp.Vehicle, core.TimeMs(minimaptest.T0 + 2000)}
+	rep, err := minimap.Import(ctx, d, minimap.Options{Movers: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mv, err := minimap.VerifyMovers(ctx, d, rep, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mv) != 1 || mv[0].Match || !mv[0].CountsMatch || mv[0].Missing != 1 || mv[0].Extra != 2 || len(mv[0].Examples) != 1 {
+		t.Fatalf("verify should find the moved sample: %+v", mv)
 	}
 }

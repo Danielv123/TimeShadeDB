@@ -96,3 +96,23 @@ func TestImportMinimapCommandErrors(t *testing.T) {
 		t.Fatalf("help: %v\n%s", err, buf.String())
 	}
 }
+
+func TestImportMinimapCommandFailsOnCorruptFiles(t *testing.T) {
+	exp := minimaptest.Write(t, t.TempDir())
+	p := filepath.Join(exp.Root, "gw-test~2E1", "nauvis", "m", "1791630300001.m.gz")
+	if err := os.WriteFile(p, []byte("garbage"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	err := runImportMinimap(context.Background(), &buf, []string{exp.Root})
+	if err == nil || !strings.Contains(err.Error(), "1 files failed") {
+		t.Fatalf("corrupt window file: err = %v\n%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "error: ") {
+		t.Errorf("output does not list the error:\n%s", buf.String())
+	}
+	buf.Reset()
+	if err := runImportMinimap(context.Background(), &buf, []string{"--allow-errors", exp.Root}); err != nil {
+		t.Fatalf("--allow-errors: %v\n%s", err, buf.String())
+	}
+}

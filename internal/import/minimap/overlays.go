@@ -31,8 +31,10 @@ type OverlayReport struct {
 	Intervals int `json:"intervals"`
 	// Events handed to the store (an open per version, a close per ended version that
 	// the next version does not replace).
-	Events int      `json:"events"`
-	Errors []string `json:"errors,omitempty"`
+	Events int `json:"events"`
+	// ErrorCount files failed to read or decode; Errors lists the first 20.
+	ErrorCount int      `json:"error_count"`
+	Errors     []string `json:"errors,omitempty"`
 	// tiles are the z0 tiles holding the versions, for the read-back check.
 	tiles map[core.TileCoord]struct{}
 	first core.TimeMs
@@ -134,6 +136,7 @@ func importOverlays(ctx context.Context, d *Dataset, opt *Options, store core.Ov
 		for _, f := range files {
 			list, err := readVersions(f.path)
 			if err != nil {
+				rep.ErrorCount++
 				if len(rep.Errors) < 20 {
 					rep.Errors = append(rep.Errors, err.Error())
 				}

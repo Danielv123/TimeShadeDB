@@ -142,13 +142,15 @@ func TestTestdata(t *testing.T) {
 	if trainJumps > 2 {
 		t.Errorf("%d train jumps left after the fixes, want <= 2", trainJumps)
 	}
-	mv, err := minimap.VerifyMovers(ctx, rep, s.m)
+	mv, err := minimap.VerifyMovers(ctx, d, rep, s.m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, v := range mv {
+		t.Logf("%s: verify %d source rows, %d matched (%d re-timed), %d dups, %d missing, %d extra, %d flag errors",
+			v.Surface, v.SourceRows, v.Matched, v.MatchedRetimed, v.SourceDups, v.Missing, v.Extra, v.FlagErrors)
 		if !v.Match {
-			t.Errorf("mover read-back mismatch: %+v", v)
+			t.Errorf("mover verify mismatch: %+v", v)
 		}
 	}
 

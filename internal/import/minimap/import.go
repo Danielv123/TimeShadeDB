@@ -87,6 +87,22 @@ type Report struct {
 	TotalMs    int64 `json:"total_ms"`
 }
 
+// FileErrors is the number of files that failed to read or decode. Import skips them
+// and goes on, so a non-zero count means the import is incomplete.
+func (r *Report) FileErrors() int {
+	n := 0
+	for _, t := range r.Terrain {
+		n += t.ErrorCount
+	}
+	for _, m := range r.Movers {
+		n += m.ErrorCount
+	}
+	for _, o := range r.Overlays {
+		n += o.ErrorCount
+	}
+	return n
+}
+
 // Import reads the dataset and feeds it into the stores in opt. Terrain, movers and
 // overlays are imported concurrently (they go to separate stores).
 func Import(ctx context.Context, d *Dataset, opt Options) (*Report, error) {

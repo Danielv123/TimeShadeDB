@@ -614,7 +614,7 @@ func (h *streamHeap) Less(i, j int) bool {
 	return h.idx[i] < h.idx[j]
 }
 func (h *streamHeap) Swap(i, j int) { h.idx[i], h.idx[j] = h.idx[j], h.idx[i] }
-func (h *streamHeap) Push(x any)   { h.idx = append(h.idx, x.(int)) }
+func (h *streamHeap) Push(x any)    { h.idx = append(h.idx, x.(int)) }
 func (h *streamHeap) Pop() any {
 	x := h.idx[len(h.idx)-1]
 	h.idx = h.idx[:len(h.idx)-1]

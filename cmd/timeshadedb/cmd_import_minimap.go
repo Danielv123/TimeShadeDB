@@ -63,6 +63,7 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	history := fs.Int("verify-history", 0, "historical checks per z0 area with --verify (-1: every snapshot)")
 	reportPath := fs.String("report", "", "write the full JSON report to this file")
 	mapsOut := fs.String("maps-out", "", "write the catalog map metadata (core.MapInfo list) to this JSON file")
+	allowErrors := fs.Bool("allow-errors", false, "exit 0 even when some files fail to read or decode (a best-effort import)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fs.SetOutput(stdout)
@@ -138,7 +139,7 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 			}
 		}
 		if opt.Movers != nil {
-			mv, err := minimap.VerifyMovers(ctx, rep, stores.Movers)
+			mv, err := minimap.VerifyMovers(ctx, d, rep, stores.Movers)
 			if err != nil {
 				return err
 			}
@@ -147,6 +148,11 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 				ok = ok && v.Match
 				fmt.Fprintf(stdout, "verify movers %s: match=%v windows=%d keyframes=%d samples=%v gones=%v handoffs=%d\n",
 					v.Surface, v.Match, v.Windows, v.Keyframes, fmtCounts(v.Stored.Samples), fmtCounts(v.Stored.Gones), v.Handoffs)
+				fmt.Fprintf(stdout, "  against the source: %d rows, %d matched (%d re-timed), %d duplicates, %d missing, %d extra, %d flag errors\n",
+					v.SourceRows, v.Matched, v.MatchedRetimed, v.SourceDups, v.Missing, v.Extra, v.FlagErrors)
+				for _, e := range v.Examples {
+					fmt.Fprintf(stdout, "  %s\n", e)
+				}
 			}
 		}
 		if opt.Overlays != nil {
@@ -173,6 +179,9 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	}
 	if !ok {
 		return errors.New("import-minimap: verification failed")
+	}
+	if n := rep.FileErrors(); n > 0 && !*allowErrors {
+		return fmt.Errorf("import-minimap: %d files failed to read or decode (listed above); the import is incomplete (--allow-errors accepts that)", n)
 	}
 	return nil
 }
@@ -242,6 +251,9 @@ func printImportReport(w io.Writer, r *minimap.Report, heap uint64) {
 	for _, o := range r.Overlays {
 		fmt.Fprintf(w, "overlays %s: %d tag and %d recipe versions, %d invalid, %d empty, %d overlaps -> %d intervals, %d events\n",
 			o.DS, o.TagVersions, o.RecipeVersions, o.Invalid, o.Empty, o.Overlaps, o.Intervals, o.Events)
+		for _, e := range o.Errors {
+			fmt.Fprintf(w, "  error: %s\n", e)
+		}
 	}
 	fmt.Fprintf(w, "overlay store: %+v\n", r.OverlayApply)
 	for _, s := range r.Warnings {
