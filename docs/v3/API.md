@@ -253,6 +253,22 @@ maps calls to these paths:
 On the live server the catalog route is `catalog` and also answers `catalog.json`. Uploads
 set `Content-Encoding` (gzip by default) and `Content-Type` per object.
 
+What the exporter writes (`internal/v3/publish/README.md` has the details and sizes):
+
+- Tile versions: every version of every tile at every level as a full tile (version 0
+  included), plus `tiledelta` for every consecutive z0 pair from version 1. The viewer can
+  then show any time from a cold start. `--keyframe-every N` stores fewer full z0 tiles,
+  but the viewer does not support that yet.
+- Timelines: every level, every UTC day from the datastore's first to its last update, and
+  today's (the static viewer asks for today's timeline for "latest").
+- Palette: the catalog's `palette_version`; versions exported earlier are kept.
+- Overlays: only tiles with intervals (a 404 means none).
+- Final timelines and day indexes are stored after the tiles, deltas, windows and keyframes
+  they name, and the catalog after everything else, so a reader never finds a name whose
+  file is not there yet. Nothing is deleted.
+- `timeshadedb publish-serve --dir <out>` serves a directory export with these headers
+  (`Content-Encoding` taken from the stored bytes).
+
 ## 7. Metrics and health
 
 - `GET /metrics` (outside `/api/v3/`): Prometheus text. Names are constants in
