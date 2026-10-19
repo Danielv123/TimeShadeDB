@@ -148,6 +148,8 @@ export class IngestQueue {
 			this.lines = this.lines.slice(this.head);
 			this.head = 0;
 		}
+		this.stats.queuedLines = this.length;
+		this.stats.queuedBytes = this.bytes;
 	}
 
 	private sleep(ms: number): Promise<void> {
@@ -224,8 +226,7 @@ export class IngestQueue {
 				this.stats.refusedLines += n;
 			}
 		}
-		this.stats.queuedLines = this.length;
-		this.stats.queuedBytes = this.bytes;
+		this.compact();
 		if (this.length === 0) {
 			const waiting = this.drained;
 			this.drained = [];

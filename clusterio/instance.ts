@@ -21,9 +21,17 @@ export const MAX_PENDING_BYTES = 32 << 20;
 export type InstanceOptions = {
 	/** The wall clock stamped as recv_ms (tests). */
 	now?: () => number;
+	/** How often envelopes are sent (tests); BATCH_MS by default. */
+	batchMs?: number;
 };
 
 const LEVELS = new Set(["info", "verbose", "warn", "error"]);
+const RECONFIGURE = new Set(["gridworld.tile", "timeshade.capture_rails", "timeshade.extra_forces"]);
+
+/** "a, b,,c" as ["a", "b", "c"]. */
+export function forceList(value: unknown): string[] {
+	return typeof value === "string" ? value.split(",").map(s => s.trim()).filter(Boolean) : [];
+}
 
 export default async function loadInstancePlugin(context: InstancePluginContext, options: InstanceOptions = {}) {
 	const { instance, logger, plugin } = context;
@@ -101,11 +109,20 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	// Clusterio parses each IPC line and calls the handler without awaiting in between, and receive awaits nothing,
 	// so lines are handled in arrival order.
 	instance.server.handle("timeshade:out", async (data: unknown) => receive(data));
-	const timer = setInterval(flush, BATCH_MS);
+	const timer = setInterval(flush, options.batchMs ?? BATCH_MS);
 	instance.hooks.exit.attach(plugin.name, () => {
 		clearInterval(timer);
 		flush();
 	});
+
+	/** An instance config field, or `fallback` when the controller does not know it (an older plugin version). */
+	function field(name: string, fallback: unknown): unknown {
+		try {
+			return (instance.config as unknown as { get(name: string): unknown }).get(name) ?? fallback;
+		} catch {
+			return fallback;
+		}
+	}
 
 	/**
 	 * The config, then a resync, in one /sc so they arrive in order. Lua checks every field; a refusal comes back as
@@ -115,13 +132,10 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 		const trace = newId();
 		const tile = tileOf(instance.config as unknown as { get(name: string): unknown });
 		splitter.setTile(tile);
-		let rails = false;
-		try {
-			rails = Boolean(instance.config.get("timeshade.capture_rails"));
-		} catch {
-			// A controller without the field (an older plugin version): the default.
-		}
-		const config: Record<string, unknown> = { rails };
+		const config: Record<string, unknown> = {
+			rails: Boolean(field("timeshade.capture_rails", false)),
+			forces: forceList(field("timeshade.extra_forces", "")),
+		};
 		if (tile) {
 			config.tile = tile;
 		}
@@ -131,9 +145,9 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	}
 
 	instance.hooks.start.attach(plugin.name, () => configure("start"));
-	instance.hooks.instanceConfigFieldChanged.attach(plugin.name, async (field: string) => {
-		if ((field === "gridworld.tile" || field === "timeshade.capture_rails") && instance.status === "running") {
-			await configure(field === "gridworld.tile" ? "tile" : "config");
+	instance.hooks.instanceConfigFieldChanged.attach(plugin.name, async (name: string) => {
+		if (RECONFIGURE.has(name) && instance.status === "running") {
+			await configure(name === "gridworld.tile" ? "tile" : "config");
 		}
 	});
 	// A new session means the controller restarted and may have lost what it had not forwarded; a resumed session lost

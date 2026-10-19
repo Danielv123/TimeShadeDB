@@ -58,15 +58,15 @@ test("at start: the config (tile and rails) then a resync, in one /sc, the JSON 
 	const plain = fakeInstanceContext(1);
 	await loadInstancePlugin(plain.context);
 	await plain.call("start");
-	assert.match(plain.rcon[0], /^\/sc ts_rt\.config\("\{\\"rails\\":false\}"\) ts_rt\.resync\("[0-9a-f]{8}\.\d+"\)$/);
+	assert.match(plain.rcon[0], /^\/sc ts_rt\.config\("\{\\"rails\\":false,\\"forces\\":\[\]\}"\) ts_rt\.resync\("[0-9a-f]{8}\.\d+"\)$/);
 
-	const f = fakeInstanceContext(3, { "gridworld.tile": tile, "timeshade.capture_rails": true });
+	const f = fakeInstanceContext(3, { "gridworld.tile": tile, "timeshade.capture_rails": true, "timeshade.extra_forces": " player, enemy,," });
 	await loadInstancePlugin(f.context);
 	await f.call("start");
 	const m = /^\/sc ts_rt\.config\("(.*)"\) ts_rt\.resync\("(.*)"\)$/.exec(f.rcon[0])!;
 	assert.ok(!/(^|[^\\])(\\\\)*"/.test(m[1]), "no unescaped quote inside the literal");
 	const unescaped = m[1].replace(/\\(.)/g, (_m, c) => (c === "n" ? "\n" : c));
-	assert.deepEqual(JSON.parse(unescaped), { rails: true, tile });
+	assert.deepEqual(JSON.parse(unescaped), { rails: true, forces: ["player", "enemy"], tile });
 	assert.ok(f.lines.some(l => l.message === "timeshade.resync start" && l.meta.reason === "start" && l.meta.trace === m[2]));
 }));
 
@@ -78,15 +78,16 @@ test("a gridworld.tile change, a rails change and a new controller session recon
 		f.instance.config.set("gridworld.tile", tile);
 		await f.call("instanceConfigFieldChanged", "gridworld.tile", tile, null);
 		await f.call("instanceConfigFieldChanged", "timeshade.capture_rails", true, false);
+		await f.call("instanceConfigFieldChanged", "timeshade.extra_forces", "player", "");
 		await f.call("controllerConnectionEvent", "resume");
 		await f.call("controllerConnectionEvent", "drop");
 		await f.call("controllerConnectionEvent", "connect");
 		assert.deepEqual(f.lines.filter(l => l.message === "timeshade.resync start").map(l => l.meta.reason),
-			["tile", "config", "reconnect"]);
+			["tile", "config", "config", "reconnect"]);
 		f.instance.status = "stopping";
 		await f.call("instanceConfigFieldChanged", "gridworld.tile", null, null);
 		await f.call("controllerConnectionEvent", "connect");
-		assert.equal(f.rcon.length, 3, "not while the instance isn't running");
+		assert.equal(f.rcon.length, 4, "not while the instance isn't running");
 		// After the tile change the instance's tile surface goes to the world's map.
 		await f.ipc({ v: 1, tick: 1, msgs: [{ type: "chunk", s: tile.surface, f: "player", x: 0, y: 0 }] });
 		mock.timers.tick(BATCH_MS);

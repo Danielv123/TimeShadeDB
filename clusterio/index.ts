@@ -10,6 +10,7 @@ declare module "@clusterio/lib" {
 	}
 	export interface InstanceConfigFields {
 		"timeshade.capture_rails": boolean;
+		"timeshade.extra_forces": string;
 	}
 	export interface Permissions {
 		"timeshade.view": never;
@@ -70,6 +71,13 @@ export const plugin: lib.PluginDeclaration = {
 			description: "Also record rail entities (an optional map layer; trains can be matched to the track).",
 			type: "boolean",
 			initialValue: false,
+		},
+		"timeshade.extra_forces": {
+			title: "Extra forces",
+			description: "Comma-separated forces to capture besides those with players (which are always captured), " +
+				"e.g. \"player\" on a server nobody has joined yet.",
+			type: "string",
+			initialValue: "",
 		},
 	},
 	messages: [EnvelopesEvent, ViewTokenRequest],

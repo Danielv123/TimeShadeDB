@@ -55,10 +55,10 @@
 		"@timeshadedb/bin-darwin-arm64": "0.1.0"
 	},
 	"devDependencies": {
-		"@clusterio/controller": "2.0.2",
-		"@clusterio/host": "2.0.2",
-		"@clusterio/lib": "2.0.2",
-		"@clusterio/web_ui": "2.0.2",
+		"@clusterio/controller": "^2.0.2",
+		"@clusterio/host": "^2.0.2",
+		"@clusterio/lib": "^2.0.2",
+		"@clusterio/web_ui": "^2.0.2",
 		"@types/express": "^5.0.6",
 		"@types/jsonwebtoken": "^9.0.10",
 		"@types/node": "^24.19.2",
