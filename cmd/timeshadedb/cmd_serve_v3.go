@@ -334,6 +334,8 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          log.New(stderr, "serve-v3 http: ", log.LstdFlags|log.Lmicroseconds),
 	}
+	// Shutdown waits for handlers; live streams would hold it until its timeout.
+	hs.RegisterOnShutdown(v.api.CloseLive)
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- hs.Serve(ln) }()
 	loopCtx, stopLoop := context.WithCancel(context.WithoutCancel(ctx))
@@ -358,7 +360,12 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 	quietf("shutting down")
 	shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = hs.Shutdown(shCtx)
+	if hs.Shutdown(shCtx) != nil {
+		// Requests still running after the timeout: cut their connections, which ends
+		// their contexts, and wait for ingest below before the stores close.
+		_ = hs.Close()
+	}
+	v.api.WaitIngest()
 	stopLoop()
 	<-loopDone
 	// Build every pending coarse tile at the horizon, so the latest state is stored.

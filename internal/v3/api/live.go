@@ -175,6 +175,11 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request) int {
 			}
 		}
 	}
+	select {
+	case <-s.closing:
+		return s.writeError(w, &apiError{http.StatusServiceUnavailable, "overloaded", "shutting down"})
+	default:
+	}
 	if !s.hub.add(c) {
 		return s.writeError(w, &apiError{http.StatusServiceUnavailable, "overloaded", "too many live clients"})
 	}
@@ -194,6 +199,8 @@ func (s *Server) serveLive(w http.ResponseWriter, r *http.Request) int {
 	for {
 		select {
 		case <-ctx.Done():
+			return http.StatusOK
+		case <-s.closing:
 			return http.StatusOK
 		case <-ping.C:
 			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))

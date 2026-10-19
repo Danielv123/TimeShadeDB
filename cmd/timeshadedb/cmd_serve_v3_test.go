@@ -370,3 +370,21 @@ func TestIconsCopiedAndServed(t *testing.T) {
 		}
 	}
 }
+
+// TestServeV3ShutdownWithLiveClient: an open live stream does not delay shutdown.
+func TestServeV3ShutdownWithLiveClient(t *testing.T) {
+	base, stop := startServeV3(t, "--db", filepath.Join(t.TempDir(), "db"))
+	res, err := http.Get(base + "/api/v3/live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("live: %d", res.StatusCode)
+	}
+	t0 := time.Now()
+	stop()
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Fatalf("shutdown took %v with a live client", d)
+	}
+}

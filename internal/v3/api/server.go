@@ -67,6 +67,12 @@ type Config struct {
 	Clock func() core.TimeMs
 	// MaxBody bounds an ingest body after decompression (default 32 MiB).
 	MaxBody int64
+	// IngestSpool bounds the raw ingest bodies held in memory at once (default 64 MiB):
+	// a body is read whole before it is applied, so a stalled client never holds the
+	// ingester; beyond the budget ingest answers 503. IngestReadTimeout bounds the time
+	// to receive one body (default 60 s; then 408).
+	IngestSpool       int64
+	IngestReadTimeout time.Duration
 	// LiveBuffer bounds the queued bytes per live client (default 1 MiB); LiveClients
 	// bounds the clients (default 64).
 	LiveBuffer  int
@@ -95,6 +101,12 @@ type Server struct {
 	live    *liveState
 	metrics *metrics
 	icons   *core.CatalogIcons
+	spool   spool
+	// ingestWG counts ingest requests in flight (WaitIngest).
+	ingestWG sync.WaitGroup
+	// closing is closed by CloseLive: live streams end.
+	closing   chan struct{}
+	closeOnce sync.Once
 
 	catMu    sync.Mutex
 	catBody  []byte
@@ -117,6 +129,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.MaxBody <= 0 {
 		cfg.MaxBody = 32 << 20
+	}
+	if cfg.IngestSpool <= 0 {
+		cfg.IngestSpool = 64 << 20
+	}
+	if cfg.IngestReadTimeout <= 0 {
+		cfg.IngestReadTimeout = 60 * time.Second
 	}
 	if cfg.LiveBuffer <= 0 {
 		cfg.LiveBuffer = 1 << 20
@@ -142,13 +160,22 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	s := &Server{cfg: cfg, metrics: newMetrics()}
+	s := &Server{cfg: cfg, metrics: newMetrics(), closing: make(chan struct{})}
+	s.spool.max = cfg.IngestSpool
 	s.files, _ = cfg.Movers.(MoverFiles)
 	s.hub = newHub(cfg.LiveClients, cfg.LiveBuffer)
 	s.live = newLiveState()
 	s.icons = loadIcons(cfg.IconsDir)
 	return s, nil
 }
+
+// CloseLive ends every live stream and refuses new ones; call it when the HTTP server
+// shuts down (http.Server.RegisterOnShutdown), whose Shutdown otherwise waits for them.
+func (s *Server) CloseLive() { s.closeOnce.Do(func() { close(s.closing) }) }
+
+// WaitIngest waits for the ingest requests in flight. After the HTTP server stopped
+// (Shutdown returned, or Close was called), call it before closing the stores.
+func (s *Server) WaitIngest() { s.ingestWG.Wait() }
 
 // SetIngester sets the ingester POST ingest uses (after New, because the ingester takes
 // the server's Notifier).
@@ -349,8 +376,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		d := time.Since(start)
 		s.metrics.observe(route, status, d)
+		// The path only: the query may carry the read token.
 		if s.cfg.SlowLog > 0 && d > s.cfg.SlowLog && route != routeLive {
-			s.cfg.Logf("slow request: %s %s -> %d in %v", r.Method, r.URL.RequestURI(), status, d.Round(10*time.Microsecond))
+			s.cfg.Logf("slow request: %s %s -> %d in %v", r.Method, r.URL.EscapedPath(), status, d.Round(10*time.Microsecond))
 		}
 	}()
 	switch {
@@ -427,6 +455,10 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, route int, seg
 		if tail != "" {
 			err = notFound("no route %s", r.URL.Path)
 			break
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			return s.writeError(w, &apiError{http.StatusMethodNotAllowed, "bad_request", "live needs GET"})
 		}
 		return s.serveLive(w, r)
 	default:
