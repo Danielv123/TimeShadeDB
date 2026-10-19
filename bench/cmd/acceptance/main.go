@@ -374,7 +374,8 @@ func (r *runner) candidate() {
 	})
 	r.step("soak", func() error {
 		return r.run("soak", r.tool("soak"), append(srvArgs("v3", "v3", bin, "soak", r.out("v3", "soak")),
-			"-work", filepath.Join(c.work, "db"), "-duration", c.soak.String())...)
+			"-work", filepath.Join(c.work, "db"), "-duration", c.soak.String(),
+			"-server-log", filepath.Join(c.work, "logs", "soak-server.log"))...)
 	})
 	r.step("trains", func() error {
 		if c.testdata == "" {

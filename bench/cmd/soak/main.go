@@ -32,10 +32,12 @@ func main() {
 	trains := flag.Int("trains", 25, "synthetic trains (v3 only)")
 	sampleMs := flag.Int64("train-sample-ms", 300, "data ms between samples of one train")
 	tick := flag.Duration("tick", 250*time.Millisecond, "send interval")
+	slice := flag.Duration("slice", 30*time.Second, "after a stall, catch up in data slices of at most this much data time, terrain then movers for each, so the two streams stay in time order")
 	readTiles := flag.Int("read-tiles", 8, "tiles read per second (0: none)")
 	memEvery := flag.Duration("mem-every", 5*time.Second, "memory sampling interval")
 	maxRSS := flag.Float64("max-rss-mib", 8192, "stop when the server RSS exceeds this")
 	allowRejected := flag.Bool("allow-rejected", false, "record rows the server did not store instead of failing")
+	slowLog := flag.Duration("server-slow-log", time.Second, "v3: start the server with --slow-log (0: off)")
 	dataClock := flag.Bool("data-clock", true, "v3: start the server with --clock data and place the replayed data so it ends now")
 	flag.Parse()
 	ing := soakIngest{allowRejected: *allowRejected}
@@ -45,6 +47,10 @@ func main() {
 	useDataClock := *dataClock && sf.Target == "v3"
 	if useDataClock && sf.Base == "" {
 		sf.AddServerArgs("--clock data")
+	}
+	if sf.Target == "v3" && sf.Base == "" && *slowLog > 0 {
+		// Slow requests and commit steps go to the server log (-server-log), to explain a stall.
+		sf.AddServerArgs("--slow-log " + slowLog.String())
 	}
 	placedStart := time.Now().UnixMilli() - int64(duration.Seconds()*(*speed)*1000) - 3600_000
 
@@ -119,46 +125,61 @@ func main() {
 	stopReason := "done"
 	ticker := time.NewTicker(*tick)
 	defer ticker.Stop()
+	var maxStall time.Duration
+	lastTick := start
+	sent := dataStart
 	for time.Since(start) < *duration {
 		<-ticker.C
-		dataNow := dataStart + int64(time.Since(start).Seconds()*(*speed)*1000)
-		// Terrain up to dataNow.
-		var batch []benchlib.ChunkRow
-		if file != nil {
-			for {
-				r := file[fileIdx]
-				t := r.T + int64(pass)*span
-				if t > dataNow {
-					break
-				}
-				r.T = t
-				batch = append(batch, r)
-				fileIdx++
-				if fileIdx == len(file) {
-					fileIdx, pass = 0, pass+1
-				}
-			}
-		} else {
-			for synth.DataTime() < dataNow {
-				batch = append(batch, synth.NextChunks(1)...)
-			}
+		if gap := time.Since(lastTick); gap > maxStall {
+			maxStall = gap
 		}
-		if err := post(ctx, client, target.EncodeChunks, batch, &ing); err != nil {
-			benchlib.Fatal(fmt.Errorf("chunks: %w", err))
-		}
-		rows += len(batch)
-		// Movers up to dataNow.
-		if moversOK {
-			n := 0
-			if mt := synth.MoverTime(); mt < dataNow {
-				n = int((dataNow-mt+cfg.TrainSampleMs-1)/cfg.TrainSampleMs) * cfg.Trains
-			}
-			if n > 0 {
-				mb := synth.NextMovers(n)
-				if err := post(ctx, client, target.EncodeMovers, mb, &ing); err != nil {
-					benchlib.Fatal(fmt.Errorf("movers: %w", err))
+		lastTick = time.Now()
+		until := dataStart + int64(time.Since(start).Seconds()*(*speed)*1000)
+		// A stall (of this loop or of the server's answers) leaves a lot of data time to
+		// send. Sending all terrain and then all movers would put the mover rows behind
+		// the clock the terrain moved, by up to the stall times the speed-up: send it in
+		// slices instead, in time order, as a capture would have.
+		for sent < until {
+			dataNow := min(until, sent+slice.Milliseconds())
+			sent = dataNow
+			// Terrain up to dataNow.
+			var batch []benchlib.ChunkRow
+			if file != nil {
+				for {
+					r := file[fileIdx]
+					t := r.T + int64(pass)*span
+					if t > dataNow {
+						break
+					}
+					r.T = t
+					batch = append(batch, r)
+					fileIdx++
+					if fileIdx == len(file) {
+						fileIdx, pass = 0, pass+1
+					}
 				}
-				samples += len(mb)
+			} else {
+				for synth.DataTime() < dataNow {
+					batch = append(batch, synth.NextChunks(1)...)
+				}
+			}
+			if err := post(ctx, client, target.EncodeChunks, batch, &ing); err != nil {
+				benchlib.Fatal(fmt.Errorf("chunks: %w", err))
+			}
+			rows += len(batch)
+			// Movers up to dataNow.
+			if moversOK {
+				n := 0
+				if mt := synth.MoverTime(); mt < dataNow {
+					n = int((dataNow-mt+cfg.TrainSampleMs-1)/cfg.TrainSampleMs) * cfg.Trains
+				}
+				if n > 0 {
+					mb := synth.NextMovers(n)
+					if err := post(ctx, client, target.EncodeMovers, mb, &ing); err != nil {
+						benchlib.Fatal(fmt.Errorf("movers: %w", err))
+					}
+					samples += len(mb)
+				}
 			}
 		}
 		// A viewer reading tiles.
@@ -204,6 +225,10 @@ func main() {
 	res.Set("soak.rows_stored", float64(ing.outcome.Accepted))
 	res.Set("soak.retries_503", float64(ing.retries))
 	res.Set("soak.retry_wait_s", ing.wait.Seconds())
+	res.Set("soak.max_stall_s", maxStall.Seconds())
+	if maxStall > 2**tick+time.Second {
+		res.Note("longest gap between send rounds: %.1f s (sent afterwards in %s data slices)", maxStall.Seconds(), *slice)
+	}
 	if o := ing.outcome; o.Late+o.Invalid+o.BadLines > 0 {
 		res.Note("server did not store some rows: late %d, invalid %d, bad lines %d", o.Late, o.Invalid, o.BadLines)
 	}
