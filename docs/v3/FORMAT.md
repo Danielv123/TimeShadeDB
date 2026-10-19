@@ -135,7 +135,14 @@ the database is served.
     days/<YYYY-MM-DD>.json               day index, core.DayIndex as JSON
     wal/                                 open-window samples (WP4, tunable)
   overlays/<datastore id>/               interval log and per-tile index (WP4, 5.6)
+  icons/                                 catalog icon spritesheet and metadata (optional)
+    icons.json                           core.CatalogIcons: {"png":"icons/<file>","json":"icons/<file>"}
+    <file>                               the two files icons.json names ([A-Za-z0-9._-], content-hashed)
 ```
+
+`icons/` is written by `import-minimap --db` from the illisis export's icons. The paths in
+`icons.json` are relative to the API base, so the catalog repeats them unchanged and
+`GET icons/<file>` serves them (API.md 2).
 
 `<x>_<y>` uses decimal integers with a leading `-` for negatives, e.g. `tiles/-3_2.blk`.
 Every JSON file is written as tmp + rename. Unknown files are ignored.

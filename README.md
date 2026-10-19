@@ -61,6 +61,20 @@ timeshadedb import-minimap --db v3db --verify D:\minimap-export
 Without `--db` it imports into in-memory stores, which only checks the export.
 `--verify` compares the imported state with the export and reads the movers and
 overlays back.
+The catalog icons of the export are copied into `v3db/icons`.
+
+## Serving a v3 database
+
+`timeshadedb serve-v3` serves the v3 HTTP API (`docs/v3/API.md`), live events, ingest
+and the embedded viewer (build it first with `npm --prefix web run build`):
+
+```powershell
+timeshadedb serve-v3 --db v3db --listen 127.0.0.1:8080
+```
+
+It listens on loopback by default; any other address needs `--ingest-token`. A standalone
+game with the `timeshade_capture` mod is forwarded with
+`timeshadedb tail --dir <factorio>/script-output/timeshade --map <key> --url http://127.0.0.1:8080`.
 
 ## Factorio export
 
