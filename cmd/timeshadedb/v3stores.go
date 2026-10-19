@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"timeshadedb/internal/v3/api"
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/movers"
 	"timeshadedb/internal/v3/overlays"
@@ -118,6 +119,57 @@ func writeV3Maps(dir string, maps []core.MapInfo) error {
 		maps = []core.MapInfo{}
 	}
 	return writeJSONFile(filepath.Join(dir, "maps.json"), maps)
+}
+
+// copyV3Icons copies the catalog icon spritesheet and its metadata of an import (paths
+// relative to the export root) into <db>/icons and names them in <db>/icons/icons.json
+// with paths relative to the API base ("icons/<file>"), which serve-v3 reads for the
+// catalog and serves under /api/v3/icons/ (docs/v3/FORMAT.md 5, API.md 2). Nothing
+// happens when the export has no icons.
+func copyV3Icons(db, root string, icons *core.CatalogIcons) error {
+	if icons == nil {
+		return nil
+	}
+	dir := filepath.Join(db, "icons")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	var out core.CatalogIcons
+	for _, c := range []struct {
+		src string
+		dst *string
+	}{{icons.PNG, &out.PNG}, {icons.JSON, &out.JSON}} {
+		name := filepath.Base(filepath.FromSlash(c.src))
+		if !validIconFile(name) {
+			return fmt.Errorf("icons: bad file name %q", c.src)
+		}
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(c.src)))
+		if err != nil {
+			return fmt.Errorf("icons: %w", err)
+		}
+		tmp := filepath.Join(dir, name+".tmp")
+		if err := os.WriteFile(tmp, b, 0o644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
+			return err
+		}
+		*c.dst = "icons/" + name
+	}
+	return writeJSONFile(filepath.Join(dir, api.IconsFile), out)
+}
+
+// validIconFile accepts the names serve-v3 serves: [A-Za-z0-9._-], no leading dot.
+func validIconFile(name string) bool {
+	if name == "" || len(name) > 200 || name[0] == '.' || name == api.IconsFile {
+		return false
+	}
+	for _, c := range []byte(name) {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // dirBytes is the total size of the regular files under dir.

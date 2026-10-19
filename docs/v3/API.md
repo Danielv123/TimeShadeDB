@@ -19,7 +19,8 @@ Status: API version 1 (`catalog.version`). JSON shapes are the Go types in
   datastore (so live content is included).
 - Default listen address is `127.0.0.1`. Binding anything else requires `--ingest-token`.
 - Responses carry `X-TSDB-Now: <map clock ms>` on `catalog`, `view`, `movers/*/live.bin`
-  and as the `now` field of live events. Viewers keep a data clock from it (never
+  (the live server sends it on every `/api/v3/` response) and as the `now` field of live
+  events. Viewers keep a data clock from it (never
   `Date.now()` alone), as illisis `movers.ts` does.
 - Compression: binary and JSON bodies are sent with `Content-Encoding: zstd` when
   `Accept-Encoding` includes `zstd`, else `gzip`, else identity, with
@@ -50,8 +51,10 @@ Status and body `{"error": "...", "code": "..."}` (`core.ErrorResponse`):
 | 400 | `bad_tile` | tile outside the grid or wrong level (`core.ErrBadTile`) |
 | 401 | `unauthorized` | missing or wrong token |
 | 404 | `not_found` | unknown datastore or surface, tile without data, version, window, keyframe or day that does not exist (`ErrUnknownDatastore`, `ErrNoTile`, `ErrNoVersion`) |
+| 405 | `bad_request` | wrong method for the route |
+| 408 | `timeout` | ingest body not received within the time limit |
 | 413 | `too_large` | ingest body over the cap |
-| 503 | `overloaded` | ingest backpressure (`core.ErrOverloaded`); `Retry-After` seconds given |
+| 503 | `overloaded` | ingest backpressure (`core.ErrOverloaded`), ingest bodies in flight over their budget, too many live clients; `Retry-After` seconds given |
 | 500 | `internal` | anything else |
 
 **Hostile requests** (PLAN.md §4.3 G2): parameter validation, the grid bound check and the
@@ -60,8 +63,10 @@ tile allocates nothing that outlives it and answers in under 1 ms.
 
 ### 1.3 Authentication
 
-- `--read-token`: when set, every GET needs `Authorization: Bearer <read token>` (or
-  `?token=` for EventSource, which cannot set headers). When unset, reads are open.
+- `--read-token`: when set, every GET under `/api/v3/` and `/metrics` needs
+  `Authorization: Bearer <read token>` or `?token=<read token>` (for EventSource and
+  `<img>` icon loads, which cannot set headers). When unset, reads are open. The viewer
+  files (`/`, `/assets/*`) and `/healthz` are always open.
 - `--ingest-token`: `POST ingest` needs `Authorization: Bearer <ingest token>`. Required
   when listening on anything but loopback.
 - Tokens are compared in constant time. Behind Clusterio, the plugin proxies
@@ -116,6 +121,17 @@ coarse live latest, the average of the committed z0 content not yet in a coarse 
 (FORMAT.md 4). If the tile has nothing pending, it equals the latest version with the live
 flag set. Cache: none. Static: no.
 
+### `GET tile/{ds}/{z}/{x}/{y}/{ver}.png`
+
+PNG of that version for external use (paletted at z0 when possible; uncharted pixels
+transparent). Cache: immutable. Static: no.
+
+### `GET icons/{file}`
+
+The catalog icon files (`catalog.icons.png` and `.json` are `icons/<file>` relative to the
+API base). The live server serves exactly the two files named in `<db>/icons/icons.json`
+(FORMAT.md 5); their names are content-hashed. Cache: immutable. Static: yes.
+
 ### `GET tiledelta/{ds}/{x}/{y}/{from}-{to}.bin`
 
 TSD3 between two versions of a z0 tile (`from < to`). Cache: immutable. Static: yes for
@@ -165,32 +181,53 @@ map-matches trains against them when present (PLAN.md §4.8 step 6).
 
 ### `GET live?ds=<id>&ds=<id>&sfc=<id>` (Server-Sent Events)
 
-Subscribes to datastores (tile events) and surfaces (mover events). Cache: none.
+Subscribes to datastores (tile events) and surfaces (mover events). GET only (other
+methods, HEAD included, get 405). Cache: none.
 Static: no; static viewers poll `catalog`, `timeline` and `live.bin` every `live_ms`.
 
 | event | data (JSON) |
 |---|---|
-| `hello` | `{"now": ms, "horizon": {"<ds>": ms}}` sent first |
+| `hello` | `{"now": ms, "horizon": {"<ds or sfc id>": ms}}` sent first: the horizon of every subscribed datastore and surface that exists |
 | `tile` | `{"ds", "z", "x", "y", "v", "live"?, "ls"?, "now"}`: a version or live content changed |
 | `horizon` | `{"ds" or "sfc", "horizon", "now"}` after a commit |
-| `movers` | `{"sfc", "now", "movers": [MoverMeta], "rows": [[entry, t, tick or null, x, y, o, flags, carriages or null]]}` new samples, in arrival order; `entry` indexes this event's `movers`; `carriages` is `[[x, y, o], ...]` |
+| `movers` | `{"sfc", "now", "movers": [MoverMeta], "rows": [[entry, t, tick or null, x, y, o, flags, carriages or null]]}` new samples, in arrival order; `entry` indexes this event's `movers`; `carriages` is `[[x, y, o], ...]`. Rows the store counted as invalid, or as late by the surface horizon of the last commit, are left out; a row the store rejected under another bound (its clock skew limits) can still appear |
 | `catalog` | `{"now"}` the catalog changed; refetch it |
 
 A comment line (`: ping`) is sent every 15 s. Each client has a bounded buffer (default
 1 MiB); a client that falls behind is disconnected and must reconnect and resync from the
-regular routes. `Last-Event-ID` is not supported.
+regular routes. `Last-Event-ID` is not supported. The number of clients is bounded
+(default 64); beyond it the route answers 503 `overloaded`. Tile events for open-window
+changes are coalesced and sent about once a second (the commit loop period); version
+changes at every level are sent after the commit that made them. A client connected
+before the server's first commit step after start is not sent the existing tiles.
 
 ### `POST ingest`
 
 Body: NDJSON capture envelopes (PROTOCOL.md), `Content-Type: application/x-ndjson`,
 optionally `Content-Encoding: gzip` or `zstd`. Auth: ingest token. Limits (flags, defaults):
-body 32 MiB after decompression (413), line 4 MiB (the line is counted in `bad_lines`).
+body 32 MiB after decompression (413), line 4 MiB (the line is counted in `bad_lines`),
+message 256 KiB and move message 4,096 entries (the message is counted as a bad message).
 
 - Lines that are not valid envelopes are skipped and counted; valid messages in other lines
   are applied. Unknown message types are ignored (forward compatibility).
 - 200 with `core.IngestResponse` (counts per kind, up to 10 error strings, highest `seq`).
-- 503 `overloaded` with `Retry-After` when the open-window buffers or the ingest queue are
-  over budget. Nothing from that body was applied; the forwarder retries the same body.
+- The body is decoded as a stream and applied in batches (at most 2,048 chunk updates or
+  4 MiB of chart text, 16,384 mover samples and 16,384 overlay events each), in order.
+  Messages are decoded a window at a time (2,048 messages or 256 KiB), however many a
+  line packs, so memory per request is bounded whatever the body size or shape.
+- The raw body is received in full before any of it is applied, under a time limit
+  (60 s; 408 `timeout` after it) and a budget for the bodies being received at once
+  (64 MiB; beyond it 503 `overloaded`), so a client that stalls mid-body never delays
+  other ingest requests.
+- 503 `overloaded` with `Retry-After` when a store refused a batch for backpressure (the
+  terrain open-window budget, the mover open-row limit). That batch may be partly applied
+  (its chunk updates can be stored before the mover store refuses its samples), the rest
+  of the body was not, and earlier batches of the same body were. The forwarder retries
+  the same body, which is safe because ingest is idempotent (below). A 413 for a body
+  that exceeds the cap only after decompression is handled the same way.
+- 415 for a `Content-Encoding` other than identity, gzip or zstd.
+- A message time more than 10 s after the server clock (a broken game clock or anchor) is
+  clamped to the clock and counted (`tsdb_ingest_rejected_total{reason="clamped"}`).
 - Ingest is at-least-once safe: terrain updates are absolute, mover samples dedupe on
   (journey, t), and overlay events with unchanged content are no-ops.
 
@@ -222,5 +259,65 @@ set `Content-Encoding` (gzip by default) and `Content-Type` per object.
   `internal/v3/core/metrics.go` (prefix `tsdb_`), with labels `ds`, `sfc`, `route`, `code`,
   `result`, `kind`, `cache`, `reason`, `src` as documented there. Per-entity series are not
   allowed (bounded cardinality, PLAN.md §4.3 G10).
+- Besides the names in `metrics.go`, the live server exports
+  `tsdb_ingest_rejected_total` with the reasons `bad_line`, `bad_message`, `overloaded`,
+  `clamped`, `owner`, `unknown_gone` and `quarantined`, the cache gauges and counters with
+  `cache="terrain"`, `"pyramid"`, `"decoded"` and `"encoded"`, `tsdb_mover_open_rows`,
+  `tsdb_mover_store_rejected_total{reason}`, `tsdb_overlay_open_intervals`,
+  `tsdb_overlay_torn_bytes_total` and the Go runtime gauges `go_memstats_heap_inuse_bytes`,
+  `go_memstats_heap_alloc_bytes`, `go_memstats_sys_bytes` and `go_goroutines`.
 - `GET /healthz`: `200 ok` when the stores are open.
 - `--pprof <addr>` (optional) serves `net/http/pprof` on a separate listener.
+
+## 8. Running the server
+
+`timeshadedb serve-v3 --db <dir>` opens (or creates) the database and serves this API, the
+live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It prints
+`listening on <addr>` as its first stdout line. Flags beyond the shared ones (README.md):
+
+- `--commit-every` (commit loop period, default 1 s);
+- `--terrain-grace` (10 s) and `--mover-grace` (15 s, at least the handoff window): how
+  far behind the clock windows close;
+- `--web-dir <dir>` (serve a viewer build from disk) or `--no-viewer`;
+- `--pprof <addr>`, `--slow-log <duration>`, `--quiet`;
+- `--salvage-overlays`: open an overlay log damaged before its end, keeping it aside;
+- `--exit-on-stdin-close`: stop when the parent process goes away (the Clusterio sidecar).
+- `--clock data`: the map clock is the newest ingested `recv_ms` (seeded from the newest
+  data in the database) instead of the wall clock, for replaying recorded captures (a
+  backlog, a benchmark stream). The graces then default to 2 minutes, because replayed
+  bodies, often posted several at once, arrive out of order. One envelope moves the
+  clock at most 1 hour forward and never past the wall clock plus 10 s (such envelopes
+  count as `clamped`), so one bad `recv_ms` cannot push the map clock ahead for good;
+  after a longer gap in the data the clock catches up over a few envelopes, whose
+  message times are clamped meanwhile.
+
+The process sets a soft memory limit of 1.5 times `--mem-budget` plus 64 MiB (Go's
+`GOMEMLIMIT`, which takes precedence when set), so garbage collection works harder before
+the process grows past its budget.
+
+Interrupt or SIGTERM shuts down cleanly: live streams are ended at once, requests in
+flight get up to 5 s (then their connections are closed), ingest requests in flight are
+waited for, the pyramid is flushed at the horizon and every store is closed. The
+`--slow-log` line names the request path without its query (which may hold the read
+token). Coarse levels load lazily (in parallel, in the background), so the server
+listens within tens of milliseconds whatever the history length; a read of a datastore
+that is not loaded yet waits only for that datastore.
+
+The commit loop commits terrain at `now - terrain-grace`, runs the pyramid build, and
+commits movers at `now - mover-grace`. Updates older than the terrain horizon are late
+(FORMAT.md 4), so a forwarder whose lines arrive more than about `terrain-grace` late
+loses open-window updates until the chunk changes again or the next resync.
+
+`timeshadedb tail --dir <script-output>/timeshade --map <key> [--url ...] [--token ...]
+[--src standalone:<name>]` forwards a standalone game's files (PROTOCOL.md 2). It adds
+`src`, `map`, `instance`, `recv_ms` and an increasing `seq` to every line, posts gzip
+bodies of up to `--batch-bytes` (1 MiB), deletes a file once all of it was acknowledged
+and a newer file exists, and posts the newest file up to its last complete line without
+deleting it. Network errors, 5xx and 429 are retried with backoff (honouring
+`Retry-After`); a 400 or 413 splits the batch, and a single line that is still refused is
+skipped and logged; any other status (401, 403, 404, 415) stops the tailer with an error.
+The acknowledged offsets are kept in a state file (`--state`, default
+`<dir>/timeshadedb-tail.state.json`, `-` for none) with a hash of each file's first
+KiB, so a restarted tailer does not post lines again; reposted lines would get a new
+`recv_ms` and stamp old data at the time of the repost. `--once` forwards what is there
+and exits.

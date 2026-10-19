@@ -47,7 +47,8 @@ Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not
   of it. A file is complete only once a newer file exists: a paused game (a headless server
   pauses with no players) stops writing without closing its file and appends to it again
   on resume, so a pause in growth is not the end of a file. The tailer may post the newest
-  file up to its last complete line (ending in `\n`), keeping the byte offset it posted to, but never
+  file up to its last complete line (ending in `\n`), keeping the byte offset it posted to
+  (`timeshadedb tail` keeps it in a state file, so a restart does not repost), but never
   deletes it.
 
 ## 3. Messages
@@ -141,7 +142,10 @@ The ingest decoder (WP6) produces core values:
 | `recipe` | `OverlayEvent{Kind: recipe, Key: "<instance>/<u>", Recipe: r, Quality: q}`; no `r`: `Close` |
 | `rail` | `OverlayEvent{Kind: rail, Key: "<instance>/<u>", Name, Direction: dir}`; no `name`: `Close` |
 | `map` | stored in `<db>/maps.json`, shown in the catalog |
-| `adopt`, `surfaces`, `resynced`, `trace` | logged; `adopt` is used by the Clusterio controller's owner map (WP10), not stored |
+| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`); not stored. The Clusterio controller may keep its own copy (WP10) |
+| `surfaces` without `created` | starts a resync of the source (a resync begins by listing the surfaces): journeys it does not re-send before `resynced` are ended there |
+| `resynced` | ends the resync: every journey the source owns and did not re-send gets a gone at the message time; logged |
+| `trace` | logged |
 
 Standalone sources use instance 0 in overlay keys.
 

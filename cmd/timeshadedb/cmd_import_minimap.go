@@ -202,6 +202,9 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 		if err := writeV3Maps(*dbDir, rep.Maps); err != nil {
 			return err
 		}
+		if err := copyV3Icons(*dbDir, d.Root, rep.Icons); err != nil {
+			return err
+		}
 		t0 := time.Now()
 		closed = true
 		if err := stores.Close(); err != nil {

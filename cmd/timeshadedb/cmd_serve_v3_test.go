@@ -1,0 +1,459 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"timeshadedb/internal/import/minimap/minimaptest"
+	"timeshadedb/internal/v3/core"
+)
+
+func TestServeV3Flags(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "--db is required"},
+		{[]string{"--db", "x", "--listen", "0.0.0.0:0"}, "--ingest-token is required"},
+		{[]string{"--db", "x", "--listen", "nope"}, "bad --listen"},
+		{[]string{"--db", "x", "--mem-budget", "1000"}, "--mem-budget"},
+		{[]string{"--db", "x", "extra"}, "unexpected arguments"},
+	} {
+		_, err := parseServeV3(io.Discard, tc.args)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: err %v, want %q", tc.args, err, tc.want)
+		}
+	}
+	if o, err := parseServeV3(io.Discard, []string{"--db", "x", "--listen", "0.0.0.0:0", "--ingest-token", "t"}); err != nil || o.ingestToken != "t" {
+		t.Fatalf("token on a public address: %v", err)
+	}
+	if o, err := parseServeV3(io.Discard, []string{"--db", "x", "--listen", "[::1]:0"}); err != nil || o == nil {
+		t.Fatalf("loopback v6: %v", err)
+	}
+}
+
+// startServeV3 runs serve-v3 on a free port and returns its base URL and a stop function
+// that waits for a clean shutdown.
+func startServeV3(t *testing.T, args ...string) (string, func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- runServeV3(ctx, pw, io.Discard, append([]string{"--listen", "127.0.0.1:0", "--no-viewer", "--quiet"}, args...))
+		pw.Close()
+	}()
+	sc := bufio.NewScanner(pr)
+	if !sc.Scan() {
+		cancel()
+		t.Fatalf("no output: %v", <-done)
+	}
+	addr, ok := strings.CutPrefix(sc.Text(), "listening on ")
+	if !ok {
+		cancel()
+		t.Fatalf("first line %q", sc.Text())
+	}
+	go io.Copy(io.Discard, pr)
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("serve-v3: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Error("serve-v3 did not stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return "http://" + addr, stop
+}
+
+func getJSON(t *testing.T, url string, v any) {
+	t.Helper()
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		t.Fatalf("GET %s: %d %s", url, res.StatusCode, b)
+	}
+	if err := json.Unmarshal(b, v); err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+}
+
+func getStatus(t *testing.T, url string) int {
+	t.Helper()
+	res, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+	return res.StatusCode
+}
+
+// TestServeV3ImportedDB imports the synthetic illisis export, serves it and reads the
+// catalog, a view, its tiles, a coarse tile and the movers, then stops the server.
+func TestServeV3ImportedDB(t *testing.T) {
+	exp := minimaptest.Write(t, t.TempDir())
+	db := filepath.Join(t.TempDir(), "db")
+	importIntoDB(t, exp.Root, db)
+	base, stop := startServeV3(t, "--db", db)
+	if s := getStatus(t, base+"/healthz"); s != 200 {
+		t.Fatalf("healthz %d", s)
+	}
+	var cat core.Catalog
+	getJSON(t, base+"/api/v3/catalog", &cat)
+	if len(cat.Maps) == 0 {
+		t.Fatal("empty catalog")
+	}
+	checked := 0
+	for _, m := range cat.Maps {
+		for _, s := range m.Surfaces {
+			for _, d := range s.Datastores {
+				b := d.Bounds
+				var vr core.ViewResponse
+				getJSON(t, base+"/api/v3/view/"+d.ID+"/0?bbox="+itoa(b[0])+","+itoa(b[1])+","+itoa(b[2])+","+itoa(b[3]), &vr)
+				if len(vr.Tiles) == 0 {
+					t.Fatalf("%s: empty view", d.ID)
+				}
+				for _, vt := range vr.Tiles {
+					if s := getStatus(t, base+"/api/v3/tile/"+d.ID+"/0/"+itoa(vt.X)+"/"+itoa(vt.Y)+"/"+itoa(int32(vt.Version))+".bin"); s != 200 {
+						t.Fatalf("%s tile %d,%d v%d: %d", d.ID, vt.X, vt.Y, vt.Version, s)
+					}
+					checked++
+				}
+				if len(d.Levels) > 1 {
+					z := d.Levels[len(d.Levels)-1]
+					getJSON(t, base+"/api/v3/view/"+d.ID+"/"+itoa(int32(z))+"?bbox=-2,-2,2,2", &vr)
+					if len(vr.Tiles) == 0 {
+						t.Fatalf("%s: empty coarse view at %d", d.ID, z)
+					}
+				}
+			}
+			if s.Movers != nil && len(s.Movers.Days) > 0 {
+				var day core.DayIndex
+				getJSON(t, base+"/api/v3/movers/"+s.ID+"/day/"+s.Movers.Days[0]+".json", &day)
+				if len(day.Windows) == 0 {
+					t.Fatalf("%s: no windows", s.ID)
+				}
+				if st := getStatus(t, base+"/api/v3/movers/"+s.ID+"/window/"+itoa64(int64(day.Windows[0].Start))+".bin"); st != 200 {
+					t.Fatalf("window: %d", st)
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no tiles checked")
+	}
+	stop()
+	// The stores were closed cleanly: a second server opens the same database.
+	base, _ = startServeV3(t, "--db", db)
+	getJSON(t, base+"/api/v3/catalog", &cat)
+}
+
+// TestTailIntoServeV3 forwards the capture fixture (raw Lua output) with `tail` into a
+// fresh serve-v3 and checks what was stored.
+func TestTailIntoServeV3(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "capture", "test", "fixtures", "game_envelopes.ndjson"))
+	if err != nil {
+		t.Skip("capture fixture missing:", err)
+	}
+	db := filepath.Join(t.TempDir(), "db")
+	base, _ := startServeV3(t, "--db", db, "--ingest-token", "secret")
+	dir := t.TempDir()
+	lines := strings.SplitAfter(strings.TrimSpace(string(fixture)), "\n")
+	half := len(lines) / 2
+	os.WriteFile(filepath.Join(dir, "0000000001-0000000000.ndjson"), []byte(strings.Join(lines[:half], "")+"\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "0000000002-0000000600.ndjson"), []byte(strings.Join(lines[half:], "")+"\n"), 0o644)
+	var out bytes.Buffer
+	if err := runTail(context.Background(), &out, io.Discard, []string{"--dir", dir, "--url", base, "--token", "secret", "--map", "lab", "--once", "--quiet"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "posted "+itoa(int32(len(lines)))+" envelopes") {
+		t.Fatalf("tail output %q", out.String())
+	}
+	left, _ := filepath.Glob(filepath.Join(dir, "*.ndjson"))
+	if len(left) != 1 || filepath.Base(left[0]) != "0000000002-0000000600.ndjson" {
+		t.Fatalf("files left %v", left)
+	}
+	// The ingested chunks are live content in the new datastore.
+	var cat core.Catalog
+	getJSON(t, base+"/api/v3/catalog", &cat)
+	if len(cat.Maps) != 1 || cat.Maps[0].Key != "lab" || len(cat.Maps[0].Surfaces) == 0 {
+		t.Fatalf("catalog %+v", cat)
+	}
+	found := false
+	for _, s := range cat.Maps[0].Surfaces {
+		for _, d := range s.Datastores {
+			if d.Last > 0 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no datastore with data: %+v", cat.Maps[0].Surfaces)
+	}
+	// The state file kept the offsets: a second run posts nothing again.
+	out.Reset()
+	if err := runTail(context.Background(), &out, io.Discard, []string{"--dir", dir, "--url", base, "--token", "secret", "--map", "lab", "--once", "--quiet"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "posted 0 envelopes") {
+		t.Fatalf("restarted tail output %q", out.String())
+	}
+	// Without the token, ingest is refused: tail stops with an error instead of
+	// retrying forever, and keeps the file.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	os.WriteFile(filepath.Join(dir, "0000000003-0000001200.ndjson"), []byte(lines[0]+"\n"), 0o644)
+	if err := runTail(ctx, io.Discard, io.Discard, []string{"--dir", dir, "--url", base, "--map", "lab", "--quiet"}); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("tail without a token: %v", err)
+	}
+	// 0002 was acknowledged in full and is no longer the newest file; 0003 stays.
+	if _, err := os.Stat(filepath.Join(dir, "0000000003-0000001200.ndjson")); err != nil {
+		t.Fatal("file deleted although ingest refused it")
+	}
+}
+
+// fakeIngest records posted envelopes; fail makes the next n posts answer 503, codes
+// answers the next posts with these statuses, maxEnvs answers 413 to bodies with more
+// envelopes, and a body with an envelope of tick 666 gets 400.
+type fakeIngest struct {
+	mu      sync.Mutex
+	envs    []map[string]any
+	fail    int
+	codes   []int
+	maxEnvs int
+}
+
+func (f *fakeIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail > 0 {
+		f.fail--
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(503)
+		return
+	}
+	if len(f.codes) > 0 {
+		code := f.codes[0]
+		f.codes = f.codes[1:]
+		w.WriteHeader(code)
+		return
+	}
+	zr, err := gzip.NewReader(r.Body)
+	if err != nil {
+		w.WriteHeader(400)
+		return
+	}
+	var envs []map[string]any
+	sc := bufio.NewScanner(zr)
+	for sc.Scan() {
+		var m map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &m); err != nil || m["tick"] == 666.0 {
+			w.WriteHeader(400)
+			return
+		}
+		envs = append(envs, m)
+	}
+	if f.maxEnvs > 0 && len(envs) > f.maxEnvs {
+		w.WriteHeader(413)
+		return
+	}
+	f.envs = append(f.envs, envs...)
+	io.WriteString(w, `{"envelopes":1,"bad_lines":0,"errors":[]}`)
+}
+
+func TestTailerFiles(t *testing.T) {
+	fi := &fakeIngest{}
+	ts := httptest.NewServer(fi)
+	defer ts.Close()
+	dir := t.TempDir()
+	var slept []time.Duration
+	tl := &tailer{dir: dir, url: ts.URL, src: "standalone:x", mapKey: "m", instance: 3, batchBytes: 1024,
+		client: ts.Client(), logf: func(string, ...any) {}, now: func() time.Time { return time.UnixMilli(5000) },
+		sleep:     func(_ context.Context, d time.Duration) error { slept = append(slept, d); return nil },
+		offsets:   map[string]*tailFile{},
+		statePath: filepath.Join(t.TempDir(), "state.json")}
+	ctx := context.Background()
+	write := func(name, s string) {
+		f, _ := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		f.WriteString(s)
+		f.Close()
+	}
+	env := func(tick int) string { return `{"v":1,"tick":` + itoa(int32(tick)) + `,"msgs":[]}` + "\n" }
+	// The newest file is posted up to its last complete line and kept.
+	write("a.ndjson", env(1)+env(2)+`{"v":1,"ti`)
+	if n, err := tl.pass(ctx); err != nil || n != 2 {
+		t.Fatalf("pass 1: %d %v", n, err)
+	}
+	if n, _ := tl.pass(ctx); n != 0 {
+		t.Fatal("re-posted acknowledged lines")
+	}
+	// The line completes; a newer file appears: a.ndjson is finished and deleted.
+	write("a.ndjson", `ck":3,"msgs":[]}`+"\n")
+	write("b.ndjson", env(4))
+	fi.fail = 1
+	if n, err := tl.pass(ctx); err != nil || n != 2 {
+		t.Fatalf("pass 2: %d %v", n, err)
+	}
+	if len(slept) != 1 || slept[0] != time.Second {
+		t.Fatalf("503 backoff %v", slept)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.ndjson")); !os.IsNotExist(err) {
+		t.Fatal("finished file not deleted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b.ndjson")); err != nil {
+		t.Fatal("newest file deleted")
+	}
+	// Large files go in several batches, cut at lines.
+	var big strings.Builder
+	for i := range 100 {
+		big.WriteString(env(100 + i))
+	}
+	write("b.ndjson", big.String())
+	if n, err := tl.pass(ctx); err != nil || n != 100 {
+		t.Fatalf("pass 3: %d %v", n, err)
+	}
+	if len(fi.envs) != 104 {
+		t.Fatalf("%d envelopes", len(fi.envs))
+	}
+	var lastSeq float64
+	for i, e := range fi.envs {
+		if e["src"] != "standalone:x" || e["map"] != "m" || e["recv_ms"].(float64) != 5000 || e["instance"].(float64) != 3 || e["v"].(float64) != 1 {
+			t.Fatalf("envelope %d: %v", i, e)
+		}
+		if s := e["seq"].(float64); s <= lastSeq {
+			t.Fatalf("seq not increasing at %d", i)
+		} else {
+			lastSeq = s
+		}
+	}
+	if fi.envs[2]["tick"].(float64) != 3 {
+		t.Fatalf("completed line: %v", fi.envs[2])
+	}
+	// A shrunk file (the same save loaded again) is read from the start.
+	os.WriteFile(filepath.Join(dir, "b.ndjson"), []byte(env(7)), 0o644)
+	if n, _ := tl.pass(ctx); n != 1 {
+		t.Fatalf("shrunk file: %d", n)
+	}
+
+	// A restarted tailer resumes from the state file: nothing is posted again.
+	write("b.ndjson", env(8))
+	restart := func() *tailer {
+		t2 := *tl
+		t2.offsets = map[string]*tailFile{}
+		if err := t2.loadState(); err != nil {
+			t.Fatal(err)
+		}
+		return &t2
+	}
+	tl = restart()
+	if n, err := tl.pass(ctx); err != nil || n != 1 {
+		t.Fatalf("pass after restart: %d %v", n, err)
+	}
+	tl = restart()
+	if n, _ := tl.pass(ctx); n != 0 {
+		t.Fatalf("restart re-posted %d envelopes", n)
+	}
+	// A file replaced under the same name (longer, different start) is read again.
+	os.WriteFile(filepath.Join(dir, "b.ndjson"), []byte(env(900)+env(901)+env(902)), 0o644)
+	tl = restart()
+	if n, _ := tl.pass(ctx); n != 3 {
+		t.Fatalf("replaced file: %d", n)
+	}
+
+	// Statuses: a batch over the cap is split, a line ingest refuses is skipped, and
+	// a wrong token stops the tailer.
+	before := len(fi.envs)
+	fi.maxEnvs = 2
+	write("b.ndjson", env(10)+env(11)+env(666)+env(12)+env(13))
+	if n, err := tl.pass(ctx); err != nil || n != 4 {
+		t.Fatalf("split and skip: %d %v", n, err)
+	}
+	if got := len(fi.envs) - before; got != 4 {
+		t.Fatalf("%d envelopes after split and skip", got)
+	}
+	fi.maxEnvs = 0
+	fi.codes = []int{401}
+	write("b.ndjson", env(14))
+	if _, err := tl.pass(ctx); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("401: %v", err)
+	}
+}
+
+func itoa(v int32) string   { return strconv.FormatInt(int64(v), 10) }
+func itoa64(v int64) string { return strconv.FormatInt(v, 10) }
+
+func TestIconsCopiedAndServed(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "icons"), 0o755)
+	os.WriteFile(filepath.Join(root, "icons", "sheet.abc.png"), []byte("\x89PNG fake"), 0o644)
+	os.WriteFile(filepath.Join(root, "icons", "meta.abc.json"), []byte(`{"item":[]}`), 0o644)
+	db := filepath.Join(t.TempDir(), "db")
+	if err := copyV3Icons(db, root, &core.CatalogIcons{PNG: "icons/sheet.abc.png", JSON: "icons/meta.abc.json"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyV3Icons(db, root, &core.CatalogIcons{PNG: "icons/../x y.png", JSON: "icons/meta.abc.json"}); err == nil {
+		t.Fatal("bad icon name accepted")
+	}
+	base, _ := startServeV3(t, "--db", db)
+	var cat core.Catalog
+	getJSON(t, base+"/api/v3/catalog", &cat)
+	if cat.Icons == nil || cat.Icons.PNG != "icons/sheet.abc.png" || cat.Icons.JSON != "icons/meta.abc.json" {
+		t.Fatalf("icons %+v", cat.Icons)
+	}
+	res, err := http.Get(base + "/api/v3/" + cat.Icons.PNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != 200 || string(b) != "\x89PNG fake" || res.Header.Get("Content-Type") != "image/png" || !strings.Contains(res.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("icon: %d %q %v", res.StatusCode, b, res.Header)
+	}
+	for _, p := range []string{"icons/icons.json", "icons/..%2Fmaps.json", "icons/other.png"} {
+		if s := getStatus(t, base+"/api/v3/"+p); s != 404 {
+			t.Fatalf("%s: %d", p, s)
+		}
+	}
+}
+
+// TestServeV3ShutdownWithLiveClient: an open live stream does not delay shutdown.
+func TestServeV3ShutdownWithLiveClient(t *testing.T) {
+	base, stop := startServeV3(t, "--db", filepath.Join(t.TempDir(), "db"))
+	res, err := http.Get(base + "/api/v3/live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("live: %d", res.StatusCode)
+	}
+	t0 := time.Now()
+	stop()
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Fatalf("shutdown took %v with a live client", d)
+	}
+}
