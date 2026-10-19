@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/coretest"
@@ -425,4 +428,95 @@ func TestLiveBounded(t *testing.T) {
 	if len(l.Movers) != 200 {
 		t.Fatalf("live movers = %d", len(l.Movers))
 	}
+}
+
+// TestConcurrent runs appends, commits and every read at the same time (the race
+// detector needs cgo, which this repository's Windows CI does not have; this at least
+// catches deadlocks, panics and inconsistent reads).
+func TestConcurrent(t *testing.T) {
+	ctx := context.Background()
+	m, _ := openTemp(t, Options{SyncInterval: 5 * time.Millisecond})
+	defer m.Close()
+	t0 := coretest.T0
+	var clock atomic.Int64
+	clock.Store(int64(t0))
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	wg.Add(1)
+	go func() { // writer: 50 trains at 5 Hz of map time, 10 s of map time per batch
+		defer wg.Done()
+		for now := t0; now < t0+3*core.Hour; now += 10 * core.Second {
+			var batch []core.MoverSample
+			for k := core.TimeMs(0); k < 10*core.Second; k += 200 {
+				batch = append(batch, trainBatch(50, now+k)...)
+			}
+			if _, err := m.Append(ctx, batch); err != nil {
+				errs <- err
+				return
+			}
+			clock.Store(int64(now))
+			if err := m.Commit(ctx, now-15*core.Second); err != nil {
+				errs <- err
+				return
+			}
+		}
+		close(stop)
+	}()
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				now := core.TimeMs(clock.Load())
+				l, err := m.Live(ctx, coretest.SFC, now-core.TimeMs(r)*core.Minute)
+				if err != nil && !errors.Is(err, core.ErrUnknownDatastore) {
+					errs <- err
+					return
+				}
+				if l != nil && len(l.Rows) > 0 && len(l.Movers) == 0 {
+					errs <- fmt.Errorf("live rows without movers")
+					return
+				}
+				for _, info := range must(m.Surfaces(ctx)) {
+					for _, d := range info.Days {
+						day, err := m.Day(ctx, info.Key, d)
+						if err != nil {
+							errs <- err
+							return
+						}
+						if len(day.Windows) > 0 {
+							ref := day.Windows[len(day.Windows)-1]
+							w, err := m.Window(ctx, info.Key, ref.Start)
+							if err != nil {
+								errs <- fmt.Errorf("window %d: %v", ref.Start, err)
+								return
+							}
+							if len(w.Rows) != ref.Rows {
+								errs <- fmt.Errorf("window %d: %d rows, index says %d", ref.Start, len(w.Rows), ref.Rows)
+								return
+							}
+						}
+					}
+				}
+			}
+		}(r)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }

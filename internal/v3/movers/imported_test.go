@@ -214,6 +214,8 @@ func readIllisisWindow(path string, s *illisisSurface, velHeading bool) (bad int
 	return bad
 }
 
+// dirBytes sums the file sizes under dir, per first path element below the surface
+// directory, and estimates the space allocated with 4 KiB clusters.
 func dirBytes(t *testing.T, dir string) (total int64, byPart map[string]int64) {
 	byPart = map[string]int64{}
 	filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
@@ -231,6 +233,8 @@ func dirBytes(t *testing.T, dir string) (total int64, byPart map[string]int64) {
 			part = parts[1]
 		}
 		byPart[part] += info.Size()
+		byPart["alloc4k"] += (info.Size() + 4095) / 4096 * 4096
+		byPart["files"]++
 		total += info.Size()
 		return nil
 	})
@@ -291,6 +295,8 @@ func TestImportedMoverSize(t *testing.T) {
 				total, parts["windows"], parts["keyframes"], parts["days"], parts["meta.json"], st.WindowsWritten, st.KeyframesWritten)
 			per := float64(total) / float64(samples)
 			t.Logf("%.2f B/sample all files (%.2f B/sample windows only); illisis 12.9, target 6", per, float64(parts["windows"])/float64(samples))
+			t.Logf("%d files; with 4 KiB allocation units %.2f B/sample (file system dependent; logical bytes are what the static export uploads)",
+				parts["files"], float64(parts["alloc4k"])/float64(samples))
 			if per > 6 {
 				t.Fatalf("%.2f B/sample exceeds the 6 B/sample target", per)
 			}
