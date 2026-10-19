@@ -408,3 +408,42 @@ func TestDataClockWaitsForApply(t *testing.T) {
 		t.Fatalf("clock %d after the body, want %d", dc.Now(), old+199*core.Second)
 	}
 }
+
+// TestIngestBytesMatchesReader: a body applied in place (IngestBytes) gives the same
+// result as the same body read from a reader.
+func TestIngestBytesMatchesReader(t *testing.T) {
+	d := core.EncodeChart(chart(0x1234))
+	h := 0.5
+	body := "not json\r\n" +
+		line(t, env{V: 1, Tick: 600, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 1, "y": 2, "d": d},
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 3, "y": 2},
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 4, "y": 2, "d": "!!"},
+			map[string]any{"type": "move", "s": "nauvis", "m": []any{
+				map[string]any{"j": "5.1.7", "k": "t", "f": "player", "x": 1.5, "y": 2.5, "h": h},
+			}},
+		}}) +
+		`{"v":1,"tick":1,"src":"s","map":"m","recv_ms":1,"msgs":[]` + strings.Repeat(" ", 400) + "}\n" +
+		"\n\n" +
+		strings.TrimSuffix(line(t, env{V: 1, Tick: 660, Src: "s", Map: "m", RecvMs: int64(base + 1000), Msgs: []any{
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 1, "y": 2, "d": d},
+		}}), "\n") + "\r"
+	a := newFixture(t, Options{MaxLine: 300 + len(d)*3})
+	b := newFixture(t, Options{MaxLine: 300 + len(d)*3})
+	ra := a.ingest(t, body)
+	rb, err := b.in.IngestBytes(context.Background(), []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ja, _ := json.Marshal(ra)
+	jb, _ := json.Marshal(rb)
+	if string(ja) != string(jb) {
+		t.Fatalf("reader %s\nbytes  %s", ja, jb)
+	}
+	if ra.Chunks.Accepted != 3 || ra.Samples.Accepted != 1 || ra.BadLines != 2 {
+		t.Fatalf("resp %s", ja)
+	}
+	if *a.notes != *b.notes || a.in.Stats() != b.in.Stats() {
+		t.Fatalf("notes %+v / %+v, stats %+v / %+v", *a.notes, *b.notes, a.in.Stats(), b.in.Stats())
+	}
+}

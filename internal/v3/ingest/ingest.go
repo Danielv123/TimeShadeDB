@@ -107,6 +107,9 @@ type Ingester struct {
 	anchors  *movers.Anchors
 	journeys map[string]*mapJourneys
 	jtick    uint64
+	// seg and win are the reusable read state of the body being applied (under mu).
+	seg segment
+	win window
 
 	stats struct {
 		envelopes, bytes, badLines, badMessages, clamped, maps, overloaded atomic.Int64
@@ -213,11 +216,29 @@ func (in *Ingester) AnchorOffsets(fn func(src string, offset float64)) {
 // (journey, t), unchanged overlay events are no-ops). Other errors are store or read
 // failures.
 func (in *Ingester) Ingest(ctx context.Context, body io.Reader) (core.IngestResponse, error) {
+	return in.ingest(ctx, body, nil)
+}
+
+// IngestBytes is Ingest on a body already in memory (the HTTP API reads bodies before
+// applying them): lines are parsed in place instead of being copied out of a reader.
+// data must not change until it returns.
+func (in *Ingester) IngestBytes(ctx context.Context, data []byte) (core.IngestResponse, error) {
+	return in.ingest(ctx, nil, data)
+}
+
+func (in *Ingester) ingest(ctx context.Context, body io.Reader, data []byte) (core.IngestResponse, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	b := &batch{in: in, ap: in.startApplier(ctx)}
 	b.resp.Errors = []string{}
-	err := b.read(ctx, body)
+	in.seg.reset()
+	var err error
+	if body != nil {
+		err = b.read(ctx, body)
+	} else {
+		err = b.readBytes(ctx, data)
+	}
+	in.seg.reset()
 	if err == nil {
 		err = b.flush()
 	}
@@ -240,7 +261,7 @@ func (in *Ingester) Ingest(ctx context.Context, body io.Reader) (core.IngestResp
 func (b *batch) read(ctx context.Context, body io.Reader) error {
 	in := b.in
 	br := bufio.NewReaderSize(body, 64<<10)
-	seg := &segment{}
+	seg := &in.seg
 	lineNo := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -270,13 +291,48 @@ func (b *batch) read(ctx context.Context, body io.Reader) error {
 	}
 }
 
+// readBytes is read on an in-memory body: the segment's lines are slices of data.
+func (b *batch) readBytes(ctx context.Context, data []byte) error {
+	in := b.in
+	seg := &in.seg
+	lineNo := 0
+	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var line []byte
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			line, data = data[:i], data[i+1:]
+		} else {
+			line, data = data, nil
+		}
+		tooLong := len(line) > in.opt.MaxLine
+		if tooLong {
+			line = nil
+		}
+		if len(line) > 0 || tooLong {
+			lineNo++
+			in.stats.bytes.Add(int64(len(line)))
+			seg.add(lineNo, line, tooLong)
+			seg.lines[len(seg.lines)-1].borrowed = true
+		}
+		if seg.full() || (len(data) == 0 && len(seg.lines) > 0) {
+			if err := b.applySegment(seg); err != nil {
+				return err
+			}
+			seg.reset()
+		}
+	}
+	return nil
+}
+
 // applySegment parses the segment's envelopes in parallel, then decodes and applies
 // their messages in order, a window at a time: decoded messages, and everything queued
 // for the stores, stay bounded however many messages a line packs.
 func (b *batch) applySegment(seg *segment) error {
 	in := b.in
 	parallel(in.opt.Workers, len(seg.lines), 1, func(i int) { seg.lines[i].parseEnvelope() })
-	w := &b.win
+	w := &in.win
 	for li := 0; li < len(seg.lines); {
 		w.items = w.items[:0]
 		size := 0
@@ -381,10 +437,11 @@ const (
 // parsedLine is one body line and, after parseEnvelope, its envelope header and an
 // iterator over its messages (spans of raw).
 type parsedLine struct {
-	no      int
-	raw     []byte
-	tooLong bool
-	blank   bool
+	no       int
+	raw      []byte
+	borrowed bool // raw is a slice of the caller's body, not a pooled buffer
+	tooLong  bool
+	blank    bool
 	env     envHeader
 	it      arrayIter
 	err     error // the line is not a valid envelope
@@ -432,7 +489,9 @@ func (s *segment) full() bool { return len(s.lines) >= segmentLines || s.bytes >
 
 func (s *segment) reset() {
 	for i := range s.lines {
-		s.recycle(s.lines[i].raw)
+		if !s.lines[i].borrowed {
+			s.recycle(s.lines[i].raw)
+		}
 		s.lines[i] = parsedLine{}
 	}
 	s.lines, s.bytes = s.lines[:0], 0
@@ -658,8 +717,7 @@ type batch struct {
 	nslab int
 	// moves is scratch space for one move message.
 	moves []core.MoverSample
-	// win is applySegment's window, cur the envelope whose messages it applies.
-	win window
+	// cur is the envelope whose messages applySegment applies.
 	cur lineState
 }
 
@@ -676,15 +734,28 @@ func (b *batch) full() bool {
 	return len(b.chunks) >= o.FlushChunks || len(b.samples) >= o.FlushSamples || len(b.events) >= o.FlushEvents
 }
 
-// slabPool recycles the pixel slabs of applied batches (the stores copy the pixels).
-var slabPool sync.Pool
+// slabs recycles the pixel slabs of applied batches (the stores copy the pixels). A
+// short list rather than a sync.Pool, which the frequent collections of a busy ingest
+// would empty.
+var slabs = make(chan *[]core.ChunkPixels, 2)
 
 func getSlab(n int) *[]core.ChunkPixels {
-	if p, ok := slabPool.Get().(*[]core.ChunkPixels); ok && len(*p) == n {
-		return p
+	select {
+	case p := <-slabs:
+		if len(*p) == n {
+			return p
+		}
+	default:
 	}
 	s := make([]core.ChunkPixels, n)
 	return &s
+}
+
+func putSlab(p *[]core.ChunkPixels) {
+	select {
+	case slabs <- p:
+	default:
+	}
 }
 
 // nextPixels returns the next free entry of the batch's slab.
@@ -1040,7 +1111,7 @@ func (in *Ingester) startApplier(ctx context.Context) *applier {
 				dc.Publish(job.clock)
 			}
 			if job.slab != nil {
-				slabPool.Put(job.slab)
+				putSlab(job.slab)
 			}
 		}
 	}()

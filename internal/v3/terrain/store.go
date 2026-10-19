@@ -46,9 +46,30 @@ const (
 	encoderWindow = 256 << 10
 )
 
-// walScratch holds WAL frame build buffers (about 2 KiB per update, at most
-// walFrameUpdates updates).
-var walScratch = sync.Pool{New: func() any { return new([]byte) }}
+// walBufs recycles WAL frame buffers: the raw scratch (about 2 KiB per update, at most
+// walFrameUpdates updates) and the encoded frames of a batch, which the WAL writes
+// before Apply returns. A short list rather than a sync.Pool: under ingest load the
+// collector runs often and a Pool drops its buffers, so every batch grew new ones.
+var walBufs = make(chan []byte, 3)
+
+func getWALBuf() []byte {
+	select {
+	case b := <-walBufs:
+		return b[:0]
+	default:
+		return nil
+	}
+}
+
+func putWALBuf(b []byte) {
+	if cap(b) == 0 || cap(b) > 2*walMaxPayload {
+		return
+	}
+	select {
+	case walBufs <- b:
+	default:
+	}
+}
 
 // decoderMaxMemory caps one decoded zstd frame: a terrain record (a keyframe is at most
 // 512 KiB) or a WAL frame (walMaxRaw, about 2.1 MB).
@@ -750,14 +771,13 @@ func (s *Store) walBatch(ups []*core.ChunkUpdate) ([]byte, core.TimeMs) {
 	for _, u := range ups {
 		maxT = max(maxT, u.T)
 	}
-	bp := walScratch.Get().(*[]byte)
-	defer walScratch.Put(bp)
-	var out []byte
+	raw, out := getWALBuf(), getWALBuf()
 	for len(ups) > 0 {
 		n := min(len(ups), walFrameUpdates)
-		out, *bp = appendWALFrame(out, s.walEnc, ups[:n], *bp)
+		out, raw = appendWALFrame(out, s.walEnc, ups[:n], raw)
 		ups = ups[n:]
 	}
+	putWALBuf(raw)
 	return out, maxT
 }
 
@@ -783,6 +803,7 @@ func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, 
 	if d.wal != nil && len(keep) > 0 {
 		frames, maxT = s.walBatch(keep)
 	}
+	defer func() { putWALBuf(frames) }() // written (or failed) by then
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.applyHorizon != h {
@@ -790,6 +811,7 @@ func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, 
 		if again := notLate(keep, d.applyHorizon); len(again) != len(keep) {
 			keep = again
 			if d.wal != nil && len(keep) > 0 {
+				putWALBuf(frames)
 				frames, maxT = s.walBatch(keep)
 			}
 		}

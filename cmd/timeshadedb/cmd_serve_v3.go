@@ -300,10 +300,12 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 		}()
 	}
 
-	// The budget covers caches and buffers; let the GC work harder before the process
-	// grows far past it (PLAN.md §5: RSS <= mem-budget + 64 MiB). GOMEMLIMIT overrides.
+	// The budget covers caches and buffers; the collector works harder as the process
+	// nears it plus a margin for the rest of the heap, so RSS stays within PLAN.md §5's
+	// mem-budget + 64 MiB (the margin leaves room for the executable's pages and the
+	// runtime's own memory). GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(o.memBudget + o.memBudget/2 + 64<<20)
+		debug.SetMemoryLimit(o.memBudget + 48<<20)
 	}
 	v, err := openV3Server(ctx, o, logf)
 	if err != nil {
