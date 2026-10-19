@@ -27,6 +27,19 @@ export interface EvalOptions {
   offTiles: number;
   /** Margin around handoffs excluded from the outside-handoff counts (ms). */
   handoffMarginMs: number;
+  /** Called for every jump outside a handoff window (diagnostics, --jumps-out). */
+  onJump?: (j: Journey, info: JumpInfo) => void;
+}
+
+/** A frame-to-frame jump of the head larger than v*dt + 2 tiles. */
+export interface JumpInfo {
+  t: number;
+  from: { x: number; y: number; t: number };
+  to: { x: number; y: number };
+  disp: number;
+  v: number;
+  /** Index of the last sample at or before t. */
+  at: number;
 }
 
 export const defaultOptions: EvalOptions = {
@@ -322,6 +335,7 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
         st.jumps++;
         if (!handoff) {
           st.jumpsOutsideHandoff++;
+          o.onJump?.(j, { t, from: prev, to: { x: p.x, y: p.y }, disp, v, at });
         }
       }
     }

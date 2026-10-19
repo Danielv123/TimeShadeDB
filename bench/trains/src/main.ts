@@ -8,14 +8,18 @@
 //       [--journeys-json <file from `measure movers`>]  (train rows from a v3 database, such
 //       as the imported test data, instead of the illisis windows; the rail mask still
 //       comes from --data)
+//       [--mask history|final]  (rail mask: tiles of the rail colour at any time of the
+//       chart history (default), or in the final chart only)
+//       [--jumps-out <file>]  (one JSON line per jump outside a handoff)
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { cpus, platform, release, arch } from "node:os";
 import { basename, dirname } from "node:path";
 
-import { illisisName, loadRailMask, loadTrainJourneys } from "./illisis_data.ts";
+import { illisisName, loadRailMask, loadTrainJourneys, type MaskMode } from "./illisis_data.ts";
 import { loadV3Journeys } from "./v3_data.ts";
-import { defaultOptions, leaveOneOut, newRenderStats, renderJourney, summarize, type LooResult } from "./metrics.ts";
+import { defaultOptions, leaveOneOut, newRenderStats, renderJourney, summarize, type JumpInfo, type LooResult } from "./metrics.ts";
+import type { Journey } from "./types.ts";
 import { renderer } from "./renderers/index.ts";
 
 function arg(name: string, def?: string): string | undefined {
@@ -36,10 +40,25 @@ const scenario = arg("scenario", "testdata")!;
 const out = arg("out");
 const maxJourneys = Number(arg("journeys", "0"));
 const journeysJson = arg("journeys-json");
+const jumpsOut = arg("jumps-out");
+const maskMode = arg("mask", "history") as MaskMode;
+if (maskMode !== "history" && maskMode !== "final") {
+  console.error("--mask must be history or final");
+  process.exit(2);
+}
+const jumpLines: string[] = [];
 const opts = {
   ...defaultOptions,
   hz: Number(arg("hz", String(defaultOptions.hz))),
   lookaheadMs: Number(arg("lookahead-ms", String(defaultOptions.lookaheadMs))),
+  // --jumps-out: one JSON line per jump outside a handoff, with the samples around it.
+  onJump: jumpsOut
+    ? (j: Journey, info: JumpInfo) => {
+        const s = j.samples;
+        const around = s.slice(Math.max(0, info.at - 3), info.at + 4).map((x) => [x.t, x.gone ? "gone" : [x.x, x.y], x.es ? "es" : ""]);
+        jumpLines.push(JSON.stringify({ id: j.id, ...info, around }));
+      }
+    : undefined,
 };
 
 const started = new Date();
@@ -49,7 +68,7 @@ if (maxJourneys > 0) {
   journeys = journeys.slice(0, maxJourneys);
 }
 const tLoad = performance.now();
-const mask = loadRailMask(data, mapDir, surfaceDir);
+const mask = loadRailMask(data, mapDir, surfaceDir, "player", Infinity, maskMode);
 const tMask = performance.now();
 console.error(`loaded ${journeys.length} journeys in ${((tLoad - t0) / 1000).toFixed(1)} s, rail mask (${mask.railTiles} tiles) in ${((tMask - tLoad) / 1000).toFixed(1)} s`);
 
@@ -83,20 +102,26 @@ const result = {
   seconds,
   machine: { os: `${platform()} ${release()}`, arch: arch(), cpu: cpus()[0]?.model ?? "", cpus: cpus().length, go: `node ${process.version}` },
   // The data path is local; record it relative to TSDB_TESTDATA when it is that, else its last element.
-  params: { data: data === process.env.TSDB_TESTDATA ? "$TSDB_TESTDATA" : basename(data), map: mapDir, surface: surfaceDir, renderer: rname,
+  params: { data: data === process.env.TSDB_TESTDATA ? "$TSDB_TESTDATA" : basename(data), map: mapDir, surface: surfaceDir, renderer: rname, mask: maskMode,
     journeys: journeysJson ? "v3 database export (" + basename(journeysJson) + ")" : "illisis windows", ...opts },
   metrics,
   notes: [
     journeysJson
       ? "train samples: the v3 database's stored rows (imported by WP5: re-timed, deduped, handoffs flagged), exported by `measure movers`"
       : "train samples: the illisis movement windows as exported (with the illisis store's clamp re-timing)",
-    "rail mask: final z0 chart pixels of colour (140,142,140); off-rail = carriage centre more than 1 tile from a rail tile",
+    maskMode === "history"
+      ? "rail mask: z0 chart pixels of a track colour (rail 0.55, elevated rail 0.73, rail ramp 0.65, Factorio utility constants) at any time of the history (every snapshot and change record), so rails under parked trains at the end and rails removed before the end count; off-rail = carriage centre more than 1 tile from a rail tile"
+      : "rail mask: final z0 chart pixels of a track colour (rail 0.55, elevated rail 0.73, rail ramp 0.65); off-rail = carriage centre more than 1 tile from a rail tile",
     "trains.offrail_* count every drawn carriage (5 per train for illisis, 1 for the head-only references); trains.head_offrail_* count the head only and compare across renderers",
     `lookahead ${opts.lookaheadMs} ms (61000 = history playback, where the next sample is always known)`,
   ],
 };
 for (const k of Object.keys(metrics).sort()) {
   console.log(`  ${k.padEnd(44)} ${Number.isInteger(metrics[k]) ? metrics[k] : metrics[k].toFixed(4)}`);
+}
+if (jumpsOut) {
+  writeFileSync(jumpsOut, jumpLines.join("\n") + (jumpLines.length ? "\n" : ""));
+  console.error(`wrote ${jumpLines.length} jumps to ${jumpsOut}`);
 }
 if (out) {
   mkdirSync(dirname(out), { recursive: true });

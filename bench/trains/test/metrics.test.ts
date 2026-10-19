@@ -98,3 +98,16 @@ test("illisis names", () => {
   assert.equal(illisisName("nauvis"), "nauvis");
   assert.equal(illisisName("Nauvis.1"), "~4Eauvis~2E1");
 });
+
+test("rail mask takes every track colour (rail, elevated rail, rail ramp)", () => {
+  const px = new Uint16Array(512 * 512);
+  px[0] = 0x8c71; // rail
+  px[1] = 0xbdd7; // elevated rail
+  px[2] = 0xa534; // rail ramp
+  px[3] = 0x51a3; // something else
+  const m = new RailMask();
+  m.addArea(0, 0, px);
+  assert.equal(m.railTiles, 3);
+  assert.ok(m.isRail(-256, -256) && m.isRail(-255, -256) && m.isRail(-254, -256));
+  assert.ok(!m.isRail(-253, -256));
+});
