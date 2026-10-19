@@ -68,7 +68,8 @@ type Options struct {
 	Clock func() core.TimeMs
 	// DataClock, if set, advances to every valid envelope's recv_ms before its messages
 	// are timed (pass DataClock.Now as Clock too, for a server replaying recorded
-	// captures). One envelope moves it at most MaxDataJump forward (default 1 h) and
+	// captures; messages are then timed against DataClock.Seen, and DataClock.Now is
+	// published only once the rows read before it were applied). One envelope moves it at most MaxDataJump forward (default 1 h) and
 	// never past the wall clock plus MaxAhead, so a single bad recv_ms cannot push the
 	// map clock far ahead; such envelopes count as clamped.
 	DataClock   *DataClock
@@ -223,6 +224,9 @@ func (in *Ingester) Ingest(ctx context.Context, body io.Reader) (core.IngestResp
 	// The applier finishes the batches already handed over; its error wins, because
 	// the reader only stops early when the applier failed.
 	aerr := b.ap.finish()
+	if aerr == nil && err == nil && in.opt.DataClock != nil {
+		in.opt.DataClock.Publish(in.opt.DataClock.Seen())
+	}
 	b.resp.Chunks.Add(b.ap.res.chunks)
 	b.resp.Samples.Add(b.ap.res.samples)
 	b.resp.Overlays.Add(b.ap.res.overlays)
@@ -675,7 +679,11 @@ func (b *batch) beginLine(l *parsedLine) {
 	if in.opt.DataClock != nil && in.opt.DataClock.Advance(env.RecvMs, WallClock(), in.opt.MaxAhead, in.opt.MaxDataJump) {
 		in.stats.clamped.Add(1)
 	}
-	b.cur = lineState{ok: true, env: env, anchor: in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed), now: in.opt.Clock()}
+	now := in.opt.Clock()
+	if in.opt.DataClock != nil {
+		now = in.opt.DataClock.Seen()
+	}
+	b.cur = lineState{ok: true, env: env, anchor: in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed), now: now}
 }
 
 // timeOf returns the map time of a tick of the current envelope (its own tick when nil),
@@ -911,6 +919,9 @@ func (b *batch) flush() error {
 	if len(job.updates)+len(job.samples)+len(job.events) == 0 {
 		return nil
 	}
+	if dc := b.in.opt.DataClock; dc != nil {
+		job.clock = dc.Seen()
+	}
 	b.ap.jobs <- job
 	return nil
 }
@@ -922,6 +933,9 @@ type applyJob struct {
 	updates []core.ChunkUpdate
 	samples []core.MoverSample
 	events  []core.OverlayEvent
+	// clock is the data clock's seen value when the batch was handed over, published
+	// once the batch is applied.
+	clock core.TimeMs
 }
 
 // applier applies batches to the stores in order on its own goroutine, so the stores'
@@ -948,6 +962,8 @@ func (in *Ingester) startApplier(ctx context.Context) *applier {
 			if err := a.apply(job); err != nil {
 				a.err = err
 				a.failed.Store(true)
+			} else if dc := in.opt.DataClock; dc != nil {
+				dc.Publish(job.clock)
 			}
 		}
 	}()

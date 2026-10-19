@@ -332,17 +332,21 @@ func TestDataClock(t *testing.T) {
 // at most MaxDataJump, and never past the wall clock plus MaxAhead.
 func TestDataClockBounded(t *testing.T) {
 	dc := &DataClock{}
-	if dc.Advance(1000, 5000, 10, 100) || dc.Now() != 1000 {
-		t.Fatalf("first advance: %d", dc.Now())
+	if dc.Advance(1000, 5000, 10, 100) || dc.Seen() != 1000 || dc.Now() != 0 {
+		t.Fatalf("first advance: seen %d now %d", dc.Seen(), dc.Now())
 	}
-	if !dc.Advance(9000, 1_000_000, 10, 100) || dc.Now() != 1100 {
-		t.Fatalf("jump not bounded: %d", dc.Now())
+	if !dc.Advance(9000, 1_000_000, 10, 100) || dc.Seen() != 1100 {
+		t.Fatalf("jump not bounded: %d", dc.Seen())
 	}
-	if !dc.Advance(1_000_000, 1150, 10, 1000) || dc.Now() != 1160 {
-		t.Fatalf("wall clock bound: %d", dc.Now())
+	if !dc.Advance(1_000_000, 1150, 10, 1000) || dc.Seen() != 1160 {
+		t.Fatalf("wall clock bound: %d", dc.Seen())
 	}
-	if dc.Advance(500, 1150, 10, 1000) || dc.Now() != 1160 {
-		t.Fatalf("went backwards: %d", dc.Now())
+	if dc.Advance(500, 1150, 10, 1000) || dc.Seen() != 1160 {
+		t.Fatalf("went backwards: %d", dc.Seen())
+	}
+	dc.Publish(dc.Seen())
+	if dc.Now() != 1160 {
+		t.Fatalf("published %d", dc.Now())
 	}
 
 	dc = &DataClock{}
@@ -357,5 +361,50 @@ func TestDataClockBounded(t *testing.T) {
 	}
 	if dc.Now() != old+core.Hour || in.Stats().Clamped != 1 {
 		t.Fatalf("clock %d (old+%d), clamped %d", dc.Now(), dc.Now()-old, in.Stats().Clamped)
+	}
+}
+
+// clockMovers records the published data clock at each Append.
+type clockMovers struct {
+	*memstore.Movers
+	dc  *DataClock
+	bad []string
+}
+
+func (m *clockMovers) Append(ctx context.Context, s []core.MoverSample) (core.ApplyResult, error) {
+	now := m.dc.Now()
+	for _, x := range s {
+		if x.T < now {
+			m.bad = append(m.bad, fmt.Sprintf("sample at %d applied after the clock reached %d", x.T, now))
+			break
+		}
+	}
+	return m.Movers.Append(ctx, s)
+}
+
+// TestDataClockWaitsForApply: the data clock the commit loop reads (Now) must not pass
+// rows that were read but not yet applied, or a commit could close their window first.
+func TestDataClockWaitsForApply(t *testing.T) {
+	dc := &DataClock{}
+	maps, _ := OpenMaps(t.TempDir())
+	mov := &clockMovers{Movers: memstore.NewMovers(), dc: dc}
+	in := New(Stores{Terrain: memstore.NewTerrain(), Movers: mov, Overlays: memstore.NewOverlays(), Maps: maps},
+		Options{Clock: dc.Now, DataClock: dc, FlushSamples: 4})
+	old := base - core.Day
+	var body strings.Builder
+	for i := range 200 {
+		body.WriteString(line(t, env{V: 1, Tick: int64(i * 60), Src: "s", Map: "m", RecvMs: int64(old) + int64(i)*1000, Msgs: []any{
+			map[string]any{"type": "move", "s": "nauvis", "m": []any{map[string]any{"j": "1", "k": "t", "x": float64(i), "y": 0, "h": 0.25}}},
+		}}))
+	}
+	resp, err := in.Ingest(context.Background(), strings.NewReader(body.String()))
+	if err != nil || resp.Samples.Accepted != 200 {
+		t.Fatalf("resp %+v err %v", resp, err)
+	}
+	if len(mov.bad) > 0 {
+		t.Fatalf("%d batches applied behind the clock, first: %s", len(mov.bad), mov.bad[0])
+	}
+	if dc.Now() != old+199*core.Second {
+		t.Fatalf("clock %d after the body, want %d", dc.Now(), old+199*core.Second)
 	}
 }
