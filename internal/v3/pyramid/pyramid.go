@@ -113,7 +113,8 @@ type Pyramid struct {
 	lazy map[core.DatastoreKey]struct{}
 
 	buildMu sync.Mutex
-	loadMu  sync.Mutex // serialises datastore loads (ensureDS)
+	// loading holds a channel per datastore being loaded by ensureDS, closed when done.
+	loading map[core.DatastoreKey]chan struct{}
 }
 
 var _ core.TileSource = (*Pyramid)(nil)
@@ -267,12 +268,20 @@ func (p *Pyramid) Preload(ctx context.Context) error {
 		keys = append(keys, k)
 	}
 	p.mu.RUnlock()
-	for _, k := range keys {
-		if _, err := p.ensureDS(ctx, k); err != nil {
-			return err
-		}
+	// Datastores load in parallel (each ensureDS also opens its series in parallel).
+	errs := make([]error, len(keys))
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, k := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			_, errs[i] = p.ensureDS(ctx, k)
+		}()
 	}
-	return nil
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // getDS returns a datastore's state for reading: loaded, or loaded now when New
@@ -375,15 +384,34 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 	if d != nil {
 		return d, nil
 	}
-	// Concurrent first reads of a deferred datastore load it once.
-	p.loadMu.Lock()
-	defer p.loadMu.Unlock()
-	p.mu.RLock()
-	d = p.ds[key]
-	p.mu.RUnlock()
-	if d != nil {
+	// Concurrent first reads of a datastore load it once; loads of different datastores
+	// run in parallel, so a read waits only for its own datastore.
+	p.mu.Lock()
+	if d = p.ds[key]; d != nil {
+		p.mu.Unlock()
 		return d, nil
 	}
+	if ch, ok := p.loading[key]; ok {
+		p.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return p.ensureDS(ctx, key)
+	}
+	if p.loading == nil {
+		p.loading = map[core.DatastoreKey]chan struct{}{}
+	}
+	ch := make(chan struct{})
+	p.loading[key] = ch
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.loading, key)
+		p.mu.Unlock()
+		close(ch)
+	}()
 	d = &dsState{
 		key:    key,
 		id:     key.ID(),
@@ -398,22 +426,49 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 	if err != nil {
 		return nil, err
 	}
-	for _, name := range names {
+	// Open the series in parallel: each open reads one index, and a cold start (or a
+	// first read of a deferred datastore) waits for all of them.
+	type loaded struct {
+		ct  *ctile
+		err error
+	}
+	results := make([]loaded, len(names))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, name := range names {
 		tile, ok := parseSeriesName(prefix, name)
 		if !ok || tile.Z < p.opt.MinZ {
 			continue
 		}
-		sr, err := p.series.Open(ctx, name, false)
-		if err != nil {
-			return nil, fmt.Errorf("pyramid: open %s: %w", name, err)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			sr, err := p.series.Open(ctx, name, false)
+			if err != nil {
+				results[i].err = fmt.Errorf("pyramid: open %s: %w", name, err)
+				return
+			}
+			ct := newTile(tile)
+			err = loadState(sr, ct)
+			if e := sr.Close(); err == nil {
+				err = e
+			}
+			if err != nil {
+				results[i].err = fmt.Errorf("pyramid: load %s: %w", name, err)
+				return
+			}
+			results[i].ct = ct
+		}()
+	}
+	wg.Wait()
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
-		ct := newTile(tile)
-		err = loadState(sr, ct)
-		if e := sr.Close(); err == nil {
-			err = e
-		}
-		if err != nil {
-			return nil, fmt.Errorf("pyramid: load %s: %w", name, err)
+		ct := r.ct
+		if ct == nil {
+			continue
 		}
 		// Records found at open were synced by the store or survived its recovery.
 		ct.n, ct.firstT, ct.lastT = ct.bn, ct.bfirstT, ct.blast
@@ -421,7 +476,7 @@ func (p *Pyramid) ensureDS(ctx context.Context, key core.DatastoreKey) (*dsState
 			ct.descT = ct.lastT
 			d.builtT = max(d.builtT, ct.lastT)
 		}
-		d.tiles[tile] = ct
+		d.tiles[ct.coord] = ct
 	}
 	d.seenT = d.builtT
 	p.mu.Lock()

@@ -42,10 +42,10 @@ func cmdServeV3(ctx context.Context, args []string) error {
 
 // v3ServerOptions are the parsed serve-v3 flags.
 type v3ServerOptions struct {
-	db, listen, ingestToken, readToken, pprof, webDir string
-	memBudget                                         int64
-	window, commitEvery, terrainGrace, moverGrace     time.Duration
-	noViewer, stdinExit, salvageOverlays, quiet       bool
+	db, listen, ingestToken, readToken, pprof, webDir      string
+	memBudget                                              int64
+	window, commitEvery, terrainGrace, moverGrace, slowLog time.Duration
+	noViewer, stdinExit, salvageOverlays, quiet            bool
 }
 
 func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
@@ -61,6 +61,7 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	fs.DurationVar(&o.commitEvery, "commit-every", time.Second, "commit loop period")
 	fs.DurationVar(&o.terrainGrace, "terrain-grace", 10*time.Second, "how far behind the clock terrain windows close")
 	fs.DurationVar(&o.moverGrace, "mover-grace", 15*time.Second, "how far behind the clock mover windows close (at least 10s)")
+	fs.DurationVar(&o.slowLog, "slow-log", 0, "log requests slower than this (0: off)")
 	fs.StringVar(&o.pprof, "pprof", "", "serve net/http/pprof on this separate address")
 	fs.StringVar(&o.webDir, "web-dir", "", "serve the viewer from this directory instead of the embedded bundle")
 	fs.BoolVar(&o.noViewer, "no-viewer", false, "do not serve the viewer")
@@ -215,6 +216,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		TerrainGrace: core.TimeMs(o.terrainGrace.Milliseconds()),
 		MoverGrace:   core.TimeMs(o.moverGrace.Milliseconds()),
 		MemBudget:    o.memBudget,
+		SlowLog:      o.slowLog,
 		Logf:         logf,
 	})
 	if err != nil {
@@ -236,7 +238,7 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 	if err != nil || o == nil {
 		return err
 	}
-	logger := log.New(stderr, "serve-v3: ", log.LstdFlags)
+	logger := log.New(stderr, "serve-v3: ", log.LstdFlags|log.Lmicroseconds)
 	logf := logger.Printf
 	quietf := logf
 	if o.quiet {
@@ -286,7 +288,7 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 		Handler:           v.api,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		ErrorLog:          log.New(stderr, "serve-v3 http: ", log.LstdFlags),
+		ErrorLog:          log.New(stderr, "serve-v3 http: ", log.LstdFlags|log.Lmicroseconds),
 	}
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- hs.Serve(ln) }()

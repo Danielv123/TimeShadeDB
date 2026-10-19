@@ -79,6 +79,8 @@ type Config struct {
 	CommitEvery  time.Duration
 	TerrainGrace core.TimeMs
 	MoverGrace   core.TimeMs
+	// SlowLog, if positive, logs requests that take longer (Logf).
+	SlowLog time.Duration
 	// MemBudget is reported as tsdb_mem_budget_bytes.
 	MemBudget int64
 	// Logf receives errors of the commit loop (default: discard).
@@ -345,7 +347,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				status = s.writeError(w, fmt.Errorf("internal error"))
 			}
 		}
-		s.metrics.observe(route, status, time.Since(start))
+		d := time.Since(start)
+		s.metrics.observe(route, status, d)
+		if s.cfg.SlowLog > 0 && d > s.cfg.SlowLog && route != routeLive {
+			s.cfg.Logf("slow request: %s %s -> %d in %v", r.Method, r.URL.RequestURI(), status, d.Round(10*time.Microsecond))
+		}
 	}()
 	switch {
 	case path == "/healthz":
