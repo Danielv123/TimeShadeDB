@@ -1,0 +1,14 @@
+{
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		"lib": ["es2023"],
+		"types": ["node"],
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"target": "es2022",
+		"forceConsistentCasingInFileNames": true,
+		"outDir": "dist/node"
+	},
+	"include": ["./*.ts", "./test/**/*.ts"],
+	"exclude": ["./dist/*", "./node_modules/*"]
+}
