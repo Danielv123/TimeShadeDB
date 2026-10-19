@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -50,6 +51,8 @@ type replayReport struct {
 	Deltas        uint64            `json:"deltas"`
 	Keyframes     uint64            `json:"keyframes"`
 	PeakOpenBytes int64             `json:"peak_open_window_bytes"`
+	PeakHeap      uint64            `json:"peak_heap_alloc_bytes"`
+	HeapAfter     uint64            `json:"heap_after_ingest_gc_bytes"`
 	Datastores    []dsReport        `json:"datastores"`
 	TotalBytes    int64             `json:"total_bytes"`
 	TerrainBytes  int64             `json:"terrain_bytes"`
@@ -196,6 +199,11 @@ func TestReplayTestdata(t *testing.T) {
 		if ob := s.Stats().OpenWindowBytes; ob > rep.PeakOpenBytes {
 			rep.PeakOpenBytes = ob
 		}
+		if (rep.Updates/batch)%256 == 0 {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			rep.PeakHeap = max(rep.PeakHeap, ms.HeapAlloc)
+		}
 	}
 	t0 := hrNow()
 	if err := s.Commit(ctx, lastT+window); err != nil {
@@ -227,6 +235,16 @@ func TestReplayTestdata(t *testing.T) {
 				t.Fatalf("%v chunk %v: stored latest differs from the source", ds, c)
 			}
 			rep.Verified++
+		}
+	}
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	rep.HeapAfter = ms.HeapAlloc
+	if p := os.Getenv("TSDB_REPLAY_HEAPPROF"); p != "" {
+		if f, err := os.Create(p); err == nil {
+			pprof.WriteHeapProfile(f)
+			f.Close()
 		}
 	}
 	if err := s.Close(); err != nil {
@@ -271,7 +289,6 @@ func TestReplayTestdata(t *testing.T) {
 	}
 	rep.StartupMs = float64(hrSince(t0).Microseconds()) / 1000
 	runtime.GC()
-	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	rep.HeapAfterOpen = ms.HeapAlloc
 	rep.StartupTiles = s.Stats().Tiles

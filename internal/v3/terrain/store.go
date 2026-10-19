@@ -39,6 +39,16 @@ import (
 // noHorizon marks a datastore that was never committed.
 const noHorizon = core.TimeMs(math.MinInt64)
 
+// Encoder limits: concurrent encoder slots and the zstd window (a keyframe is 256 KiB).
+const (
+	maxEncoders   = 4
+	maxDecoders   = 8
+	encoderWindow = 256 << 10
+)
+
+// walScratch holds WAL frame build buffers (about 2 KiB per update).
+var walScratch = sync.Pool{New: func() any { return new([]byte) }}
+
 // openChunkBytes is the accounted size of one open-window chunk entry.
 const openChunkBytes = core.ChunkPixelCount*2 + 64
 
@@ -131,7 +141,8 @@ type Store struct {
 	dir    string
 	opt    Options
 	series *series.Store
-	enc    *zstd.Encoder
+	enc    *zstd.Encoder // terrain records
+	walEnc *zstd.Encoder // WAL frames
 	dec    *zstd.Decoder
 	cache  *decodedCache
 
@@ -176,7 +187,6 @@ type dsState struct {
 	commitMu sync.Mutex
 	pal      *palette
 	wal      *wal
-	walRaw   []byte // WAL scratch, guarded by mu
 }
 
 // tileState is the in-memory summary of one z0 tile. History stays on disk.
@@ -248,17 +258,30 @@ func Open(dir string, opt Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One encoder for records and one (fastest) for the WAL, each with a few concurrent
+	// slots and a 256 KiB window: the encoders' memory is bounded and small, unlike a
+	// pool of NumCPU full-size encoders (PLAN.md §4.3 G5).
 	enc, err := zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(opt.Level),
-		zstd.WithEncoderConcurrency(opt.Workers),
+		zstd.WithEncoderConcurrency(min(opt.Workers, maxEncoders)),
 		zstd.WithLowerEncoderMem(true),
 		zstd.WithEncoderCRC(false),
-		zstd.WithWindowSize(1<<20))
+		zstd.WithWindowSize(encoderWindow))
 	if err != nil {
 		return nil, err
 	}
+	walEnc, err := zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(maxEncoders),
+		zstd.WithLowerEncoderMem(true),
+		zstd.WithEncoderCRC(false),
+		zstd.WithWindowSize(encoderWindow))
+	if err != nil {
+		enc.Close()
+		return nil, err
+	}
 	dec, err := zstd.NewReader(nil,
-		zstd.WithDecoderConcurrency(runtime.GOMAXPROCS(0)),
+		zstd.WithDecoderConcurrency(min(runtime.GOMAXPROCS(0), maxDecoders)),
 		zstd.WithDecoderMaxMemory(64<<20))
 	if err != nil {
 		return nil, err
@@ -268,6 +291,7 @@ func Open(dir string, opt Options) (*Store, error) {
 		opt:    opt,
 		series: ss,
 		enc:    enc,
+		walEnc: walEnc,
 		dec:    dec,
 		cache:  newDecodedCache(max(opt.DecodedCacheBytes, 0)),
 		ds:     map[core.DatastoreKey]*dsState{},
@@ -306,6 +330,7 @@ func (s *Store) abort() {
 	}
 	s.series.Close()
 	s.enc.Close()
+	s.walEnc.Close()
 	s.dec.Close()
 }
 
@@ -615,11 +640,10 @@ func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, 
 		return res, nil
 	}
 	if d.wal != nil {
+		bp := walScratch.Get().(*[]byte)
 		var frame []byte
-		frame, d.walRaw = encodeWALFrame(s.enc, keep, d.walRaw)
-		if cap(d.walRaw) > 4<<20 {
-			d.walRaw = nil // do not pin a huge scratch buffer
-		}
+		frame, *bp = encodeWALFrame(s.walEnc, keep, *bp)
+		walScratch.Put(bp)
 		if err := d.wal.append(frame, maxT); err != nil {
 			return res, err
 		}
@@ -979,6 +1003,7 @@ func (s *Store) Close() error {
 	}
 	keep(s.series.Close())
 	s.enc.Close()
+	s.walEnc.Close()
 	s.dec.Close()
 	s.cache.clear()
 	s.openBytes.Store(0)
