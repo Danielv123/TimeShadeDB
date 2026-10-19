@@ -3,6 +3,7 @@ package timeshadedb
 import (
 	"bufio"
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -2445,8 +2447,10 @@ func latestChunkSnapshotAtOrBefore(snaps []chunkSnapshotRecord, tick uint64) int
 // headers checked) and reuses its buffers. It is not safe for concurrent use.
 type chunkFrameReader struct {
 	files map[string]*os.File
-	buf   []byte
-	raw   []byte
+	// maxFiles bounds the open files (0 means 16).
+	maxFiles int
+	buf      []byte
+	raw      []byte
 }
 
 type chunkFrameBufs struct {
@@ -2476,7 +2480,11 @@ func (r *chunkFrameReader) file(ref chunkFrameRef) (*os.File, error) {
 	if f := r.files[ref.path]; f != nil {
 		return f, nil
 	}
-	if len(r.files) >= 16 {
+	limit := r.maxFiles
+	if limit <= 0 {
+		limit = 16
+	}
+	if len(r.files) >= limit {
 		// Bound the open handles when a read spans many tiles.
 		for _, f := range r.files {
 			_ = f.Close()
@@ -2614,4 +2622,230 @@ func applyChunkDeltaPayload(raw []byte, frameTick, maxTick uint64, pixels *[Chun
 		return 0, nil
 	}
 	return int(count), nil
+}
+
+// ChunkHistoryRow is one stored chunk row, as ScanChunkHistory reports it: the
+// chunk's full state after the row was applied.
+type ChunkHistoryRow struct {
+	Key   DatastoreKey
+	Chunk ChunkCoord
+	Tick  uint64
+	Seq   uint64
+	// Pixels is only valid during the callback; copy it to keep it.
+	Pixels *[ChunkPixelCount]uint16
+}
+
+// ChunkCoords returns every chunk of the datastore that holds data, sorted by (x, y).
+func (db *DB) ChunkCoords(key DatastoreKey) ([]ChunkCoord, error) {
+	if err := db.ensureChunksLoaded(); err != nil {
+		return nil, err
+	}
+	db.chunkMu.RLock()
+	defer db.chunkMu.RUnlock()
+	ds := db.chunkDatastores[key]
+	if ds == nil {
+		return nil, fmt.Errorf("%w: %s/%s/%s", ErrDatastoreNotFound, key.SavefileUUID, key.Surface, key.Force)
+	}
+	out := make([]ChunkCoord, 0, len(ds.chunks))
+	for coord, chunk := range ds.chunks {
+		if chunk.legacy != nil || len(chunk.index.snapshots) > 0 || len(chunk.index.deltas) > 0 {
+			out = append(out, coord)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].X != out[j].X {
+			return out[i].X < out[j].X
+		}
+		return out[i].Y < out[j].Y
+	})
+	return out, nil
+}
+
+// ChunkDatastoreProgressTime returns the modification time of the datastore's
+// progress file: the wall-clock time its latest row was ingested.
+func (db *DB) ChunkDatastoreProgressTime(key DatastoreKey) (time.Time, error) {
+	info, err := os.Stat(filepath.Join(chunkDatastorePath(db.path, key), "progress.json"))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
+}
+
+// ScanChunkHistory calls fn for every stored row of the datastore, oldest first:
+// rows are merged across chunks by (tick, row sequence), and each chunk's rows come
+// in the order they were written. History is read from disk frame by frame; memory
+// is one chunk state (2 KiB) plus one cursor per chunk. Rows written while the scan
+// runs may or may not be reported.
+func (db *DB) ScanChunkHistory(ctx context.Context, key DatastoreKey, fn func(ChunkHistoryRow) error) error {
+	if err := db.ensureChunksLoaded(); err != nil {
+		return err
+	}
+	db.chunkMu.RLock()
+	ds := db.chunkDatastores[key]
+	type ref struct {
+		coord ChunkCoord
+		chunk *factorioChunkState
+		tile  *chunkTileState
+	}
+	var refs []ref
+	if ds != nil {
+		refs = make([]ref, 0, len(ds.chunks))
+		for coord, chunk := range ds.chunks {
+			refs = append(refs, ref{coord: coord, chunk: chunk, tile: ds.tiles[chunkTileCoordForChunk(coord)]})
+		}
+	}
+	db.chunkMu.RUnlock()
+	if ds == nil {
+		return fmt.Errorf("%w: %s/%s/%s", ErrDatastoreNotFound, key.SavefileUUID, key.Surface, key.Force)
+	}
+	dsDir := chunkDatastorePath(db.path, key)
+	h := make(chunkCursorHeap, 0, len(refs))
+	for _, r := range refs {
+		if r.tile != nil {
+			r.tile.mu.RLock()
+		}
+		plan := newChunkFramePlan(dsDir, r.coord, r.chunk)
+		if r.tile != nil {
+			r.tile.mu.RUnlock()
+		}
+		c := &chunkFrameCursor{plan: plan}
+		if c.advance() {
+			h = append(h, c)
+		}
+	}
+	heap.Init(&h)
+	reader := newChunkFrameReader()
+	reader.maxFiles = 256
+	defer reader.close()
+	for h.Len() > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		c := h[0]
+		if c.pixels == nil {
+			c.pixels = new([ChunkPixelCount]uint16)
+		}
+		if _, err := reader.apply(c.head, ^uint64(0), c.pixels); err != nil {
+			return err
+		}
+		if err := fn(ChunkHistoryRow{Key: key, Chunk: c.plan.coord, Tick: c.head.tick, Seq: c.head.seq, Pixels: c.pixels}); err != nil {
+			return err
+		}
+		if c.advance() {
+			heap.Fix(&h, 0)
+		} else {
+			heap.Pop(&h)
+		}
+	}
+	return nil
+}
+
+// chunkFrameCursor walks one chunk's frames in write order without materializing
+// them: the legacy segment first, then the tile segment.
+type chunkFrameCursor struct {
+	plan   chunkFramePlan
+	seg    int // 0 legacy, 1 tile, 2 done
+	snap   int
+	delta  int
+	head   chunkFrameRef
+	pixels *[ChunkPixelCount]uint16
+}
+
+// advance moves head to the next frame and reports whether there is one.
+func (c *chunkFrameCursor) advance() bool {
+	for c.seg < 2 {
+		legacy := c.seg == 0
+		idx := c.plan.index
+		if legacy {
+			idx = c.plan.legacy
+		}
+		// Deltas recorded before the next snapshot come first.
+		if c.snap < len(idx.snapshots) {
+			if c.delta < int(idx.snapshots[c.snap].FirstDeltaFrameIdx) && c.delta < len(idx.deltas) {
+				c.head = c.plan.deltaRef(legacy, idx.deltas[c.delta])
+				c.delta++
+				return true
+			}
+			c.head = c.plan.snapshotRef(legacy, idx.snapshots[c.snap])
+			c.snap++
+			return true
+		}
+		if c.delta < len(idx.deltas) {
+			c.head = c.plan.deltaRef(legacy, idx.deltas[c.delta])
+			c.delta++
+			return true
+		}
+		c.seg++
+		c.snap, c.delta = 0, 0
+	}
+	return false
+}
+
+type chunkCursorHeap []*chunkFrameCursor
+
+func (h chunkCursorHeap) Len() int { return len(h) }
+func (h chunkCursorHeap) Less(i, j int) bool {
+	a, b := h[i].head, h[j].head
+	if a.tick != b.tick {
+		return a.tick < b.tick
+	}
+	return a.seq < b.seq
+}
+func (h chunkCursorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *chunkCursorHeap) Push(x any)   { *h = append(*h, x.(*chunkFrameCursor)) }
+func (h *chunkCursorHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	old[n-1] = nil
+	*h = old[:n-1]
+	return x
+}
+
+// ChunkTickRange returns the smallest and greatest tick of any stored row of the
+// datastore, from the in-memory indexes. ok is false when it holds no row.
+func (db *DB) ChunkTickRange(key DatastoreKey) (first, last uint64, ok bool, err error) {
+	if err := db.ensureChunksLoaded(); err != nil {
+		return 0, 0, false, err
+	}
+	db.chunkMu.RLock()
+	ds := db.chunkDatastores[key]
+	var tiles []*chunkTileState
+	if ds != nil {
+		tiles = make([]*chunkTileState, 0, len(ds.tiles))
+		for _, ts := range ds.tiles {
+			tiles = append(tiles, ts)
+		}
+	}
+	db.chunkMu.RUnlock()
+	if ds == nil {
+		return 0, 0, false, fmt.Errorf("%w: %s/%s/%s", ErrDatastoreNotFound, key.SavefileUUID, key.Surface, key.Force)
+	}
+	observe := func(tick uint64) {
+		if !ok || tick < first {
+			first = tick
+		}
+		if !ok || tick > last {
+			last = tick
+		}
+		ok = true
+	}
+	for _, ts := range tiles {
+		ts.mu.RLock()
+		for _, chunk := range ts.chunks {
+			for _, idx := range []*chunkIndex{chunk.legacy, &chunk.index} {
+				if idx == nil {
+					continue
+				}
+				for _, snap := range idx.snapshots {
+					observe(snap.Tick)
+				}
+				for _, delta := range idx.deltas {
+					observe(delta.MinTick)
+				}
+			}
+		}
+		ts.mu.RUnlock()
+	}
+	return first, last, ok, nil
 }

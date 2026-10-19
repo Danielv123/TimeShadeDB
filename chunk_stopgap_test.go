@@ -582,3 +582,76 @@ func TestConcurrentChunkIngestAndReads(t *testing.T) {
 		t.Fatalf("latest tick = %d %v %v", latest, ok, err)
 	}
 }
+
+// TestScanChunkHistoryReplaysEveryStoredRow checks the history stream the v3
+// migrator reads: every stored row once, in tick order, each chunk's rows in write
+// order, with the chunk's full state after the row.
+func TestScanChunkHistoryReplaysEveryStoredRow(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "db.tshd")
+	db, err := Open(OpenOptions{Path: dbPath, Format: FormatChunks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := DatastoreKey{SavefileUUID: "save-1", Surface: "nauvis", Force: "player"}
+	coords := []ChunkCoord{{X: -17, Y: -1}, {X: -1, Y: -1}, {X: 0, Y: 0}, {X: 16, Y: 3}}
+	oracle := newChunkOracle()
+	rng := rand.New(rand.NewSource(11))
+	ingestRandomHistory(t, db, key, oracle, rng, coords, 200, 500)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := Open(OpenOptions{Path: dbPath, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+
+	// Stored rows: the oracle's rows minus resends that changed nothing.
+	want := map[ChunkCoord][]oracleRow{}
+	total := 0
+	for c, rows := range oracle.rows {
+		for i, row := range rows {
+			if i > 0 && row.pixels == rows[i-1].pixels {
+				continue
+			}
+			want[c] = append(want[c], row)
+			total++
+		}
+	}
+	got := map[ChunkCoord][]oracleRow{}
+	var lastTick, lastSeq uint64
+	n := 0
+	err = ro.ScanChunkHistory(context.Background(), key, func(row ChunkHistoryRow) error {
+		if row.Tick < lastTick || (row.Tick == lastTick && row.Seq < lastSeq) {
+			return fmt.Errorf("row %d (tick %d seq %d) after tick %d seq %d", n, row.Tick, row.Seq, lastTick, lastSeq)
+		}
+		lastTick, lastSeq = row.Tick, row.Seq
+		got[row.Chunk] = append(got[row.Chunk], oracleRow{tick: row.Tick, pixels: *row.Pixels})
+		n++
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != total {
+		t.Fatalf("scanned %d rows, want %d", n, total)
+	}
+	for c, rows := range want {
+		if len(got[c]) != len(rows) {
+			t.Fatalf("chunk %v: %d rows, want %d", c, len(got[c]), len(rows))
+		}
+		for i := range rows {
+			if got[c][i].tick != rows[i].tick || got[c][i].pixels != rows[i].pixels {
+				t.Fatalf("chunk %v row %d differs (tick %d, want %d)", c, i, got[c][i].tick, rows[i].tick)
+			}
+		}
+	}
+	first, last, ok, err := ro.ChunkTickRange(key)
+	if err != nil || !ok || first != 500 || last != lastTick {
+		t.Fatalf("tick range = %d..%d %v %v, want 500..%d", first, last, ok, err, lastTick)
+	}
+	gotCoords, err := ro.ChunkCoords(key)
+	if err != nil || len(gotCoords) != len(coords) {
+		t.Fatalf("chunk coords = %v %v", gotCoords, err)
+	}
+}
