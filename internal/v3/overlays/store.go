@@ -25,8 +25,20 @@
 // 8 bytes per record. The tile Version is its record count. Open intervals cost one
 // entry each (tile, ordinal, start and a 64-bit content hash, about 90 bytes with the
 // key). Interval contents stay on disk; queries read a tile's records with positioned
-// reads through an LRU of decoded tiles bounded by Options.CacheBytes. A torn or
-// corrupt tail is truncated at Open.
+// reads through an LRU of decoded tiles bounded by Options.CacheBytes.
+//
+// At Open a torn tail (an incomplete or bad frame with no valid record after it, as a
+// crash during the last write leaves) is truncated. Damage followed by valid records
+// is not a torn write: deleting those records would lose history and let tile versions
+// (cache and ETag keys) go back and be reused for other content, so Open fails with
+// ErrCorrupt instead. With Options.Salvage the damaged log is kept as
+// log.ivl.damaged-<unix ns> and the store continues from the valid prefix.
+//
+// Applying events creates a datastore's directory only when it gets its first record,
+// so close events for unknown keys or datastores leave no state behind. Every
+// datastore keeps its log open; the per-tile index (8 bytes per record) and the open
+// map (about 140 bytes per open interval, key included) are in memory and are not part
+// of a memory budget, and the log is never compacted (see the WP4 report follow-ups).
 package overlays
 
 import (
@@ -42,6 +54,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"timeshadedb/internal/v3/core"
 )
@@ -59,6 +72,10 @@ type Options struct {
 	CacheBytes int64
 	// NoSync skips the fsync after each Apply (tests, bulk imports).
 	NoSync bool
+	// Salvage opens a log with damage in the middle: the damaged file is kept as
+	// log.ivl.damaged-<unix ns> and the store continues from the records before the
+	// damage (Stats.Salvaged). Without it Open fails with ErrCorrupt.
+	Salvage bool
 }
 
 // Store implements core.OverlayStore on disk.
@@ -79,6 +96,9 @@ type Store struct {
 
 var _ core.OverlayStore = (*Store)(nil)
 
+// ErrCorrupt is returned by Open for a log with damage followed by valid records.
+var ErrCorrupt = errors.New("overlays: log damaged before its end")
+
 // Stats are counters and gauges for /metrics and tests.
 type Stats struct {
 	Accepted, Late, Invalid int64
@@ -88,6 +108,8 @@ type Stats struct {
 	OpenIntervals           int   // gauge
 	Tiles                   int   // gauge: tiles with overlays
 	LogBytes                int64 // gauge: total log size
+	TornBytes               int64 // torn tails truncated at Open
+	Salvaged                int   // damaged logs set aside at Open (Options.Salvage)
 }
 
 type kindKey struct {
@@ -176,7 +198,8 @@ func (o *Store) newDS(key core.DatastoreKey) *dsState {
 
 func (d *dsState) logPath() string { return filepath.Join(d.dir, "log.ivl") }
 
-// loadDS reads meta.json and replays the log, truncating a torn or corrupt tail.
+// loadDS reads meta.json and replays the log, truncating a torn tail; damage followed by
+// valid records is ErrCorrupt (or salvaged).
 func (o *Store) loadDS(key core.DatastoreKey) (*dsState, error) {
 	d := o.newDS(key)
 	b, err := os.ReadFile(filepath.Join(d.dir, "meta.json"))
@@ -241,6 +264,22 @@ func (o *Store) loadDS(key core.DatastoreKey) (*dsState, error) {
 		return true
 	})
 	d.opens = uint32(len(ordTile))
+	if good < len(log) && validFrameAfter(log, good) {
+		if !o.opts.Salvage {
+			return nil, fmt.Errorf("%w: %s at offset %d of %d (Options.Salvage keeps the %d bytes before it)",
+				ErrCorrupt, d.logPath(), good, len(log), good)
+		}
+		aside := fmt.Sprintf("%s.damaged-%d", d.logPath(), time.Now().UnixNano())
+		if err := os.Rename(d.logPath(), aside); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(d.logPath(), log[:good], 0o644); err != nil {
+			return nil, err
+		}
+		o.stats.Salvaged++
+	} else if good < len(log) {
+		o.stats.TornBytes += int64(len(log) - good)
+	}
 	f, err := os.OpenFile(d.logPath(), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -249,6 +288,12 @@ func (o *Store) loadDS(key core.DatastoreKey) (*dsState, error) {
 		if err := f.Truncate(int64(good)); err != nil {
 			f.Close()
 			return nil, err
+		}
+		if !o.opts.NoSync {
+			if err := f.Sync(); err != nil {
+				f.Close()
+				return nil, err
+			}
 		}
 	}
 	d.f, d.size = f, int64(good)
@@ -348,6 +393,10 @@ func (o *Store) Apply(ctx context.Context, events []core.OverlayEvent) (core.App
 	o.stats.Late += int64(res.Late)
 	o.stats.Invalid += int64(res.Invalid)
 	for _, d := range created {
+		if writes[d] == nil {
+			delete(o.ds, d.key) // nothing to store: leave no state behind
+			continue
+		}
 		if err := o.create(d); err != nil {
 			o.err = fmt.Errorf("overlays: %w", err)
 			return res, o.err

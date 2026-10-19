@@ -51,6 +51,30 @@ func scanRecords(b []byte, fn func(payload []byte) bool) int {
 	return off
 }
 
+// validFrameAfter reports whether b holds a complete, CRC-valid frame with a decodable
+// record at any offset after from. It tells damage in the middle of a log (valid
+// records follow) from a torn tail (nothing valid follows; zero-filled space included,
+// since an empty payload does not decode).
+func validFrameAfter(b []byte, from int) bool {
+	for p := from + 1; p+8 < len(b); p++ {
+		n := int(binary.LittleEndian.Uint32(b[p:]))
+		if n == 0 || n > maxRecord || p+8+n > len(b) {
+			continue
+		}
+		payload := b[p+8 : p+8+n]
+		if payload[0] != recOpen && payload[0] != recEnd {
+			continue
+		}
+		if crc32.Checksum(payload, castagnoli) != binary.LittleEndian.Uint32(b[p+4:]) {
+			continue
+		}
+		if _, err := decodeRecord(payload); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func appendString(b []byte, s string) []byte {
 	b = binary.AppendUvarint(b, uint64(len(s)))
 	return append(b, s...)

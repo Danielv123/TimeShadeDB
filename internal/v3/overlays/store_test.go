@@ -2,6 +2,7 @@ package overlays
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -189,8 +190,9 @@ func TestTornTail(t *testing.T) {
 	}
 }
 
-// TestCorruptRecord flips a byte inside an early record: the log is cut there, and the
-// store opens with the records before it.
+// TestCorruptRecord flips a byte inside an early record. Valid records follow, so this
+// is not a torn write: Open refuses the log instead of deleting them; with Salvage it
+// keeps the damaged file aside and continues from the records before the damage.
 func TestCorruptRecord(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -203,15 +205,75 @@ func TestCorruptRecord(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 	raw[len(raw)/2] ^= 0x55
 	os.WriteFile(path, raw, 0o644)
-	o = open(t, dir, Options{NoSync: true})
+	if o, err := Open(dir, Options{NoSync: true}); !errors.Is(err, ErrCorrupt) {
+		if o != nil {
+			o.Close()
+		}
+		t.Fatalf("open of a log damaged in the middle = %v, want ErrCorrupt", err)
+	}
+	if after, _ := os.ReadFile(path); !reflect.DeepEqual(after, raw) {
+		t.Fatal("a refused open changed the log")
+	}
+	o = open(t, dir, Options{NoSync: true, Salvage: true})
 	defer o.Close()
 	v, _ := o.Version(ctx, coretest.DS, core.TileAt(5, 5, 0))
-	if v == 0 || v >= 10 {
-		t.Fatalf("version after corruption = %d", v)
+	if v == 0 || v >= 10 || o.Stats().Salvaged != 1 {
+		t.Fatalf("version after salvage = %d, stats %+v", v, o.Stats())
 	}
 	got, _ := o.Query(ctx, coretest.DS, core.OverlayQuery{Tile: core.TileAt(5, 5, 0), T0: 0, T1: 10000})
 	if uint64(len(got)) != v {
 		t.Fatalf("%d intervals for version %d", len(got), v)
+	}
+	aside, _ := filepath.Glob(path + ".damaged-*")
+	if len(aside) != 1 {
+		t.Fatalf("damaged copies: %v", aside)
+	}
+	if kept, _ := os.ReadFile(aside[0]); !reflect.DeepEqual(kept, raw) {
+		t.Fatal("the damaged copy differs from the damaged log")
+	}
+}
+
+// TestZeroTail: a crash can leave the end of a log zero-filled; that is a torn tail.
+func TestZeroTail(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	o := open(t, dir, Options{NoSync: true})
+	o.Apply(ctx, []core.OverlayEvent{{DS: coretest.DS, T: 100, Interval: core.Interval{Kind: core.OverlayTag, Key: "1/1", X: 1, Y: 1, Text: "a"}}})
+	o.Close()
+	path := filepath.Join(dir, "overlays", coretest.DS.ID(), "log.ivl")
+	raw, _ := os.ReadFile(path)
+	os.WriteFile(path, append(raw, make([]byte, 4096)...), 0o644)
+	o = open(t, dir, Options{NoSync: true})
+	defer o.Close()
+	if fi, _ := os.Stat(path); fi.Size() != int64(len(raw)) || o.Stats().TornBytes != 4096 {
+		t.Fatalf("size %d, want %d; stats %+v", fi.Size(), len(raw), o.Stats())
+	}
+	if v, _ := o.Version(ctx, coretest.DS, core.TileAt(1, 1, 0)); v != 1 {
+		t.Fatalf("version = %d", v)
+	}
+}
+
+// TestHostileApply: events that store nothing (closes of unknown keys, invalid events)
+// create no datastore, directory or file handle.
+func TestHostileApply(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	o := open(t, dir, Options{NoSync: true})
+	defer o.Close()
+	var evs []core.OverlayEvent
+	for i := 0; i < 1000; i++ {
+		ds := core.DatastoreKey{Map: fmt.Sprint("m", i), Surface: "s", Force: "f"}
+		evs = append(evs, core.OverlayEvent{DS: ds, T: 1, Close: true, Interval: core.Interval{Kind: core.OverlayRail, Key: fmt.Sprint(i)}})
+	}
+	res, err := o.Apply(ctx, evs)
+	if err != nil || res.Accepted != 1000 {
+		t.Fatalf("apply = %+v, %v", res, err)
+	}
+	if dss, _ := o.Datastores(ctx); len(dss) != 0 {
+		t.Fatalf("datastores = %v", dss)
+	}
+	if ents, _ := os.ReadDir(filepath.Join(dir, "overlays")); len(ents) != 0 {
+		t.Fatalf("%d entries created on disk", len(ents))
 	}
 }
 
@@ -304,8 +366,38 @@ func TestRailsScale(t *testing.T) {
 	if total != n-n/10 || st.CacheBytes > 4<<20 {
 		t.Fatalf("total %d, stats %+v", total, st)
 	}
+	t.Logf("NoSync (no fsync per Apply); TestRailsApplyFsync measures the fsync cost")
 	t.Logf("%d rails: apply %v (%.0f events/s), heap after reopen %.1f MB (%.0f B per open interval), 1681 tile queries %v (%.0f µs each, cache %d KB), reopen %v",
 		n, apply.Round(time.Millisecond), float64(n)/apply.Seconds(), float64(int64(ms1.HeapAlloc)-int64(ms0.HeapAlloc))/1e6,
 		float64(int64(ms1.HeapAlloc)-int64(ms0.HeapAlloc))/float64(st.OpenIntervals), query.Round(time.Millisecond),
 		float64(query.Microseconds())/1681, st.CacheBytes>>10, reopen.Round(time.Millisecond))
+}
+
+// TestRailsApplyFsync measures applying rails with an fsync per Apply (the default), in
+// batches of 5,000 and of 100 events.
+func TestRailsApplyFsync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	ctx := context.Background()
+	for _, batch := range []int{5000, 100} {
+		o := open(t, t.TempDir(), Options{})
+		const n = 50_000
+		var evs []core.OverlayEvent
+		for i := 0; i < n; i++ {
+			evs = append(evs, core.OverlayEvent{DS: coretest.DS, T: core.TimeMs(1000 + i), Interval: core.Interval{
+				Kind: core.OverlayRail, Key: fmt.Sprintf("248495586/%d", 100000+i), Instance: 248495586,
+				X: float64(i%2000) + 1, Y: float64(i/2000) + 1, Name: "straight-rail"}})
+		}
+		t0 := time.Now()
+		for i := 0; i < n; i += batch {
+			if _, err := o.Apply(ctx, evs[i:i+batch]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		d := time.Since(t0)
+		o.Close()
+		t.Logf("fsync per Apply, batches of %d: %d rails in %v (%.0f events/s, %.2f ms per Apply)",
+			batch, n, d.Round(time.Millisecond), float64(n)/d.Seconds(), float64(d.Microseconds())/1000/float64(n/batch))
+	}
 }
