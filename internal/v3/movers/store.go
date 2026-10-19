@@ -38,13 +38,14 @@ type Options struct {
 	// MaxOpenRows bounds the samples held in open windows across all surfaces
 	// (default 1,048,576, about 75 MB). Append returns ErrOverloaded beyond it.
 	MaxOpenRows int
-	// MaxTrailRows bounds, per surface, the closed rows kept for Live (the last
-	// core.LiveTrail before the horizon; default 262,144). When exceeded the oldest
-	// are dropped, so Live may miss trail rows (never last states).
+	// MaxTrailRows bounds the closed rows kept for Live (the last core.LiveTrail
+	// before the horizon; default 262,144), summed over all surfaces. When exceeded
+	// the oldest are dropped, so Live may miss trail rows (never last states).
 	MaxTrailRows int
-	// MaxLiveMovers bounds, per surface, the journeys tracked as live (last row not a
-	// gone; default 131,072). Beyond it the journeys with the oldest last row are
-	// forgotten, as if they had a gone: they are left out of keyframes and Live.
+	// MaxLiveMovers bounds the journeys tracked as live (last row not a gone; default
+	// 131,072), summed over all surfaces. Beyond it the journeys with the oldest last
+	// row are forgotten, as if they had a gone: they are left out of keyframes and
+	// Live.
 	MaxLiveMovers int
 	// MaxAhead bounds how far after the reference clock a sample may be (default 1
 	// hour; < 0 disables). The reference is the later of the latest Commit upTo (at
@@ -205,6 +206,7 @@ func Open(db string, opts Options) (*Store, error) {
 			}
 		}
 	}
+	m.rebalance()
 	if !opts.NoWAL {
 		w, err := openWAL(filepath.Join(m.dir, "wal"), opts.SyncInterval)
 		if err != nil {
@@ -419,6 +421,8 @@ func (m *Store) Commit(ctx context.Context, upTo core.TimeMs) error {
 		m.openRows -= n
 		changed = true
 	}
+	// The surfaces committed first above could take what later ones then claimed.
+	m.rebalance()
 	if changed && m.wal != nil {
 		var entries []walEntry
 		for _, k := range keys {
@@ -597,10 +601,10 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 		}
 	}
 	sort.SliceStable(trail, func(i, j int) bool { return trail[i].t < trail[j].t })
-	if len(trail) > m.opts.MaxTrailRows {
-		trail = append([]*row(nil), trail[len(trail)-m.opts.MaxTrailRows:]...)
+	if lim := m.share(s, m.opts.MaxTrailRows, trailLen); len(trail) > lim {
+		trail = append([]*row(nil), trail[len(trail)-lim:]...)
 	}
-	evicted := m.evictLive(live)
+	evicted := evictLive(live, m.share(s, m.opts.MaxLiveMovers, liveLen))
 	// Day indexes, then the surface meta (the horizon) last.
 	for d := range touched {
 		if err := s.writeDay(d, sync); err != nil {
@@ -638,10 +642,50 @@ func advance(live map[string]*row, rows []*row) {
 	}
 }
 
-// evictLive applies Options.MaxLiveMovers to a live map and returns how many journeys
-// it forgot.
-func (m *Store) evictLive(live map[string]*row) int64 {
-	if len(live) <= m.opts.MaxLiveMovers {
+func trailLen(s *surface) int { return len(s.trail) }
+func liveLen(s *surface) int  { return len(s.live) }
+
+// share returns how much of a limit shared by all surfaces (MaxTrailRows,
+// MaxLiveMovers) surface s may use: what the other surfaces leave of it, but at least
+// an equal share, so a busy surface cannot starve the others for good. Each surface is
+// trimmed when it commits, so a surface that grew before others appeared gives back
+// its excess at its next commit. Callers hold m.mu for writing.
+func (m *Store) share(s *surface, limit int, used func(*surface) int) int {
+	others, n := 0, len(m.sfc)
+	if m.sfc[s.key] != s {
+		n++ // s is being loaded and not in the map yet
+	}
+	for _, o := range m.sfc {
+		if o != s {
+			others += used(o)
+		}
+	}
+	return max(limit/max(n, 1), limit-others, 1)
+}
+
+// rebalance trims every surface's trail and live map to its share, so the totals stay
+// within the limits. Open loads each surface with the whole limits and calls it once
+// all are loaded; Commit calls it after committing every surface. Callers hold m.mu
+// for writing.
+func (m *Store) rebalance() {
+	keys := make([]core.SurfaceKey, 0, len(m.sfc))
+	for k := range m.sfc {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID() < keys[j].ID() })
+	for _, k := range keys {
+		s := m.sfc[k]
+		if lim := m.share(s, m.opts.MaxTrailRows, trailLen); len(s.trail) > lim {
+			s.trail = append([]*row(nil), s.trail[len(s.trail)-lim:]...)
+		}
+		m.stats.Evicted += evictLive(s.live, m.share(s, m.opts.MaxLiveMovers, liveLen))
+	}
+}
+
+// evictLive keeps at most limit journeys of a live map, forgetting those with the
+// oldest last row, and returns how many it forgot.
+func evictLive(live map[string]*row, limit int) int64 {
+	if len(live) <= limit {
 		return 0
 	}
 	all := make([]*row, 0, len(live))
@@ -654,7 +698,7 @@ func (m *Store) evictLive(live map[string]*row) int64 {
 		}
 		return all[i].meta.ID < all[j].meta.ID
 	})
-	n := len(all) - m.opts.MaxLiveMovers
+	n := len(all) - limit
 	for _, r := range all[:n] {
 		delete(live, r.meta.ID)
 	}
@@ -883,7 +927,7 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 	if len(s.trail) > m.opts.MaxTrailRows {
 		s.trail = s.trail[len(s.trail)-m.opts.MaxTrailRows:]
 	}
-	m.stats.Evicted += m.evictLive(s.live)
+	m.stats.Evicted += evictLive(s.live, m.opts.MaxLiveMovers)
 	return s, nil
 }
 

@@ -430,6 +430,58 @@ func TestLiveBounded(t *testing.T) {
 	}
 }
 
+// TestLiveBoundedAcrossSurfaces checks that MaxTrailRows and MaxLiveMovers bound the
+// totals over all surfaces, also right after a reopen, and that every surface keeps at
+// least an equal share.
+func TestLiveBoundedAcrossSurfaces(t *testing.T) {
+	ctx := context.Background()
+	opts := Options{SyncInterval: -1, MaxTrailRows: 500, MaxLiveMovers: 50}
+	m, dir := openTemp(t, opts)
+	t0 := coretest.T0
+	const surfaces = 4
+	check := func(when string, m *Store) {
+		t.Helper()
+		st := m.Stats()
+		if st.TrailRows > opts.MaxTrailRows || st.LiveMovers > opts.MaxLiveMovers {
+			t.Fatalf("%s: totals over the limits: %+v", when, st)
+		}
+		for i := 0; i < surfaces; i++ {
+			s := m.sfc[core.SurfaceKey{Map: "m", Surface: fmt.Sprint("s", i)}]
+			if s == nil || len(s.live) < opts.MaxLiveMovers/surfaces || len(s.trail) < opts.MaxTrailRows/surfaces {
+				t.Fatalf("%s: surface %d lost its share", when, i)
+			}
+		}
+	}
+	for sec := core.TimeMs(0); sec <= 20*core.Minute; sec += core.Second {
+		var batch []core.MoverSample
+		for i := 0; i < surfaces; i++ {
+			for j := 0; j < 60; j++ {
+				batch = append(batch, core.MoverSample{Surface: core.SurfaceKey{Map: "m", Surface: fmt.Sprint("s", i)},
+					Meta: core.MoverMeta{ID: fmt.Sprint("j", i, "-", j), Kind: core.KindVehicle, Force: "player", Name: "car"},
+					T:    t0 + sec + core.TimeMs(j), X: float64(sec / 100), Y: float64(j)})
+			}
+		}
+		if _, err := m.Append(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+		if sec%core.Minute == 0 && sec > 0 {
+			ok(t, m.Commit(ctx, t0+sec))
+			if sec%core.MoverWindowLen == 0 { // a window closed
+				check(fmt.Sprint("after commit at ", sec), m)
+			}
+		}
+	}
+	ok(t, m.Close())
+	// Open rebuilds each surface's trail and live map from disk with the whole limits
+	// and must then trim them to their shares.
+	m, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	check("after reopen", m)
+}
+
 // TestConcurrent runs appends, commits and every read at the same time (the race
 // detector needs cgo, which this repository's Windows CI does not have; this at least
 // catches deadlocks, panics and inconsistent reads).
