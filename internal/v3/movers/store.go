@@ -304,6 +304,14 @@ func (m *Store) ref() (core.TimeMs, bool) {
 	return t, ok
 }
 
+// Pressure returns the share of Options.MaxOpenRows the open windows hold (Append
+// refuses batches beyond 1). A server commits early when it grows.
+func (m *Store) Pressure() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return float64(m.openRows) / float64(m.opts.MaxOpenRows)
+}
+
 // Append implements core.MoverStore. The batch is checked and logged to the WAL before
 // anything changes in memory: when the WAL write fails nothing is applied and the
 // result is zero.

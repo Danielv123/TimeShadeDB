@@ -110,6 +110,8 @@ type Server struct {
 	// closing is closed by CloseLive: live streams end.
 	closing   chan struct{}
 	closeOnce sync.Once
+	// kick asks the commit loop for a step now (ingest filled the mover open windows).
+	kick chan struct{}
 
 	catMu    sync.Mutex
 	catBody  []byte
@@ -163,7 +165,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	s := &Server{cfg: cfg, metrics: newMetrics(), closing: make(chan struct{})}
+	s := &Server{cfg: cfg, metrics: newMetrics(), closing: make(chan struct{}), kick: make(chan struct{}, 1)}
 	s.spool.max = cfg.IngestSpool
 	s.files, _ = cfg.Movers.(MoverFiles)
 	s.hub = newHub(cfg.LiveClients, cfg.LiveBuffer)

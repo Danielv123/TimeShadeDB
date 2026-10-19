@@ -158,10 +158,14 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v := &v3Server{}
 	fail := func(err error) (*v3Server, error) { return nil, errors.Join(err, v.Close()) }
 	clock := ingest.WallClock
+	// refClock is the movers' MaxAhead/MaxBehind reference: on the data clock the newest
+	// data read, which runs ahead of the commit clock until those rows are applied.
+	refClock := clock
 	var dataClock *ingest.DataClock
 	if o.clock == "data" {
 		dataClock = &ingest.DataClock{}
 		clock = dataClock.Now
+		refClock = dataClock.Seen
 	}
 
 	topt := terrain.SplitBudget(o.memBudget / 2)
@@ -194,7 +198,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 
 	// About 72 bytes per open mover row (WP4); an eighth of the budget.
 	maxRows := int(o.memBudget / 8 / 72)
-	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: clock, Logf: logf})
+	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: refClock, Logf: logf})
 	if err != nil {
 		return fail(fmt.Errorf("movers: %w", err))
 	}
