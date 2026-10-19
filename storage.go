@@ -141,46 +141,39 @@ type snapshotCacheEntry struct {
 	bytes  int64
 }
 
+// compressionPool holds the shared zstd encoders. EncodeAll is safe for concurrent use,
+// so one encoder per level serves every goroutine, with up to encoderConcurrency
+// encodes in flight. The fast encoder (chunk frames, small legacy deltas) uses a small
+// window and the low-memory mode: its inputs are a few KB. The best-compression encoder
+// is only built when a legacy tile database needs it.
 type compressionPool struct {
-	jobs chan compressionJob
-	wg   sync.WaitGroup
+	fast     *zstd.Encoder
+	fastErr  error
+	bestOnce sync.Once
+	best     *zstd.Encoder
+	bestErr  error
 }
 
-type compressionJob struct {
-	raw   []byte
-	level zstd.EncoderLevel
-	resp  chan compressionResult
-}
-
-type compressionResult struct {
-	payload []byte
-	err     error
+// encoderConcurrency bounds the encoder states each shared encoder keeps.
+func encoderConcurrency() int {
+	n := runtime.GOMAXPROCS(0)
+	if n > 8 {
+		n = 8
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func newCompressionPool() *compressionPool {
-	workers := runtime.NumCPU() / 2
-	if workers < 1 {
-		workers = 1
-	}
-	p := &compressionPool{jobs: make(chan compressionJob, 2*workers)}
-	p.wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go func() {
-			defer p.wg.Done()
-			fast, fastErr := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
-			if fastErr == nil {
-				defer fast.Close()
-			}
-			best, bestErr := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
-			if bestErr == nil {
-				defer best.Close()
-			}
-			for job := range p.jobs {
-				payload, err := compressWithReusableEncoders(job.raw, job.level, fast, fastErr, best, bestErr)
-				job.resp <- compressionResult{payload: payload, err: err}
-			}
-		}()
-	}
+	p := &compressionPool{}
+	p.fast, p.fastErr = zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(encoderConcurrency()),
+		zstd.WithWindowSize(1<<17),
+		zstd.WithLowerEncoderMem(true),
+	)
 	return p
 }
 
@@ -188,18 +181,59 @@ func (p *compressionPool) compress(raw []byte, level zstd.EncoderLevel) ([]byte,
 	if p == nil {
 		return compressZstd(raw, level)
 	}
-	resp := make(chan compressionResult, 1)
-	p.jobs <- compressionJob{raw: raw, level: level, resp: resp}
-	result := <-resp
-	return result.payload, result.err
+	if level == zstd.SpeedFastest {
+		if p.fastErr != nil {
+			return nil, p.fastErr
+		}
+		return p.fast.EncodeAll(raw, nil), nil
+	}
+	if level != zstd.SpeedBestCompression {
+		return compressZstd(raw, level)
+	}
+	p.bestOnce.Do(func() {
+		p.best, p.bestErr = zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedBestCompression),
+			zstd.WithEncoderConcurrency(encoderConcurrency()),
+		)
+	})
+	if p.bestErr != nil {
+		return nil, p.bestErr
+	}
+	return p.best.EncodeAll(raw, nil), nil
 }
 
 func (p *compressionPool) close() {
 	if p == nil {
 		return
 	}
-	close(p.jobs)
-	p.wg.Wait()
+	if p.fast != nil {
+		_ = p.fast.Close()
+	}
+	p.bestOnce.Do(func() {})
+	if p.best != nil {
+		_ = p.best.Close()
+	}
+}
+
+var (
+	sharedDecoderOnce sync.Once
+	sharedDecoder     *zstd.Decoder
+	sharedDecoderErr  error
+)
+
+// zstdDecoder returns the process-wide zstd decoder. DecodeAll is safe for concurrent
+// use; the decoder is never closed.
+func zstdDecoder() *zstd.Decoder {
+	sharedDecoderOnce.Do(func() {
+		sharedDecoder, sharedDecoderErr = zstd.NewReader(nil,
+			zstd.WithDecoderConcurrency(0),
+			zstd.WithDecoderLowmem(true),
+		)
+		if sharedDecoderErr != nil {
+			panic(fmt.Sprintf("timeshadedb: zstd decoder: %v", sharedDecoderErr))
+		}
+	})
+	return sharedDecoder
 }
 
 func openDB(opts OpenOptions) (*DB, error) {
@@ -641,26 +675,12 @@ func (db *DB) compressionLevel(raw []byte, kind uint8) zstd.EncoderLevel {
 	return zstd.SpeedBestCompression
 }
 
-func compressWithReusableEncoders(raw []byte, level zstd.EncoderLevel, fast *zstd.Encoder, fastErr error, best *zstd.Encoder, bestErr error) ([]byte, error) {
-	if level == zstd.SpeedFastest {
-		if fastErr != nil {
-			return nil, fastErr
-		}
-		return fast.EncodeAll(raw, nil), nil
-	}
-	if bestErr != nil {
-		return nil, bestErr
-	}
-	return best.EncodeAll(raw, nil), nil
-}
-
 func decompressZstd(payload []byte, rawLen uint32) ([]byte, error) {
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, err
+	var dst []byte
+	if rawLen <= 1<<24 {
+		dst = make([]byte, 0, rawLen)
 	}
-	defer dec.Close()
-	raw, err := dec.DecodeAll(payload, nil)
+	raw, err := zstdDecoder().DecodeAll(payload, dst)
 	if err != nil {
 		return nil, err
 	}

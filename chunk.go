@@ -36,15 +36,31 @@ const (
 	chunkSnapshotMaxDeltaFrames = 256
 )
 
+// ErrDatastoreNotFound is returned (wrapped) by chunk reads for a datastore key the
+// database does not hold.
+var ErrDatastoreNotFound = errors.New("timeshadedb: datastore not found")
+
+// chunkDatastore holds one datastore's live chunk state. History is not kept in
+// memory: reads replay frames from the tile files on disk.
 type chunkDatastore struct {
-	key             DatastoreKey
-	chunks          map[ChunkCoord]*factorioChunkState
-	events          map[ChunkCoord][]chunkLogEntry
+	key    DatastoreKey
+	chunks map[ChunkCoord]*factorioChunkState
+	// tiles holds one entry per 512 px tile that has at least one chunk. Its lock
+	// guards the tile's chunk states and files. Entries are only created by ingest
+	// and load, never by reads, so hostile tile requests allocate nothing.
+	tiles           map[chunkTileCoord]*chunkTileState
 	latestTick      uint64
 	latestChunk     ChunkCoord
 	latestRowSeq    uint64
+	maxTick         uint64
 	dirsReady       bool
 	metadataWritten bool
+}
+
+// chunkTileState is the lock and chunk list of one tile shard.
+type chunkTileState struct {
+	mu     sync.RWMutex
+	chunks map[ChunkCoord]*factorioChunkState
 }
 
 type chunkDatastoreProgress struct {
@@ -55,12 +71,15 @@ type chunkDatastoreProgress struct {
 }
 
 type factorioChunkState struct {
-	pixels                  [ChunkPixelCount]uint16
-	seen                    bool
-	latestTick              uint64
-	latestRowSeq            uint64
-	index                   chunkIndex
-	tileBacked              bool
+	pixels       [ChunkPixelCount]uint16
+	seen         bool
+	latestTick   uint64
+	latestRowSeq uint64
+	index        chunkIndex
+	tileBacked   bool
+	// legacy is the index of the chunk's legacy per-chunk file (chunks/*.cdat), if
+	// any. Its frames precede every frame in index.
+	legacy                  *chunkIndex
 	lastSnapshotBytes       uint32
 	deltaFramesSinceSnap    uint32
 	deltaEventsSinceSnap    uint32
@@ -94,17 +113,6 @@ type chunkDeltaRecord struct {
 	FirstEventSeq  uint64
 	LastEventSeq   uint64
 	Checksum       uint32
-}
-
-type chunkFrameInfo struct {
-	kind          uint8
-	tick          uint64
-	maxTick       uint64
-	eventCount    uint32
-	rawLen        uint32
-	compressedLen uint32
-	checksum      uint32
-	payload       []byte
 }
 
 type chunkTileCoord struct {
@@ -160,7 +168,6 @@ type chunkTileBatchResult struct {
 	result   IngestChunkResult
 	touched  map[DatastoreKey]struct{}
 	progress map[DatastoreKey]chunkDatastoreProgress
-	events   map[DatastoreKey]map[ChunkCoord][]chunkLogEntry
 	err      error
 }
 
@@ -169,29 +176,12 @@ type chunkCopyDatastore struct {
 	latestTick   uint64
 	latestChunk  ChunkCoord
 	latestRowSeq uint64
-	events       map[ChunkCoord][]chunkLogEntry
+	chunks       []chunkCopyChunk
 }
 
-type chunkReadPlan struct {
+type chunkCopyChunk struct {
 	coord ChunkCoord
-	path  string
-	tile  chunkTileCoord
-	idx   chunkIndex
-}
-
-type chunkFrameRead struct {
-	coord  ChunkCoord
-	path   string
-	tile   chunkTileCoord
-	offset uint64
-	kind   uint8
-}
-
-type chunkReplayState struct {
-	pixels       [ChunkPixelCount]uint16
-	seen         bool
-	snapshotTick uint64
-	replayed     int
+	plan  chunkFramePlan
 }
 
 func createChunkDB(path string, cacheSize int64) (*DB, error) {
@@ -298,7 +288,14 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 		}
 		rowGroups[key] = append(rowGroups[key], row)
 	}
-	releaseTileLocks := db.acquireChunkTileLocks(groupOrder)
+	tileStates := make(map[chunkTileBatchKey]*chunkTileState, len(groupOrder))
+	db.chunkMu.Lock()
+	for _, key := range groupOrder {
+		ds := db.chunkDatastoreLocked(key.key)
+		tileStates[key] = ds.tileLocked(chunkTileCoord{X: key.tileX, Y: key.tileY})
+	}
+	db.chunkMu.Unlock()
+	releaseTileLocks := acquireChunkTileLocks(groupOrder, tileStates)
 	defer releaseTileLocks()
 
 	groups := map[chunkTileBatchKey][]chunkIngestWork{}
@@ -324,7 +321,14 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 	workerResults := db.processChunkTileBatches(ctx, groups, groupOrder)
 	result := &IngestChunkResult{}
 	progress := map[DatastoreKey]chunkDatastoreProgress{}
-	events := map[DatastoreKey]map[ChunkCoord][]chunkLogEntry{}
+	maxTicks := map[DatastoreKey]uint64{}
+	for _, rows := range groups {
+		for _, work := range rows {
+			if work.row.Tick > maxTicks[work.row.Key] {
+				maxTicks[work.row.Key] = work.row.Tick
+			}
+		}
+	}
 	for _, workerResult := range workerResults {
 		if workerResult.err != nil {
 			return nil, workerResult.err
@@ -343,31 +347,18 @@ func (db *DB) ingestChunkRows(ctx context.Context, rows []ParsedChunkRow) (*Inge
 				progress[key] = workerProgress
 			}
 		}
-		for key, chunkEvents := range workerResult.events {
-			target := events[key]
-			if target == nil {
-				target = map[ChunkCoord][]chunkLogEntry{}
-				events[key] = target
-			}
-			for coord, entries := range chunkEvents {
-				target[coord] = append(target[coord], entries...)
-			}
-		}
 	}
 	db.chunkMu.Lock()
 	defer db.chunkMu.Unlock()
-	for key, chunkEvents := range events {
-		ds := touchedDatastores[key]
-		for coord, entries := range chunkEvents {
-			ds.events[coord] = append(ds.events[coord], entries...)
-		}
-	}
 	for key, latest := range progress {
 		ds := touchedDatastores[key]
 		if latest.LatestRowSeq > ds.latestRowSeq {
 			ds.latestTick = latest.LatestTick
 			ds.latestChunk = ChunkCoord{X: latest.LatestChunkX, Y: latest.LatestChunkY}
 			ds.latestRowSeq = latest.LatestRowSeq
+		}
+		if tick := maxTicks[key]; tick > ds.maxTick {
+			ds.maxTick = tick
 		}
 	}
 	for _, ds := range touchedDatastores {
@@ -418,46 +409,39 @@ func (db *DB) copyChunksTo(ctx context.Context, dst *DB) (*ChunkCopyStats, error
 		batch = batch[:0]
 		return nil
 	}
+	reader := newChunkFrameReader()
+	defer reader.close()
 	for _, ds := range datastores {
-		coords := make([]ChunkCoord, 0, len(ds.events))
-		for coord := range ds.events {
-			coords = append(coords, coord)
-		}
-		sort.Slice(coords, func(i, j int) bool {
-			if coords[i].X != coords[j].X {
-				return coords[i].X < coords[j].X
-			}
-			return coords[i].Y < coords[j].Y
-		})
 		latestPixels := map[ChunkCoord][ChunkPixelCount]uint16{}
-		for _, coord := range coords {
-			entries := append([]chunkLogEntry(nil), ds.events[coord]...)
-			sort.Slice(entries, func(i, j int) bool {
-				if entries[i].Seq != entries[j].Seq {
-					return entries[i].Seq < entries[j].Seq
+		for _, chunk := range ds.chunks {
+			// Replay every stored frame of the chunk in row order, as the rows were
+			// ingested. History is read from disk, one frame at a time.
+			frames := chunk.plan.all()
+			sort.SliceStable(frames, func(i, j int) bool {
+				if frames[i].seq != frames[j].seq {
+					return frames[i].seq < frames[j].seq
 				}
-				return entries[i].Tick < entries[j].Tick
+				return frames[i].tick < frames[j].tick
 			})
 			var pixels [ChunkPixelCount]uint16
-			for _, entry := range entries {
+			for _, frame := range frames {
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				for _, change := range entry.Changes {
-					if int(change.Pos) >= len(pixels) {
-						return nil, fmt.Errorf("timeshadedb: chunk log position out of bounds: %d", change.Pos)
-					}
-					pixels[change.Pos] = change.Color
+				if _, err := reader.apply(frame, ^uint64(0), &pixels); err != nil {
+					return nil, err
 				}
-				batch = append(batch, ParsedChunkRow{Key: ds.key, Tick: entry.Tick, Chunk: coord, Pixels: pixels})
+				batch = append(batch, ParsedChunkRow{Key: ds.key, Tick: frame.tick, Chunk: chunk.coord, Pixels: pixels})
 				if len(batch) >= chunkCopyBatchRows {
 					if err := flush(); err != nil {
 						return nil, err
 					}
 				}
 			}
-			latestPixels[coord] = pixels
-			stats.Chunks++
+			if len(frames) > 0 {
+				latestPixels[chunk.coord] = pixels
+				stats.Chunks++
+			}
 		}
 		if ds.latestRowSeq > 0 {
 			if pixels, ok := latestPixels[ds.latestChunk]; ok {
@@ -477,23 +461,22 @@ func (db *DB) copyChunksTo(ctx context.Context, dst *DB) (*ChunkCopyStats, error
 	return stats, nil
 }
 
+// snapshotChunkCopyDatastores captures, for every datastore, the frame plan of every
+// chunk. Index slices are append-only, so the captured slice headers stay valid
+// while ingest appends to them.
 func (db *DB) snapshotChunkCopyDatastores(ctx context.Context) ([]chunkCopyDatastore, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	db.chunkMu.RLock()
-	loaded := db.chunkLoaded
-	db.chunkMu.RUnlock()
-	if !loaded {
-		db.chunkMu.Lock()
-		if err := db.loadChunksLocked(); err != nil {
-			db.chunkMu.Unlock()
-			return nil, err
-		}
-		db.chunkMu.Unlock()
+	if err := db.ensureChunksLoaded(); err != nil {
+		return nil, err
+	}
+	type chunkRef struct {
+		coord ChunkCoord
+		chunk *factorioChunkState
+		tile  *chunkTileState
 	}
 	db.chunkMu.RLock()
-	defer db.chunkMu.RUnlock()
 	keys := make([]DatastoreKey, 0, len(db.chunkDatastores))
 	for key := range db.chunkDatastores {
 		keys = append(keys, key)
@@ -508,24 +491,43 @@ func (db *DB) snapshotChunkCopyDatastores(ctx context.Context) ([]chunkCopyDatas
 		return keys[i].Surface < keys[j].Surface
 	})
 	out := make([]chunkCopyDatastore, 0, len(keys))
+	refs := make([][]chunkRef, 0, len(keys))
 	for _, key := range keys {
 		ds := db.chunkDatastores[key]
-		copyDS := chunkCopyDatastore{
+		out = append(out, chunkCopyDatastore{
 			key:          key,
 			latestTick:   ds.latestTick,
 			latestChunk:  ds.latestChunk,
 			latestRowSeq: ds.latestRowSeq,
-			events:       make(map[ChunkCoord][]chunkLogEntry, len(ds.events)),
+		})
+		dsRefs := make([]chunkRef, 0, len(ds.chunks))
+		for coord, chunk := range ds.chunks {
+			dsRefs = append(dsRefs, chunkRef{coord: coord, chunk: chunk, tile: ds.tiles[chunkTileCoordForChunk(coord)]})
 		}
-		for coord, entries := range ds.events {
-			copied := make([]chunkLogEntry, len(entries))
-			for i, entry := range entries {
-				copied[i] = entry
-				copied[i].Changes = append([]chunkPixelChange(nil), entry.Changes...)
+		sort.Slice(dsRefs, func(i, j int) bool {
+			if dsRefs[i].coord.X != dsRefs[j].coord.X {
+				return dsRefs[i].coord.X < dsRefs[j].coord.X
 			}
-			copyDS.events[coord] = copied
+			return dsRefs[i].coord.Y < dsRefs[j].coord.Y
+		})
+		refs = append(refs, dsRefs)
+	}
+	db.chunkMu.RUnlock()
+
+	for i := range out {
+		dsDir := chunkDatastorePath(db.path, out[i].key)
+		chunks := make([]chunkCopyChunk, 0, len(refs[i]))
+		for _, ref := range refs[i] {
+			if ref.tile != nil {
+				ref.tile.mu.RLock()
+			}
+			plan := newChunkFramePlan(dsDir, ref.coord, ref.chunk)
+			if ref.tile != nil {
+				ref.tile.mu.RUnlock()
+			}
+			chunks = append(chunks, chunkCopyChunk{coord: ref.coord, plan: plan})
 		}
-		out = append(out, copyDS)
+		out[i].chunks = chunks
 	}
 	return out, nil
 }
@@ -566,14 +568,16 @@ func (db *DB) processChunkTileBatches(ctx context.Context, groups map[chunkTileB
 	return out
 }
 
-func (db *DB) acquireChunkTileLocks(keys []chunkTileBatchKey) func() {
+// acquireChunkTileLocks write-locks the tiles in a fixed order, so concurrent ingests
+// cannot deadlock. The tile states must exist (see chunkDatastore.tileLocked).
+func acquireChunkTileLocks(keys []chunkTileBatchKey, tiles map[chunkTileBatchKey]*chunkTileState) func() {
 	ordered := append([]chunkTileBatchKey(nil), keys...)
 	sort.Slice(ordered, func(i, j int) bool {
 		return compareChunkTileBatchKey(ordered[i], ordered[j]) < 0
 	})
-	locks := make([]*sync.Mutex, 0, len(ordered))
+	locks := make([]*sync.RWMutex, 0, len(ordered))
 	for _, key := range ordered {
-		lock := db.chunkTileLock(key)
+		lock := &tiles[key].mu
 		lock.Lock()
 		locks = append(locks, lock)
 	}
@@ -582,11 +586,6 @@ func (db *DB) acquireChunkTileLocks(keys []chunkTileBatchKey) func() {
 			locks[i].Unlock()
 		}
 	}
-}
-
-func (db *DB) chunkTileLock(key chunkTileBatchKey) *sync.Mutex {
-	v, _ := db.chunkTileLocks.LoadOrStore(key, &sync.Mutex{})
-	return v.(*sync.Mutex)
 }
 
 func compareChunkTileBatchKey(a, b chunkTileBatchKey) int {
@@ -627,7 +626,6 @@ func (db *DB) processChunkTileBatch(ctx context.Context, batch []chunkIngestWork
 	result := chunkTileBatchResult{
 		touched:  map[DatastoreKey]struct{}{},
 		progress: map[DatastoreKey]chunkDatastoreProgress{},
-		events:   map[DatastoreKey]map[ChunkCoord][]chunkLogEntry{},
 	}
 	writes := make([]chunkWrite, 0, len(batch))
 	lastPayloads := map[ChunkCoord]string{}
@@ -657,9 +655,22 @@ func (db *DB) processChunkTileBatch(ctx context.Context, batch []chunkIngestWork
 			pixels = decoded
 		}
 		wasSeen := chunk.seen
-		changes := make([]chunkPixelChange, 0, ChunkPixelCount)
+		// Size the change list exactly: it is kept until the batch is written.
+		changed := ChunkPixelCount
+		if wasSeen {
+			changed = 0
+			for i, color := range pixels {
+				if chunk.pixels[i] != color {
+					changed++
+				}
+			}
+		}
+		var changes []chunkPixelChange
+		if changed > 0 {
+			changes = make([]chunkPixelChange, 0, changed)
+		}
 		for i, color := range pixels {
-			if !chunk.seen || chunk.pixels[i] != color {
+			if !wasSeen || chunk.pixels[i] != color {
 				chunk.pixels[i] = color
 				changes = append(changes, chunkPixelChange{Pos: uint16(i), Color: color})
 			}
@@ -680,12 +691,6 @@ func (db *DB) processChunkTileBatch(ctx context.Context, batch []chunkIngestWork
 				write.snapshotPixels = chunk.pixels
 			}
 			writes = append(writes, write)
-			chunkEvents := result.events[row.Key]
-			if chunkEvents == nil {
-				chunkEvents = map[ChunkCoord][]chunkLogEntry{}
-				result.events[row.Key] = chunkEvents
-			}
-			chunkEvents[row.Chunk] = append(chunkEvents[row.Chunk], entry)
 		}
 		result.recordChunkProgress(row, seq, uint64(len(changes)), uint64(ChunkPixelCount-len(changes)))
 	}
@@ -760,16 +765,19 @@ func (db *DB) chunksAt(ctx context.Context, key DatastoreKey, tick uint64, coord
 	if len(coords) == 0 {
 		return map[ChunkCoord]*ChunkResult{}, nil
 	}
+	if err := db.ensureChunksLoaded(); err != nil {
+		return nil, err
+	}
+
 	db.chunkMu.RLock()
-	loaded := db.chunkLoaded
+	ds := db.chunkDatastores[key]
+	var dsDir string
+	if ds != nil {
+		dsDir = chunkDatastorePath(db.path, key)
+	}
 	db.chunkMu.RUnlock()
-	if !loaded {
-		db.chunkMu.Lock()
-		if err := db.loadChunksLocked(); err != nil {
-			db.chunkMu.Unlock()
-			return nil, err
-		}
-		db.chunkMu.Unlock()
+	if ds == nil {
+		return nil, fmt.Errorf("%w: %s/%s/%s", ErrDatastoreNotFound, key.SavefileUUID, key.Surface, key.Force)
 	}
 
 	groups := map[chunkTileCoord][]ChunkCoord{}
@@ -777,7 +785,6 @@ func (db *DB) chunksAt(ctx context.Context, key DatastoreKey, tick uint64, coord
 		tile := chunkTileCoordForChunk(coord)
 		groups[tile] = append(groups[tile], coord)
 	}
-	results := map[ChunkCoord]*ChunkResult{}
 	tiles := make([]chunkTileCoord, 0, len(groups))
 	for tile := range groups {
 		tiles = append(tiles, tile)
@@ -788,34 +795,32 @@ func (db *DB) chunksAt(ctx context.Context, key DatastoreKey, tick uint64, coord
 		}
 		return tiles[i].Y < tiles[j].Y
 	})
+	results := map[ChunkCoord]*ChunkResult{}
+	reader := newChunkFrameReader()
+	defer reader.close()
 	for _, tile := range tiles {
-		tileResults, err := db.chunksAtInTile(ctx, key, tick, tile, groups[tile])
-		if err != nil {
+		if err := db.chunksAtInTile(ctx, ds, dsDir, tick, tile, groups[tile], reader, results); err != nil {
 			return nil, err
-		}
-		for coord, result := range tileResults {
-			results[coord] = result
 		}
 	}
 	return results, nil
 }
 
-func (db *DB) chunksAtInTile(ctx context.Context, key DatastoreKey, tick uint64, tile chunkTileCoord, coords []ChunkCoord) (map[ChunkCoord]*ChunkResult, error) {
-	lock := db.chunkTileLock(chunkTileBatchKey{key: key, tileX: tile.X, tileY: tile.Y})
-	lock.Lock()
-	defer lock.Unlock()
-
+// chunksAtInTile reads the chunks of one tile at a tick into results. Tiles that hold no
+// chunk return immediately, without taking a lock or allocating. The tile lock is held
+// only while chunk state is copied, never during disk IO.
+func (db *DB) chunksAtInTile(ctx context.Context, ds *chunkDatastore, dsDir string, tick uint64, tile chunkTileCoord, coords []ChunkCoord, reader *chunkFrameReader, results map[ChunkCoord]*ChunkResult) error {
 	db.chunkMu.RLock()
-	ds := db.chunkDatastores[key]
-	if ds == nil {
-		db.chunkMu.RUnlock()
-		return nil, fmt.Errorf("timeshadedb: datastore not found: %s/%s/%s", key.SavefileUUID, key.Surface, key.Force)
+	ts := ds.tiles[tile]
+	db.chunkMu.RUnlock()
+	if ts == nil {
+		return nil
 	}
-	results := map[ChunkCoord]*ChunkResult{}
-	plans := make([]chunkReadPlan, 0, len(coords))
-	eventFallbacks := map[ChunkCoord][]chunkLogEntry{}
+	key := ds.key
+	var plans []chunkCopyChunk
+	ts.mu.RLock()
 	for _, coord := range coords {
-		chunk := ds.chunks[coord]
+		chunk := ts.chunks[coord]
 		if chunk == nil || !chunk.seen {
 			continue
 		}
@@ -833,233 +838,56 @@ func (db *DB) chunksAtInTile(ctx context.Context, key DatastoreKey, tick uint64,
 			}
 			continue
 		}
-		idx := cloneChunkIndex(chunk.index)
-		if len(idx.snapshots) == 0 {
-			eventFallbacks[coord] = append([]chunkLogEntry(nil), ds.events[coord]...)
-			continue
-		}
-		path := chunkTileDataPath(db.path, key, tile)
-		if !chunk.tileBacked {
-			path = chunkDataPath(db.path, key, coord)
-		}
-		plans = append(plans, chunkReadPlan{coord: coord, path: path, tile: tile, idx: idx})
-		eventFallbacks[coord] = append([]chunkLogEntry(nil), ds.events[coord]...)
+		plans = append(plans, chunkCopyChunk{coord: coord, plan: newChunkFramePlan(dsDir, coord, chunk)})
 	}
-	db.chunkMu.RUnlock()
+	ts.mu.RUnlock()
 
-	if len(plans) == 0 {
-		for coord, events := range eventFallbacks {
-			if result := chunkResultFromEvents(key, tick, coord, events); result != nil {
-				results[coord] = result
-			}
-		}
-		return results, nil
-	}
-	replayed, err := db.replayChunkReadPlans(ctx, key, tick, plans)
-	if err != nil {
-		return nil, err
-	}
-	for coord, result := range replayed {
-		results[coord] = result
-	}
-	for coord, events := range eventFallbacks {
-		if results[coord] != nil {
-			continue
-		}
-		if result := chunkResultFromEvents(key, tick, coord, events); result != nil {
-			results[coord] = result
-		}
-	}
-	return results, nil
-}
-
-func (db *DB) replayChunkReadPlans(ctx context.Context, key DatastoreKey, tick uint64, plans []chunkReadPlan) (map[ChunkCoord]*ChunkResult, error) {
-	states := map[ChunkCoord]*chunkReplayState{}
-	reads := make([]chunkFrameRead, 0)
-	for _, plan := range plans {
-		snapIdx := latestChunkSnapshotAtOrBefore(plan.idx.snapshots, tick)
-		if snapIdx < 0 {
-			continue
-		}
-		snap := plan.idx.snapshots[snapIdx]
-		states[plan.coord] = &chunkReplayState{snapshotTick: snap.Tick}
-		reads = append(reads, chunkFrameRead{
-			coord:  plan.coord,
-			path:   plan.path,
-			tile:   plan.tile,
-			offset: snap.FrameOffset,
-			kind:   frameKindSnapshot,
-		})
-		end := uint32(len(plan.idx.deltas))
-		if snapIdx+1 < len(plan.idx.snapshots) {
-			end = plan.idx.snapshots[snapIdx+1].FirstDeltaFrameIdx
-		}
-		for di := snap.FirstDeltaFrameIdx; di < end; di++ {
-			delta := plan.idx.deltas[di]
-			if delta.MinTick > tick {
-				break
-			}
-			reads = append(reads, chunkFrameRead{
-				coord:  plan.coord,
-				path:   plan.path,
-				tile:   plan.tile,
-				offset: delta.FrameOffset,
-				kind:   frameKindDelta,
-			})
-		}
-	}
-	sort.Slice(reads, func(i, j int) bool {
-		if reads[i].path != reads[j].path {
-			return reads[i].path < reads[j].path
-		}
-		return reads[i].offset < reads[j].offset
-	})
-
-	files := map[string]*os.File{}
-	defer func() {
-		for _, f := range files {
-			_ = f.Close()
-		}
-	}()
-	for _, read := range reads {
+	for _, p := range plans {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
-		f := files[read.path]
-		if f == nil {
-			var err error
-			f, err = os.Open(read.path)
-			if err != nil {
-				return nil, err
-			}
-			switch filepath.Ext(read.path) {
-			case ".tdat":
-				if err := readChunkTileDataHeader(f, read.tile); err != nil {
-					_ = f.Close()
-					return nil, err
-				}
-			case ".cdat":
-				if err := readChunkDataHeader(f, read.coord); err != nil {
-					_ = f.Close()
-					return nil, err
-				}
-			}
-			files[read.path] = f
-		}
-		info, err := readChunkFrame(f, read.offset)
+		result, err := p.plan.replayAt(reader, key, tick)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if info.kind != read.kind {
-			return nil, fmt.Errorf("timeshadedb: chunk index kind mismatch: index %d frame %d", read.kind, info.kind)
-		}
-		raw, err := decompressZstd(info.payload, info.rawLen)
-		if err != nil {
-			return nil, err
-		}
-		if crc32.ChecksumIEEE(raw) != info.checksum {
-			return nil, errors.New("timeshadedb: chunk frame checksum mismatch")
-		}
-		state := states[read.coord]
-		if state == nil {
-			continue
-		}
-		switch read.kind {
-		case frameKindSnapshot:
-			pixels, err := decodeChunkSnapshot(raw)
-			if err != nil {
-				return nil, err
-			}
-			state.pixels = pixels
-			state.seen = true
-			state.snapshotTick = info.tick
-		case frameKindDelta:
-			deltaTick, changes, err := decodeChunkDeltaPayload(raw)
-			if err != nil {
-				return nil, err
-			}
-			if deltaTick != info.tick {
-				return nil, fmt.Errorf("timeshadedb: chunk delta tick mismatch: payload %d frame %d", deltaTick, info.tick)
-			}
-			if info.tick > tick {
-				continue
-			}
-			for _, change := range changes {
-				state.pixels[change.Pos] = change.Color
-			}
-			state.replayed += len(changes)
+		if result != nil {
+			results[p.coord] = result
 		}
 	}
-
-	results := map[ChunkCoord]*ChunkResult{}
-	for coord, state := range states {
-		if !state.seen {
-			continue
-		}
-		pixels := make([]uint16, ChunkPixelCount)
-		copy(pixels, state.pixels[:])
-		results[coord] = &ChunkResult{
-			Key:          key,
-			Chunk:        coord,
-			Tick:         tick,
-			Width:        ChunkSize,
-			Height:       ChunkSize,
-			Pixels:       pixels,
-			SnapshotTick: state.snapshotTick,
-			Replayed:     state.replayed,
-		}
-	}
-	return results, nil
+	return nil
 }
 
-func latestChunkSnapshotAtOrBefore(snaps []chunkSnapshotRecord, tick uint64) int {
-	i := sort.Search(len(snaps), func(i int) bool {
-		return snaps[i].Tick > tick
-	})
-	return i - 1
-}
-
-func cloneChunkIndex(idx chunkIndex) chunkIndex {
-	return chunkIndex{
-		snapshots: append([]chunkSnapshotRecord(nil), idx.snapshots...),
-		deltas:    append([]chunkDeltaRecord(nil), idx.deltas...),
-	}
-}
-
-func chunkResultFromEvents(key DatastoreKey, tick uint64, coord ChunkCoord, events []chunkLogEntry) *ChunkResult {
-	var pixels [ChunkPixelCount]uint16
-	var seen bool
-	var replayed int
-	var snapshotTick uint64
-	for _, entry := range events {
-		if entry.Tick > tick {
-			break
-		}
-		seen = true
-		snapshotTick = entry.Tick
-		for _, change := range entry.Changes {
-			if int(change.Pos) >= len(pixels) {
-				return nil
-			}
-			pixels[change.Pos] = change.Color
-			replayed++
-		}
-	}
-	if !seen {
+// ensureChunksLoaded loads the chunk index on first use.
+func (db *DB) ensureChunksLoaded() error {
+	db.chunkMu.RLock()
+	loaded := db.chunkLoaded
+	db.chunkMu.RUnlock()
+	if loaded {
 		return nil
 	}
-	out := make([]uint16, ChunkPixelCount)
-	copy(out, pixels[:])
-	return &ChunkResult{
-		Key:          key,
-		Chunk:        coord,
-		Tick:         tick,
-		Width:        ChunkSize,
-		Height:       ChunkSize,
-		Pixels:       out,
-		SnapshotTick: snapshotTick,
-		Replayed:     replayed,
+	db.chunkMu.Lock()
+	defer db.chunkMu.Unlock()
+	return db.loadChunksLocked()
+}
+
+// ChunkDatastoreLatestTick returns the greatest tick ingested into the datastore, and
+// whether the datastore exists. A chunk tile requested at a smaller tick will not
+// change any more as long as rows arrive in tick order.
+func (db *DB) ChunkDatastoreLatestTick(key DatastoreKey) (uint64, bool, error) {
+	if err := db.ensureChunksLoaded(); err != nil {
+		return 0, false, err
 	}
+	db.chunkMu.RLock()
+	defer db.chunkMu.RUnlock()
+	ds := db.chunkDatastores[key]
+	if ds == nil {
+		return 0, false, nil
+	}
+	tick := ds.maxTick
+	if ds.latestTick > tick {
+		tick = ds.latestTick
+	}
+	return tick, true, nil
 }
 
 func (db *DB) ingestMetadata(savefileUUID string) (*IngestMetadata, error) {
@@ -1645,7 +1473,10 @@ func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 			chunk.deltaBytesSinceSnapshot += uint64(compLen)
 		}
 	}
-	return writeChunkTileIndex(db.path, ds.key, tile, chunkIndexesForTile(ds, tile))
+	db.chunkMu.RLock()
+	ts := ds.tiles[tile]
+	db.chunkMu.RUnlock()
+	return writeChunkTileIndex(db.path, ds.key, tile, chunkIndexesForTile(ts))
 }
 
 func (db *DB) ensureChunkDatastoreFilesLocked(ds *chunkDatastore) error {
@@ -1769,64 +1600,53 @@ func encodeChunkDeltaPayload(tick uint64, changes []chunkPixelChange) []byte {
 	return buf.Bytes()
 }
 
-func decodeChunkDeltaPayload(raw []byte) (uint64, []chunkPixelChange, error) {
-	if len(raw) < 18 || string(raw[:4]) != "CDEL" {
-		return 0, nil, errors.New("timeshadedb: bad chunk delta payload")
-	}
-	version := binary.LittleEndian.Uint16(raw[4:6])
-	if version != formatVersion {
-		return 0, nil, fmt.Errorf("timeshadedb: unsupported chunk delta payload version %d", version)
-	}
-	count := binary.LittleEndian.Uint32(raw[6:10])
-	tick := binary.LittleEndian.Uint64(raw[10:18])
-	pos := 18
-	changes := make([]chunkPixelChange, 0, count)
-	for i := uint32(0); i < count; i++ {
-		p, n := binary.Uvarint(raw[pos:])
-		if n <= 0 {
-			return 0, nil, errors.New("timeshadedb: bad chunk delta position varint")
-		}
-		pos += n
-		if pos+2 > len(raw) {
-			return 0, nil, errors.New("timeshadedb: truncated chunk delta color")
-		}
-		if p >= ChunkPixelCount {
-			return 0, nil, fmt.Errorf("timeshadedb: chunk delta position out of bounds: %d", p)
-		}
-		changes = append(changes, chunkPixelChange{Pos: uint16(p), Color: binary.LittleEndian.Uint16(raw[pos : pos+2])})
-		pos += 2
-	}
-	if pos != len(raw) {
-		return 0, nil, errors.New("timeshadedb: trailing bytes in chunk delta payload")
-	}
-	return tick, changes, nil
-}
-
 func (db *DB) chunkDatastoreLocked(key DatastoreKey) *chunkDatastore {
 	if db.chunkDatastores == nil {
 		db.chunkDatastores = map[DatastoreKey]*chunkDatastore{}
 	}
 	ds := db.chunkDatastores[key]
 	if ds == nil {
+		// Clone the key: it may be a substring of a whole ingested TSV line.
+		key = DatastoreKey{
+			SavefileUUID: strings.Clone(key.SavefileUUID),
+			Surface:      strings.Clone(key.Surface),
+			Force:        strings.Clone(key.Force),
+		}
 		ds = &chunkDatastore{
 			key:    key,
 			chunks: map[ChunkCoord]*factorioChunkState{},
-			events: map[ChunkCoord][]chunkLogEntry{},
+			tiles:  map[chunkTileCoord]*chunkTileState{},
 		}
 		db.chunkDatastores[key] = ds
 	}
 	return ds
 }
 
+// tileLocked returns the tile state, creating it. Callers hold db.chunkMu for writing.
+func (ds *chunkDatastore) tileLocked(tile chunkTileCoord) *chunkTileState {
+	ts := ds.tiles[tile]
+	if ts == nil {
+		ts = &chunkTileState{chunks: map[ChunkCoord]*factorioChunkState{}}
+		ds.tiles[tile] = ts
+	}
+	return ts
+}
+
+// chunkLocked returns the chunk state, creating it. Callers hold db.chunkMu for writing
+// and, outside of load, the chunk's tile lock.
 func (ds *chunkDatastore) chunkLocked(coord ChunkCoord) *factorioChunkState {
 	chunk := ds.chunks[coord]
 	if chunk == nil {
 		chunk = &factorioChunkState{}
 		ds.chunks[coord] = chunk
+		ds.tileLocked(chunkTileCoordForChunk(coord)).chunks[coord] = chunk
 	}
 	return chunk
 }
 
+// loadChunkDataFilesLocked reads every datastore's tile and legacy chunk indexes and
+// rebuilds each chunk's live pixels from its newest snapshot and the deltas after it.
+// No other history is decoded or kept in memory.
 func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 	root := filepath.Join(db.path, chunkDatastoresDir)
 	entries, err := os.ReadDir(root)
@@ -1837,6 +1657,8 @@ func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 		return false, err
 	}
 	loaded := false
+	reader := newChunkFrameReader()
+	defer reader.close()
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -1865,10 +1687,18 @@ func (db *DB) loadChunkDataFilesLocked() (bool, error) {
 		} else if loadedTiles {
 			loaded = true
 		}
+		if err := db.restoreChunkStatesLocked(ds, dsDir, reader); err != nil {
+			return false, err
+		}
+		reader.close()
+		reader = newChunkFrameReader()
 		if progress != nil {
 			ds.latestTick = progress.LatestTick
 			ds.latestChunk = ChunkCoord{X: progress.LatestChunkX, Y: progress.LatestChunkY}
 			ds.latestRowSeq = progress.LatestRowSeq
+		}
+		if ds.latestTick > ds.maxTick {
+			ds.maxTick = ds.latestTick
 		}
 	}
 	return loaded, nil
@@ -1888,17 +1718,15 @@ func (db *DB) loadLegacyChunkIndexFilesLocked(ds *chunkDatastore, dsDir string) 
 		if file.IsDir() || filepath.Ext(file.Name()) != ".cidx" {
 			continue
 		}
-		idxPath := filepath.Join(chunksDir, file.Name())
-		coord, idx, err := readChunkIndex(idxPath)
+		coord, idx, err := readChunkIndex(filepath.Join(chunksDir, file.Name()))
 		if err != nil {
 			return false, err
 		}
-		dataPath := chunkDataPath(db.path, ds.key, coord)
-		if err := db.loadChunkFramesLocked(ds, coord, idx, false, dataPath, func(f *os.File) error {
-			return readChunkDataHeader(f, coord)
-		}); err != nil {
-			return false, err
+		if len(idx.snapshots) == 0 && len(idx.deltas) == 0 {
+			continue
 		}
+		chunk := ds.chunkLocked(coord)
+		chunk.legacy = &idx
 		loaded = true
 	}
 	return loaded, nil
@@ -1918,119 +1746,83 @@ func (db *DB) loadChunkTileIndexFilesLocked(ds *chunkDatastore, dsDir string) (b
 		if file.IsDir() || filepath.Ext(file.Name()) != ".tidx" {
 			continue
 		}
-		idxPath := filepath.Join(tilesDir, file.Name())
-		tile, indexes, err := readChunkTileIndex(idxPath)
+		_, indexes, err := readChunkTileIndex(filepath.Join(tilesDir, file.Name()))
 		if err != nil {
 			return false, err
 		}
-		dataPath := chunkTileDataPath(db.path, ds.key, tile)
 		for coord, idx := range indexes {
-			if err := db.loadChunkFramesLocked(ds, coord, idx, true, dataPath, func(f *os.File) error {
-				return readChunkTileDataHeader(f, tile)
-			}); err != nil {
-				return false, err
+			if len(idx.snapshots) == 0 && len(idx.deltas) == 0 {
+				continue
 			}
+			chunk := ds.chunkLocked(coord)
+			chunk.index = idx
+			chunk.tileBacked = true
 			loaded = true
 		}
 	}
 	return loaded, nil
 }
 
-func (db *DB) loadChunkFramesLocked(ds *chunkDatastore, coord ChunkCoord, idx chunkIndex, tileBacked bool, dataPath string, readHeader func(*os.File) error) error {
-	f, err := os.Open(dataPath)
-	if err != nil {
-		return err
+// restoreChunkStatesLocked rebuilds the live state of every chunk of a datastore from
+// disk: pixels from the newest snapshot and the deltas after it, the newest frame's
+// tick and sequence number, and the snapshot heuristic counters.
+func (db *DB) restoreChunkStatesLocked(ds *chunkDatastore, dsDir string, reader *chunkFrameReader) error {
+	coords := make([]ChunkCoord, 0, len(ds.chunks))
+	for coord := range ds.chunks {
+		coords = append(coords, coord)
 	}
-	defer f.Close()
-	if err := readHeader(f); err != nil {
-		return err
-	}
-	chunk := ds.chunkLocked(coord)
-	chunk.index = idx
-	chunk.tileBacked = tileBacked
-	type indexedFrame struct {
-		offset uint64
-		seq    uint64
-		kind   uint8
-	}
-	frames := make([]indexedFrame, 0, len(idx.snapshots)+len(idx.deltas))
-	for _, snap := range idx.snapshots {
-		frames = append(frames, indexedFrame{offset: snap.FrameOffset, seq: snap.EventSeq, kind: frameKindSnapshot})
-	}
-	for _, delta := range idx.deltas {
-		frames = append(frames, indexedFrame{offset: delta.FrameOffset, seq: delta.LastEventSeq, kind: frameKindDelta})
-	}
-	sort.Slice(frames, func(i, j int) bool { return frames[i].offset < frames[j].offset })
-	for _, frame := range frames {
-		info, err := readChunkFrame(f, frame.offset)
-		if err != nil {
-			return err
+	// Tile order keeps reads within one file together.
+	sort.Slice(coords, func(i, j int) bool {
+		ti, tj := chunkTileCoordForChunk(coords[i]), chunkTileCoordForChunk(coords[j])
+		if ti != tj {
+			if ti.X != tj.X {
+				return ti.X < tj.X
+			}
+			return ti.Y < tj.Y
 		}
-		raw, err := decompressZstd(info.payload, info.rawLen)
-		if err != nil {
-			return err
+		if coords[i].X != coords[j].X {
+			return coords[i].X < coords[j].X
 		}
-		if crc32.ChecksumIEEE(raw) != info.checksum {
-			return errors.New("timeshadedb: chunk frame checksum mismatch")
+		return coords[i].Y < coords[j].Y
+	})
+	var newest chunkFrameRef
+	var newestCoord ChunkCoord
+	found := false
+	for _, coord := range coords {
+		chunk := ds.chunks[coord]
+		plan := newChunkFramePlan(dsDir, coord, chunk)
+		last, ok := plan.last()
+		if !ok {
+			continue
 		}
-		if info.kind != frame.kind {
-			return fmt.Errorf("timeshadedb: chunk index kind mismatch: index %d frame %d", frame.kind, info.kind)
-		}
-		switch frame.kind {
-		case frameKindSnapshot:
-			pixels, err := decodeChunkSnapshot(raw)
-			if err != nil {
+		frames, _ := plan.framesAt(^uint64(0))
+		var pixels [ChunkPixelCount]uint16
+		for _, frame := range frames {
+			if _, err := reader.apply(frame, ^uint64(0), &pixels); err != nil {
 				return err
 			}
-			chunk.pixels = pixels
-			changes := make([]chunkPixelChange, 0, ChunkPixelCount)
-			for i, color := range pixels {
-				changes = append(changes, chunkPixelChange{Pos: uint16(i), Color: color})
-			}
-			db.applyLoadedChunkEntryLocked(ds, chunk, chunkLogEntry{
-				Seq:     frame.seq,
-				Tick:    info.tick,
-				Key:     ds.key,
-				Chunk:   coord,
-				Changes: changes,
-			})
-		case frameKindDelta:
-			tick, changes, err := decodeChunkDeltaPayload(raw)
-			if err != nil {
-				return err
-			}
-			if tick != info.tick {
-				return fmt.Errorf("timeshadedb: chunk delta tick mismatch: payload %d frame %d", tick, info.tick)
-			}
-			for _, change := range changes {
-				chunk.pixels[change.Pos] = change.Color
-			}
-			db.applyLoadedChunkEntryLocked(ds, chunk, chunkLogEntry{
-				Seq:     frame.seq,
-				Tick:    info.tick,
-				Key:     ds.key,
-				Chunk:   coord,
-				Changes: changes,
-			})
-		default:
-			return fmt.Errorf("timeshadedb: unsupported chunk frame kind %d", info.kind)
 		}
+		chunk.pixels = pixels
+		chunk.seen = true
+		chunk.latestTick = last.tick
+		chunk.latestRowSeq = last.seq
+		if last.tick > ds.maxTick {
+			ds.maxTick = last.tick
+		}
+		if seq := plan.maxSeq(); seq >= db.nextChunkSeq {
+			db.nextChunkSeq = seq + 1
+		}
+		if !found || last.seq > newest.seq {
+			newest, newestCoord, found = last, coord, true
+		}
+		chunk.observeSnapshotCountersFromIndex()
 	}
-	chunk.observeSnapshotCountersFromIndex()
+	if found {
+		ds.latestTick = newest.tick
+		ds.latestChunk = newestCoord
+		ds.latestRowSeq = newest.seq
+	}
 	return nil
-}
-
-func (db *DB) applyLoadedChunkEntryLocked(ds *chunkDatastore, chunk *factorioChunkState, entry chunkLogEntry) {
-	chunk.seen = true
-	chunk.latestTick = entry.Tick
-	chunk.latestRowSeq = entry.Seq
-	ds.events[entry.Chunk] = append(ds.events[entry.Chunk], entry)
-	ds.latestTick = entry.Tick
-	ds.latestChunk = entry.Chunk
-	ds.latestRowSeq = entry.Seq
-	if entry.Seq >= db.nextChunkSeq {
-		db.nextChunkSeq = entry.Seq + 1
-	}
 }
 
 func (chunk *factorioChunkState) observeSnapshotCountersFromIndex() {
@@ -2092,30 +1884,6 @@ func readChunkTileDataHeader(f *os.File, tile chunkTileCoord) error {
 		return errors.New("timeshadedb: chunk tile data header mismatch")
 	}
 	return nil
-}
-
-func readChunkFrame(f *os.File, offset uint64) (*chunkFrameInfo, error) {
-	hdr := make([]byte, chunkFrameHeaderLen)
-	if _, err := f.ReadAt(hdr, int64(offset)); err != nil {
-		return nil, err
-	}
-	if string(hdr[:4]) != "CFRM" {
-		return nil, errors.New("timeshadedb: bad chunk frame magic")
-	}
-	info := &chunkFrameInfo{
-		kind:          hdr[4],
-		tick:          binary.LittleEndian.Uint64(hdr[5:13]),
-		maxTick:       binary.LittleEndian.Uint64(hdr[13:21]),
-		eventCount:    binary.LittleEndian.Uint32(hdr[21:25]),
-		rawLen:        binary.LittleEndian.Uint32(hdr[25:29]),
-		compressedLen: binary.LittleEndian.Uint32(hdr[29:33]),
-		checksum:      binary.LittleEndian.Uint32(hdr[33:37]),
-	}
-	info.payload = make([]byte, info.compressedLen)
-	if _, err := f.ReadAt(info.payload, int64(offset)+int64(chunkFrameHeaderLen)); err != nil {
-		return nil, err
-	}
-	return info, nil
 }
 
 func writeChunkIndex(root string, key DatastoreKey, coord ChunkCoord, idx chunkIndex) error {
@@ -2438,12 +2206,12 @@ func chunkTileFileStem(tile chunkTileCoord) string {
 	return fmt.Sprintf("tx_%d_ty_%d", tile.X, tile.Y)
 }
 
-func chunkIndexesForTile(ds *chunkDatastore, tile chunkTileCoord) map[ChunkCoord]chunkIndex {
-	indexes := map[ChunkCoord]chunkIndex{}
-	for coord, chunk := range ds.chunks {
-		if chunkTileCoordForChunk(coord) == tile {
-			indexes[coord] = chunk.index
-		}
+// chunkIndexesForTile returns the tile index of every chunk in the tile. Callers hold
+// the tile lock.
+func chunkIndexesForTile(ts *chunkTileState) map[ChunkCoord]chunkIndex {
+	indexes := make(map[ChunkCoord]chunkIndex, len(ts.chunks))
+	for coord, chunk := range ts.chunks {
+		indexes[coord] = chunk.index
 	}
 	return indexes
 }
@@ -2462,4 +2230,388 @@ func chunkTileDataPath(root string, key DatastoreKey, tile chunkTileCoord) strin
 
 func chunkTileIndexPath(root string, key DatastoreKey, tile chunkTileCoord) string {
 	return filepath.Join(chunkDatastorePath(root, key), "tiles", chunkTileFileStem(tile)+".tidx")
+}
+
+// chunkFrameRef locates one stored chunk frame.
+type chunkFrameRef struct {
+	path    string
+	legacy  bool // the frame lives in a legacy per-chunk .cdat file
+	coord   ChunkCoord
+	offset  uint64
+	compLen uint32
+	rawLen  uint32
+	kind    uint8
+	tick    uint64
+	seq     uint64
+}
+
+// chunkFramePlan is the stored history of one chunk: the frames of its legacy
+// per-chunk file (if any), followed by the frames of its tile shard. It holds slice
+// headers of the chunk's append-only indexes, captured under the tile lock.
+type chunkFramePlan struct {
+	coord      ChunkCoord
+	legacyPath string
+	legacy     chunkIndex
+	tilePath   string
+	index      chunkIndex
+}
+
+func newChunkFramePlan(dsDir string, coord ChunkCoord, chunk *factorioChunkState) chunkFramePlan {
+	plan := chunkFramePlan{coord: coord, index: chunk.index}
+	if chunk.tileBacked || len(chunk.index.snapshots) > 0 || len(chunk.index.deltas) > 0 {
+		plan.tilePath = filepath.Join(dsDir, "tiles", chunkTileFileStem(chunkTileCoordForChunk(coord))+".tdat")
+	}
+	if chunk.legacy != nil {
+		plan.legacy = *chunk.legacy
+		plan.legacyPath = filepath.Join(dsDir, "chunks", chunkFileStem(coord)+".cdat")
+	}
+	return plan
+}
+
+func (p *chunkFramePlan) snapshotRef(legacy bool, snap chunkSnapshotRecord) chunkFrameRef {
+	path := p.tilePath
+	if legacy {
+		path = p.legacyPath
+	}
+	return chunkFrameRef{
+		path:    path,
+		legacy:  legacy,
+		coord:   p.coord,
+		offset:  snap.FrameOffset,
+		compLen: snap.CompressedLen,
+		rawLen:  snap.RawLen,
+		kind:    frameKindSnapshot,
+		tick:    snap.Tick,
+		seq:     snap.EventSeq,
+	}
+}
+
+func (p *chunkFramePlan) deltaRef(legacy bool, delta chunkDeltaRecord) chunkFrameRef {
+	path := p.tilePath
+	if legacy {
+		path = p.legacyPath
+	}
+	return chunkFrameRef{
+		path:    path,
+		legacy:  legacy,
+		coord:   p.coord,
+		offset:  delta.FrameOffset,
+		compLen: delta.CompressedLen,
+		rawLen:  delta.RawLen,
+		kind:    frameKindDelta,
+		tick:    delta.MinTick,
+		seq:     delta.LastEventSeq,
+	}
+}
+
+// segment appends the frames of one index in write order: deltas recorded before a
+// snapshot precede it, deltas after the last snapshot follow it.
+func (p *chunkFramePlan) segment(legacy bool, idx chunkIndex, out []chunkFrameRef) []chunkFrameRef {
+	di := 0
+	for _, snap := range idx.snapshots {
+		for ; di < int(snap.FirstDeltaFrameIdx) && di < len(idx.deltas); di++ {
+			out = append(out, p.deltaRef(legacy, idx.deltas[di]))
+		}
+		out = append(out, p.snapshotRef(legacy, snap))
+	}
+	for ; di < len(idx.deltas); di++ {
+		out = append(out, p.deltaRef(legacy, idx.deltas[di]))
+	}
+	return out
+}
+
+// all returns every frame of the chunk in write order.
+func (p *chunkFramePlan) all() []chunkFrameRef {
+	out := make([]chunkFrameRef, 0, len(p.legacy.snapshots)+len(p.legacy.deltas)+len(p.index.snapshots)+len(p.index.deltas))
+	out = p.segment(true, p.legacy, out)
+	return p.segment(false, p.index, out)
+}
+
+type chunkPlanSegment struct {
+	legacy bool
+	idx    chunkIndex
+}
+
+// segmentsNewestFirst returns the tile segment, then the legacy one.
+func (p *chunkFramePlan) segmentsNewestFirst() [2]chunkPlanSegment {
+	return [2]chunkPlanSegment{{false, p.index}, {true, p.legacy}}
+}
+
+// framesAt returns the frames to replay for the chunk's state at tick. When fromZero
+// is true no snapshot at or before tick exists, and the frames replay from black up to
+// the first frame after tick (what the former in-memory event log did). Otherwise the
+// first frame is the newest snapshot at or before tick, followed by its deltas up to
+// tick.
+func (p *chunkFramePlan) framesAt(tick uint64) (frames []chunkFrameRef, fromZero bool) {
+	for _, seg := range p.segmentsNewestFirst() {
+		snapIdx := latestChunkSnapshotAtOrBefore(seg.idx.snapshots, tick)
+		if snapIdx < 0 {
+			continue
+		}
+		snap := seg.idx.snapshots[snapIdx]
+		end := uint32(len(seg.idx.deltas))
+		if snapIdx+1 < len(seg.idx.snapshots) {
+			end = seg.idx.snapshots[snapIdx+1].FirstDeltaFrameIdx
+		}
+		frames = append(frames, p.snapshotRef(seg.legacy, snap))
+		for di := snap.FirstDeltaFrameIdx; di < end; di++ {
+			delta := seg.idx.deltas[di]
+			if delta.MinTick > tick {
+				break
+			}
+			frames = append(frames, p.deltaRef(seg.legacy, delta))
+		}
+		return frames, false
+	}
+	for _, frame := range p.all() {
+		if frame.tick > tick {
+			break
+		}
+		frames = append(frames, frame)
+	}
+	return frames, true
+}
+
+// last returns the chunk's newest frame in write order.
+func (p *chunkFramePlan) last() (chunkFrameRef, bool) {
+	for _, seg := range p.segmentsNewestFirst() {
+		nSnap, nDelta := len(seg.idx.snapshots), len(seg.idx.deltas)
+		if nSnap > 0 && int(seg.idx.snapshots[nSnap-1].FirstDeltaFrameIdx) >= nDelta {
+			return p.snapshotRef(seg.legacy, seg.idx.snapshots[nSnap-1]), true
+		}
+		if nDelta > 0 {
+			return p.deltaRef(seg.legacy, seg.idx.deltas[nDelta-1]), true
+		}
+	}
+	return chunkFrameRef{}, false
+}
+
+// maxSeq returns the greatest row sequence number of any frame.
+func (p *chunkFramePlan) maxSeq() uint64 {
+	var out uint64
+	for _, seg := range p.segmentsNewestFirst() {
+		for _, snap := range seg.idx.snapshots {
+			out = max(out, snap.EventSeq)
+		}
+		for _, delta := range seg.idx.deltas {
+			out = max(out, delta.LastEventSeq)
+		}
+	}
+	return out
+}
+
+// replayAt rebuilds the chunk's state at tick from disk. It returns nil when the
+// chunk has no data at or before tick.
+func (p *chunkFramePlan) replayAt(reader *chunkFrameReader, key DatastoreKey, tick uint64) (*ChunkResult, error) {
+	frames, fromZero := p.framesAt(tick)
+	if len(frames) == 0 {
+		return nil, nil
+	}
+	var pixels [ChunkPixelCount]uint16
+	replayed := 0
+	snapshotTick := frames[0].tick
+	for _, frame := range frames {
+		n, err := reader.apply(frame, tick, &pixels)
+		if err != nil {
+			return nil, err
+		}
+		replayed += n
+		if fromZero {
+			snapshotTick = frame.tick
+		}
+	}
+	out := make([]uint16, ChunkPixelCount)
+	copy(out, pixels[:])
+	return &ChunkResult{
+		Key:          key,
+		Chunk:        p.coord,
+		Tick:         tick,
+		Width:        ChunkSize,
+		Height:       ChunkSize,
+		Pixels:       out,
+		SnapshotTick: snapshotTick,
+		Replayed:     replayed,
+	}, nil
+}
+
+func latestChunkSnapshotAtOrBefore(snaps []chunkSnapshotRecord, tick uint64) int {
+	i := sort.Search(len(snaps), func(i int) bool {
+		return snaps[i].Tick > tick
+	})
+	return i - 1
+}
+
+// chunkFrameReader reads and applies frames. It keeps the files it opened (with their
+// headers checked) and reuses its buffers. It is not safe for concurrent use.
+type chunkFrameReader struct {
+	files map[string]*os.File
+	buf   []byte
+	raw   []byte
+}
+
+type chunkFrameBufs struct {
+	buf []byte
+	raw []byte
+}
+
+var chunkFrameBufPool = sync.Pool{New: func() any { return new(chunkFrameBufs) }}
+
+func newChunkFrameReader() *chunkFrameReader {
+	bufs := chunkFrameBufPool.Get().(*chunkFrameBufs)
+	return &chunkFrameReader{buf: bufs.buf, raw: bufs.raw}
+}
+
+func (r *chunkFrameReader) close() {
+	for _, f := range r.files {
+		_ = f.Close()
+	}
+	r.files = nil
+	if cap(r.buf) <= 1<<20 && cap(r.raw) <= 1<<20 {
+		chunkFrameBufPool.Put(&chunkFrameBufs{buf: r.buf[:0], raw: r.raw[:0]})
+	}
+	r.buf, r.raw = nil, nil
+}
+
+func (r *chunkFrameReader) file(ref chunkFrameRef) (*os.File, error) {
+	if f := r.files[ref.path]; f != nil {
+		return f, nil
+	}
+	if len(r.files) >= 16 {
+		// Bound the open handles when a read spans many tiles.
+		for _, f := range r.files {
+			_ = f.Close()
+		}
+		clear(r.files)
+	}
+	f, err := os.Open(ref.path)
+	if err != nil {
+		return nil, err
+	}
+	if ref.legacy {
+		err = readChunkDataHeader(f, ref.coord)
+	} else {
+		err = readChunkTileDataHeader(f, chunkTileCoordForChunk(ref.coord))
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if r.files == nil {
+		r.files = map[string]*os.File{}
+	}
+	r.files[ref.path] = f
+	return f, nil
+}
+
+// apply reads one frame with a single positioned read (header and payload together),
+// checks it and applies it to pixels. A delta newer than maxTick is checked but not
+// applied. It returns the number of pixel changes a delta applied (0 for a snapshot).
+func (r *chunkFrameReader) apply(ref chunkFrameRef, maxTick uint64, pixels *[ChunkPixelCount]uint16) (int, error) {
+	f, err := r.file(ref)
+	if err != nil {
+		return 0, err
+	}
+	hdrLen := int(chunkFrameHeaderLen)
+	buf, err := r.readAt(f, int64(ref.offset), hdrLen+int(ref.compLen))
+	if err != nil {
+		return 0, err
+	}
+	if string(buf[:4]) != "CFRM" {
+		return 0, errors.New("timeshadedb: bad chunk frame magic")
+	}
+	kind := buf[4]
+	tick := binary.LittleEndian.Uint64(buf[5:13])
+	rawLen := binary.LittleEndian.Uint32(buf[25:29])
+	compLen := binary.LittleEndian.Uint32(buf[29:33])
+	checksum := binary.LittleEndian.Uint32(buf[33:37])
+	if compLen != ref.compLen {
+		// The index disagrees with the frame header: trust the header, as the
+		// two-read frame reader did.
+		if buf, err = r.readAt(f, int64(ref.offset), hdrLen+int(compLen)); err != nil {
+			return 0, err
+		}
+	}
+	if kind != ref.kind {
+		return 0, fmt.Errorf("timeshadedb: chunk index kind mismatch: index %d frame %d", ref.kind, kind)
+	}
+	raw, err := zstdDecoder().DecodeAll(buf[hdrLen:], r.raw[:0])
+	if err != nil {
+		return 0, err
+	}
+	r.raw = raw
+	if len(raw) != int(rawLen) {
+		return 0, fmt.Errorf("timeshadedb: decoded payload length %d, expected %d", len(raw), rawLen)
+	}
+	if crc32.ChecksumIEEE(raw) != checksum {
+		return 0, errors.New("timeshadedb: chunk frame checksum mismatch")
+	}
+	switch kind {
+	case frameKindSnapshot:
+		if len(raw) != chunkPayloadBytes {
+			return 0, fmt.Errorf("timeshadedb: chunk snapshot has %d bytes, expected %d", len(raw), chunkPayloadBytes)
+		}
+		for i := range pixels {
+			pixels[i] = binary.LittleEndian.Uint16(raw[i*2 : i*2+2])
+		}
+		return 0, nil
+	case frameKindDelta:
+		return applyChunkDeltaPayload(raw, tick, maxTick, pixels)
+	default:
+		return 0, fmt.Errorf("timeshadedb: unsupported chunk frame kind %d", kind)
+	}
+}
+
+func (r *chunkFrameReader) readAt(f *os.File, offset int64, n int) ([]byte, error) {
+	if cap(r.buf) < n {
+		r.buf = make([]byte, n)
+	}
+	buf := r.buf[:n]
+	if _, err := f.ReadAt(buf, offset); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// applyChunkDeltaPayload checks a delta payload (magic, version, tick, positions, no
+// trailing bytes) and, when frameTick <= maxTick, applies it to pixels without
+// allocating.
+func applyChunkDeltaPayload(raw []byte, frameTick, maxTick uint64, pixels *[ChunkPixelCount]uint16) (int, error) {
+	if len(raw) < 18 || string(raw[:4]) != "CDEL" {
+		return 0, errors.New("timeshadedb: bad chunk delta payload")
+	}
+	version := binary.LittleEndian.Uint16(raw[4:6])
+	if version != formatVersion {
+		return 0, fmt.Errorf("timeshadedb: unsupported chunk delta payload version %d", version)
+	}
+	count := binary.LittleEndian.Uint32(raw[6:10])
+	tick := binary.LittleEndian.Uint64(raw[10:18])
+	if tick != frameTick {
+		return 0, fmt.Errorf("timeshadedb: chunk delta tick mismatch: payload %d frame %d", tick, frameTick)
+	}
+	apply := frameTick <= maxTick
+	pos := 18
+	for i := uint32(0); i < count; i++ {
+		p, n := binary.Uvarint(raw[pos:])
+		if n <= 0 {
+			return 0, errors.New("timeshadedb: bad chunk delta position varint")
+		}
+		pos += n
+		if pos+2 > len(raw) {
+			return 0, errors.New("timeshadedb: truncated chunk delta color")
+		}
+		if p >= ChunkPixelCount {
+			return 0, fmt.Errorf("timeshadedb: chunk delta position out of bounds: %d", p)
+		}
+		if apply {
+			pixels[p] = binary.LittleEndian.Uint16(raw[pos : pos+2])
+		}
+		pos += 2
+	}
+	if pos != len(raw) {
+		return 0, errors.New("timeshadedb: trailing bytes in chunk delta payload")
+	}
+	if !apply {
+		return 0, nil
+	}
+	return int(count), nil
 }
