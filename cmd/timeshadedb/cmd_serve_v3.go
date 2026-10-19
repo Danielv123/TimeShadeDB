@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"timeshadedb"
 	"timeshadedb/internal/v3/api"
 	"timeshadedb/internal/v3/core"
@@ -147,9 +149,12 @@ func (v *v3Server) Close() error {
 }
 
 // openV3Server opens every store under o.db and builds the API server. The memory
-// budget is split (PLAN.md §4.3): half to the terrain store (terrain.SplitBudget), a
-// quarter to the encoded-response cache, an eighth to decoded coarse images, and the
-// rest to mover open rows and overlay caches.
+// budget is split (PLAN.md §4.3): 3/8 to the terrain store (terrain.SplitBudget), 3/16
+// to the encoded-response cache, 3/32 to decoded coarse images, 1/32 to overlay caches
+// and an eighth bounds the mover open rows (held only while a burst outruns the commit
+// loop). The rest of the budget is left to the working memory of ingest and reads and
+// to the encoders, so the caches can fill without the collector running constantly
+// against the memory limit (runServeV3).
 func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...any)) (*v3Server, error) {
 	t0 := time.Now()
 	if err := os.MkdirAll(o.db, 0o755); err != nil {
@@ -168,7 +173,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		refClock = dataClock.Seen
 	}
 
-	topt := terrain.SplitBudget(o.memBudget / 2)
+	topt := terrain.SplitBudget(o.memBudget * 3 / 8)
 	topt.Window = core.TimeMs(o.window.Milliseconds())
 	// Each commit worker holds decoded tiles and an encoder; bound them for memory.
 	topt.Workers = min(runtime.GOMAXPROCS(0), 8)
@@ -182,14 +187,18 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 
 	// Coarse series load lazily (and are preloaded in the background), so the server
 	// listens at once whatever the size of the history.
-	pyr, err := pyramid.New(ctx, ter, ter.SeriesStore(), pyramid.Options{CacheBytes: o.memBudget / 8, Lazy: true})
+	// SpeedBetterCompression rather than the default best: the best encoder holds about
+	// 34 MiB of tables for the life of the server, and the coarse tiles a live server
+	// builds come out only about 4% larger (imports keep the best level).
+	pyr, err := pyramid.New(ctx, ter, ter.SeriesStore(), pyramid.Options{CacheBytes: o.memBudget * 3 / 32, Lazy: true,
+		ZstdLevel: zstd.SpeedBetterCompression})
 	if err != nil {
 		return fail(fmt.Errorf("pyramid: %w", err))
 	}
 	v.pyr = pyr
 	v.closers = append(v.closers, pyr.Close)
 
-	rend, err := tileenc.NewRenderer(pyr, ter, tileenc.Options{CacheBytes: o.memBudget / 4})
+	rend, err := tileenc.NewRenderer(pyr, ter, tileenc.Options{CacheBytes: o.memBudget * 3 / 16})
 	if err != nil {
 		return fail(err)
 	}

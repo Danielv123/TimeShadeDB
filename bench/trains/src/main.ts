@@ -11,6 +11,8 @@
 //       [--mask history|final]  (rail mask: tiles of the rail colour at any time of the
 //       chart history (default), or in the final chart only)
 //       [--jumps-out <file>]  (one JSON line per jump outside a handoff)
+//       [--offrail-out <file>]  (one JSON line per run of frames with a carriage more
+//       than 2 tiles off outside a handoff)
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { cpus, platform, release, arch } from "node:os";
@@ -18,7 +20,7 @@ import { basename, dirname } from "node:path";
 
 import { illisisName, loadRailMask, loadTrainJourneys, type MaskMode } from "./illisis_data.ts";
 import { loadV3Journeys } from "./v3_data.ts";
-import { defaultOptions, leaveOneOut, newRenderStats, renderJourney, summarize, type JumpInfo, type LooResult } from "./metrics.ts";
+import { defaultOptions, leaveOneOut, newRenderStats, renderJourney, summarize, type JumpInfo, type LooResult, type OffRailInfo } from "./metrics.ts";
 import type { Journey } from "./types.ts";
 import { renderer } from "./renderers/index.ts";
 
@@ -47,6 +49,9 @@ if (maskMode !== "history" && maskMode !== "final") {
   process.exit(2);
 }
 const jumpLines: string[] = [];
+const offOut = arg("offrail-out");
+// Off-rail frames grouped into runs per journey: consecutive frames (one step apart).
+const offRuns: { id: string; t0: number; t1: number; frames: number; maxDist: number; maxCar: number; x: number; y: number; around: unknown }[] = [];
 const opts = {
   ...defaultOptions,
   hz: Number(arg("hz", String(defaultOptions.hz))),
@@ -59,6 +64,22 @@ const opts = {
         jumpLines.push(JSON.stringify({ id: j.id, ...info, around }));
       }
     : undefined,
+  onOffRail: offOut
+    ? (j: Journey, info: OffRailInfo) => {
+        const last = offRuns[offRuns.length - 1];
+        if (last && last.id === j.id && info.t - last.t1 <= 200) {
+          last.t1 = info.t;
+          last.frames++;
+          if (info.dist > last.maxDist) {
+            Object.assign(last, { maxDist: info.dist, maxCar: info.car, x: info.x, y: info.y });
+          }
+          return;
+        }
+        const s = j.samples;
+        const around = s.slice(Math.max(0, info.at - 2), info.at + 3).map((x) => [x.t, x.gone ? "gone" : [x.x, x.y], x.stop ? "stop" : "", x.es ? "es" : "", x.car ? "car" + x.car.length : ""]);
+        offRuns.push({ id: j.id, t0: info.t, t1: info.t, frames: 1, maxDist: info.dist, maxCar: info.car, x: info.x, y: info.y, around });
+      }
+    : undefined,
 };
 
 const started = new Date();
@@ -66,6 +87,13 @@ const t0 = performance.now();
 let journeys = journeysJson ? loadV3Journeys(journeysJson) : loadTrainJourneys(data, mapDir, surfaceDir);
 if (maxJourneys > 0) {
   journeys = journeys.slice(0, maxJourneys);
+}
+// --shard k/n: only every n-th journey from the k-th (0-based), to run diagnostics in
+// parallel processes; the metrics then cover that shard only.
+const shard = arg("shard");
+if (shard) {
+  const [k, n] = shard.split("/").map(Number);
+  journeys = journeys.filter((_j, i) => i % n === k);
 }
 const tLoad = performance.now();
 const mask = loadRailMask(data, mapDir, surfaceDir, "player", Infinity, maskMode);
@@ -118,6 +146,10 @@ const result = {
 };
 for (const k of Object.keys(metrics).sort()) {
   console.log(`  ${k.padEnd(44)} ${Number.isInteger(metrics[k]) ? metrics[k] : metrics[k].toFixed(4)}`);
+}
+if (offOut) {
+  writeFileSync(offOut, offRuns.map((x) => JSON.stringify(x)).join(String.fromCharCode(10)) + String.fromCharCode(10));
+  console.error(`wrote ${offRuns.length} off-rail runs to ${offOut}`);
 }
 if (jumpsOut) {
   writeFileSync(jumpsOut, jumpLines.join("\n") + (jumpLines.length ? "\n" : ""));

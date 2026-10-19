@@ -29,6 +29,20 @@ export interface EvalOptions {
   handoffMarginMs: number;
   /** Called for every jump outside a handoff window (diagnostics, --jumps-out). */
   onJump?: (j: Journey, info: JumpInfo) => void;
+  /** Called for every frame with a carriage more than 2 tiles off outside a handoff (--offrail-out). */
+  onOffRail?: (j: Journey, info: OffRailInfo) => void;
+}
+
+/** A frame with a carriage centre more than 2 tiles from a rail. */
+export interface OffRailInfo {
+  t: number;
+  /** Index of the carriage (0 = head) and its centre and distance. */
+  car: number;
+  x: number;
+  y: number;
+  dist: number;
+  /** Index of the last sample at or before t. */
+  at: number;
 }
 
 /** A frame-to-frame jump of the head larger than v*dt + 2 tiles. */
@@ -296,7 +310,9 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
       st.headOver2OutsideHandoff++;
     }
     const movingFrame = prev !== undefined && Math.hypot(p.x - prev.x, p.y - prev.y) > 0.05;
+    let ci = -1;
     for (const d of dists) {
+      ci++;
       if (movingFrame) {
         st.movingCarFrames++;
         st.movingDist.add(d);
@@ -313,6 +329,10 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
         st.carOver2++;
         if (!handoff) {
           st.carOver2OutsideHandoff++;
+          if (o.onOffRail) {
+            const c = p.cars[ci] ?? p;
+            o.onOffRail(j, { t, car: ci, x: c.x, y: c.y, dist: d, at });
+          }
         }
       }
     }
