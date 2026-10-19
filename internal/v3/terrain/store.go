@@ -489,25 +489,19 @@ func (s *Store) loadDS(id string) (d *dsState, err error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	var tls []*tileState
 	for _, e := range ents {
 		tc, ok := parseTileFile(e.Name())
 		if !ok || e.IsDir() {
 			continue
 		}
-		tl := &tileState{coord: tc, name: tileName(id, tc)}
-		h, err := s.series.OpenSeries(tl.name, false)
-		if err != nil {
-			return nil, err
-		}
-		sum := h.Summary()
-		h.Close()
-		tl.versions, tl.firstT, tl.lastT = sum.Versions, sum.FirstT, sum.LastT
-		tl.sinceBase, tl.bytesSinceBase = sum.SinceBase, sum.BytesSinceBase
-		tl.refLen = sum.LastBaseLen
-		if tl.refLen == 0 {
-			tl.refLen = sum.FirstLen
-		}
-		d.tiles[tc] = tl
+		tls = append(tls, &tileState{coord: tc, name: tileName(id, tc)})
+	}
+	if err := s.loadTileSummaries(tls); err != nil {
+		return nil, err
+	}
+	for _, tl := range tls {
+		d.tiles[tl.coord] = tl
 	}
 	if !s.opt.NoWAL {
 		if d.wal, err = openWAL(filepath.Join(dir, "wal"), s.opt.NoSync); err != nil {
@@ -550,6 +544,58 @@ func (s *Store) loadDS(id string) (d *dsState, err error) {
 		}
 	}
 	return d, nil
+}
+
+// loadTileWorkers bounds the tile series loadTileSummaries opens at once.
+const loadTileWorkers = 16
+
+// loadTileSummaries fills each tile's version summary from its series. Opening a series
+// mostly waits on the file system (and is much slower on Windows while the files are
+// fresh from a bulk write), so up to loadTileWorkers series are opened at once.
+func (s *Store) loadTileSummaries(tls []*tileState) error {
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		first error
+	)
+	jobs := make(chan *tileState)
+	for w := 0; w < min(loadTileWorkers, len(tls)); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for tl := range jobs {
+				h, err := s.series.OpenSeries(tl.name, false)
+				if err != nil {
+					mu.Lock()
+					if first == nil {
+						first = err
+					}
+					mu.Unlock()
+					continue
+				}
+				sum := h.Summary()
+				h.Close()
+				tl.versions, tl.firstT, tl.lastT = sum.Versions, sum.FirstT, sum.LastT
+				tl.sinceBase, tl.bytesSinceBase = sum.SinceBase, sum.BytesSinceBase
+				tl.refLen = sum.LastBaseLen
+				if tl.refLen == 0 {
+					tl.refLen = sum.FirstLen
+				}
+			}
+		}()
+	}
+	for _, tl := range tls {
+		mu.Lock()
+		failed := first != nil
+		mu.Unlock()
+		if failed {
+			break
+		}
+		jobs <- tl
+	}
+	close(jobs)
+	wg.Wait()
+	return first
 }
 
 // ensureDS returns the datastore, creating it (directory, meta.json, palette, WAL) if

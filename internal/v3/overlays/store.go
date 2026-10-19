@@ -110,6 +110,11 @@ type Stats struct {
 	LogBytes                int64 // gauge: total log size
 	TornBytes               int64 // torn tails truncated at Open
 	Salvaged                int   // damaged logs set aside at Open (Options.Salvage)
+	// IndexBytes (gauge) estimates the memory of what Open rebuilds and keeps for
+	// every datastore: the per-tile record index (8 B per record plus about 64 B per
+	// tile) and the open-interval map (about 100 B plus the key per open interval).
+	// It grows with the history and is not part of CacheBytes or any budget.
+	IndexBytes int64
 }
 
 type kindKey struct {
@@ -668,6 +673,12 @@ func (o *Store) Stats() Stats {
 		st.OpenIntervals += len(d.open)
 		st.Tiles += len(d.tiles)
 		st.LogBytes += d.size
+		for _, locs := range d.tiles {
+			st.IndexBytes += 64 + 8*int64(cap(locs))
+		}
+		for k := range d.open {
+			st.IndexBytes += 100 + int64(len(k.key))
+		}
 	}
 	return st
 }

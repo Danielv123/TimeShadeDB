@@ -198,7 +198,9 @@ type TerrainStore interface {
 	Commit(ctx context.Context, upTo TimeMs) error
 	// EnsureDatastore creates the datastore with window length w if it does not exist
 	// (w <= 0 means DefaultTerrainWindow). Apply creates unknown datastores with the
-	// default window, so calling this is only needed for a non-default window.
+	// default window, so calling this is only needed for a non-default window. A new
+	// datastore has no horizon (accepts any T) until the next Commit; it does not
+	// inherit the horizon of other datastores.
 	EnsureDatastore(ctx context.Context, ds DatastoreKey, w TimeMs) error
 	// Datastores lists every datastore, sorted by ID.
 	Datastores(ctx context.Context) ([]DatastoreInfo, error)

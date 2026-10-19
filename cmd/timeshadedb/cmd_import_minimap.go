@@ -99,6 +99,12 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 		if err != nil {
 			return err
 		}
+		// The import cannot resume: the stores would drop everything before their
+		// horizon as late, so it only writes into an empty database.
+		if err := checkImportTargetEmpty(ctx, stores); err != nil {
+			stores.Close()
+			return fmt.Errorf("import-minimap: %s: %w", *dbDir, err)
+		}
 	} else {
 		stores = openMemImportStores()
 	}
@@ -123,8 +129,21 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	if !*noOverlays {
 		opt.Overlays = stores.Overlays
 	}
-	var memBefore runtime.MemStats
-	runtime.ReadMemStats(&memBefore)
+	// The pyramid is built from the terrain store alone, so it starts as soon as the
+	// terrain import is done, while the movers are still importing.
+	var pyr *pyramid.BuildStats
+	var pyrMs int64
+	if ter != nil && opt.Terrain != nil && !*noPyramid {
+		opt.AfterTerrain = func(ctx context.Context) error {
+			t0 := time.Now()
+			st, err := buildV3Pyramid(ctx, ter)
+			if err != nil {
+				return fmt.Errorf("pyramid: %w", err)
+			}
+			pyr, pyrMs = &st, time.Since(t0).Milliseconds()
+			return nil
+		}
+	}
 	rep, err := minimap.Import(ctx, d, opt)
 	if err != nil {
 		return err
@@ -141,17 +160,11 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 		TerrainVerify  *minimap.TerrainVerify  `json:"terrain_verify,omitempty"`
 		MoverVerify    []minimap.MoverVerify   `json:"mover_verify,omitempty"`
 		OverlayVerify  []minimap.OverlayVerify `json:"overlay_verify,omitempty"`
-	}{Import: rep, HeapAllocBytes: mem.HeapAlloc}
+	}{Import: rep, HeapAllocBytes: mem.HeapAlloc, Pyramid: pyr, PyramidMs: pyrMs}
 	printImportReport(stdout, rep, mem.HeapAlloc)
-	if ter != nil && opt.Terrain != nil && !*noPyramid {
-		t0 := time.Now()
-		st, err := buildV3Pyramid(ctx, ter)
-		if err != nil {
-			return err
-		}
-		full.Pyramid, full.PyramidMs = &st, time.Since(t0).Milliseconds()
-		fmt.Fprintf(stdout, "pyramid: %d versions (%d snapshots, %d deltas), %d payload bytes, %d ms\n",
-			st.Versions, st.Snapshots, st.Deltas, st.Bytes, full.PyramidMs)
+	if pyr != nil {
+		fmt.Fprintf(stdout, "pyramid: %d versions (%d snapshots, %d deltas), %d payload bytes, %d ms (started after terrain, during the mover import)\n",
+			pyr.Versions, pyr.Snapshots, pyr.Deltas, pyr.Bytes, pyrMs)
 	}
 
 	ok := true
@@ -229,8 +242,38 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	if !ok {
 		return errors.New("import-minimap: verification failed")
 	}
+	// The importer feeds every store in time order, so late rows mean lost history.
+	if n := rep.TerrainApply.Late + rep.MoverApply.Late + rep.OverlayApply.Late; n > 0 {
+		return fmt.Errorf("import-minimap: the stores dropped %d updates as late (terrain %d, movers %d, overlays %d)",
+			n, rep.TerrainApply.Late, rep.MoverApply.Late, rep.OverlayApply.Late)
+	}
 	if n := rep.FileErrors(); n > 0 && !*allowErrors {
 		return fmt.Errorf("import-minimap: %d files failed to read or decode (listed above); the import is incomplete (--allow-errors accepts that)", n)
+	}
+	return nil
+}
+
+// checkImportTargetEmpty fails when any file-backed store already holds a datastore
+// or surface.
+func checkImportTargetEmpty(ctx context.Context, s importStores) error {
+	if infos, err := s.Terrain.Datastores(ctx); err != nil {
+		return err
+	} else if len(infos) > 0 {
+		return fmt.Errorf("already holds %d terrain datastores (%s, ...); import into an empty --db", len(infos), infos[0].Key.ID())
+	}
+	if sfcs, err := s.Movers.Surfaces(ctx); err != nil {
+		return err
+	} else if len(sfcs) > 0 {
+		return fmt.Errorf("already holds movers for %d surfaces; import into an empty --db", len(sfcs))
+	}
+	if l, ok := s.Overlays.(interface {
+		Datastores(context.Context) ([]core.DatastoreKey, error)
+	}); ok {
+		if keys, err := l.Datastores(ctx); err != nil {
+			return err
+		} else if len(keys) > 0 {
+			return fmt.Errorf("already holds overlays for %d datastores (%s, ...); import into an empty --db", len(keys), keys[0].ID())
+		}
 	}
 	return nil
 }

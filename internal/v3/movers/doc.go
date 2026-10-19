@@ -61,16 +61,18 @@
 //
 // No history is held in memory. Per surface the store keeps the open rows (bounded
 // across surfaces by Options.MaxOpenRows; Append returns ErrOverloaded beyond it), the
-// closed rows of the last core.LiveTrail before the horizon (Options.MaxTrailRows) and
-// the last row of every live journey (Options.MaxLiveMovers), from which keyframes and
-// Live are built. Opening rebuilds these from the newest keyframe, the windows after it
+// closed rows of the last core.LiveTrail before the horizon and the last row of every
+// live journey, from which keyframes and Live are built. Options.MaxTrailRows and
+// Options.MaxLiveMovers bound those two summed over all surfaces: each commit trims the
+// surface it commits to what the other surfaces leave of the limit, or an equal share
+// if that is more (Store.share). Opening rebuilds these from the newest keyframe, the windows after it
 // and the WAL; nothing older is read. A window or keyframe that does not decode is
 // logged, counted (Stats.Corrupt) and skipped there, so one damaged file cannot stop
 // the store opening; Window and Keyframe return an error for it.
 //
-// MaxTrailRows and MaxLiveMovers are per surface, so the worst case grows with the
-// number of surfaces; they are not yet derived from a global --mem-budget (WP6/WP11).
-// During a Commit the store briefly holds about 2-3 times the open rows of the surface
+// The limits are not yet derived from a global --mem-budget (WP6/WP11). Open loads
+// each surface with the whole limits and trims them to their shares once all surfaces
+// are loaded, so the store briefly holds more while it opens. During a Commit the store briefly holds about 2-3 times the open rows of the surface
 // being committed (the sorted and deduplicated row pointers, the rows that stay open,
 // the MoverRow arrays and the encoded window bodies) plus a copy of its live map.
 //

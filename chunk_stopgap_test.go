@@ -95,7 +95,10 @@ func ingestRandomHistory(t *testing.T, db *DB, key DatastoreKey, oracle *chunkOr
 			state[c] = px
 			rowTick := tick
 			if rng.Intn(20) == 0 && rowTick > firstTick {
-				rowTick-- // a second row at the previous round's tick
+				// One tick before the rest of this round, so ticks inside a batch
+				// are not sorted. It is still after the previous round (tick-60):
+				// rows never go back across rounds (v2 does not order them, B3).
+				rowTick--
 			}
 			rows = append(rows, ParsedChunkRow{Key: key, Tick: rowTick, Chunk: c, Pixels: px})
 		}
