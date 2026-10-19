@@ -1,9 +1,5 @@
-//go:build integration
-
 // Integration tests against WP2's file-backed stores (internal/v3/terrain and
-// internal/v3/series). They need those packages, so they only build with
-// -tags integration on a branch that has both WP2 and WP3 (the v3 branch after the
-// merge); drop the tag once both are merged.
+// internal/v3/series). TestWholeMapFileStores needs TSDB_TESTDATA.
 
 package pyramid
 

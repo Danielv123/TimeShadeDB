@@ -16,6 +16,8 @@ import (
 	"timeshadedb/internal/import/minimap"
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/memstore"
+	"timeshadedb/internal/v3/pyramid"
+	"timeshadedb/internal/v3/terrain"
 )
 
 func init() {
@@ -27,9 +29,8 @@ func init() {
 	})
 }
 
-// importStores are the stores import-minimap writes into. Until the v3 terrain (WP2) and
-// mover/overlay (WP4) stores are merged the command imports into the in-memory
-// reference stores, which is what the WP5 acceptance run measures.
+// importStores are the stores import-minimap writes into: the file-backed v3 stores
+// under --db (v3stores.go), or the in-memory reference stores without it.
 type importStores struct {
 	Terrain  core.TerrainStore
 	Movers   core.MoverStore
@@ -64,6 +65,8 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	reportPath := fs.String("report", "", "write the full JSON report to this file")
 	mapsOut := fs.String("maps-out", "", "write the catalog map metadata (core.MapInfo list) to this JSON file")
 	allowErrors := fs.Bool("allow-errors", false, "exit 0 even when some files fail to read or decode (a best-effort import)")
+	dbDir := fs.String("db", "", "v3 database root to import into (default: in-memory reference stores, nothing is written)")
+	noPyramid := fs.Bool("no-pyramid", false, "with --db, skip building the coarse levels after the import")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fs.SetOutput(stdout)
@@ -89,8 +92,22 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	if err != nil {
 		return err
 	}
-	stores := openMemImportStores()
-	defer stores.Close()
+	var stores importStores
+	var ter *terrain.Store
+	if *dbDir != "" {
+		stores, ter, err = openV3ImportStores(*dbDir)
+		if err != nil {
+			return err
+		}
+	} else {
+		stores = openMemImportStores()
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			stores.Close()
+		}
+	}()
 	opt := minimap.Options{
 		Window:   core.TimeMs(window.Milliseconds()),
 		Workers:  *workers,
@@ -117,11 +134,25 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	full := struct {
 		Import         *minimap.Report         `json:"import"`
 		HeapAllocBytes uint64                  `json:"heap_alloc_bytes"`
+		Pyramid        *pyramid.BuildStats     `json:"pyramid,omitempty"`
+		PyramidMs      int64                   `json:"pyramid_ms,omitempty"`
+		CloseMs        int64                   `json:"close_ms,omitempty"`
+		DiskBytes      int64                   `json:"disk_bytes,omitempty"`
 		TerrainVerify  *minimap.TerrainVerify  `json:"terrain_verify,omitempty"`
 		MoverVerify    []minimap.MoverVerify   `json:"mover_verify,omitempty"`
 		OverlayVerify  []minimap.OverlayVerify `json:"overlay_verify,omitempty"`
 	}{Import: rep, HeapAllocBytes: mem.HeapAlloc}
 	printImportReport(stdout, rep, mem.HeapAlloc)
+	if ter != nil && opt.Terrain != nil && !*noPyramid {
+		t0 := time.Now()
+		st, err := buildV3Pyramid(ctx, ter)
+		if err != nil {
+			return err
+		}
+		full.Pyramid, full.PyramidMs = &st, time.Since(t0).Milliseconds()
+		fmt.Fprintf(stdout, "pyramid: %d versions (%d snapshots, %d deltas), %d payload bytes, %d ms\n",
+			st.Versions, st.Snapshots, st.Deltas, st.Bytes, full.PyramidMs)
+	}
 
 	ok := true
 	if *verify {
@@ -166,6 +197,21 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 				fmt.Fprintf(stdout, "verify overlays %s: match=%v intervals=%d\n", v.DS, v.Match, v.Intervals)
 			}
 		}
+	}
+	if *dbDir != "" {
+		if err := writeV3Maps(*dbDir, rep.Maps); err != nil {
+			return err
+		}
+		t0 := time.Now()
+		closed = true
+		if err := stores.Close(); err != nil {
+			return err
+		}
+		full.CloseMs = time.Since(t0).Milliseconds()
+		if full.DiskBytes, err = dirBytes(*dbDir); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "database %s: %d bytes on disk, closed in %d ms\n", *dbDir, full.DiskBytes, full.CloseMs)
 	}
 	if *reportPath != "" {
 		if err := writeJSONFile(*reportPath, full); err != nil {

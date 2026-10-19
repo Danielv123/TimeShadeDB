@@ -45,8 +45,22 @@ if the game did not run at 60 UPS. The savefile UUID becomes the v3 map name unl
 `--map` is given. v3 keeps the net change per chunk and terrain window (`--window`,
 default 60s), so states that lasted less than a window are not carried over; at every
 window boundary the copy equals the v2 database. The source is opened read-only.
-`--dry-run` migrates into memory and writes nothing. Writing with `--db` needs a
-binary that includes the v3 terrain engine.
+`--dry-run` migrates into memory and writes nothing. `--db` writes the v3 terrain
+store and then builds its coarse zoom levels (the pyramid).
+
+## Importing an illisis/minimap export
+
+`timeshadedb import-minimap` reads an illisis/minimap S3 export (the directory that
+holds `maps.json.gz`) and writes terrain, movers, tags and recipes into a v3 database,
+then builds the pyramid and stores the map metadata in `maps.json`:
+
+```powershell
+timeshadedb import-minimap --db v3db --verify D:\minimap-export
+```
+
+Without `--db` it imports into in-memory stores, which only checks the export.
+`--verify` compares the imported state with the export and reads the movers and
+overlays back.
 
 ## Factorio export
 

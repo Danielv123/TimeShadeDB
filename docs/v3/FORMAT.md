@@ -266,7 +266,7 @@ on the same map is 3.09 B per chunk-hour (5.3), so z0 and pyramid together come 
 Replayed live through WP2's file-backed terrain store (a commit before every batch of
 1,024 updates, `Update` after each commit, a flush at the end), the whole map stored
 3.09 B per chunk-hour for z0 and 1.82 for the pyramid, 4.91 in total
-(`internal/v3/pyramid` TestWholeMapFileStores, build tag `integration`).
+(`internal/v3/pyramid` TestWholeMapFileStores, with TSDB_TESTDATA set).
 
 ### 5.5 Mover windows on disk (WP4)
 

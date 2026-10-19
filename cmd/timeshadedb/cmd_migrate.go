@@ -27,9 +27,15 @@ func init() {
 // --dry-run, which migrates into the in-memory reference store.
 var v3TerrainStoreOpener func(ctx context.Context, dir string) (core.TerrainStore, error)
 
+// v3TerrainFinisher, when set, runs after a migration into a store from
+// v3TerrainStoreOpener and before verification: it builds the coarse levels (the
+// pyramid) and returns a summary for the output.
+var v3TerrainFinisher func(ctx context.Context, store core.TerrainStore) (any, error)
+
 type migrateV3Output struct {
 	Target    string                `json:"target"`
 	Migration migrate.Stats         `json:"migration"`
+	Pyramid   any                   `json:"pyramid,omitempty"`
 	Verify    *migrate.VerifyReport `json:"verify,omitempty"`
 }
 
@@ -123,6 +129,11 @@ func runMigrateV3(ctx context.Context, args []string, stdout io.Writer) error {
 	out.Migration, err = migrate.Migrate(ctx, src, dst, opts)
 	if err != nil {
 		return err
+	}
+	if !*dryRun && v3TerrainFinisher != nil {
+		if out.Pyramid, err = v3TerrainFinisher(ctx, dst); err != nil {
+			return err
+		}
 	}
 	if *verify > 0 {
 		report, err := migrate.Verify(ctx, src, dst, opts, migrate.VerifyOptions{Samples: *verify, Seed: *seed, Window: opts.Window})

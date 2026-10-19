@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"timeshadedb"
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/memstore"
+	"timeshadedb/internal/v3/migrate"
 )
 
 func writeSmallChunkDB(t *testing.T) string {
@@ -68,21 +68,45 @@ func TestMigrateV3DryRun(t *testing.T) {
 func TestMigrateV3Targets(t *testing.T) {
 	path := writeSmallChunkDB(t)
 	var out bytes.Buffer
-	err := runMigrateV3(context.Background(), []string{"--from", path, "--db", filepath.Join(t.TempDir(), "v3")}, &out)
-	if err == nil || !strings.Contains(err.Error(), "no v3 terrain store") {
-		t.Fatalf("missing store error = %v", err)
-	}
 	if err := runMigrateV3(context.Background(), []string{"--from", path}, &out); err == nil {
 		t.Fatal("neither --db nor --dry-run accepted")
 	}
 
+	// The built-in opener (v3stores.go) writes the file-backed store and its pyramid.
+	realDir := filepath.Join(t.TempDir(), "v3real")
+	if err := runMigrateV3(context.Background(), []string{"--from", path, "--db", realDir}, &out); err != nil {
+		t.Fatalf("migrate into the file store: %v\n%s", err, out.String())
+	}
+	var res struct {
+		Pyramid *struct {
+			Versions int `json:"versions"`
+		} `json:"pyramid"`
+		Verify *migrate.VerifyReport `json:"verify"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if res.Pyramid == nil || res.Pyramid.Versions == 0 || res.Verify == nil || !res.Verify.OK() {
+		t.Fatalf("file store migration output:\n%s", out.String())
+	}
+	reopened, err := v3TerrainStoreOpener(context.Background(), realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	infos, err := reopened.Datastores(context.Background())
+	reopened.Close()
+	if err != nil || len(infos) != 1 || infos[0].Tiles == 0 {
+		t.Fatalf("reopened file store datastores = %+v (%v)", infos, err)
+	}
+
 	store := memstore.NewTerrain()
 	opened := ""
+	saved := v3TerrainStoreOpener
 	v3TerrainStoreOpener = func(ctx context.Context, dir string) (core.TerrainStore, error) {
 		opened = dir
 		return keepOpen{store}, nil
 	}
-	defer func() { v3TerrainStoreOpener = nil }()
+	defer func() { v3TerrainStoreOpener = saved }()
 	dir := filepath.Join(t.TempDir(), "v3")
 	out.Reset()
 	if err := runMigrateV3(context.Background(), []string{"--from", path, "--db", dir, "--window", "5m"}, &out); err != nil {
@@ -91,7 +115,7 @@ func TestMigrateV3Targets(t *testing.T) {
 	if opened != dir {
 		t.Fatalf("opened %q, want %q", opened, dir)
 	}
-	infos, err := store.Datastores(context.Background())
+	infos, err = store.Datastores(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
