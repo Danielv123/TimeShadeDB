@@ -1,8 +1,9 @@
 // Fetching tile bodies off the main thread (PLAN.md §4.7 "Loading"): a pool of 2-4 workers
-// fetches (the browser decompresses through Content-Encoding), validates the header and
-// transfers the ArrayBuffer back, so the main thread only uploads the texture. For the
-// Canvas2D renderer the worker can also expand pixels to RGBA through the palette LUT.
-// DirectLoader does the same on the calling thread (tests, or when workers are unavailable).
+// fetches (the browser decompresses through Content-Encoding) and transfers the ArrayBuffer
+// back. For the Canvas2D renderer the worker also decodes the tile and expands its pixels to
+// RGBA through the palette LUT; otherwise the header is validated on the main thread when the
+// body is decoded (terrain.ts). DirectLoader fetches on the calling thread (tests, WebGL2 by
+// default, or when workers are unavailable or fail to start).
 
 import { decodeTile } from "../api/wire.ts";
 import { expandRgba, lutFor } from "./renderer.ts";
@@ -121,18 +122,27 @@ export class WorkerLoader implements TileLoader {
   readonly kind = "worker" as const;
   private readonly workers: Worker[];
   private readonly load: number[];
+  /** Workers that failed (script blocked by CSP, wrong asset base, crash): never picked again. */
+  private readonly dead: boolean[];
   private readonly pending = new Map<number, Pending>();
   private nextId = 1;
+  private readonly fallback: DirectLoader;
 
-  constructor(make: () => Worker, size: number) {
+  constructor(make: () => Worker, size: number, fallback: DirectLoader = new DirectLoader()) {
     this.workers = [];
     this.load = [];
+    this.dead = [];
+    this.fallback = fallback;
     for (let i = 0; i < size; i++) {
       const w = make();
       const idx = i;
       w.onmessage = (e: MessageEvent<WorkerResponse>) => this.onMessage(idx, e.data);
-      w.onerror = () => {
-        // A worker that fails to start rejects its pending fetches; callers retry.
+      w.onerror = (ev: Event) => {
+        ev.preventDefault?.();
+        // A worker that fails is not used again; its pending fetches are rejected and the
+        // callers retry (on another worker, or on the main thread once all have failed).
+        this.dead[idx] = true;
+        w.terminate();
         for (const [id, p] of this.pending) {
           if (p.worker === idx) {
             this.finish(id);
@@ -142,18 +152,27 @@ export class WorkerLoader implements TileLoader {
       };
       this.workers.push(w);
       this.load.push(0);
+      this.dead.push(false);
     }
+  }
+
+  /** Workers still usable. */
+  get alive(): number {
+    return this.dead.filter(d => !d).length;
   }
 
   fetch(url: string, headers: Record<string, string>, signal: AbortSignal, opts?: FetchOptions): Promise<FetchResult> {
     if (signal.aborted) {
       return Promise.reject(abortError());
     }
-    let wi = 0;
-    for (let i = 1; i < this.load.length; i++) {
-      if (this.load[i] < this.load[wi]) {
+    let wi = -1;
+    for (let i = 0; i < this.load.length; i++) {
+      if (!this.dead[i] && (wi < 0 || this.load[i] < this.load[wi])) {
         wi = i;
       }
+    }
+    if (wi < 0) {
+      return this.fallback.fetch(url, headers, signal, opts);
     }
     const id = this.nextId++;
     return new Promise<FetchResult>((resolve, reject) => {
@@ -172,9 +191,12 @@ export class WorkerLoader implements TileLoader {
   }
 
   setLut(lut: Uint32Array | null): void {
-    for (const w of this.workers) {
-      w.postMessage({ type: "lut", lut } satisfies WorkerRequest);
-    }
+    this.fallback.setLut(lut);
+    this.workers.forEach((w, i) => {
+      if (!this.dead[i]) {
+        w.postMessage({ type: "lut", lut } satisfies WorkerRequest);
+      }
+    });
   }
 
   private finish(id: number): Pending | undefined {

@@ -23,17 +23,24 @@ export function clampScale(scale: number): number {
 
 /**
  * The level for a camera: the coarsest level whose pixels are still at least one device
- * pixel, rounded to the nearest level (z0 when zoomed in), limited to the levels that exist.
+ * pixel, rounded to the nearest level (z0 when zoomed in), then snapped to the nearest level
+ * that exists (`levels` may have gaps).
  */
 export function levelFor(scale: number, dpr: number, levels?: readonly number[]): number {
   const devicePerTile = scale * dpr;
   let z = Math.round(Math.log2(devicePerTile));
   z = Math.min(0, Math.max(MIN_Z, z));
-  if (levels && levels.length > 0) {
-    const min = Math.min(...levels);
-    if (z < min) {
-      z = min;
+  if (levels && levels.length > 0 && !levels.includes(z)) {
+    // The nearest level that exists; on a tie the finer one.
+    let best = levels[0];
+    for (const l of levels) {
+      const d = Math.abs(l - z);
+      const bd = Math.abs(best - z);
+      if (d < bd || (d === bd && l > best)) {
+        best = l;
+      }
     }
+    z = best;
   }
   return z;
 }

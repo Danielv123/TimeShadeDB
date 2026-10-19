@@ -12,6 +12,7 @@ import { expandRgba, lutFor, paletteLut, rgb565Lut, snapRect } from "./renderer.
 import { defaultMaxInFlight, Scheduler } from "./scheduler.ts";
 import { TimelineVersions, timelineVersionAt, ViewVersions } from "./versions.ts";
 import { HttpError } from "./sources.ts";
+import { DirectLoader, WorkerLoader } from "./loader.ts";
 import { decodePalette, decodeTile, pixelColor, rgb565ToRgb } from "../api/wire.ts";
 import type { CatalogDatastore, DataSource, TimelineResponse, ViewResponse } from "../api/types";
 
@@ -257,4 +258,144 @@ test("view versions: cells, missing tiles and live events", async () => {
   assert.ok(!vv.apply({ ds: fixtureDs.id, z: 0, x: 1, y: 0, v: 3, now: 0 }), "same state: no change");
   assert.ok(!vv.apply({ ds: "other", z: 0, x: 1, y: 0, v: 9, now: 0 }));
   vv.dispose();
+});
+
+test("timeline versions: latest is answered by a later day's timeline (static exports seed today's)", async () => {
+  const timeline: TimelineResponse = json("timeline_z0.json");
+  // Today's timeline, two days after the newest data: no points, v0 = the latest versions.
+  const today: TimelineResponse = { ...timeline, date: "2026-10-12", start: timeline.start + 2 * 86400_000, final: false, tiles: [{ x: 0, y: 0, v0: 2, points: [] }, { x: 1, y: 0, v0: 1, points: [] }] };
+  const calls: string[] = [];
+  let todayStatus = 200;
+  const src = fakeSource({
+    timeline: async (_ds, _z, date) => {
+      calls.push(date);
+      if (date === today.date) {
+        if (todayStatus === 404) {
+          throw new HttpError(404, "not_found", "no day");
+        }
+        return today;
+      }
+      return timeline;
+    },
+  });
+  const tv = new TimelineVersions(src, fixtureDs, () => {});
+  const range = { z: 0, x0: 0, y0: 0, x1: 1, y1: 0 };
+  tv.seed(today);
+  assert.deepEqual(tv.get(0, 0, 0), { v: 2 }, "latest from today's v0");
+  assert.deepEqual(tv.get(0, 1, 0), { v: 1 });
+  assert.equal(tv.get(-1, 0, 0), undefined, "other levels still need their own timeline");
+  tv.ensure(range);
+  await tick();
+  assert.deepEqual(calls, [], "no request for the newest data day");
+  assert.ok(tv.loaded(0, fixtureDs.last + 86400_000));
+  // A history time inside the data still needs its own day.
+  tv.setTarget(1791630060000);
+  assert.equal(tv.get(0, 0, 0), undefined);
+  tv.ensure(range);
+  await tick();
+  assert.deepEqual(calls, ["2026-10-10"]);
+  assert.deepEqual(tv.get(0, 0, 0), { v: 1 });
+  // A later day that turns out not to exist (404 on refresh) stops standing in.
+  const tv2 = new TimelineVersions(src, fixtureDs, () => {});
+  tv2.seed(today);
+  todayStatus = 404;
+  calls.length = 0;
+  tv2.refresh();
+  await tick();
+  assert.deepEqual(calls, ["2026-10-12"]);
+  assert.equal(tv2.get(0, 0, 0), undefined, "an empty 404 day says nothing about latest");
+  tv2.ensure(range);
+  await tick();
+  assert.deepEqual(calls, ["2026-10-12", "2026-10-10"]);
+  assert.deepEqual(tv2.get(0, 0, 0), { v: 2 });
+  tv.dispose();
+  tv2.dispose();
+});
+
+test("level selection snaps to the nearest level that exists", () => {
+  assert.equal(levelFor(1 / 4, 1, [0, -1, -4]), -1, "-2 is missing: -1 is nearer than -4");
+  assert.equal(levelFor(1 / 8, 1, [0, -1, -4]), -4, "-3 is missing: -4 is nearer");
+  assert.equal(levelFor(1 / 16, 1, [0, -2, -4]), -4);
+  assert.equal(levelFor(1 / 8, 1, [0, -2, -4]), -2, "a tie picks the finer level");
+  assert.equal(levelFor(1, 1, [-1, -2]), -1, "no z0: the finest level");
+});
+
+test("view versions: only unanswered tiles are requested, wide ranges are split both ways", async () => {
+  const calls: number[][] = [];
+  const src = fakeSource({
+    view: async (ds, z, bbox) => {
+      calls.push([...bbox]);
+      return { ds, z, t: 0, horizon: 0, tiles: [] };
+    },
+  });
+  const ds = { ...fixtureDs, bounds: [-10000, -10, 10000, 10] as [number, number, number, number] };
+  const vv = new ViewVersions(src, ds, () => {});
+  vv.ensure({ z: 0, x0: 0, y0: 0, x1: 3, y1: 2 });
+  await tick();
+  assert.deepEqual(calls, [[0, 0, 3, 2]]);
+  // Panning one column asks for that column only.
+  vv.ensure({ z: 0, x0: 1, y0: 0, x1: 4, y1: 2 });
+  await tick();
+  assert.deepEqual(calls[1], [4, 0, 4, 2]);
+  // A range wider than 4,096 tiles is answered completely, in pieces of at most 4,096.
+  calls.length = 0;
+  vv.ensure({ z: 0, x0: -5000, y0: 0, x1: 5000, y1: 1 });
+  await tick();
+  assert.ok(calls.length > 2);
+  for (const b of calls) {
+    assert.ok((b[2] - b[0] + 1) * (b[3] - b[1] + 1) <= 4096, `bbox ${b}`);
+  }
+  for (let x = -5000; x <= 5000; x += 250) {
+    assert.equal(vv.get(0, x, 0), null, `tile ${x},0 answered`);
+    assert.equal(vv.get(0, x, 1), null, `tile ${x},1 answered`);
+  }
+  calls.length = 0;
+  vv.ensure({ z: 0, x0: -5000, y0: 0, x1: 5000, y1: 1 });
+  await tick();
+  assert.deepEqual(calls, [], "nothing left to ask");
+  vv.dispose();
+});
+
+test("worker loader: failed workers are not used again; then fetches run on the main thread", async () => {
+  class FakeWorker {
+    onmessage: ((e: MessageEvent) => void) | null = null;
+    onerror: ((e: Event) => void) | null = null;
+    posted: { type: string; id?: number }[] = [];
+    terminated = false;
+    postMessage(m: { type: string; id?: number }): void {
+      this.posted.push(m);
+    }
+    terminate(): void {
+      this.terminated = true;
+    }
+  }
+  const workers: FakeWorker[] = [];
+  const direct: string[] = [];
+  const fallback = new DirectLoader(async url => {
+    direct.push(url);
+    return new Response(new Uint8Array([1, 2, 3]));
+  });
+  const loader = new WorkerLoader(
+    () => {
+      const w = new FakeWorker();
+      workers.push(w);
+      return w as unknown as Worker;
+    },
+    2,
+    fallback,
+  );
+  const signal = new AbortController().signal;
+  const p1 = loader.fetch("a", {}, signal);
+  assert.equal(workers[0].posted.filter(m => m.type === "fetch").length, 1);
+  workers[0].onerror!(new Event("error"));
+  await assert.rejects(p1, /tile worker failed/);
+  assert.ok(workers[0].terminated);
+  assert.equal(loader.alive, 1);
+  void loader.fetch("b", {}, signal).catch(() => {});
+  assert.equal(workers[1].posted.filter(m => m.type === "fetch").length, 1, "the next fetch goes to the live worker");
+  workers[1].onerror!(new Event("error"));
+  const r = await loader.fetch("c", {}, signal);
+  assert.deepEqual(direct, ["c"]);
+  assert.equal(r.buffer.byteLength, 3);
+  loader.dispose();
 });

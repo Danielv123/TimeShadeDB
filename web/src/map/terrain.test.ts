@@ -10,7 +10,7 @@ import { perf } from "../perf.ts";
 import { DirectLoader } from "./loader.ts";
 import { ServerSource, StaticSource } from "./sources.ts";
 import { TerrainEngine, type FrameResult } from "./terrain.ts";
-import { syntheticDataset, tk, type MockDataset, type SyntheticOptions } from "./testing/dataset.ts";
+import { syntheticDataset, tk, utcDay, type MockDataset, type SyntheticOptions } from "./testing/dataset.ts";
 import { FakeRenderer, type FakeTexture } from "./testing/fakes.ts";
 import { MockServer } from "./testing/mockserver.ts";
 
@@ -420,4 +420,93 @@ test("switching between history and live keeps cached timelines and view answers
   assert.equal(server.requests(/\/timeline\//).length, 1, "one timeline for the day");
   // Back to live refreshes the view answers once (they may have moved meanwhile).
   assert.equal(server.requests(/\/view\//).length, 2);
+});
+
+test("static latest: today's timeline answers when the newest data is days old", async () => {
+  const { engine, catalog, ds, server, source, renderer, data } = await setup({ bounds: [0, 0, 1, 0], versions: 2, coarse: 0 }, "static");
+  const today = utcDay(Date.now());
+  const lastDay = utcDay(Math.max(ds.horizon, ds.last));
+  assert.notEqual(today, lastDay, "the synthetic data is older than today");
+  // What boot.ts / index.html fetch before the catalog is known.
+  const seed = await source.timeline(ds.id, 0, today);
+  server.clearLog();
+  engine.setDatastore(catalog, ds);
+  engine.seedTimeline(seed);
+  const vp = { width: 1024, height: 512, dpr: 1 };
+  const r = await settle(engine, { x: 256, y: 0, scale: 1 }, vp);
+  assert.equal(r.full, 2);
+  assert.deepEqual(server.requests(/\/timeline\/[^/]+\/0\//).map(l => l.path), [], "no request for the newest data day");
+  const want = [...data.stores.values()][0].tiles.get(tk(0, 0, 0))!.versions[1].pixels;
+  assert.ok(renderer.live().some(t => t.pixels.every((p, i) => p === want[i])), "the latest version is drawn");
+});
+
+test("a newer version that 404s still shows the older loaded version", async () => {
+  const { engine, catalog, ds, server, data } = await setup({ bounds: [0, 0, 0, 0], versions: 2, coarse: 0 });
+  const tile = [...data.stores.values()][0].tiles.get(tk(0, 0, 0))!;
+  const v = tile.versions;
+  const cam = { x: 0, y: 0, scale: 1 };
+  const vp = { width: 512, height: 512, dpr: 1 };
+  engine.setDatastore(catalog, ds);
+  engine.setTime(v[0].t);
+  await settle(engine, cam, vp);
+  // The (cached) timeline still lists version 2, but the tile and delta routes lose it.
+  tile.versions = [v[0]];
+  server.clearLog();
+  engine.setTime(v[1].t);
+  const r = await settle(engine, cam, vp);
+  assert.ok(server.requests(/\/tile\/.*\/2\.bin$/).length === 1, "version 2 was tried");
+  assert.equal(r.full, 1, "nothing more to load");
+  assert.equal(r.draws.length, 1, "version 1 is still drawn");
+});
+
+test("perf counters: textureBytes is absolute after a reset; tilesFromCache counts tiles shown without a request", async () => {
+  const { engine, catalog, ds } = await setup({ bounds: [0, 0, 3, 0], versions: 1, coarse: 0 });
+  const vp = { width: 1024, height: 512, dpr: 1 };
+  engine.setDatastore(catalog, ds);
+  await settle(engine, { x: 256, y: 0, scale: 1 }, vp);
+  assert.equal(perf().counters.tilesFromCache, 0, "everything was fetched");
+  const bytes = engine.stats().textureBytes;
+  assert.ok(bytes > 0);
+  perf().reset();
+  // One column to the right: the visible tiles were loaded before (view or ring).
+  await settle(engine, { x: 768, y: 0, scale: 1 }, vp);
+  assert.equal(perf().counters.textureBytes, engine.stats().textureBytes);
+  assert.ok(perf().counters.textureBytes >= bytes);
+  assert.equal(perf().counters.tilesFromCache, 2);
+  assert.equal(perf().counters.tilesRequested, 0);
+});
+
+test("a datastore switch while the palette loads fetches each palette once", async () => {
+  const data = syntheticDataset({ bounds: [0, 0, 1, 0], versions: 1, coarse: 0 });
+  const other = syntheticDataset({ bounds: [0, 0, 1, 0], versions: 1, coarse: 0, dsId: "gw-test~2E1.nauvis.enemy", seed: 2 });
+  const otherStore = [...other.stores.values()][0];
+  otherStore.ds.force = "enemy";
+  data.stores.set(otherStore.ds.id, otherStore);
+  data.catalog.maps[0].surfaces[0].datastores.push(otherStore.ds);
+  const server = await new MockServer(data).start();
+  servers.push(server);
+  const source = new ServerSource({ base: `${server.url}/api/v3/` });
+  const catalog = await source.catalog();
+  const [a, b] = catalog.maps[0].surfaces[0].datastores;
+  const engine = new TerrainEngine({ source, renderer: new FakeRenderer(), loader: new DirectLoader() });
+  engines.push(engine);
+  const esc = (s: string) => s.replace(/[.~]/g, "\$&");
+  const releaseA = server.hold(new RegExp(`/palette/${esc(a.id)}/`));
+  const releaseB = server.hold(new RegExp(`/palette/${esc(b.id)}/`));
+  // The second tile of the new datastore arrives after the old palette finished.
+  const releaseTile = server.hold(new RegExp(`/tile/${esc(b.id)}/0/1/`));
+  const cam = { x: 256, y: 0, scale: 1 };
+  const vp = { width: 1024, height: 512, dpr: 1 };
+  engine.setDatastore(catalog, a);
+  await sleep(20);
+  engine.setDatastore(catalog, b);
+  await spin(engine, cam, 30, vp);
+  releaseA();
+  await spin(engine, cam, 30, vp);
+  releaseTile();
+  await spin(engine, cam, 30, vp);
+  releaseB();
+  const r = await settle(engine, cam, vp);
+  assert.equal(r.full, 2);
+  assert.equal(server.requests(new RegExp(`/palette/${esc(b.id)}/`)).length, 1);
 });

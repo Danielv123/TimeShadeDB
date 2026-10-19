@@ -15,7 +15,7 @@ texture caching and tile deltas. Contracts: `docs/v3/API.md`, `docs/v3/FORMAT.md
 | `scheduler.ts` | Priority scheduler: at most 16 requests in flight (6 on HTTP/1.1), lowest priority first, unwanted requests dropped or aborted |
 | `sources.ts` | `ServerSource` (`/api/v3/`, fetch-based SSE with bearer token) and `StaticSource` (export file names, client-side overlay filter); both expose request URLs (`UrlSource`) |
 | `boot.ts` | Start-up: source detection and the speculative first `view`/`timeline` request; adopts the requests `index.html` starts before the bundle loads |
-| `loader.ts`, `tile_worker.ts` | `DirectLoader` (main-thread fetch) and `WorkerLoader` (pool of 2-4 workers; expands tiles to RGBA for Canvas2D) |
+| `loader.ts`, `tile_worker.ts` | `DirectLoader` (main-thread fetch) and `WorkerLoader` (pool of 2-4 workers that fetch and transfer bodies; for Canvas2D they also decode tiles and expand them to RGBA). A worker that fails is not used again; with none left, fetches run on the main thread |
 | `render_gl.ts` | WebGL2: R8UI (pal8) / R16UI (pal16, rgb565) textures, 256x256 RGBA palette texture, RGB565 expanded in the shader |
 | `render_2d.ts` | Canvas2D: 512x512 RGBA canvas per tile through a 65,536-entry lookup table |
 | `renderer.ts` | Renderer interface, lookup tables, pixel snapping |
@@ -24,15 +24,22 @@ texture caching and tile deltas. Contracts: `docs/v3/API.md`, `docs/v3/FORMAT.md
 
 ## How a frame works
 
-1. Level: `round(log2(scale * dpr))`, clamped to `[min level of the datastore, 0]`.
+1. Level: `round(log2(scale * dpr))`, limited to `[-10, 0]` and snapped to the nearest level
+   in the datastore's `levels` (the finer one on a tie), so gaps in `levels` never select a
+   level without tiles.
 2. Versions: live server and latest: `view` for the visible rectangle plus a one-tile ring
-   (one request per level, then `tile` events); history, or any time on a static export: the
-   day's `timeline` (cached; neighbouring days are fetched when idle, the next day during
-   timelapse).
+   (one request per level for the tiles without an answer, then `tile` events; every `hello`
+   on the event stream re-requests them, since events before the subscription or during a
+   reconnect are missed); history, or any time on a static export: the day's `timeline`
+   (cached; neighbouring days are fetched when idle, the next day during timelapse). For
+   latest, or any time after the newest data, a loaded timeline of a later day also answers
+   (its `v0` is the version at the newest data), so the timeline of today that start-up
+   fetches on a static export is used even when the newest data is days old.
 3. For each visible tile at its wanted version: draw its texture, else (in this order) an
    older version of the same tile, its nearest loaded ancestor (sub-rectangle, scaled up) or
    loaded descendants (one and two levels down, scaled down). Tiles with no data count as
-   complete.
+   complete. A wanted version that answers 404 counts as complete for 30 s, and the older
+   data is still drawn.
 4. Requests: visible tiles (by distance from the centre), then the ring, then the parent level
    (only for tiles with nothing loaded at all, and only after the visible level is resolved).
    Requests for tiles that left the view are aborted. A z0 tile whose older committed version
@@ -62,7 +69,10 @@ view.setTime(t); view.goLive(); view.play(3_600_000); view.setLayers(["movers"])
 - Any `DataSource` works; one that also implements `UrlSource` (both sources here do) gets its
   tile bodies fetched by URL. A Clusterio adapter (WP10) can use `new ServerSource({ base:
   "/api/timeshade/api/v3/" })` behind the plugin's auth proxy, or implement `DataSource`.
-- Renderer: `renderer: "auto" | "webgl2" | "canvas2d"` (page: `?renderer=canvas2d`). Loader:
+- Renderer: `renderer: "auto" | "webgl2" | "canvas2d"` (page: `?renderer=canvas2d`). In
+  `auto`, a WebGL2 renderer that fails to initialise (shader or link error, context lost at
+  start-up) is replaced by Canvas2D on a new canvas element; if that fails too, the app shows
+  an error notice. Loader:
   default is direct fetches for WebGL2 and the worker pool for Canvas2D (page:
   `?loader=worker|direct`); see the measurements below for why.
 - Page URL state: `map`, `surface`, `force`, `x`, `y`, `s` (CSS px per tile), `t` (absent =
@@ -70,6 +80,11 @@ view.setTime(t); view.goLive(); view.play(3_600_000); view.setLayers(["movers"])
 - `window.__tsdbMap` (tests, benchmarks): `setCamera(x, y, s)`, `setTime(t)`, `goLive()`,
   `play(speed)`, `pause()`, `fit()`, `state()`, `view` (the `MapView`;
   `view.readTerrainPixels()` reads back the drawn terrain).
+- Perf counters (`window.__tsdbPerf.counters`): `textureBytes` is set to the bytes the texture
+  LRU holds on every frame (absolute, so it is right again after `reset()`);
+  `tilesFromCache` counts visible tiles shown from an already loaded texture, once per view
+  change (pan, zoom or time step), without a request. HTTP cache hits are not detected (they
+  count as `tilesRequested`/`tilesLoaded`).
 - Static exports (WP12): set `<meta name="tsdb-source" content="static">` in the exported
   `index.html`. Start-up then fetches `catalog.json` and today's timeline while the bundle
   loads, and never probes `/api/v3/`. Without it the viewer still works (it falls back after
@@ -79,14 +94,17 @@ view.setTime(t); view.goLive(); view.play(3_600_000); view.setLayers(["movers"])
 
 `npm test` (from `web/`) runs `src/**/*.test.ts` with Node's type stripping:
 
-- `core.test.ts`: camera, LRU, scheduler, clock, lookup tables against the fixtures, timeline
-  and view version resolution;
+- `core.test.ts`: camera (including level snapping), LRU, scheduler, clock, lookup tables
+  against the fixtures, timeline and view version resolution (later-day timelines answering
+  latest, unanswered-only and split `view` requests), the worker loader's fallback;
 - `sources.test.ts`: both sources against the mock server (paths, errors, aborts, the data
   clock, static mapping, SSE parsing and live events);
 - `terrain.test.ts`: the engine over real HTTP with a recording renderer: first paint order,
   never-black on zoom in and out, versioned refetch with deltas (texture pixels checked), static
   delta chains, aborts, scrub vs timelapse, palette growth, 404 tiles, live tiles, the texture
-  budget, datastore switches, no spurious aborts under microtask planning;
+  budget, datastore switches, no spurious aborts under microtask planning, today's timeline
+  answering latest on a static export with old data, a 404 version still drawing the older
+  one, the perf counters, one palette fetch across a datastore switch;
 - `boot.test.ts`: the `index.html` early-start script computes exactly what `boot.ts` would
   (600 random URLs and viewports), and `boot()` adopts it.
 
@@ -104,7 +122,8 @@ Windows 11, 32 cores, NVIDIA RTX 5090 (ANGLE D3D11), Chromium 1223 headless, Nod
 the illisis test export, nauvis, newest 4 snapshots per area as versions (35 z0 tiles, levels
 0 to -4, palette 149), served by the mock server with gzip. 1920x1080, dpr 1, nauvis centre at
 z0 (15 visible tiles). CDP network emulation 40 ms latency and 50 Mbit/s. "Cold" = no HTTP
-cache, new browser context; "warm" = reload with cache. 15 runs each, data shifted to "now".
+cache, new browser context; "warm" = reload with cache. 15 runs each, data shifted to "now"
+(`--shift-to-now`) unless noted.
 
 | Case | Cold first full paint p50 / p95 | Warm p50 | Target (PLAN §5) |
 |---|---|---|---|
@@ -112,6 +131,8 @@ cache, new browser context; "warm" = reload with cache. 15 runs each, data shift
 | live server, HTTP/2 | 296 / 328 ms | 249 ms | met |
 | static export, HTTP/1.1 | 383 / 395 ms | 223 ms | met |
 | static export, HTTP/2 | 290 / 316 ms | 250 ms | met (see the stall note) |
+| static export, HTTP/1.1, data not shifted (newest data 2 days old) | 390 / 416 ms (444 / 457 ms before today's timeline could answer latest) | 225 ms | met |
+| live server, HTTP/1.1, rerun after the review fixes | 385 / 400 ms | 217 ms | met |
 
 Before the start-up work (same harness, HTTP/1.1, worker loader): 600 ms p50. Steps: speculative
 first `view` with the catalog (518), direct loader (472), `index.html` early start (412),
@@ -130,10 +151,17 @@ Other rows (HTTP/1.1 unless noted):
 | Canvas2D fallback, cold first paint | 424-440 ms p50 (HTTP/1.1, before the last start-up changes) | |
 | Renderer output | bit-exact against the expected RGB565 expansion: 0 of 897,280 pixels differ in 8 cases (WebGL2/Canvas2D x server/static x z0/z-1), real and synthetic data | |
 
-Loader choice: with WebGL2, direct fetches were faster than the worker pool (cold p50 472 vs
-518 ms on HTTP/1.1, 372 vs 397 ms on HTTP/2): the browser decompresses off the main thread
-anyway, the main thread only uploads an index texture, and four worker scripts cost requests
-during start-up. The pool is kept for Canvas2D, where it expands pixels to RGBA.
+Loader choice (a deviation from PLAN §4.7, which has the worker pool fetch for every
+renderer; it needs the plan owner's acceptance): with WebGL2, direct fetches were faster than
+the worker pool (cold p50 472 vs 518 ms on HTTP/1.1, 372 vs 397 ms on HTTP/2): the browser
+decompresses off the main thread anyway, the main thread only uploads an index texture, and
+four worker scripts cost requests during start-up. The pool is kept for Canvas2D, where it
+expands pixels to RGBA. `?loader=worker` restores the plan's behaviour.
+
+The timelapse row on the illisis data exercises little: in the last 10 h of the data, 10 s at
+1 h/s loads 1 tile and 1 delta, so it mostly measures an idle loop (also with
+`--snapshots 64`). Only the synthetic dense run loads hundreds of deltas. WP11 should rerun it
+on the imported database over a window with real churn.
 
 Known limits and observations:
 

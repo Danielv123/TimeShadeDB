@@ -8,7 +8,7 @@ import type { Catalog, CatalogDatastore, DataSource, LiveTileEvent, TimelineResp
 import type { Camera, Viewport } from "./layer";
 import { decodePalette, decodeTile, decodeTileDelta } from "../api/wire.ts";
 import { tileSpan } from "../api/grid.ts";
-import { perfCount, perfEvent } from "../perf.ts";
+import { perf, perfCount, perfEvent } from "../perf.ts";
 import {
   ancestorSubRect,
   boundsAtLevel,
@@ -122,6 +122,11 @@ export class TerrainEngine {
 
   private palettePromise: Promise<void> | null = null;
   private paletteWanted = 0;
+  /** Aborts the palette fetches of the current datastore. */
+  private paletteAbort = new AbortController();
+  /** Version keys loaded or counted during the current epoch (for tilesFromCache). */
+  private readonly loadedThisEpoch = new Set<string>();
+  private lastSweep = 0;
 
   private epoch = 0;
   private epochSig = "";
@@ -153,11 +158,11 @@ export class TerrainEngine {
       budget: opts.textureBudget ?? DEFAULT_TEXTURE_BUDGET,
       onEvict: (key, rec) => {
         this.renderer.deleteTexture(rec.tex);
-        perfCount("textureBytes", -rec.tex.bytes);
         const set = this.byTile.get(rec.tile);
         set?.delete(rec.ver);
         if (set && set.size === 0) {
           this.byTile.delete(rec.tile);
+          this.lastDrawn.delete(rec.tile);
         }
         this.drawnOnce.delete(key);
       },
@@ -165,6 +170,7 @@ export class TerrainEngine {
     this.renderer.onLost = () => {
       // Every texture is gone; drop the records so tiles load again.
       this.textures.clear();
+      this.syncTextureBytes();
       this.redraw();
     };
   }
@@ -203,8 +209,11 @@ export class TerrainEngine {
     this.failed.clear();
     this.renderer.resetPalette();
     this.loader.setLut(null);
+    this.paletteAbort.abort();
+    this.paletteAbort = new AbortController();
     this.palettePromise = null;
     this.paletteWanted = 0;
+    this.syncTextureBytes();
     this.disposeResolvers();
     this.bumpEpoch();
     if (ds) {
@@ -292,10 +301,34 @@ export class TerrainEngine {
 
   dispose(): void {
     this.gen++;
+    this.paletteAbort.abort();
     this.scheduler.clear();
     this.disposeResolvers();
     this.textures.clear();
+    this.syncTextureBytes();
     this.loader.dispose();
+  }
+
+  /**
+   * Sets the textureBytes perf counter to the bytes the LRU holds now (an absolute value, so
+   * it stays right after TsdbPerf.reset()).
+   */
+  private syncTextureBytes(): void {
+    perf().counters.textureBytes = this.textures.bytes;
+  }
+
+  /** Drops expired `missing` and `failed` entries (otherwise pruned only on lookup). */
+  private sweep(tNow: number): void {
+    for (const [k, at] of this.missing) {
+      if (tNow - at > MISSING_TTL_MS) {
+        this.missing.delete(k);
+      }
+    }
+    for (const [k, f] of this.failed) {
+      if (tNow - f.at > 30_000) {
+        this.failed.delete(k);
+      }
+    }
   }
 
   private disposeResolvers(): void {
@@ -336,6 +369,7 @@ export class TerrainEngine {
 
   private bumpEpoch(): void {
     this.epoch++;
+    this.loadedThisEpoch.clear();
   }
 
   /**
@@ -448,34 +482,46 @@ export class TerrainEngine {
             continue;
           }
           let want: Want | null = null;
+          // The wanted version answered 404 (a race, or a static export still uploading):
+          // nothing more loads for a while, so the tile counts as complete, but whatever
+          // older data is loaded is still drawn below.
+          let missingNow = false;
           if (ans === undefined) {
             unresolved++;
           } else {
             want = wantFor(z, x, y, ans);
             if (this.isMissing(want.key, tNow)) {
+              missingNow = true;
               covered++;
               full++;
-              continue;
-            }
-            const own = this.textures.get(want.key);
-            if (own) {
-              this.textures.pin(want.key);
-              ownDraws.push({ tex: own.tex, sx: 0, sy: 0, sw: 512, sh: 512, dx, dy, dw, dh });
-              if (!scheduleOnly) {
-                this.markDrawn(want.key, tk, want.ver);
+            } else {
+              const own = this.textures.get(want.key);
+              if (own) {
+                this.textures.pin(want.key);
+                ownDraws.push({ tex: own.tex, sx: 0, sy: 0, sw: 512, sh: 512, dx, dy, dw, dh });
+                if (!scheduleOnly) {
+                  this.markDrawn(want.key, tk, want.ver);
+                  if (!this.loadedThisEpoch.has(want.key)) {
+                    // Shown from an already loaded texture: no request for this view.
+                    this.loadedThisEpoch.add(want.key);
+                    perfCount("tilesFromCache");
+                  }
+                }
+                covered++;
+                full++;
+                continue;
               }
-              covered++;
-              full++;
-              continue;
+              this.requestTile(want, z, x, y, prioOf(PRIO_VISIBLE, z, x, y), wanted, busyTiles, tNow);
             }
-            this.requestTile(want, z, x, y, prioOf(PRIO_VISIBLE, z, x, y), wanted, busyTiles, tNow);
           }
           // Fallbacks, best first: an older version of this tile, then ancestors, then children.
           const stale = this.staleFor(tk);
           if (stale) {
             this.textures.pin(`${tk}@${stale.ver}`);
             ownDraws.push({ tex: stale.tex, sx: 0, sy: 0, sw: 512, sh: 512, dx, dy, dw, dh });
-            covered++;
+            if (!missingNow) {
+              covered++;
+            }
             continue;
           }
           let shown = false;
@@ -511,7 +557,7 @@ export class TerrainEngine {
               }
             }
           }
-          if (shown) {
+          if (shown && !missingNow) {
             covered++;
           }
         }
@@ -552,6 +598,12 @@ export class TerrainEngine {
     }
     this.scheduler.pump();
     this.textures.evict();
+    // Every frame, so the counter is right again soon after a TsdbPerf.reset().
+    this.syncTextureBytes();
+    if (tNow - this.lastSweep > MISSING_TTL_MS) {
+      this.lastSweep = tNow;
+      this.sweep(tNow);
+    }
 
     draws.push(...ancestorDraws, ...childDraws, ...ownDraws);
     const result: FrameResult = { z, draws, visible, covered, full, unresolved };
@@ -697,6 +749,7 @@ export class TerrainEngine {
             })
           : false;
         if (done) {
+          this.failed.delete(want.key);
           return;
         }
       }
@@ -862,7 +915,8 @@ export class TerrainEngine {
       }
     }
     this.textures.set(want.key, { tex, tile: tk, ver, version: want.version, z }, tex.bytes);
-    perfCount("textureBytes", tex.bytes);
+    this.loadedThisEpoch.add(want.key);
+    this.syncTextureBytes();
     let set = this.byTile.get(tk);
     if (!set) {
       set = new Set();
@@ -880,18 +934,18 @@ export class TerrainEngine {
     this.paletteWanted = Math.max(this.paletteWanted, n);
     if (!this.palettePromise) {
       const gen = this.gen;
+      const abort = this.paletteAbort.signal;
       const run = async (): Promise<void> => {
         while (gen === this.gen && this.renderer.paletteLength < this.paletteWanted) {
           const ds = this.ds!;
           // The catalog's palette version always exists (static exports keep the latest).
           const need = this.paletteWanted;
           const ver = ds.palette_version >= need ? ds.palette_version : need;
-          const ctrl = new AbortController();
           const { buffer } = await this.fetchBody(
             "palette",
             s => s.paletteUrl(ds.id, ver),
-            () => this.source.palette(ds.id, ver, ctrl.signal),
-            ctrl.signal,
+            () => this.source.palette(ds.id, ver, abort),
+            abort,
           );
           if (gen !== this.gen) {
             return;
@@ -908,10 +962,16 @@ export class TerrainEngine {
         }
       };
       perfEvent("tile.request", { key: `palette@${n}`, z: 0, prio: PRIO_PALETTE });
-      this.palettePromise = run().finally(() => {
-        this.palettePromise = null;
-        this.redraw();
+      const p: Promise<void> = run().finally(() => {
+        // A datastore switch may already have started the next run.
+        if (this.palettePromise === p) {
+          this.palettePromise = null;
+        }
+        if (gen === this.gen) {
+          this.redraw();
+        }
       });
+      this.palettePromise = p;
     }
     const p = this.palettePromise;
     if (!signal) {

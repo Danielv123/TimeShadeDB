@@ -8,7 +8,7 @@
 
 import type { CatalogDatastore, DataSource, LiveTileEvent, TimelineResponse, TimelineTile, TimeMs, Version, ViewResponse } from "../api/types";
 import { utcDay } from "../api/grid.ts";
-import { boundsAtLevel, tileKey, type TileRange } from "./camera.ts";
+import { boundsAtLevel, tileKey, tileWorldRect, type TileRange } from "./camera.ts";
 import { HttpError } from "./sources.ts";
 
 export interface TileVersion {
@@ -49,6 +49,8 @@ interface TimelineEntry {
   loading: AbortController | null;
   failedAt: number;
   stale: boolean;
+  /** The day answered 404 (no timeline): `tiles` is empty, and it never stands in for another day. */
+  notFound: boolean;
 }
 
 /** Version of a timeline tile at t: the newest point at or before t, else v0. */
@@ -113,13 +115,42 @@ export class TimelineVersions implements VersionResolver {
     return utcDay(Math.min(t, top));
   }
 
-  get(z: number, x: number, y: number): VersionAnswer {
-    const t = this.effectiveTime();
+  /**
+   * The loaded timeline that answers level z at time t: the one of t's day, else (for t at or
+   * after the newest committed time, which includes latest) any later day's timeline. Nothing
+   * changed between `top` and the start of a later day, so that day's v0 is the version at
+   * `top`. Static exports write today's timeline, which start-up fetches before the catalog
+   * says what the newest day is (boot.ts).
+   */
+  private entryFor(z: number, t: TimeMs): TimelineEntry | null | undefined {
     const day = this.dayFor(t);
     if (day === null) {
       return null;
     }
     const e = this.entries.get(`${z}/${day}`);
+    if (e?.tiles && !e.notFound) {
+      return e;
+    }
+    if (t >= Math.max(this.ds.horizon, this.ds.last)) {
+      let best: TimelineEntry | undefined;
+      for (const o of this.entries.values()) {
+        if (o.z === z && o.tiles && !o.notFound && o.date > day && (!best || o.date < best.date)) {
+          best = o;
+        }
+      }
+      if (best) {
+        return best;
+      }
+    }
+    return e?.tiles ? e : undefined;
+  }
+
+  get(z: number, x: number, y: number): VersionAnswer {
+    const t = this.effectiveTime();
+    const e = this.entryFor(z, t);
+    if (e === null) {
+      return null;
+    }
     if (!e || !e.tiles) {
       return undefined;
     }
@@ -132,10 +163,18 @@ export class TimelineVersions implements VersionResolver {
   }
 
   ensure(range: TileRange): void {
-    const day = this.dayFor(this.effectiveTime());
-    if (day !== null) {
-      this.load(range.z, day);
+    const t = this.effectiveTime();
+    const day = this.dayFor(t);
+    if (day === null) {
+      return;
     }
+    const e = this.entryFor(range.z, t);
+    if (e && e.date !== day) {
+      // A later day answers; keep it fresh instead of loading the newest data day.
+      this.load(range.z, e.date);
+      return;
+    }
+    this.load(range.z, day);
   }
 
   /** Adds a timeline fetched elsewhere (boot.ts), unless that day is already loaded. */
@@ -149,7 +188,7 @@ export class TimelineVersions implements VersionResolver {
       return;
     }
     if (!e) {
-      e = { date: res.date, z: res.z, tiles: null, final: false, loading: null, failedAt: -Infinity, stale: false };
+      e = { date: res.date, z: res.z, tiles: null, final: false, loading: null, failedAt: -Infinity, stale: false, notFound: false };
       this.entries.set(key, e);
       this.trim();
     }
@@ -162,6 +201,7 @@ export class TimelineVersions implements VersionResolver {
     e.tiles = tiles;
     e.final = res.final;
     e.stale = false;
+    e.notFound = false;
     this.onChange();
   }
 
@@ -173,10 +213,10 @@ export class TimelineVersions implements VersionResolver {
     }
   }
 
-  /** Whether the timeline for (z, day of t) is loaded. */
+  /** Whether a timeline that answers level z at time t is loaded. */
   loaded(z: number, t: TimeMs): boolean {
-    const day = this.dayFor(t);
-    return day === null || !!this.entries.get(`${z}/${day}`)?.tiles;
+    const e = this.entryFor(z, t);
+    return e === null || !!e?.tiles;
   }
 
   refresh(): void {
@@ -200,7 +240,7 @@ export class TimelineVersions implements VersionResolver {
     const key = `${z}/${day}`;
     let e = this.entries.get(key);
     if (!e) {
-      e = { date: day, z, tiles: null, final: false, loading: null, failedAt: -Infinity, stale: false };
+      e = { date: day, z, tiles: null, final: false, loading: null, failedAt: -Infinity, stale: false, notFound: false };
       this.entries.set(key, e);
       this.trim();
     } else {
@@ -232,6 +272,7 @@ export class TimelineVersions implements VersionResolver {
         e.tiles = tiles;
         e.final = res.final;
         e.stale = false;
+        e.notFound = false;
         this.onChange();
       },
       (err: unknown) => {
@@ -244,6 +285,7 @@ export class TimelineVersions implements VersionResolver {
           e.tiles = new Map();
           e.final = false;
           e.stale = false;
+          e.notFound = true;
           this.onChange();
           return;
         }
@@ -265,6 +307,8 @@ export class TimelineVersions implements VersionResolver {
 
 /** Most tiles one `view` request may cover (API.md: at most 4,096). */
 export const VIEW_MAX_TILES = 4096;
+/** ViewVersions forgets far-away answers beyond this many remembered tiles. */
+const PRUNE_AT = 50_000;
 
 /**
  * Live-server versions at t=latest. One `view` request covers the whole wanted rectangle
@@ -281,6 +325,7 @@ export class ViewVersions implements VersionResolver {
   private readonly pending = new Map<string, number>();
   private readonly loading = new Set<AbortController>();
   private refreshGen = 0;
+  private pruneAt = PRUNE_AT;
   /** Live events: tile key -> event sequence, so an older `view` answer never overwrites a newer event. */
   private readonly touched = new Map<string, number>();
   private eventSeq = 0;
@@ -331,27 +376,82 @@ export class ViewVersions implements VersionResolver {
     if (x0 > x1 || y0 > y1) {
       return;
     }
-    // Rows with tiles that need an answer.
-    let need = false;
-    for (let y = y0; y <= y1 && !need; y++) {
+    this.prune(range);
+    this.fetchMissing(range.z, x0, y0, x1, y1);
+  }
+
+  /** Whether tile (z, x, y) has no current answer and no request covering it. */
+  private needs(z: number, x: number, y: number): boolean {
+    const key = tileKey(z, x, y);
+    const k = this.known.get(key);
+    const p = this.pending.get(key);
+    return (k === undefined || k < this.refreshGen) && (p === undefined || p < this.refreshGen);
+  }
+
+  /**
+   * Requests the bounding box of the tiles in [x0..x1, y0..y1] that need an answer, split into
+   * pieces of at most VIEW_MAX_TILES (in both directions), each again shrunk to its own tiles
+   * that need one.
+   */
+  private fetchMissing(z: number, x0: number, y0: number, x1: number, y1: number): void {
+    let nx0 = Infinity;
+    let ny0 = Infinity;
+    let nx1 = -Infinity;
+    let ny1 = -Infinity;
+    for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
-        const key = tileKey(range.z, x, y);
-        const k = this.known.get(key);
-        const p = this.pending.get(key);
-        if ((k === undefined || k < this.refreshGen) && (p === undefined || p < this.refreshGen)) {
-          need = true;
-          break;
+        if (this.needs(z, x, y)) {
+          nx0 = Math.min(nx0, x);
+          nx1 = Math.max(nx1, x);
+          ny0 = Math.min(ny0, y);
+          ny1 = Math.max(ny1, y);
         }
       }
     }
-    if (!need) {
+    if (nx0 > nx1) {
       return;
     }
-    const w = x1 - x0 + 1;
-    const rows = Math.max(1, Math.floor(VIEW_MAX_TILES / w));
-    for (let ry = y0; ry <= y1; ry += rows) {
-      this.fetch(range.z, [x0, ry, Math.min(x1, x0 + Math.min(w, VIEW_MAX_TILES) - 1), Math.min(y1, ry + rows - 1)]);
+    const w = nx1 - nx0 + 1;
+    const h = ny1 - ny0 + 1;
+    if (w * h <= VIEW_MAX_TILES) {
+      this.fetch(z, [nx0, ny0, nx1, ny1]);
+      return;
     }
+    const cw = Math.min(w, VIEW_MAX_TILES);
+    const ch = Math.max(1, Math.floor(VIEW_MAX_TILES / cw));
+    for (let cy = ny0; cy <= ny1; cy += ch) {
+      for (let cx = nx0; cx <= nx1; cx += cw) {
+        this.fetchMissing(z, cx, cy, Math.min(nx1, cx + cw - 1), Math.min(ny1, cy + ch - 1));
+      }
+    }
+  }
+
+  /**
+   * Bounds memory on long sessions: once more than PRUNE_AT tiles are remembered, forgets
+   * answers far from `range` (and at other levels). They are asked for again when needed.
+   */
+  private prune(range: TileRange): void {
+    if (this.known.size + this.states.size <= this.pruneAt) {
+      return;
+    }
+    // Keep tiles (any level) within four view sizes of the range, in world units.
+    const a = tileWorldRect(range.z, range.x0, range.y0);
+    const b = tileWorldRect(range.z, range.x1, range.y1);
+    const mx = 4 * (b[2] - a[0]);
+    const my = 4 * (b[3] - a[1]);
+    const keep = (key: string): boolean => {
+      const [z, x, y] = key.split("/").map(Number);
+      const r = tileWorldRect(z, x, y);
+      return r[2] >= a[0] - mx && r[0] <= b[2] + mx && r[3] >= a[1] - my && r[1] <= b[3] + my;
+    };
+    for (const m of [this.states, this.known, this.touched]) {
+      for (const key of m.keys()) {
+        if (!this.pending.has(key) && !keep(key)) {
+          m.delete(key);
+        }
+      }
+    }
+    this.pruneAt = Math.max(PRUNE_AT, 2 * (this.known.size + this.states.size));
   }
 
   /**

@@ -112,7 +112,7 @@ export class MapView {
   catalog: Catalog;
   camera: Camera;
   private readonly container: HTMLElement;
-  private readonly terrainCanvas: HTMLCanvasElement;
+  private terrainCanvas: HTMLCanvasElement;
   private readonly overlay: HTMLCanvasElement;
   private readonly overlayCtx: CanvasRenderingContext2D;
   private readonly opts: MapViewOptions;
@@ -199,6 +199,13 @@ export class MapView {
         if (choice === "webgl2") {
           throw err;
         }
+        console.warn("WebGL2 renderer failed, using Canvas2D", err);
+        // getContext("webgl2") may have succeeded before init failed (shader error, context
+        // lost at start-up); that canvas can no longer give a 2D context, so use a new one.
+        const fresh = document.createElement("canvas");
+        fresh.className = this.terrainCanvas.className;
+        this.terrainCanvas.replaceWith(fresh);
+        this.terrainCanvas = fresh;
       }
     }
     return new Canvas2DRenderer(this.terrainCanvas);
@@ -378,9 +385,10 @@ export class MapView {
       return;
     }
     if (this.source.subscribe) {
-      // The first hello only confirms the subscription; later ones follow a reconnect, after
-      // which versions may have moved without events.
-      let hellos = 0;
+      // Every hello resyncs the versions: tile events between the first `view` answers and
+      // the subscription (which opens only after the first full paint), or during a
+      // reconnect, were missed. It costs one `view` request per level in view; answers stay
+      // usable meanwhile.
       const every = Math.max(2000, this.catalog.live_ms || 5000);
       this.unsubscribe = this.source.subscribe(
         { ds: [ds.id], sfc: [] },
@@ -390,9 +398,7 @@ export class MapView {
               clearInterval(this.pollTimer);
               this.pollTimer = null;
             }
-            if (hellos++ > 0) {
-              this.engine.refreshVersions();
-            }
+            this.engine.refreshVersions();
           },
           tile: (e: LiveTileEvent) => this.engine.applyLiveTile(e),
           horizon: () => void this.refreshCatalog(),

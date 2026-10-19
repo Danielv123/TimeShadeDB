@@ -138,31 +138,38 @@ export function App({ boot }: { boot: Promise<Boot> }) {
       return;
     }
     const params = new URLSearchParams(location.search);
-    const v = new MapView({
-      container: host.current,
-      source: ready.source,
-      catalog: ready.catalog,
-      renderer: (params.get("renderer") as RendererChoice | null) ?? "auto",
-      loader: params.get("loader") === "direct" ? new DirectLoader() : params.get("loader") === "worker" ? createLoader() : undefined,
-      layers: layerFactories,
-      enabledLayers: layersRef.current,
-      camera: initialUrl.camera ?? undefined,
-      onState: s => {
-        setState(s);
-        if (s.tiles.visible > 0 && s.tiles.full === s.tiles.visible) {
-          setShowLogo(true);
-        }
-        if (!urlTimer.current) {
-          urlTimer.current = setTimeout(() => {
-            urlTimer.current = null;
-            writeUrl(v.state(), layersRef.current);
-          }, 400);
-        }
-      },
-      onHover: (hit, world) => setHover({ hit, world }),
-      onCatalog: c => setCatalog(c),
-      viewSeed: ready.seed,
-    });
+    let v: MapView;
+    try {
+      v = new MapView({
+        container: host.current,
+        source: ready.source,
+        catalog: ready.catalog,
+        renderer: (params.get("renderer") as RendererChoice | null) ?? "auto",
+        loader: params.get("loader") === "direct" ? new DirectLoader() : params.get("loader") === "worker" ? createLoader() : undefined,
+        layers: layerFactories,
+        enabledLayers: layersRef.current,
+        camera: initialUrl.camera ?? undefined,
+        onState: s => {
+          setState(s);
+          if (s.tiles.visible > 0 && s.tiles.full === s.tiles.visible) {
+            setShowLogo(true);
+          }
+          if (!urlTimer.current) {
+            urlTimer.current = setTimeout(() => {
+              urlTimer.current = null;
+              writeUrl(v.state(), layersRef.current);
+            }, 400);
+          }
+        },
+        onHover: (hit, world) => setHover({ hit, world }),
+        onCatalog: c => setCatalog(c),
+        viewSeed: ready.seed,
+      });
+    } catch (err) {
+      console.error(err);
+      setError(`Could not start the map renderer: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     view.current = v;
     const fromUrl = initialUrl.sel !== null && v.select(initialUrl.sel);
     if (!fromUrl) {
