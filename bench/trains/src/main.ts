@@ -8,7 +8,7 @@
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { cpus, platform, release, arch } from "node:os";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 
 import { illisisName, loadRailMask, loadTrainJourneys } from "./illisis_data.ts";
 import { defaultOptions, leaveOneOut, newRenderStats, renderJourney, summarize, type LooResult } from "./metrics.ts";
@@ -77,10 +77,12 @@ const result = {
   started: started.toISOString(),
   seconds,
   machine: { os: `${platform()} ${release()}`, arch: arch(), cpu: cpus()[0]?.model ?? "", cpus: cpus().length, go: `node ${process.version}` },
-  params: { data, map: mapDir, surface: surfaceDir, renderer: rname, ...opts },
+  // The data path is local; record it relative to TSDB_TESTDATA when it is that, else its last element.
+  params: { data: data === process.env.TSDB_TESTDATA ? "$TSDB_TESTDATA" : basename(data), map: mapDir, surface: surfaceDir, renderer: rname, ...opts },
   metrics,
   notes: [
     "rail mask: final z0 chart pixels of colour (140,142,140); off-rail = carriage centre more than 1 tile from a rail tile",
+    "trains.offrail_* count every drawn carriage (5 per train for illisis, 1 for the head-only references); trains.head_offrail_* count the head only and compare across renderers",
     `lookahead ${opts.lookaheadMs} ms (61000 = history playback, where the next sample is always known)`,
   ],
 };

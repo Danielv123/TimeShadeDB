@@ -168,6 +168,10 @@ export interface RenderStats {
   movingDist: Hist;
   rawMoving: number;
   rawMovingOff: number;
+  /** Head-only rail distance per frame, comparable across renderers that draw different numbers of carriages. */
+  headDist: Hist;
+  headOff: number;
+  headOver2OutsideHandoff: number;
 }
 
 export function newRenderStats(): RenderStats {
@@ -175,6 +179,7 @@ export function newRenderStats(): RenderStats {
     frames: 0, carFrames: 0, carOff: 0, carOver2: 0, carOver2OutsideHandoff: 0, dist: new Hist(0.01, 32),
     jumps: 0, jumpsOutsideHandoff: 0, rawSamples: 0, rawOff: 0, maxJump: 0,
     movingCarFrames: 0, movingCarOff: 0, movingDist: new Hist(0.01, 32), rawMoving: 0, rawMovingOff: 0,
+    headDist: new Hist(0.01, 32), headOff: 0, headOver2OutsideHandoff: 0,
   };
 }
 
@@ -241,6 +246,7 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
   let prev: { x: number; y: number; t: number } | undefined;
   let prevKey = "";
   let prevDists: number[] = [];
+  let prevHead = 0;
   // Index of the last sample at or before the frame, for the speed bound.
   let at = 0;
   for (let t = first.t; t <= last.t; t += step) {
@@ -261,10 +267,20 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
     // Parked trains repeat the same pose: reuse the distances.
     const key = p.cars.length + ":" + p.x + "," + p.y + ":" + (p.cars.length ? p.cars[p.cars.length - 1].x + "," + p.cars[p.cars.length - 1].y : "");
     let dists: number[];
+    let head: number;
     if (key === prevKey) {
       dists = prevDists;
+      head = prevHead;
     } else {
       dists = p.cars.map((c) => mask.distance(c.x, c.y));
+      head = mask.distance(p.x, p.y);
+    }
+    st.headDist.add(head);
+    if (head > o.offTiles) {
+      st.headOff++;
+    }
+    if (head > 2 && !handoff) {
+      st.headOver2OutsideHandoff++;
     }
     const movingFrame = prev !== undefined && Math.hypot(p.x - prev.x, p.y - prev.y) > 0.05;
     for (const d of dists) {
@@ -289,6 +305,7 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
     }
     prevKey = key;
     prevDists = dists;
+    prevHead = head;
     if (prev) {
       const dt = (t - prev.t) / 1000;
       const disp = Math.hypot(p.x - prev.x, p.y - prev.y);
@@ -344,5 +361,8 @@ export function summarize(loo: LooResult, st: RenderStats): Record<string, numbe
   m["trains.moving_offrail_p99_tiles"] = st.movingDist.quantile(0.99);
   m["trains.raw_moving_offrail_share"] = st.rawMoving ? st.rawMovingOff / st.rawMoving : NaN;
   m["trains.moving_offrail_excess_pp"] = (m["trains.moving_offrail_share"] - m["trains.raw_moving_offrail_share"]) * 100;
+  m["trains.head_offrail_share"] = st.frames ? st.headOff / st.frames : NaN;
+  m["trains.head_offrail_p99_tiles"] = st.headDist.quantile(0.99);
+  m["trains.head_offrail_over2_outside_handoff"] = st.headOver2OutsideHandoff;
   return m;
 }

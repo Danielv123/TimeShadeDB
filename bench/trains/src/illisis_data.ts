@@ -1,6 +1,6 @@
 // Reads train journeys and the final z0 chart from an illisis/minimap static export (the
 // test data). Formats: illisis store/movers.ts (movement windows) and shared/codec.ts
-// (MMS1 snapshots, MMC1 change files), as decoded by research/scripts/mmlib.py. The data
+// (MMS1 snapshots, MMC1 change files), as bench/internal/benchlib/illisis_stream.go also decodes them. The data
 // is untrusted: it is only parsed (JSON, gzip, fixed binary layouts), never executed.
 
 import { readdirSync, readFileSync, existsSync } from "node:fs";
