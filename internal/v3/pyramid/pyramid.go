@@ -71,6 +71,9 @@ type Options struct {
 	ZstdLevel zstd.EncoderLevel
 }
 
+// imageCost is the cache accounting size of one decoded coarse image.
+const imageCost = 2*core.TilePixelCount + 64
+
 // DefaultIntervals is the default per-level schedule (FORMAT.md 4).
 var DefaultIntervals = []core.TimeMs{5 * core.Minute, 15 * core.Minute, 60 * core.Minute}
 
@@ -185,8 +188,9 @@ func New(ctx context.Context, terrain Terrain, series core.SeriesStore, opt Opti
 		opt:     opt,
 		enc:     enc,
 		dec:     dec,
-		cache: tileenc.NewLRU[imgKey, *core.TileImage](opt.CacheBytes, 8, func(*core.TileImage) int64 {
-			return 2*core.TilePixelCount + 64
+		// Every shard must hold a few images, or small budgets would cache nothing.
+		cache: tileenc.NewLRU[imgKey, *core.TileImage](opt.CacheBytes, int(min(8, max(1, opt.CacheBytes/(4*imageCost)))), func(*core.TileImage) int64 {
+			return imageCost
 		}),
 		ds: map[core.DatastoreKey]*dsState{},
 	}

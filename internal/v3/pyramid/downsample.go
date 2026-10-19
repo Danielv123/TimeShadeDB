@@ -29,7 +29,8 @@ func downsampleInto(out, child []uint16, ox, oy int) {
 }
 
 // downsample builds a parent tile from its four children (core.TileCoord.Children
-// order; nil = all uncharted). Same result as core.Downsample, about 4x faster.
+// order; nil = all uncharted). Same result as core.Downsample, about 1.4x faster
+// (BenchmarkDownsample: 0.56 ms against 0.80 ms).
 func downsample(children [4]*core.TileImage) *core.TileImage {
 	out := core.NewTileImage()
 	const half = core.TileSize / 2
