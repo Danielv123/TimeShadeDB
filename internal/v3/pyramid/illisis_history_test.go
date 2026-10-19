@@ -281,13 +281,15 @@ func TestIllisisTuning(t *testing.T) {
 		name string
 		opt  Options
 	}{
-		{"5/15/60 r16 c256", Options{Intervals: iv(5, 15, 60), SnapshotRatio: 16, MaxChain: 256}},
 		{"5/15/60 r32 c512", Options{Intervals: iv(5, 15, 60), SnapshotRatio: 32, MaxChain: 512}},
 		{"15/60/240 r16 c256", Options{Intervals: iv(15, 60, 240), SnapshotRatio: 16, MaxChain: 256}},
 		{"15/60/240 r32 c512", Options{Intervals: iv(15, 60, 240), SnapshotRatio: 32, MaxChain: 512}},
 		{"15/60/240 r64 c1024", Options{Intervals: iv(15, 60, 240), SnapshotRatio: 64, MaxChain: 1024}},
 		{"30/60/240 r32 c512", Options{Intervals: iv(30, 60, 240), SnapshotRatio: 32, MaxChain: 512}},
 		{"15/60/240/1440 r32 c512", Options{Intervals: iv(15, 60, 240, 240, 1440), SnapshotRatio: 32, MaxChain: 512}},
+		{"15/60/240/1440 r64 c1024", Options{Intervals: iv(15, 60, 240, 240, 1440), SnapshotRatio: 64, MaxChain: 1024}},
+		{"15/60/480 r64 c512", Options{Intervals: iv(15, 60, 480), SnapshotRatio: 64, MaxChain: 512}}, // default
+		{"30/60/240 r64 c512", Options{Intervals: iv(30, 60, 240), SnapshotRatio: 64, MaxChain: 512}},
 	} {
 		var all, nauvis int64
 		var allCH, nauvisCH float64

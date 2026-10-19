@@ -9,8 +9,7 @@
 // built for, and its content is exactly the average of the z0 content at T.
 //
 // Versions are built on a schedule per level (tunable, Options.Intervals; default
-// z-1 every 15 min, z-2 every 60 min, z <= -3 every 240 min) when a z0 descendant
-// changed:
+// z-1 every 15 min, z-2 every 60 min, z <= -3 every 8 h) when a z0 descendant changed:
 //
 //   - Update (live) builds at T = the datastore horizon. Versions effective before the
 //     horizon never change (core.TileSource), so the z0 content at T is final and a
@@ -70,10 +69,10 @@ type Options struct {
 	// MaxChain caps the deltas between snapshots (default 512), bounding a cold read.
 	MaxChain int
 	// SnapshotRatio: a snapshot replaces a delta when the delta bytes since the last
-	// snapshot would exceed this multiple of the snapshot's size (default 32).
-	// Measured on the illisis nauvis history at 5/15/60 min (TestIllisisTuning): ratio
-	// 4 / chain 128 stored 2.95 B per chunk-hour, ratio 16 / chain 256 2.09, ratio 32 /
-	// chain 512 1.82, with cold historical reads at p95 1.2-1.6 ms.
+	// snapshot would exceed this multiple of the snapshot's size (default 64).
+	// Measured on the whole illisis test map at 15/60/240 min (TestIllisisTuning):
+	// ratio 16 / chain 256 stored 1.98 B per chunk-hour, ratio 32 / chain 512 1.96,
+	// ratio 64 / chain 1024 1.91, with cold historical reads at p95 1.0-1.8 ms.
 	SnapshotRatio float64
 	// ZstdLevel compresses record payloads (default zstd.SpeedBestCompression, about
 	// 6% smaller than SpeedDefault on coarse records; snapshots are rare).
@@ -84,10 +83,10 @@ type Options struct {
 const imageCost = 2*core.TilePixelCount + 64
 
 // DefaultIntervals is the default per-level schedule (FORMAT.md 4): z-1 every 15 min,
-// z-2 every 60 min, z <= -3 every 240 min. The plan's 5/15/60 min schedule stored more
-// bytes than the disk target (PLAN.md §5) allows next to z0 (TestIllisisHistory);
-// between versions the live latest (ReadTile) keeps every level current.
-var DefaultIntervals = []core.TimeMs{15 * core.Minute, 60 * core.Minute, 240 * core.Minute}
+// z-2 every 60 min, z <= -3 every 8 h. The plan's 5/15/60 min schedule stored more bytes
+// than the disk target (PLAN.md §5) allows next to z0 (TestIllisisTuning); between
+// versions the live latest (ReadTile) keeps every level current.
+var DefaultIntervals = []core.TimeMs{15 * core.Minute, 60 * core.Minute, 480 * core.Minute}
 
 // ErrAlreadyBuilt is returned by Rebuild for a datastore that already has coarse records.
 var ErrAlreadyBuilt = errors.New("pyramid: coarse levels already built")
@@ -207,7 +206,7 @@ func New(ctx context.Context, terrain Terrain, series core.SeriesStore, opt Opti
 		opt.MaxChain = 512
 	}
 	if opt.SnapshotRatio <= 0 {
-		opt.SnapshotRatio = 32
+		opt.SnapshotRatio = 64
 	}
 	if opt.ZstdLevel == 0 {
 		opt.ZstdLevel = zstd.SpeedBestCompression

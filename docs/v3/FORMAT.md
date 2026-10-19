@@ -87,7 +87,7 @@ The full rules are on `core.TerrainStore`. In short:
 Coarse levels (z < 0, WP3) have their own versions per coarse tile: each record the
 pyramid writes is the next version. Recommended schedule (tunable): write a version of a
 coarse tile when a descendant changed, at most once per aligned interval of 15 min (z -1),
-60 min (z -2) or 240 min (z <= -3), and always keep the latest state reachable. The
+60 min (z -2) or 8 h (z <= -3), and always keep the latest state reachable. The
 reference oracle (`memstore.Pyramid`) writes a version at every change. (The plan's 5/15/60
 min schedule stored about 2.3 B per chunk-hour over the illisis test map, which with z0
 exceeds the PLAN.md §5 disk target; see 5.4.)
@@ -250,15 +250,17 @@ nothing). Two kinds:
 
 Snapshot rule (tunable; defaults measured on the illisis test map): write a snapshot
 instead of a delta when more than half the pixels changed, after 512 deltas, or when the
-delta bytes since the last snapshot would exceed 32 times that snapshot. With the 15/60/240
-min schedule, an offline rebuild of the illisis history (all 12 surfaces) stores 3.02 MB,
-1.96 B per chunk-hour including record headers and index (nauvis alone 1.50), with cold
-reads of any historical version at p95 about 1.1 ms (`internal/v3/pyramid`
-TestIllisisHistory, TestIllisisTuning). The 5/15/60 schedule stored 2.29 B per chunk-hour.
+delta bytes since the last snapshot would exceed 64 times that snapshot. With the default
+15 min / 60 min / 8 h schedule, an offline rebuild of the illisis history (all 12 surfaces;
+the same versions as a live server that commits every window) stores 2.89 MB, 1.88 B per
+chunk-hour including record headers and index (nauvis alone 1.40), with cold reads of any
+historical version at p95 about 1.1-1.8 ms (`internal/v3/pyramid` TestIllisisHistory,
+TestIllisisTuning). The plan's 5/15/60 min schedule stored 2.29 B per chunk-hour. WP2's z0
+on the same map is 3.09 B per chunk-hour (5.3), so z0 and pyramid together come to 4.96.
 Replayed live through WP2's file-backed terrain store (a commit before every batch of
-1,024 updates, `Update` after each commit, a flush at the end), the whole map stored z0 at
-3.09 and the pyramid at 1.86 B per chunk-hour, 4.94 in total (`internal/v3/pyramid`
-TestWholeMapFileStores, build tag `integration`).
+1,024 updates, `Update` after each commit, a flush at the end), the whole map stored
+3.09 B per chunk-hour for z0 and 1.82 for the pyramid, 4.91 in total
+(`internal/v3/pyramid` TestWholeMapFileStores, build tag `integration`).
 
 ### 5.5 Mover windows on disk (WP4)
 
