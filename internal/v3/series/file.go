@@ -301,8 +301,8 @@ func (f *file) close() error {
 	if e := f.idx.Close(); err == nil {
 		err = e
 	}
-	f.blk, f.idx = nil, nil
 	f.mu.Lock()
+	f.blk, f.idx = nil, nil
 	f.entries = nil
 	f.mu.Unlock()
 	return err
@@ -311,6 +311,10 @@ func (f *file) close() error {
 // readRange reads records first..last (inclusive) with one contiguous read.
 func (f *file) readRange(first, last uint64) ([]core.Record, error) {
 	f.mu.RLock()
+	if f.blk == nil {
+		f.mu.RUnlock()
+		return nil, core.ErrClosed
+	}
 	n := uint64(len(f.entries))
 	if first > last || last >= n {
 		f.mu.RUnlock()
@@ -320,12 +324,12 @@ func (f *file) readRange(first, last uint64) ([]core.Record, error) {
 	copy(ents, f.entries[first:last+1])
 	blk := f.blk
 	f.mu.RUnlock()
-	if blk == nil {
-		return nil, core.ErrClosed
-	}
 	base := ents[0].off
 	buf := make([]byte, ents[len(ents)-1].end()-base)
 	if _, err := blk.ReadAt(buf, base); err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return nil, core.ErrClosed // Store.Close ran concurrently
+		}
 		return nil, fmt.Errorf("series %q: read: %w", f.name, err)
 	}
 	out := make([]core.Record, len(ents))

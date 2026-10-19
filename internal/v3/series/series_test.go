@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -389,5 +390,97 @@ func TestIdleIndexBytesBound(t *testing.T) {
 		s, _ := st.OpenSeries(fmt.Sprintf("t/%d", i), false)
 		checkPrefix(t, s, 60)
 		s.Close()
+	}
+}
+
+// TestConcurrentEvictionAndClose churns series through a one-entry LRU (every release
+// evicts and closes a file outside the store lock while other goroutines reopen the
+// same names), then closes the store while readers are still running. Reads must return
+// either the written records or core.ErrClosed, and every series must reopen intact.
+// Run with -race.
+func TestConcurrentEvictionAndClose(t *testing.T) {
+	dir := t.TempDir()
+	opt := Options{NoSync: true, MaxOpen: 1}
+	s, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"a/x", "a/y", "b/z"}
+	const perSeries = 20
+	for _, name := range names {
+		h, err := s.OpenSeries(name, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendN(t, h, 0, perSeries)
+		if err := h.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		h.Close()
+	}
+	stop := make(chan struct{})
+	errs := make(chan error, 16)
+	var wg sync.WaitGroup
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(g)))
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				h, err := s.OpenSeries(names[r.Intn(len(names))], false)
+				if errors.Is(err, core.ErrClosed) {
+					return
+				}
+				if err != nil {
+					errs <- err
+					return
+				}
+				seq := uint64(r.Intn(perSeries))
+				rec, err := h.Read(context.Background(), seq)
+				switch {
+				case errors.Is(err, core.ErrClosed):
+				case err != nil:
+					errs <- err
+					return
+				case !bytes.Equal(rec.Payload, payloadFor(seq)):
+					errs <- fmt.Errorf("record %d differs", seq)
+					return
+				}
+				h.Len()
+				h.Meta(seq)
+				h.Close()
+			}
+		}(g)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(stop)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if st := s.Stats(); st.Evictions == 0 {
+		t.Fatal("no evictions")
+	}
+	s2, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	for _, name := range names {
+		h, err := s2.OpenSeries(name, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkPrefix(t, h, perSeries)
+		h.Close()
 	}
 }

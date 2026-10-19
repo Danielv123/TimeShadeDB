@@ -42,6 +42,9 @@ type Store struct {
 	idle   lruList // files with refs == 0, most recently used first
 	// idleBytes is the index memory of the idle files.
 	idleBytes int64
+	// closing holds evicted files that are being closed outside mu; an open of the
+	// same name waits for the channel so two file objects never write one index.
+	closing map[string]chan struct{}
 
 	opens, evictions atomic.Uint64
 }
@@ -59,7 +62,7 @@ func Open(dir string, opt Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &Store{root: dir, opt: opt, files: map[string]*file{}}, nil
+	return &Store{root: dir, opt: opt, files: map[string]*file{}, closing: map[string]chan struct{}{}}, nil
 }
 
 // Root returns the store directory.
@@ -104,6 +107,12 @@ func (s *Store) OpenSeries(name string, create bool) (*Series, error) {
 	if s.closed {
 		s.mu.Unlock()
 		return nil, core.ErrClosed
+	}
+	if ch := s.closing[name]; ch != nil {
+		// An evicted copy is still being closed (flushing its index): wait for it.
+		s.mu.Unlock()
+		<-ch
+		return s.OpenSeries(name, create)
 	}
 	if f := s.files[name]; f != nil {
 		f.refs++
@@ -153,12 +162,13 @@ func (s *Store) OpenSeries(name string, create bool) (*Series, error) {
 	return &Series{f: f, s: s}, nil
 }
 
-// release drops one reference and closes idle files beyond MaxOpen.
+// release drops one reference and closes idle files beyond MaxOpen. Evicted files
+// are closed (which may fsync and write their index) after s.mu is released.
 func (s *Store) release(f *file) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	f.refs--
 	if f.refs > 0 || f.err != nil || s.files[f.name] != f {
+		s.mu.Unlock()
 		return
 	}
 	f.lru = s.idle.pushFront(f)
@@ -166,14 +176,31 @@ func (s *Store) release(f *file) {
 	f.lru.bytes = int64(cap(f.entries)) * entrySize
 	f.mu.RUnlock()
 	s.idleBytes += f.lru.bytes
+	type evicted struct {
+		f  *file
+		ch chan struct{}
+	}
+	var out []evicted
 	for s.idle.len > s.opt.MaxOpen || (s.idleBytes > s.opt.MaxIdleIndexBytes && s.idle.len > 0) {
 		old := s.idle.back()
 		s.idleBytes -= old.bytes
 		s.idle.remove(old.f.lru)
 		old.f.lru = nil
 		delete(s.files, old.f.name)
-		_ = old.f.close() // records are already durable or are rebuilt on open
+		ch := make(chan struct{})
+		s.closing[old.f.name] = ch
+		out = append(out, evicted{old.f, ch})
 		s.evictions.Add(1)
+	}
+	s.mu.Unlock()
+	for _, e := range out {
+		_ = e.f.close() // records are already durable or are rebuilt on open
+		s.mu.Lock()
+		if s.closing[e.f.name] == e.ch {
+			delete(s.closing, e.f.name)
+		}
+		s.mu.Unlock()
+		close(e.ch)
 	}
 }
 
@@ -256,7 +283,14 @@ func (s *Store) Close() error {
 	s.files = map[string]*file{}
 	s.idle = lruList{}
 	s.idleBytes = 0
+	closing := make([]chan struct{}, 0, len(s.closing))
+	for _, ch := range s.closing {
+		closing = append(closing, ch)
+	}
 	s.mu.Unlock()
+	for _, ch := range closing {
+		<-ch
+	}
 	var first error
 	for _, f := range files {
 		<-f.ready

@@ -40,8 +40,11 @@ func (h *Series) Append(ctx context.Context, rec core.Record) (uint64, error) {
 	return f.append(rec)
 }
 
-// Len implements core.Series.
+// Len implements core.Series. It is 0 after the handle or the store was closed.
 func (h *Series) Len() uint64 {
+	if h.closed.Load() {
+		return 0
+	}
 	h.f.mu.RLock()
 	defer h.f.mu.RUnlock()
 	return uint64(len(h.f.entries))
@@ -49,8 +52,14 @@ func (h *Series) Len() uint64 {
 
 // Meta implements core.Series.
 func (h *Series) Meta(seq uint64) (core.RecordMeta, error) {
+	if h.closed.Load() {
+		return core.RecordMeta{}, core.ErrClosed
+	}
 	h.f.mu.RLock()
 	defer h.f.mu.RUnlock()
+	if h.f.blk == nil {
+		return core.RecordMeta{}, core.ErrClosed
+	}
 	if seq >= uint64(len(h.f.entries)) {
 		return core.RecordMeta{}, fmt.Errorf("%w: record %d", core.ErrNoVersion, seq)
 	}
