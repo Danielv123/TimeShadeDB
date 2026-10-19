@@ -28,11 +28,15 @@ const (
 )
 
 // Size caps after decompression. The largest files in the test data are a 1.4 MB
-// change file and 0.5 MB snapshots; the caps leave a wide margin while bounding what a
-// hostile file can make the importer allocate.
+// change file, 0.5 MB snapshots, a 230 KB window file, a 100 KB recipes file and a
+// 27 KB area index (it grows with the history). The caps leave a wide margin while
+// bounding what a hostile file can make the importer allocate: window and keyframe
+// JSON is decoded into generic values (about 10x its size) on up to GOMAXPROCS
+// workers at once, so its cap is the smallest.
 const (
-	maxChangeBytes = 64 << 20
-	maxJSONBytes   = 64 << 20
+	maxChangeBytes = 16 << 20
+	maxJSONBytes   = 8 << 20
+	maxWindowBytes = 2 << 20
 )
 
 var (

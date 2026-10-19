@@ -3,9 +3,14 @@ package minimap_test
 import (
 	"context"
 	"os"
+	"runtime"
+	"runtime/metrics"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"timeshadedb/internal/import/minimap"
+	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/memstore"
 )
 
@@ -163,5 +168,88 @@ func TestTestdata(t *testing.T) {
 		if !v.Match {
 			t.Errorf("overlay read-back mismatch: %+v", v)
 		}
+	}
+}
+
+// countingMovers is a MoverStore that keeps nothing: it counts samples and checks that
+// they arrive in time order.
+type countingMovers struct {
+	core.MoverStore
+	samples    int
+	last       core.TimeMs
+	outOfOrder int
+}
+
+func (s *countingMovers) Append(_ context.Context, samples []core.MoverSample) (core.ApplyResult, error) {
+	for _, m := range samples {
+		if m.T < s.last {
+			s.outOfOrder++
+		}
+		s.last = max(s.last, m.T)
+	}
+	s.samples += len(samples)
+	return core.ApplyResult{Accepted: len(samples)}, nil
+}
+
+func (s *countingMovers) Commit(context.Context, core.TimeMs) error { return nil }
+
+// TestTestdataMoverHeap imports the test export's movers into a store that keeps
+// nothing and bounds the importer's peak heap: the mover import streams, so its memory
+// does not grow with the length of the history. Set TSDB_TESTDATA to run it.
+func TestTestdataMoverHeap(t *testing.T) {
+	root := os.Getenv("TSDB_TESTDATA")
+	if root == "" {
+		t.Skip("TSDB_TESTDATA not set")
+	}
+	d, err := minimap.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	sample := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	metrics.Read(sample)
+	base := sample[0].Value.Uint64()
+	var peak atomic.Uint64
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+		tk := time.NewTicker(2 * time.Millisecond)
+		defer tk.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+				metrics.Read(s)
+				if v := s[0].Value.Uint64(); v > peak.Load() {
+					peak.Store(v)
+				}
+			}
+		}
+	}()
+	store := &countingMovers{}
+	rep, err := minimap.Import(context.Background(), d, minimap.Options{Movers: store})
+	close(stop)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := peak.Load()
+	if p > base {
+		p -= base
+	} else {
+		p = 0
+	}
+	t.Logf("movers: %d samples in %d ms, peak heap %d MB above the %d MB baseline", store.samples, rep.MoversMs, p>>20, base>>20)
+	if store.samples != rep.MoverApply.Accepted || store.samples < 2_000_000 {
+		t.Errorf("store got %d samples, report says %d", store.samples, rep.MoverApply.Accepted)
+	}
+	if store.outOfOrder != 0 {
+		t.Errorf("%d samples arrived out of time order", store.outOfOrder)
+	}
+	if p > 150<<20 {
+		t.Errorf("peak heap %d MB, want <= 150 MB", p>>20)
 	}
 }

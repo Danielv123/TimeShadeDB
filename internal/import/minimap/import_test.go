@@ -181,7 +181,7 @@ func TestImportMovers(t *testing.T) {
 	check("train jumps before", mr.TrainJumpsBefore, 1)
 	check("train jumps after", mr.TrainJumpsAfter, 0)
 	check("headings derived", mr.HeadingsDerived, 3)
-	check("no heading", mr.NoHeading, 4)
+	check("no heading", mr.NoHeading, 7)
 	check("imported train samples", mr.Imported.Samples["t"], 9)
 	check("imported train journeys", mr.Imported.Journeys["t"], 2)
 	if rep.MoverApply != (core.ApplyResult{Accepted: 18}) {
@@ -238,7 +238,7 @@ func TestImportMovers(t *testing.T) {
 	}
 	veh := rows[exp.Vehicle]
 	if len(veh) != 3 || veh[0].Orientation != 0 || veh[1].Orientation != 0.25 || veh[2].Orientation != 0.25 ||
-		veh[2].Flags&core.FlagStop == 0 || veh[0].Flags&core.FlagNoHeading != 0 {
+		veh[2].Flags&core.FlagStop == 0 || veh[0].Flags&core.FlagNoHeading == 0 || veh[1].Flags&core.FlagNoHeading == 0 {
 		t.Fatalf("vehicle rows: %+v", veh)
 	}
 	parked := rows[exp.Parked]

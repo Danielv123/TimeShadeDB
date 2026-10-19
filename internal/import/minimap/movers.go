@@ -4,12 +4,9 @@
 package minimap
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"math"
-	"sort"
-	"sync"
 
 	"timeshadedb/internal/v3/core"
 )
@@ -29,7 +26,7 @@ type srcRow struct {
 	x, y   float64
 	vx, vy float64
 	h      float64
-	meta   int32 // index into the surface's meta table
+	meta   *core.MoverMeta // interned per surface; never modified after interning
 	flags  uint8
 }
 
@@ -106,7 +103,8 @@ func parseMeta(m []any) (core.MoverMeta, bool) {
 type decodedWindow struct {
 	metas   []core.MoverMeta
 	metaOK  []bool
-	rows    []srcRow // meta holds the window-local mover index
+	rows    []srcRow // meta is nil; mi holds the window-local mover index
+	mi      []int32
 	first   int64    // the file's time (its earliest row)
 	last    int64
 	invalid int
@@ -115,7 +113,7 @@ type decodedWindow struct {
 
 func decodeWindowFile(path string) decodedWindow {
 	var out decodedWindow
-	b, err := readGz(path, maxJSONBytes)
+	b, err := readGz(path, maxWindowBytes)
 	if err != nil {
 		out.err = err
 		return out
@@ -135,6 +133,7 @@ func decodeWindowFile(path string) decodedWindow {
 		out.metas[i], out.metaOK[i] = parseMeta(m)
 	}
 	out.rows = make([]srcRow, 0, len(w.S))
+	out.mi = make([]int32, 0, len(w.S))
 	out.first = w.T
 	out.last = math.MinInt64
 	for _, r := range w.S {
@@ -148,7 +147,7 @@ func decodeWindowFile(path string) decodedWindow {
 			out.invalid++
 			continue
 		}
-		row := srcRow{t: w.T + int64(dt), meta: int32(idx)}
+		row := srcRow{t: w.T + int64(dt)}
 		if len(r) == 2 {
 			row.flags = rowGone
 		} else {
@@ -163,6 +162,7 @@ func decodeWindowFile(path string) decodedWindow {
 			}
 		}
 		out.rows = append(out.rows, row)
+		out.mi = append(out.mi, int32(idx))
 		out.last = max(out.last, row.t)
 	}
 	return out
@@ -201,18 +201,27 @@ type MoverReport struct {
 	// as the train ((carriages - 1) * 7 tiles), the leading end having flipped.
 	EndSwitches int `json:"end_switches"`
 	// DupSamplesDropped and DupGonesDropped are rows dropped because a later row of the
-	// same journey had the same time (after re-timing).
+	// same journey had the same time. Re-timing never creates equal times, so these are
+	// exactly the source rows followed by a row of the same journey with an equal stamp.
 	DupSamplesDropped int `json:"dup_samples_dropped"`
 	DupGonesDropped   int `json:"dup_gones_dropped"`
-	// Keyframe rows read, rows matching a window row (same journey and time), seeds
-	// imported for journeys with no row at or before the keyframe, and conflicts (the
-	// keyframe lists a journey whose last row before it is a gone).
+	// Keyframe rows read, rows whose sample time equals the journey's last window row
+	// at or before the keyframe, seeds imported for journeys with no window row at or
+	// before the keyframe, and conflicts (the keyframe lists a journey whose last window
+	// row at or before it is a gone).
 	KeyframeRows      int `json:"keyframe_rows"`
 	KeyframeMatched   int `json:"keyframe_matched"`
 	KeyframeSeeded    int `json:"keyframe_seeded"`
 	KeyframeConflicts int `json:"keyframe_conflicts"`
-	// HeadingsDerived vehicle samples got their orientation from the velocity;
-	// NoHeading samples carry FlagNoHeading; Stops carry FlagStop.
+	// KeyframeSeedsClamped seeds had a sample time more than seedMaxLag before their
+	// keyframe and were placed seedMaxLag before it.
+	KeyframeSeedsClamped int `json:"keyframe_seeds_clamped"`
+	// OpenRunCuts counts the times rows of a journey were fixed before the row after
+	// them was known, because no row followed within openRunLag (the streaming bound).
+	OpenRunCuts int `json:"open_run_cuts"`
+	// HeadingsDerived vehicle samples got their orientation from the velocity (they
+	// still carry FlagNoHeading, since the orientation is an estimate); NoHeading
+	// samples carry FlagNoHeading; Stops carry FlagStop.
 	HeadingsDerived int `json:"headings_derived"`
 	NoHeading       int `json:"no_heading"`
 	Stops           int `json:"stops"`
@@ -235,188 +244,6 @@ func (r *MoverReport) addErr(err error) {
 	if len(r.Errors) < 20 {
 		r.Errors = append(r.Errors, err.Error())
 	}
-}
-
-// surfaceData is one surface after decoding and fixing.
-type surfaceData struct {
-	key      core.SurfaceKey
-	metas    []core.MoverMeta
-	journeys []string
-	rows     map[string][]srcRow // per journey, sorted by t, fixed
-	rep      *MoverReport
-}
-
-// loadSurface decodes, fixes and seeds one surface's movers.
-func loadSurface(ctx context.Context, d *Dataset, src *SourceSurface, workers int) (*surfaceData, error) {
-	rep := &MoverReport{Surface: src.Key.ID(), WindowFiles: len(src.Windows), KeyframeFiles: len(src.Keyframes),
-		Source: newCounts(), Imported: newCounts(), Retimed: map[string]int{}}
-	sd := &surfaceData{key: src.Key, rows: map[string][]srcRow{}, rep: rep}
-
-	// Decode windows in parallel, merge in file order.
-	decoded := make([]decodedWindow, len(src.Windows))
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				decoded[j] = decodeWindowFile(src.WindowPath(src.Windows[j]))
-			}
-		}()
-	}
-	for j := range src.Windows {
-		if ctx.Err() != nil {
-			break
-		}
-		jobs <- j
-	}
-	close(jobs)
-	wg.Wait()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	metaIdx := map[core.MoverMeta]int32{}
-	intern := func(m core.MoverMeta) int32 {
-		i, ok := metaIdx[m]
-		if !ok {
-			i = int32(len(sd.metas))
-			sd.metas = append(sd.metas, m)
-			metaIdx[m] = i
-		}
-		return i
-	}
-	W := d.WindowMs
-	for j := range decoded {
-		dw := &decoded[j]
-		if dw.err != nil {
-			rep.addErr(dw.err)
-			continue
-		}
-		rep.InvalidRows += dw.invalid
-		local := make([]int32, len(dw.metas))
-		for i, m := range dw.metas {
-			if dw.metaOK[i] {
-				local[i] = intern(m)
-			}
-		}
-		for _, r := range dw.rows {
-			r.meta = local[r.meta]
-			// The floor after a close is the close time + 1 (or later), and a clamped
-			// sample is stamped with it, so it is the earliest time in its file.
-			if mod := r.t % W; mod <= 2 || (r.t == dw.first && dw.first%W < boundarySlack) {
-				r.flags |= rowBoundary
-			}
-			id := sd.metas[r.meta].ID
-			sd.rows[id] = append(sd.rows[id], r)
-		}
-		decoded[j] = decodedWindow{}
-	}
-	for id := range sd.rows {
-		sd.journeys = append(sd.journeys, id)
-	}
-	sort.Strings(sd.journeys)
-
-	for _, id := range sd.journeys {
-		rows := sd.rows[id]
-		sort.SliceStable(rows, func(a, b int) bool { return rows[a].t < rows[b].t })
-		kind := string(sd.metas[rows[0].meta].Kind)
-		rep.Source.Journeys[kind]++
-		for _, r := range rows {
-			k := string(sd.metas[r.meta].Kind)
-			if r.flags&rowGone != 0 {
-				rep.Source.Gones[k]++
-			} else {
-				rep.Source.Samples[k]++
-			}
-		}
-		rep.SourceDupPairs += dupPairs(rows)
-		if kind == string(core.KindTrain) {
-			rep.TrainJumpsBefore += trainJumps(rows)
-		}
-		rows = fixJourney(rows, sd.metas, rep)
-		if kind == string(core.KindTrain) {
-			rep.TrainJumpsAfter += trainJumps(rows)
-		}
-		sd.rows[id] = rows
-	}
-
-	if err := seedKeyframes(ctx, src, sd, intern); err != nil {
-		return nil, err
-	}
-
-	for _, id := range sd.journeys {
-		rows := sd.rows[id]
-		if len(rows) == 0 {
-			continue
-		}
-		rep.Imported.Journeys[string(sd.metas[rows[0].meta].Kind)]++
-		for i, r := range rows {
-			k := string(sd.metas[r.meta].Kind)
-			if r.flags&rowGone != 0 {
-				rep.Imported.Gones[k]++
-				for _, n := range rows[i+1:] {
-					if n.t > r.t+int64(core.HandoffWindow) {
-						break
-					}
-					if n.flags&rowGone == 0 {
-						rep.Handoffs++
-						break
-					}
-				}
-			} else {
-				rep.Imported.Samples[k]++
-			}
-			if rep.FirstT == 0 || core.TimeMs(r.t) < rep.FirstT {
-				rep.FirstT = core.TimeMs(r.t)
-			}
-			rep.LastT = max(rep.LastT, core.TimeMs(r.t))
-		}
-	}
-	return sd, nil
-}
-
-// dupPairs counts consecutive samples with equal times, a gone resetting the chain.
-func dupPairs(rows []srcRow) int {
-	n := 0
-	prev := -1
-	for i, r := range rows {
-		if r.flags&rowGone != 0 {
-			prev = -1
-			continue
-		}
-		if prev >= 0 && rows[prev].t == r.t {
-			n++
-		}
-		prev = i
-	}
-	return n
-}
-
-// trainJumps is research/scripts/jumps.py: consecutive samples (no gone between) with
-// 0 < dt <= 3 s whose displacement exceeds max(|v|, |v_prev|) * dt + 6 tiles.
-func trainJumps(rows []srcRow) int {
-	n := 0
-	prev := -1
-	for i, r := range rows {
-		if r.flags&rowGone != 0 {
-			prev = -1
-			continue
-		}
-		if prev >= 0 && r.flags&rowEndSwitch == 0 {
-			p := rows[prev]
-			dt := float64(r.t-p.t) / 1000
-			if dt > 0 && dt <= 3 {
-				v := max(math.Hypot(r.vx, r.vy), math.Hypot(p.vx, p.vy))
-				if math.Hypot(r.x-p.x, r.y-p.y) > v*dt+6 {
-					n++
-				}
-			}
-		}
-		prev = i
-	}
-	return n
 }
 
 // Clamp fix tuning.
@@ -444,8 +271,8 @@ const (
 func dist(a, b *srcRow) float64 { return math.Hypot(a.x-b.x, a.y-b.y) }
 func speed(r *srcRow) float64   { return math.Hypot(r.vx, r.vy) }
 
-// fixJourney applies the clamp re-timing, the duplicate rule and end-switch detection to
-// one journey's rows (sorted by t). It returns the fixed rows, still sorted by t.
+// retimeRows applies the clamp re-timing to rows (one journey, sorted by t). rows[:from]
+// are context that was fixed (and emitted) earlier: they are read but never changed.
 //
 // Re-timing works on runs of consecutive boundary-stamped samples (no gone inside). The
 // true times of a run lie before its stamps. With a good sample P before the run and a
@@ -453,11 +280,11 @@ func speed(r *srcRow) float64   { return math.Hypot(r.vx, r.vy) }
 // the reported speeds within a factor of 2, the run is spread over P..N in proportion
 // to the distance travelled. Otherwise each sample is placed at the previous one plus
 // its distance over its reported speed (or, after a gone, at the next one minus that).
-// No sample moves later than its stamp, and order is kept.
-func fixJourney(rows []srcRow, metas []core.MoverMeta, rep *MoverReport) []srcRow {
-	kind := string(metas[rows[0].meta].Kind)
+// No row moves later than its stamp, rows keep their order, and a re-timed row never
+// lands on another row's time.
+func retimeRows(rows []srcRow, from int, kind string, rep *MoverReport) {
 	isRun := func(r *srcRow) bool { return r.flags&(rowGone|rowBoundary) == rowBoundary }
-	for i := 0; i < len(rows); {
+	for i := from; i < len(rows); {
 		if !isRun(&rows[i]) {
 			i++
 			continue
@@ -467,30 +294,13 @@ func fixJourney(rows []srcRow, metas []core.MoverMeta, rep *MoverReport) []srcRo
 			j++
 		}
 		rep.BoundaryStamped += j - i
-		retimeRun(rows, i, j, kind, rep)
+		retimeRun(rows, from, i, j, kind, rep)
 		i = j
 	}
-	sort.SliceStable(rows, func(a, b int) bool { return rows[a].t < rows[b].t })
-	out := rows[:0]
-	for i := range rows {
-		if i+1 < len(rows) && rows[i+1].t == rows[i].t {
-			if rows[i].flags&rowGone != 0 {
-				rep.DupGonesDropped++
-			} else {
-				rep.DupSamplesDropped++
-			}
-			continue
-		}
-		out = append(out, rows[i])
-	}
-	if kind == string(core.KindTrain) {
-		markEndSwitches(out, metas, rep)
-	}
-	return out
 }
 
-// retimeRun re-times the boundary-stamped samples rows[i:j].
-func retimeRun(rows []srcRow, i, j int, kind string, rep *MoverReport) {
+// retimeRun re-times the boundary-stamped samples rows[i:j]; rows[:from] are frozen.
+func retimeRun(rows []srcRow, from, i, j int, kind string, rep *MoverReport) {
 	stamp := make([]int64, j-i)
 	for k := i; k < j; k++ {
 		stamp[k-i] = rows[k].t
@@ -529,7 +339,7 @@ func retimeRun(rows []srcRow, i, j int, kind string, rep *MoverReport) {
 		ok = forwardEstimate(rows, i, j, est)
 	case hasN:
 		ok = backwardEstimate(rows, i, j, est)
-		if ok && i > 0 && rows[i-1].flags&rowBoundary != 0 && est[0] <= rows[i-1].t && est[0] < stamp[0]-retimeMinShift {
+		if ok && i > from && rows[i-1].flags&rowBoundary != 0 && est[0] <= rows[i-1].t && est[0] < stamp[0]-retimeMinShift {
 			// A boundary-stamped gone right before the run was clamped too: it may move
 			// back as far as the row before it allows.
 			g := &rows[i-1]
@@ -604,91 +414,6 @@ func backwardEstimate(rows []srcRow, i, j int, est []int64) bool {
 	return moved
 }
 
-// markEndSwitches flags train samples where the leading end flipped: a jump (as in
-// trainJumps, 0 < dt <= 3 s) at low speed whose length matches the train's front-to-back
-// distance.
-func markEndSwitches(rows []srcRow, metas []core.MoverMeta, rep *MoverReport) {
-	prev := -1
-	for i := range rows {
-		r := &rows[i]
-		if r.flags&rowGone != 0 {
-			prev = -1
-			continue
-		}
-		if prev >= 0 {
-			p := &rows[prev]
-			n := metas[r.meta].Carriages
-			dt := float64(r.t-p.t) / 1000
-			d := dist(p, r)
-			if n >= 2 && dt > 0 && dt <= endSwitchMaxDt && d > max(speed(r), speed(p))*dt+6 && min(speed(r), speed(p)) < 3 {
-				l := float64((n - 1) * carriagePitch)
-				if math.Abs(d-l) <= 0.3*l+2 {
-					r.flags |= rowEndSwitch
-					rep.EndSwitches++
-				}
-			}
-		}
-		prev = i
-	}
-}
-
-// seedKeyframes reads the surface's keyframes in time order. A keyframe mover whose
-// journey has no row at or before the keyframe is imported as a sample at its own time.
-func seedKeyframes(ctx context.Context, src *SourceSurface, sd *surfaceData, intern func(core.MoverMeta) int32) error {
-	rep := sd.rep
-	for _, kt := range src.Keyframes {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		b, err := readGz(src.KeyframePath(kt), maxJSONBytes)
-		if err != nil {
-			rep.addErr(err)
-			continue
-		}
-		var kf keyframeJSON
-		if err := json.Unmarshal(b, &kf); err != nil {
-			rep.addErr(fmt.Errorf("%s: %w: %v", src.KeyframePath(kt), ErrFormat, err))
-			continue
-		}
-		for _, lm := range kf.Movers {
-			rep.KeyframeRows++
-			row, meta, ok := parseLiveMover(lm)
-			if !ok || row.t > kf.T {
-				rep.InvalidRows++
-				continue
-			}
-			rows := sd.rows[meta.ID]
-			i := sort.Search(len(rows), func(i int) bool { return rows[i].t > kf.T })
-			if i > 0 {
-				j := sort.Search(len(rows), func(j int) bool { return rows[j].t >= row.t })
-				if j < len(rows) && rows[j].t == row.t {
-					rep.KeyframeMatched++
-				}
-				if rows[i-1].flags&rowGone != 0 {
-					rep.KeyframeConflicts++
-				}
-				continue
-			}
-			row.meta = intern(meta)
-			row.flags |= rowSeed
-			k := sort.Search(len(rows), func(k int) bool { return rows[k].t >= row.t })
-			if k < len(rows) && rows[k].t == row.t {
-				continue
-			}
-			rows = append(rows, srcRow{})
-			copy(rows[k+1:], rows[k:])
-			rows[k] = row
-			if len(sd.rows[meta.ID]) == 0 {
-				sd.journeys = append(sd.journeys, meta.ID)
-			}
-			sd.rows[meta.ID] = rows
-			rep.KeyframeSeeded++
-		}
-	}
-	sort.Strings(sd.journeys)
-	return nil
-}
-
 // parseLiveMover reads [id, kind, force, name, n, x, y, vx, vy, ts, kinds, colour, h].
 func parseLiveMover(lm []any) (srcRow, core.MoverMeta, bool) {
 	if len(lm) < 13 {
@@ -733,139 +458,3 @@ func headingFromVelocity(vx, vy float64) float64 {
 	return o
 }
 
-// outSample is a fixed sample ready for the store, in compact form.
-type outSample struct {
-	t     int64
-	x, y  float64
-	o     float64
-	flags core.MoverFlags
-	meta  int32 // global meta index
-	sfc   int32
-}
-
-// buildSamples converts a surface's fixed rows to outSamples, deriving flags and
-// headings, and appends them to out.
-func buildSamples(sd *surfaceData, sfc int32, metaBase int32, out []outSample) []outSample {
-	rep := sd.rep
-	for _, id := range sd.journeys {
-		haveH := false
-		lastH := 0.0
-		for _, r := range sd.rows[id] {
-			s := outSample{t: r.t, meta: metaBase + r.meta, sfc: sfc, flags: core.FlagNoTick}
-			if r.flags&rowGone != 0 {
-				s.flags |= core.FlagGone
-				out = append(out, s)
-				continue
-			}
-			s.x, s.y = r.x, r.y
-			if r.flags&rowEndSwitch != 0 {
-				s.flags |= core.FlagEndSwitch
-			}
-			if r.vx == 0 && r.vy == 0 {
-				s.flags |= core.FlagStop
-				rep.Stops++
-			}
-			switch {
-			case r.flags&rowHasH != 0:
-				s.o = r.h
-			case sd.metas[r.meta].Kind == core.KindVehicle && (r.vx != 0 || r.vy != 0):
-				lastH, haveH = headingFromVelocity(r.vx, r.vy), true
-				s.o = lastH
-				rep.HeadingsDerived++
-			case sd.metas[r.meta].Kind == core.KindVehicle && haveH:
-				s.o = lastH
-				rep.HeadingsDerived++
-			default:
-				s.flags |= core.FlagNoHeading
-				rep.NoHeading++
-			}
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// importMovers decodes and fixes every surface's movers and feeds them to the store in
-// global time order. Each Commit trails the feed by more than core.HandoffWindow, so the
-// store sees the sample that makes a gone a handoff before it closes the gone's window.
-func importMovers(ctx context.Context, d *Dataset, opt *Options, store core.MoverStore) ([]*MoverReport, core.ApplyResult, error) {
-	var res core.ApplyResult
-	var surfaces []*surfaceData
-	for _, src := range d.Surfaces {
-		if !opt.wantSurface(src.Key) {
-			continue
-		}
-		sd, err := loadSurface(ctx, d, src, opt.Workers)
-		if err != nil {
-			return nil, res, err
-		}
-		surfaces = append(surfaces, sd)
-	}
-	var (
-		metas   []core.MoverMeta
-		keys    []core.SurfaceKey
-		samples []outSample
-		reports []*MoverReport
-	)
-	for i, sd := range surfaces {
-		samples = buildSamples(sd, int32(i), int32(len(metas)), samples)
-		metas = append(metas, sd.metas...)
-		keys = append(keys, sd.key)
-		reports = append(reports, sd.rep)
-		sd.rows = nil
-	}
-	sort.SliceStable(samples, func(a, b int) bool { return samples[a].t < samples[b].t })
-
-	batch := make([]core.MoverSample, 0, 8192)
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		r, err := store.Append(ctx, batch)
-		res.Add(r)
-		batch = batch[:0]
-		return err
-	}
-	if len(samples) == 0 {
-		return reports, res, nil
-	}
-	every := opt.MoverCommitEvery
-	next := core.WindowStart(core.TimeMs(samples[0].t), core.MoverWindowLen) + every
-	for _, s := range samples {
-		t := core.TimeMs(s.t)
-		for t > next+core.HandoffWindow {
-			if err := flush(); err != nil {
-				return reports, res, err
-			}
-			if err := store.Commit(ctx, next); err != nil {
-				return reports, res, err
-			}
-			next += every
-			if t > next+core.HandoffWindow+every {
-				next = core.WindowStart(t-core.HandoffWindow, core.MoverWindowLen)
-			}
-		}
-		batch = append(batch, core.MoverSample{
-			Surface:     keys[s.sfc],
-			Meta:        metas[s.meta],
-			T:           t,
-			X:           s.x,
-			Y:           s.y,
-			Orientation: s.o,
-			Flags:       s.flags,
-		})
-		if len(batch) == cap(batch) {
-			if err := flush(); err != nil {
-				return reports, res, err
-			}
-		}
-	}
-	if err := flush(); err != nil {
-		return reports, res, err
-	}
-	last := core.TimeMs(samples[len(samples)-1].t)
-	if err := store.Commit(ctx, core.WindowEnd(last, core.MoverWindowLen)); err != nil {
-		return reports, res, err
-	}
-	return reports, res, nil
-}
