@@ -162,6 +162,12 @@ func (r *Renderer) cached(ctx context.Context, k cacheKey, build func(ctx contex
 		return Body{Data: b, Encoding: k.enc}, nil
 	}
 	r.flightMu.Lock()
+	// A flight that finished between the Get above and this lock has put its body in
+	// the cache before leaving r.flights, so look again rather than build it twice.
+	if b, ok := r.cache.Get(k); ok {
+		r.flightMu.Unlock()
+		return Body{Data: b, Encoding: k.enc}, nil
+	}
 	if f := r.flights[k]; f != nil {
 		r.flightMu.Unlock()
 		select {
