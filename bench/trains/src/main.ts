@@ -5,12 +5,16 @@
 //   node dist/eval.mjs --data <illisis export> [--map gw-bc41437d~2E1] [--surface nauvis]
 //       [--renderer illisis|linear|hermite|v3] [--lookahead-ms 61000] [--hz 10]
 //       [--label illisis] [--scenario testdata] [--out result.json] [--journeys N]
+//       [--journeys-json <file from `measure movers`>]  (train rows from a v3 database, such
+//       as the imported test data, instead of the illisis windows; the rail mask still
+//       comes from --data)
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { cpus, platform, release, arch } from "node:os";
 import { basename, dirname } from "node:path";
 
 import { illisisName, loadRailMask, loadTrainJourneys } from "./illisis_data.ts";
+import { loadV3Journeys } from "./v3_data.ts";
 import { defaultOptions, leaveOneOut, newRenderStats, renderJourney, summarize, type LooResult } from "./metrics.ts";
 import { renderer } from "./renderers/index.ts";
 
@@ -31,6 +35,7 @@ const label = arg("label", rname)!;
 const scenario = arg("scenario", "testdata")!;
 const out = arg("out");
 const maxJourneys = Number(arg("journeys", "0"));
+const journeysJson = arg("journeys-json");
 const opts = {
   ...defaultOptions,
   hz: Number(arg("hz", String(defaultOptions.hz))),
@@ -39,7 +44,7 @@ const opts = {
 
 const started = new Date();
 const t0 = performance.now();
-let journeys = loadTrainJourneys(data, mapDir, surfaceDir);
+let journeys = journeysJson ? loadV3Journeys(journeysJson) : loadTrainJourneys(data, mapDir, surfaceDir);
 if (maxJourneys > 0) {
   journeys = journeys.slice(0, maxJourneys);
 }
@@ -78,9 +83,13 @@ const result = {
   seconds,
   machine: { os: `${platform()} ${release()}`, arch: arch(), cpu: cpus()[0]?.model ?? "", cpus: cpus().length, go: `node ${process.version}` },
   // The data path is local; record it relative to TSDB_TESTDATA when it is that, else its last element.
-  params: { data: data === process.env.TSDB_TESTDATA ? "$TSDB_TESTDATA" : basename(data), map: mapDir, surface: surfaceDir, renderer: rname, ...opts },
+  params: { data: data === process.env.TSDB_TESTDATA ? "$TSDB_TESTDATA" : basename(data), map: mapDir, surface: surfaceDir, renderer: rname,
+    journeys: journeysJson ? "v3 database export (" + basename(journeysJson) + ")" : "illisis windows", ...opts },
   metrics,
   notes: [
+    journeysJson
+      ? "train samples: the v3 database's stored rows (imported by WP5: re-timed, deduped, handoffs flagged), exported by `measure movers`"
+      : "train samples: the illisis movement windows as exported (with the illisis store's clamp re-timing)",
     "rail mask: final z0 chart pixels of colour (140,142,140); off-rail = carriage centre more than 1 tile from a rail tile",
     "trains.offrail_* count every drawn carriage (5 per train for illisis, 1 for the head-only references); trains.head_offrail_* count the head only and compare across renderers",
     `lookahead ${opts.lookaheadMs} ms (61000 = history playback, where the next sample is always known)`,

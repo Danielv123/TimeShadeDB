@@ -109,10 +109,15 @@ async function openPage(context) {
     offline: false, latency: rtt, downloadThroughput: (mbit * 1e6) / 8, uploadThroughput: (mbit * 1e6) / 8,
   });
   await cdp.send("Performance.enable");
-  const net = { bytes: 0, requests: 0, fromCache: 0 };
+  // loads: every finished request's URL and network bytes, for the scrub's byte check.
+  const net = { bytes: 0, requests: 0, fromCache: 0, loads: [] };
+  const urls = new Map();
+  cdp.on("Network.requestWillBeSent", (e) => urls.set(e.requestId, e.request.url));
   cdp.on("Network.loadingFinished", (e) => {
     net.bytes += e.encodedDataLength;
     net.requests++;
+    net.loads.push({ url: urls.get(e.requestId) ?? "", bytes: e.encodedDataLength });
+    urls.delete(e.requestId);
   });
   cdp.on("Network.requestServedFromCache", () => net.fromCache++);
   page.on("pageerror", (e) => notes.push(`page error: ${String(e).slice(0, 200)}`));
@@ -273,18 +278,54 @@ if (viewer === "illisis") {
     let since = await page.evaluate((t) => { const s = performance.now(); window.__tsdbControl.seek(t); return s; }, t);
     await nextPaint(page, since, "scrub start");
     const scrub = [], scrubBytes = [];
+    // "Bytes <= the changed tiles" (PLAN.md 5): v3 tile URLs carry the tile's version
+    // (tile/{ds}/{z}/{x}/{y}/{ver}.bin), so a step that downloads a URL this page has
+    // already downloaded fetched an unchanged tile again. Bytes of first-seen tile and
+    // tiledelta URLs are the changed tiles; the rest (view manifests, ...) is overhead.
+    const v3Tile = /\/(tile|tiledelta)\/[^?#]*\.bin(?:[?#]|$)/;
+    const seen = new Set();
+    let mark = 0;
+    const classify = () => {
+      const c = { changed: 0, unchanged: 0, unchangedReqs: 0, other: 0 };
+      for (; mark < net.loads.length; mark++) {
+        const { url, bytes } = net.loads[mark];
+        if (!v3Tile.test(url) || url.includes("/live.bin")) {
+          c.other += bytes;
+        } else if (seen.has(url)) {
+          if (bytes > 0) { c.unchanged += bytes; c.unchangedReqs++; }
+        } else {
+          seen.add(url);
+          c.changed += bytes;
+        }
+      }
+      return c;
+    };
+    const unchangedBytes = [], unchangedReqs = [], changedBytes = [], otherBytes = [];
     for (let i = 0; i < scrubSteps && t - 300_000 > first; i++) {
       t -= 300_000;
       const b0 = net.bytes;
+      classify(); // everything before this step (the first paints, the scrub start) counts as seen
       since = await page.evaluate((t) => { const s = performance.now(); window.__tsdbControl.seek(t); return s; }, t);
       const p = await nextPaint(page, since, `scrub step ${i + 1}`);
       if (p.full !== undefined) {
         scrub.push(p.full);
         scrubBytes.push(net.bytes - b0);
+        const c = classify();
+        unchangedBytes.push(c.unchanged);
+        unchangedReqs.push(c.unchangedReqs);
+        changedBytes.push(c.changed);
+        otherBytes.push(c.other);
       }
     }
     put("web.scrub_ms", scrub);
     put("web.scrub_bytes", scrubBytes);
+    if (viewer === "v3") {
+      put("web.scrub_changed_tile_bytes", changedBytes);
+      put("web.scrub_other_bytes", otherBytes);
+      put("web.scrub_unchanged_tile_requests", unchangedReqs);
+      metrics["web.scrub_unchanged_tile_bytes"] = unchangedBytes.reduce((a, b) => a + b, 0);
+      notes.push("scrub bytes: tile and tiledelta URLs downloaded again in a scrub step (same version) count as unchanged-tile bytes; requests answered from the browser cache add 0");
+    }
 
     // Timelapse at 1 h/s for 10 s, from 24 h before the end (or the start).
     const t0 = Math.max(first, end - 24 * 3600_000);

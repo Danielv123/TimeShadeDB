@@ -8,6 +8,13 @@
 // Go heap from /metrics when the server exports go_memstats_heap_inuse_bytes. A single
 // working-set reading moves by more than the 2 MiB budget on its own.
 //
+// With -gc (the default), a v3 server the tool starts also gets --pprof on a free
+// loopback port, and every memory reading is preceded by a forced garbage collection
+// (GET /debug/pprof/heap?gc=1) and -gc-settle for the runtime to return freed pages.
+// Without it the readings mostly show how far the collector let garbage grow, which
+// says nothing about what the requests left behind. The live heap after the forced
+// collection (go_memstats_heap_alloc_bytes) is what the requests retained.
+//
 // A guard stops the run when the server's RSS passes -max-rss-mib or after
 // -max-duration. The growth per million requests is extrapolated only from at least
 // -min-extrapolate requests, or when the growth is already far past the budget
@@ -20,7 +27,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +53,9 @@ func main() {
 	settle := flag.Duration("settle", 2*time.Second, "wait before the readings after the run")
 	minExtrap := flag.Int("min-extrapolate", 100000, "fewest requests to extrapolate the growth per million from")
 	clearGrowth := flag.Float64("clear-growth-mib", 64, "growth (MiB) that is reported per million even from fewer requests, because it is far past the budget")
+	forceGC := flag.Bool("gc", true, "v3: start the server with --pprof and force a garbage collection before each memory reading")
+	pprofURL := flag.String("pprof", "", "pprof base URL of a -base server, for -gc (e.g. http://127.0.0.1:6060)")
+	gcSettle := flag.Duration("gc-settle", 30*time.Second, "wait after the forced collection, before the readings (the runtime returns freed pages gradually)")
 	flag.Parse()
 
 	res := sf.NewResult("attack")
@@ -52,6 +65,31 @@ func main() {
 		}
 	}
 	res.Param("db", sf.DB)
+	gcURL := ""
+	if *forceGC && sf.Target == "v3" {
+		switch {
+		case sf.Base != "":
+			gcURL = strings.TrimRight(*pprofURL, "/")
+		default:
+			port, err := freePort()
+			if err != nil {
+				benchlib.Fatal(err)
+			}
+			args := sf.Args
+			if args == "" {
+				args = benchlib.DefaultServerArgs["v3"]
+				if sf.Token != "" {
+					args += " --ingest-token " + sf.Token
+				}
+			}
+			sf.Args = args + fmt.Sprintf(" --pprof 127.0.0.1:%d", port)
+			gcURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+		}
+	}
+	if gcURL != "" {
+		res.Param("gc_settle_s", gcSettle.Seconds())
+		res.Note("memory read after a forced garbage collection (pprof heap?gc=1) and %s of settling", *gcSettle)
+	}
 	srv, base, err := sf.Start()
 	if err != nil {
 		benchlib.Fatal(err)
@@ -92,11 +130,14 @@ func main() {
 	time.Sleep(time.Second)
 	var before memReading
 	if srv != nil {
-		before = readMem(ctx, srv, client, sf.Target, *readings)
+		before = readMem(ctx, srv, client, sf.Target, *readings, gcURL, *gcSettle)
 		res.Set("attack.rss_before_mib", before.rss)
 		res.Set("attack.private_before_mib", before.private)
 		if before.heap >= 0 {
 			res.Set("attack.heap_before_mib", before.heap)
+		}
+		if before.live >= 0 {
+			res.Set("attack.live_heap_before_mib", before.live)
 		}
 	}
 
@@ -193,13 +234,17 @@ func main() {
 		if srv.Exited() {
 			res.Note("server exited; no memory after")
 		} else {
-			after := readMem(ctx, srv, client, sf.Target, *readings)
+			after := readMem(ctx, srv, client, sf.Target, *readings, gcURL, *gcSettle)
 			res.Set("attack.rss_after_mib", after.rss)
 			res.Set("attack.private_after_mib", after.private)
 			res.Set("attack.rss_growth_mib", after.rss-before.rss)
 			res.Set("attack.private_growth_mib", after.private-before.private)
 			if after.heap >= 0 && before.heap >= 0 {
 				res.Set("attack.heap_growth_mib", after.heap-before.heap)
+			}
+			if after.live >= 0 && before.live >= 0 {
+				res.Set("attack.live_heap_after_mib", after.live)
+				res.Set("attack.live_heap_growth_mib", after.live-before.live)
 			}
 			if done > 0 {
 				per := func(name string, growth float64) {
@@ -221,6 +266,9 @@ func main() {
 				if after.heap >= 0 && before.heap >= 0 {
 					per("heap", after.heap-before.heap)
 				}
+				if after.live >= 0 && before.live >= 0 {
+					per("live_heap", after.live-before.live)
+				}
 			}
 		}
 	}
@@ -233,11 +281,48 @@ type memReading struct {
 	rss, private float64
 	// heap is go_memstats_heap_inuse_bytes from /metrics in MiB, or -1.
 	heap float64
+	// live is go_memstats_heap_alloc_bytes in MiB after a forced collection, or -1.
+	live float64
 }
 
-// readMem takes n readings 250 ms apart and returns the medians.
-func readMem(ctx context.Context, srv *benchlib.Server, c *benchlib.Client, target string, n int) memReading {
-	var rss, priv, heap []float64
+// freePort returns a loopback port that was free a moment ago.
+func freePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// collect forces a garbage collection in the server through pprof (heap?gc=1 runs
+// runtime.GC before writing the profile).
+func collect(gcURL string) error {
+	r, err := http.Get(gcURL + "/debug/pprof/heap?gc=1")
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	io.Copy(io.Discard, r.Body)
+	if r.StatusCode != 200 {
+		return fmt.Errorf("pprof heap: HTTP %d", r.StatusCode)
+	}
+	return nil
+}
+
+// readMem takes n readings 250 ms apart and returns the medians. With gcURL it first
+// forces a collection, waits settle, and collects again.
+func readMem(ctx context.Context, srv *benchlib.Server, c *benchlib.Client, target string, n int, gcURL string, settle time.Duration) memReading {
+	gcOK := false
+	if gcURL != "" {
+		if err := collect(gcURL); err != nil {
+			fmt.Println("attack: forced collection failed:", err)
+		} else {
+			time.Sleep(settle)
+			gcOK = collect(gcURL) == nil
+		}
+	}
+	var rss, priv, heap, live []float64
 	for i := 0; i < max(1, n); i++ {
 		if i > 0 {
 			time.Sleep(250 * time.Millisecond)
@@ -247,32 +332,45 @@ func readMem(ctx context.Context, srv *benchlib.Server, c *benchlib.Client, targ
 			priv = append(priv, benchlib.MiB(mi.Private))
 		}
 		if target == "v3" {
-			if h, ok := goHeap(ctx, c); ok {
+			if h, a, ok := goHeap(ctx, c); ok {
 				heap = append(heap, h)
+				if gcOK && a >= 0 {
+					live = append(live, a)
+				}
 			}
 		}
 	}
-	m := memReading{rss: benchlib.Median(rss), private: benchlib.Median(priv), heap: -1}
+	m := memReading{rss: benchlib.Median(rss), private: benchlib.Median(priv), heap: -1, live: -1}
 	if len(heap) > 0 {
 		m.heap = benchlib.Median(heap)
+	}
+	if len(live) > 0 {
+		m.live = benchlib.Median(live)
 	}
 	return m
 }
 
-// goHeap reads go_memstats_heap_inuse_bytes from the server's /metrics, if exported.
-func goHeap(ctx context.Context, c *benchlib.Client) (float64, bool) {
+// goHeap reads go_memstats_heap_inuse_bytes and go_memstats_heap_alloc_bytes (-1 when
+// missing) from the server's /metrics, in MiB.
+func goHeap(ctx context.Context, c *benchlib.Client) (inuse, alloc float64, ok bool) {
 	r, err := c.Get(ctx, "/metrics", true, nil)
 	if err != nil || r.Status != 200 {
-		return 0, false
+		return 0, 0, false
 	}
+	alloc = -1
 	sc := bufio.NewScanner(bytes.NewReader(r.Body))
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	for sc.Scan() {
-		if v, ok := strings.CutPrefix(sc.Text(), "go_memstats_heap_inuse_bytes "); ok {
+		if v, found := strings.CutPrefix(sc.Text(), "go_memstats_heap_inuse_bytes "); found {
 			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-				return f / (1 << 20), true
+				inuse, ok = f/(1<<20), true
+			}
+		}
+		if v, found := strings.CutPrefix(sc.Text(), "go_memstats_heap_alloc_bytes "); found {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				alloc = f / (1 << 20)
 			}
 		}
 	}
-	return 0, false
+	return inuse, alloc, ok
 }

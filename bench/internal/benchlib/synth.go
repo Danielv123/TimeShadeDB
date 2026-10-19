@@ -229,6 +229,15 @@ func (s *Synth) NextMovers(n int) []MoverRow {
 	return out
 }
 
+// AlignMovers makes the mover samples continue from the chunk stream's current data
+// time when that is later. A v3 server on the data clock (--clock data) has moved its
+// clock with the chunks, so movers starting back at Start would arrive behind it.
+func (s *Synth) AlignMovers() {
+	if s.t > s.nextMov {
+		s.nextMov = math.Ceil(s.t)
+	}
+}
+
 // HotChunks returns the coordinates of the hot set (for tests).
 func (s *Synth) HotChunks() []core.ChunkCoord {
 	out := make([]core.ChunkCoord, len(s.hot))

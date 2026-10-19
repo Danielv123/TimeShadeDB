@@ -8,13 +8,25 @@
 //	    the same numbers for an illisis/minimap export (the test data), as a baseline
 //	measure stream -data <export root> -out <dir> [-coalesce 60000]
 //	    the chunk TSV stream (<map>.chunks.tsv) that ingestbench and soak replay
+//	measure capture -repo <repo> [-runs 3] [-affinity FF00] [-- extra run_game.mjs args]
+//	    the capture's UPS cost: runs `node capture/test/run_game.mjs --mode bench`
+//	    (headless Factorio, WP9) and records its steady-state deltas per tick
+//	measure movers -db <v3 db> [-surface gw-bc41437d~2E1.nauvis] -out journeys.json
+//	    the train journeys stored in a v3 database, for the train evaluator's
+//	    --journeys-json (the imported, re-timed rows instead of the illisis windows)
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,13 +53,17 @@ func main() {
 		cmdIllisis(os.Args[2:])
 	case "stream":
 		cmdStream(os.Args[2:])
+	case "capture":
+		cmdCapture(os.Args[2:])
+	case "movers":
+		cmdMovers(os.Args[2:])
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream [flags]")
+	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream|capture|movers [flags]")
 	os.Exit(2)
 }
 
@@ -127,7 +143,10 @@ func cmdV3Disk(args []string) {
 	res.Param("ds", *ds)
 	res.Set("disk.db_bytes", float64(d.Total))
 	res.Set("disk.db_mib", float64(d.Total)/(1<<20))
-	res.Set("disk.store_mib", float64(d.Total-d.WAL)/(1<<20))
+	// Like the illisis figure: everything stored except the icons (and the WAL, which
+	// is empty once the store is closed).
+	res.Set("disk.store_mib", float64(d.Total-d.WAL-d.Icons)/(1<<20))
+	res.Set("disk.icons_bytes", float64(d.Icons))
 	res.Set("disk.terrain_z0_bytes", float64(d.TerrainZ0))
 	res.Set("disk.pyramid_bytes", float64(d.Pyramid))
 	res.Set("disk.terrain_meta_bytes", float64(d.TerrainMeta))
@@ -231,4 +250,106 @@ func cmdStream(args []string) {
 		fmt.Printf("%s: %d chunk rows -> %s\n", f.Map, f.Rows, f.Path)
 	}
 	fmt.Printf("stream written in %.1fs\n", time.Since(start).Seconds())
+}
+
+// Lines printed by capture/test/run_game.mjs --mode bench (runBench).
+var (
+	captureMeanRE   = regexp.MustCompile(`bench: capture costs (-?[0-9.]+) ms/tick of Lua time \(scriptUpdate \+ luaGarbageIncremental, mean\), (-?[0-9.]+) ms/tick of the whole tick`)
+	captureMedianRE = regexp.MustCompile(`bench: capture costs (-?[0-9.]+) ms/tick of Lua time by the medians`)
+	captureResyncRE = regexp.MustCompile(`capture costs (-?[0-9.]+) ms/tick\s*$`)
+	capturePairRE   = regexp.MustCompile(`bench pair \d+: capture Lua cost (-?[0-9.]+) ms/tick`)
+	captureVersion  = regexp.MustCompile(`^Factorio (\S+) at `)
+)
+
+// parseCaptureBench reads the bench summary out of run_game.mjs's output.
+func parseCaptureBench(out string, res *benchlib.Result) error {
+	m := captureMeanRE.FindStringSubmatch(out)
+	if m == nil {
+		return fmt.Errorf("no \"bench: capture costs ... mean\" line in the output")
+	}
+	lua, _ := strconv.ParseFloat(m[1], 64)
+	whole, _ := strconv.ParseFloat(m[2], 64)
+	res.Set("capture.ms_per_tick", lua)
+	res.Set("capture.whole_ms_per_tick", whole)
+	if m := captureMedianRE.FindStringSubmatch(out); m != nil {
+		v, _ := strconv.ParseFloat(m[1], 64)
+		res.Set("capture.ms_per_tick_p50", v)
+	}
+	var pairs []float64
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if m := capturePairRE.FindStringSubmatch(line); m != nil {
+			v, _ := strconv.ParseFloat(m[1], 64)
+			pairs = append(pairs, v)
+		}
+		if strings.Contains(line, "during a resync") {
+			if m := captureResyncRE.FindStringSubmatch(line); m != nil {
+				v, _ := strconv.ParseFloat(m[1], 64)
+				res.Set("capture.resync_ms_per_tick", v)
+			}
+		}
+		if m := captureVersion.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			res.Param("factorio", m[1])
+		}
+		if t := strings.TrimSpace(line); strings.HasPrefix(t, "WARN bench:") {
+			res.Note("%s", t)
+		}
+	}
+	if len(pairs) > 0 {
+		lo, hi := pairs[0], pairs[0]
+		for _, v := range pairs {
+			lo, hi = min(lo, v), max(hi, v)
+		}
+		res.Set("capture.pairs", float64(len(pairs)))
+		res.Set("capture.pair_min_ms_per_tick", lo)
+		res.Set("capture.pair_max_ms_per_tick", hi)
+	}
+	return nil
+}
+
+func cmdCapture(args []string) {
+	fs := flag.NewFlagSet("capture", flag.ExitOnError)
+	var c common
+	c.register(fs, "v3")
+	repo := fs.String("repo", ".", "TimeShadeDB repository root (holds capture/test/run_game.mjs)")
+	runs := fs.Int("runs", 3, "interleaved pairs (with and without the capture)")
+	affinity := fs.String("affinity", "", "Windows only: hex CPU mask to pin node and Factorio to (cmd start /affinity), e.g. FF00")
+	host := fs.String("host", "mod", "mod (standalone mod) or clusterio (the save-patch module)")
+	fs.Parse(args)
+	if c.scenario == "" {
+		c.scenario = "ups"
+	}
+	script := filepath.Join(*repo, "capture", "test", "run_game.mjs")
+	nodeArgs := append([]string{script, "--mode", "bench", "--runs", strconv.Itoa(*runs), "--host", *host}, fs.Args()...)
+	var cmd *exec.Cmd
+	if *affinity != "" && runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", append([]string{"/c", "start", "", "/affinity", *affinity, "/wait", "/b", "node"}, nodeArgs...)...)
+	} else {
+		cmd = exec.Command("node", nodeArgs...)
+	}
+	cmd.Dir = filepath.Join(*repo, "capture", "test")
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	res := c.result("capture")
+	res.Param("runs", *runs)
+	res.Param("host", *host)
+	res.Param("affinity", *affinity)
+	if err := benchlib.StartTied(cmd); err != nil {
+		benchlib.Fatal(err)
+	}
+	runErr := cmd.Wait()
+	out := buf.String()
+	if strings.Contains(out, "SKIP: no Factorio") {
+		benchlib.Fatal(fmt.Errorf("measure capture: no Factorio found (set FACTORIO_EXE)"))
+	}
+	if err := parseCaptureBench(out, res); err != nil {
+		benchlib.Fatal(fmt.Errorf("measure capture: %w (run_game.mjs: %v)", err, runErr))
+	}
+	if runErr != nil {
+		res.Note("run_game.mjs exited with %v (it fails when a steady-state delta is over 0.3 ms/tick)", runErr)
+	}
+	if err := res.Write(c.out); err != nil {
+		benchlib.Fatal(err)
+	}
 }

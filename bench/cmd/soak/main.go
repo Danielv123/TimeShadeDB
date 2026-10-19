@@ -36,8 +36,17 @@ func main() {
 	memEvery := flag.Duration("mem-every", 5*time.Second, "memory sampling interval")
 	maxRSS := flag.Float64("max-rss-mib", 8192, "stop when the server RSS exceeds this")
 	allowRejected := flag.Bool("allow-rejected", false, "record rows the server did not store instead of failing")
+	dataClock := flag.Bool("data-clock", true, "v3: start the server with --clock data and place the replayed data so it ends now")
 	flag.Parse()
 	ing := soakIngest{allowRejected: *allowRejected}
+	// A v3 server on the wall clock counts replayed history as late, and on the data
+	// clock it never moves past the wall clock (+10 s). So the soak's data is placed to
+	// end at the present: it starts duration*speed (plus an hour of margin) ago.
+	useDataClock := *dataClock && sf.Target == "v3"
+	if useDataClock && sf.Base == "" {
+		sf.AddServerArgs("--clock data")
+	}
+	placedStart := time.Now().UnixMilli() - int64(duration.Seconds()*(*speed)*1000) - 3600_000
 
 	res := sf.NewResult("soak")
 	res.Param("duration_s", duration.Seconds())
@@ -76,8 +85,20 @@ func main() {
 			benchlib.Fatal(fmt.Errorf("input: %v (%d rows)", err, len(file)))
 		}
 		span = file[len(file)-1].T - file[0].T + 60000
+		if useDataClock {
+			off := placedStart - file[0].T
+			for i := range file {
+				file[i].T += off
+			}
+		}
 		cfg.Start = file[0].T
 		res.Param("input", *input)
+	} else if useDataClock {
+		cfg.Start = placedStart
+	}
+	if useDataClock {
+		res.Param("clock", "data")
+		res.Param("data_start_ms", cfg.Start)
 	}
 	synth = benchlib.NewSynth(cfg)
 	res.Param("synth", map[string]any{"chunks": cfg.Chunks, "update_rate": cfg.UpdateRate, "trains": cfg.Trains})
