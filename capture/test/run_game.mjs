@@ -1,6 +1,9 @@
 // Headless Factorio tests of the capture (docs/v3/PROTOCOL.md section 6). Needs a Factorio 2.x install; nothing else.
 //
 //   node run_game.mjs [--mode test|clusterio|bench|all] [--factorio <factorio.exe>] [--keep] [--ticks N]
+//   test options: [--write-fixture] (rewrite fixtures/game_envelopes.ndjson from this run)
+//   bench options: [--runs N] [--trains N] [--charted N] [--chart-reads N] [--profile] [--micro]
+//                  [--real-charts <illisis export dir>] [--compare <another capture/ dir>]
 //
 // test       the standalone mod (test build) and the driver mod run scenario.lua; the envelopes it wrote to
 //            script-output/timeshade are validated line by line, chart bytes are recomputed, train samples are checked
@@ -29,6 +32,11 @@ const option = (name, fallback) => {
 const flag = (name) => args.includes(name);
 const modeArg = flag("--bench") ? "bench" : option("--mode", "all");
 const keep = flag("--keep");
+if (option("--real-charts", null) && option("--host", "mod") === "clusterio") {
+	// the real charts are only wired into the standalone mod's test interface: the harness would bench generated ones
+	console.log("ERROR: --real-charts only works with the standalone mod, not with --host clusterio");
+	process.exit(2);
+}
 const factorio = option("--factorio", process.env.FACTORIO_EXE
 	?? "C:/Program Files (x86)/Steam/steamapps/common/Factorio/bin/x64/factorio.exe");
 
@@ -427,6 +435,46 @@ function runTest() {
 	}
 	const types = new Set(msgs.map(m => m.type));
 	note(`test: message types seen: ${[...types].sort().join(", ")}`);
+	if (flag("--write-fixture")) {
+		writeFixture(lines, results);
+	}
+}
+
+/**
+ * --write-fixture: rewrite fixtures/game_envelopes.ndjson (the Go decode test's input) from this run: the first line,
+ * then each line that shows something no earlier pick did (a message type, a sample flag, a vehicle, a gone, the
+ * scheduled train), in game order.
+ */
+function writeFixture(lines, results) {
+	const seen = new Set();
+	const picked = [];
+	lines.forEach((line, i) => {
+		const features = new Set();
+		for (const m of JSON.parse(line).msgs) {
+			features.add(`type:${m.type}`);
+			if (m.type === "chunk" && m.d === undefined) {
+				features.add("deleted");
+			}
+			for (const e of m.type === "move" ? m.m : []) {
+				for (const f of ["car", "es", "stop", "tick", "gone"]) {
+					if (e[f] !== undefined) {
+						features.add(`${e.k ?? ""}:${f}`);
+					}
+				}
+				features.add(`kind:${e.k ?? "gone"}`);
+				if (results.c_id && e.j?.endsWith(`.${results.c_id}`)) {
+					features.add("scheduled train");
+				}
+			}
+		}
+		if (i === 0 || [...features].some(f => !seen.has(f))) {
+			picked.push(line);
+			features.forEach(f => seen.add(f));
+		}
+	});
+	const out = path.join(here, "fixtures", "game_envelopes.ndjson");
+	fs.writeFileSync(out, picked.map(l => l + "\n").join(""));
+	note(`test: wrote ${picked.length} of ${lines.length} lines to ${out} (${[...seen].sort().join(", ")})`);
 }
 
 function runClusterio() {
@@ -465,6 +513,59 @@ function runClusterio() {
 	check(start, "clusterio: the start resync finished");
 }
 
+/**
+ * `max` distinct 2,048-byte charts from an illisis/minimap export (--real-charts <dir>): the whole-block records
+ * (a chunk's full chart) of the level-0 change files (MMC1: "MMC1", then per record u32 dt, u8 block, u16 n, and
+ * n = 0 means 1,024 RGB565 LE pixels follow, else n x (u16 pos, u16 colour)). The export is only read as data. Returns
+ * a Lua module source: a list of helpers.encode_string-format strings (zlib, base64) for helpers.decode_string.
+ */
+function realCharts(dir, max = 509, scan = 20000) {
+	const seen = new Set();
+	const out = [];
+	const walk = (d, depth) => {
+		for (const entry of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+			if (out.length >= scan) {
+				return;
+			}
+			const p = path.join(d, entry.name);
+			if (entry.isDirectory() && depth < 6) {
+				walk(p, depth + 1);
+			} else if (entry.isFile() && entry.name.endsWith(".c.gz") && /[\\/]0[\\/][-\d]+_[-\d]+$/.test(d)) {
+				// untrusted data: cap the inflated size (a level-0 change file is far smaller) and skip what exceeds it
+				let b;
+				try {
+					b = zlib.gunzipSync(fs.readFileSync(p), { maxOutputLength: 64 * 1024 * 1024 });
+				} catch {
+					continue;
+				}
+				if (b.subarray(0, 4).toString("latin1") !== "MMC1") {
+					continue;
+				}
+				for (let o = 4; o + 7 <= b.length && out.length < scan;) {
+					const n = b.readUInt16LE(o + 5);
+					o += 7;
+					if (n === 0) {
+						const chart = b.subarray(o, o + 2048);
+						o += 2048;
+						const key = chart.toString("base64");
+						if (chart.length === 2048 && !seen.has(key) && chart.some(v => v !== 0)) {
+							seen.add(key);
+							out.push(zlib.deflateSync(chart).toString("base64"));
+						}
+					} else {
+						o += 4 * n;
+					}
+				}
+			}
+		}
+	};
+	walk(dir, 0);
+	// every k-th of the first `scan` found, so the sample spreads over the export's maps, surfaces and areas
+	const step = Math.max(1, Math.floor(out.length / max));
+	const pick = out.filter((_, i) => i % step === 0).slice(0, max);
+	return "return {\n" + pick.map(s => `\t"${s}",\n`).join("") + "}\n";
+}
+
 /** Rows of every run in a --benchmark-verbose output (one header per run). */
 function parseVerbose(stdout) {
 	const lines = stdout.split(/\r?\n/);
@@ -500,37 +601,95 @@ function runBench() {
 		+ `a resync at ${resyncTick}`);
 	const build = buildCapture(path.join(root, "build-bench"));
 	const cfg = { mode: "bench", trains, chunks: 50176, charted: Number(option("--charted", 20)), report_tick: ticks - 10,
-		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, micro: flag("--micro") ? 700 : false,
-		chart_reads: Number(option("--chart-reads", 1)) };
-	const box = sandbox("bench", {
-		timeshade_capture: (dst) => copyTree(build.modDir, dst),
-		timeshade_capture_testdriver: (dst) => {
-			copyTree(path.join(here, "game", "testdriver"), dst);
-			for (const f of ["scenario.lua", "synthetic.lua"]) {
-				fs.copyFileSync(path.join(here, "game", f), path.join(dst, f));
+		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, profile_start: warm, micro: flag("--micro") ? 700 : false,
+		chart_reads: Number(option("--chart-reads", 1)), real_charts: Boolean(option("--real-charts", null)) };
+	const realLua = cfg.real_charts ? realCharts(option("--real-charts")) : null;
+	// --host clusterio benches the Clusterio module in the harness (one Lua state, as in a patched save, lines printed to
+	// stdout) against the same harness with the module not loaded; the default benches the standalone mod
+	const host = option("--host", "mod");
+	const driver = (dst) => {
+		copyTree(path.join(here, "game", "testdriver"), dst);
+		for (const f of ["scenario.lua", "synthetic.lua"]) {
+			fs.copyFileSync(path.join(here, "game", f), path.join(dst, f));
+		}
+	};
+	const harness = (moduleDir) => (dst) => {
+		copyTree(path.join(here, "game", "clusterio_harness"), dst);
+		copyTree(moduleDir, path.join(dst, "modules", "timeshade"));
+		for (const f of ["scenario.lua", "synthetic.lua"]) {
+			fs.copyFileSync(path.join(here, "game", f), path.join(dst, f));
+		}
+	};
+	/** The sandboxes for one capture build: returns [[label, box, before()], ...] for the runs without and with it. */
+	const boxes = (name, modDir, moduleDir, withoutToo) => {
+		if (host === "clusterio") {
+			const out = [];
+			const withBox = sandbox(name, { timeshade_clusterio_harness: harness(moduleDir) }, cfg);
+			if (withoutToo) {
+				const nullBox = sandbox(`${name}-null`, { timeshade_clusterio_harness: harness(moduleDir) },
+					{ ...cfg, no_capture: true });
+				out.push(["without", nullBox, () => {}]);
 			}
-		},
-		// the baseline's stand-in for the capture's test interface: the driver's remote calls cost the same in both runs
-		timeshade_capture_null: (dst) => copyTree(path.join(here, "game", "nullcapture"), dst),
-	}, cfg);
-	fs.rmSync(path.join(box.modsDir, "timeshade_capture", "config.lua"));
-	fs.rmSync(path.join(box.modsDir, "timeshade_capture_null", "config.lua"));
+			out.push(["with", withBox, () => {}]);
+			return out;
+		}
+		const box = sandbox(name, {
+			timeshade_capture: (dst) => {
+				copyTree(modDir, dst);
+				if (realLua) {
+					fs.writeFileSync(path.join(dst, "test", "real_charts.lua"), realLua);
+				}
+			},
+			timeshade_capture_testdriver: driver,
+			// the baseline's stand-in for the capture's test interface: the driver's remote calls cost the same in both
+			timeshade_capture_null: (dst) => copyTree(path.join(here, "game", "nullcapture"), dst),
+		}, cfg);
+		fs.rmSync(path.join(box.modsDir, "timeshade_capture", "config.lua"));
+		fs.rmSync(path.join(box.modsDir, "timeshade_capture_null", "config.lua"));
+		setEnabled(box, { timeshade_capture_null: false }); // both define the test interface
+		const out = [];
+		if (withoutToo) {
+			out.push(["without", box, () => setEnabled(box, { timeshade_capture: false, timeshade_capture_null: true })]);
+		}
+		out.push(["with", box, () => setEnabled(box, { timeshade_capture: true, timeshade_capture_null: false })]);
+		return out;
+	};
+	const variants = boxes("bench", build.modDir, build.moduleDir, true);
+	const box = variants.find(v => v[0] === "with")[1];
 	const save = path.join(box.dir, "bench.zip");
-	setEnabled(box, { timeshade_capture_null: false }); // both define the test interface
 	run(box, ["--create", save], "create");
+	// --compare <capture dir>: another version of the capture (an older checkout's capture/), built the same way and run
+	// on the same save in its own sandbox, interleaved with the others, so both versions see the same machine load
+	const compareDir = option("--compare", null);
+	if (compareDir) {
+		const altOut = path.join(root, "build-alt");
+		execFileSync(process.execPath, [path.join(compareDir, "build.mjs"), "--out", altOut, "--test", "--no-zip",
+			"--factorio-version", majorMinor()], { encoding: "utf8" });
+		const altInfo = JSON.parse(fs.readFileSync(path.join(compareDir, "mod", "timeshade_capture", "info.json"), "utf8"));
+		const [alt] = boxes("bench-alt", path.join(altOut, `${altInfo.name}_${altInfo.version}`),
+			path.join(altOut, "clusterio_module"), false);
+		variants.push(["alt", alt[1], alt[2]]);
+		note(`bench: comparing with the capture in ${compareDir} ("alt")`);
+	}
+	note(`bench: host ${host === "clusterio" ? "Clusterio module (harness, stdout)" : "standalone mod (files)"}`);
 	const runs = Number(option("--runs", 3));
 	const result = {};
-	// interleaved (without, with, without, with, ...) so a burst of load on the machine hits both alike
-	const per = { without: [], with: [] };
+	// interleaved (without, with[, alt], without, with[, alt], ...) so a burst of load on the machine hits each alike
+	const per = { without: [], with: [], alt: [] };
 	const pairs = [];
 	for (let r = 0; r < runs; r++) {
-		for (const [label, enabled] of [["without", false], ["with", true]]) {
-			setEnabled(box, { timeshade_capture: enabled, timeshade_capture_null: !enabled });
-			const res = run(box, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
+		for (const [label, vbox, before] of variants) {
+			before();
+			const res = run(vbox, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
 				`bench-${label}-${r}`);
-			if (enabled && r === 0) {
+			if (label === "with" && r === 0 && host === "clusterio") {
+				const ipc = res.stdout.split(/\r?\n/).filter(l => l.startsWith("\f$ipc:timeshade:out?j"));
+				const bytes = ipc.reduce((n, l) => n + l.length + 1, 0);
+				note(`bench: ${ipc.length} IPC lines, ${(bytes / (ticks / 60)).toFixed(0)} bytes per game second printed`);
+			}
+			if (label === "with" && r === 0) {
 				for (const m of res.stdout.matchAll(/TSTEST (?:prof|micro) (.*)/g)) {
-					note(`bench profile (ticks 1-${resyncTick - 1}): ${m[1].trim()}`);
+					note(`bench profile (ticks ${warm}-${resyncTick - 1}): ${m[1].trim()}`);
 				}
 			}
 			const rows = parseVerbose(res.stdout);
@@ -550,7 +709,16 @@ function runBench() {
 		const base = meanOf(p.without, x => x.whole / 1e6);
 		baselines.push(base);
 		note(`bench pair ${r}: capture Lua cost ${(meanOf(p.with, lua) - meanOf(p.without, lua)).toFixed(4)} ms/tick `
+			+ (p.alt ? `(alt ${(meanOf(p.alt, lua) - meanOf(p.without, lua)).toFixed(4)}) ` : "")
 			+ `(baseline Lua ${meanOf(p.without, lua).toFixed(4)} ms, whole tick ${base.toFixed(4)} ms)`);
+	}
+	if (compareDir) {
+		const steadyOf = (label) => per[label].filter(x => x.tick < resyncTick);
+		const luaMean = (label) => meanOf(steadyOf(label), x => (x.script + x.gc) / 1e6);
+		const wholeMean = (label) => meanOf(steadyOf(label), x => x.whole / 1e6);
+		note(`bench compare: capture Lua cost ${(luaMean("with") - luaMean("without")).toFixed(4)} ms/tick, alt `
+			+ `${(luaMean("alt") - luaMean("without")).toFixed(4)}; whole tick ${(wholeMean("with") - wholeMean("without"))
+				.toFixed(4)}, alt ${(wholeMean("alt") - wholeMean("without")).toFixed(4)}`);
 	}
 	if (Math.max(...baselines) > 1.2 * Math.min(...baselines)) {
 		note(`WARN bench: the baseline's whole tick moved from ${Math.min(...baselines).toFixed(3)} to `
@@ -582,9 +750,11 @@ function runBench() {
 	if (fs.existsSync(benchJson)) {
 		note(`bench: capture stats at the end ${fs.readFileSync(benchJson, "utf8")}`);
 	}
-	const files = fs.readdirSync(path.join(box.write, "script-output", "timeshade")).sort();
-	const bytes = files.reduce((n, f) => n + fs.statSync(path.join(box.write, "script-output", "timeshade", f)).size, 0);
-	note(`bench: ${files.length} files, ${(bytes / runs / (ticks / 60)).toFixed(0)} bytes per game second written`);
+	if (host !== "clusterio") {
+		const files = fs.readdirSync(path.join(box.write, "script-output", "timeshade")).sort();
+		const bytes = files.reduce((n, f) => n + fs.statSync(path.join(box.write, "script-output", "timeshade", f)).size, 0);
+		note(`bench: ${files.length} files, ${(bytes / runs / (ticks / 60)).toFixed(0)} bytes per game second written`);
+	}
 	const deltaResync = result.with.resyncLua.mean - result.without.resyncLua.mean;
 	note(`bench: during a resync (400 ticks from tick ${resyncTick}): Lua ${fmt(result.with.resyncLua)} with, `
 		+ `${fmt(result.without.resyncLua)} without; capture costs ${deltaResync.toFixed(4)} ms/tick`);
@@ -601,7 +771,8 @@ function runBench() {
 	const spikes = result.with.lua.max - result.without.lua.p50;
 	if (spikes > 1) {
 		note(`WARN bench: the slowest tick with the capture takes ${result.with.lua.max.toFixed(3)} ms of Lua time `
-			+ `(p99 ${result.with.lua.p99.toFixed(3)} ms): the file writes (the standalone mod writes its buffer every 2 s)`);
+			+ `(p99 ${result.with.lua.p99.toFixed(3)} ms): the standalone mod's buffered file write (every 120 ticks, about `
+			+ `1.3 ms on Windows), the mover scan (every 30 ticks), garbage collection and table growth`);
 	}
 }
 

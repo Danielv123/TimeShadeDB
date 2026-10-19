@@ -24,7 +24,7 @@ end)
 
 script.on_event(defines.events.on_tick, function(e)
 	if cfg.profile and remote.interfaces["timeshade_capture_test"] then
-		if e.tick == 1 then
+		if e.tick == (cfg.profile_start or 1) then
 			remote.call("timeshade_capture_test", "profile")
 		elseif e.tick == cfg.profile then
 			remote.call("timeshade_capture_test", "profile_report")

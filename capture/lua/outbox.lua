@@ -20,11 +20,14 @@ local queue, moves, oversize, lines_out, bytes_out = {}, {}, 0, 0, 0
 --- sink(line, tick): where each line goes. The host sets it before the first flush.
 outbox.sink = function(_) end
 
---- encode(table) -> JSON text: json.lua, with its fast path for move messages (helpers.table_to_json does the same
---- several times slower).
+--- encode(table) -> JSON text: json.lua, with its fast paths for move and chunk messages (helpers.table_to_json does the
+--- same several times slower).
 outbox.encode = function(msg)
-	if msg.type == "move" then
+	local ty = msg.type
+	if ty == "move" then
 		return json.encode_move(msg)
+	elseif ty == "chunk" then
+		return json.encode_chunk(msg)
 	end
 	return json.encode(msg)
 end

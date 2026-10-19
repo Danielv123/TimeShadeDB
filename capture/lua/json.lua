@@ -133,31 +133,59 @@ function json.encode(v)
 	return concat(out)
 end
 
--- A train sample with every usual field, in one string.format call (the generic path makes one string per field).
+-- A train sample with every usual field, in one string.format call (the generic path makes one string per field), with
+-- or without its own tick.
 local SAMPLE = '{"j":%s,"k":"t","f":%s,"name":%s,"x":%.14g,"y":%.14g,"h":%.14g,"n":%d,"o":%s,"c":%s'
+local SAMPLE_TICK = SAMPLE .. ',"tick":%d'
 
---- The JSON text of a move message: train samples without car through SAMPLE, anything else through json.encode. The
---- same text as json.encode would give, up to key order.
+--- The JSON text of a move message: train samples without car through SAMPLE, anything else through the generic
+--- encoder, all into one buffer joined once. The same text as json.encode would give, up to key order.
 function json.encode_move(msg)
-	local parts = {}
+	local out, n = { '{"type":"move","s":', str(msg.s), ',"m":[' }, 3
 	for i, e in ipairs(msg.m) do
+		if i > 1 then
+			n = n + 1
+			out[n] = ","
+		end
 		if e.k == "t" and e.h and e.n and e.o and e.c and e.f and e.name and not e.car then
-			local s = format(SAMPLE, str(e.j), str(e.f), str(e.name), e.x, e.y, e.h, e.n, str(e.o), str(e.c))
+			n = n + 1
 			if e.tick then
-				s = s .. ',"tick":' .. tostring_(e.tick)
+				out[n] = format(SAMPLE_TICK, str(e.j), str(e.f), str(e.name), e.x, e.y, e.h, e.n, str(e.o), str(e.c), e.tick)
+			else
+				out[n] = format(SAMPLE, str(e.j), str(e.f), str(e.name), e.x, e.y, e.h, e.n, str(e.o), str(e.c))
 			end
 			if e.stop then
-				s = s .. ',"stop":true'
+				n = n + 1
+				out[n] = ',"stop":true'
 			end
 			if e.es then
-				s = s .. ',"es":true'
+				n = n + 1
+				out[n] = ',"es":true'
 			end
-			parts[i] = s .. "}"
+			n = n + 1
+			out[n] = "}"
 		else
-			parts[i] = json.encode(e)
+			n = value(e, out, n)
 		end
 	end
-	return '{"type":"move","s":' .. str(msg.s) .. ',"m":[' .. concat(parts, ",") .. "]}"
+	n = n + 1
+	out[n] = "]}"
+	return concat(out)
+end
+
+local CHUNK = '{"type":"chunk","s":%s,"f":%s,"x":%d,"y":%d'
+
+--- The JSON text of a chunk message. d (helpers.encode_string's base64) needs no escaping, so it is not scanned for
+--- characters to escape as json.encode would; a chunk without d is a deletion.
+function json.encode_chunk(msg)
+	local s = format(CHUNK, str(msg.s), str(msg.f), msg.x, msg.y)
+	if msg.tick then
+		s = s .. ',"tick":' .. tostring_(msg.tick)
+	end
+	if msg.d then
+		return s .. ',"d":"' .. msg.d .. '"}'
+	end
+	return s .. "}"
 end
 
 return json

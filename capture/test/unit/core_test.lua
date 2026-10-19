@@ -76,6 +76,39 @@ t.test("the FIFO: order kept; the cap refuses event pushes; a push without a cap
 	t.expect_same(q, { head = 1, tail = 0 }, "an empty queue resets its indexes")
 end)
 
+t.test("the ring: order kept across the wrap; full at cap; its slots stay within 1..cap", function()
+	local q = core.queue(3)
+	t.expect_eq(core.pop(q), nil, "empty")
+	t.expect_eq(core.peek(q), nil, "nothing to peek")
+	local want, next_in = {}, 1
+	for round = 1, 10 do
+		while core.push(q, next_in) do
+			want[#want + 1] = next_in
+			next_in = next_in + 1
+		end
+		t.expect_eq(core.size(q), 3, "full at cap (round " .. round .. ")")
+		for _ = 1, round % 3 + 1 do
+			t.expect_eq(core.peek(q), want[1])
+			t.expect_eq(core.pop(q), table.remove(want, 1))
+		end
+	end
+	for k in pairs(q) do
+		t.expect_true(type(k) == "string" or (k >= 1 and k <= 3), "slot " .. tostring(k))
+	end
+	while core.pop(q) do
+	end
+	t.expect_eq(core.size(q), 0)
+end)
+
+t.test("chunk keys come back as surface, force and position", function()
+	for _, k in ipairs({ { 1, 1, -3, 4 }, { 1, 0, 0, 0 }, { 8191, 63, 31250, -31250 }, { 7, 63, -31250, 31250 },
+		{ 2, 5, -1, -1 } }) do
+		local si, fi, x, y = core.unkey(core.key(k[1], k[2], k[3], k[4]))
+		t.expect_same({ si, fi, x, y }, k, "unkey of " .. table.concat(k, ","))
+		t.expect_eq(string.format("%d,%d", x, y), k[3] .. "," .. k[4], "integers")
+	end
+end)
+
 t.test("chart cache: at most cap entries, recent keys survive, old hits are promoted", function()
 	local c = core.cache(4)
 	for i = 1, 100 do
@@ -102,41 +135,52 @@ end)
 t.test("debounce: a chunk is read at most once per DEBOUNCE ticks; one charted while cooling is read when it ends",
 	function()
 		local d = core.debounce()
-		local item = { key = "1:1:0,0" }
-		t.expect_eq(core.charted(d, item), "queued")
-		t.expect_eq(core.charted(d, item), "waiting", "already queued")
-		t.expect_eq(core.take(d, 100), item, "read at 100")
-		t.expect_eq(core.charted(d, item), "dirty", "charted while cooling")
-		t.expect_eq(core.charted(d, item), "dirty")
+		local key = core.key(1, 1, 0, 0)
+		t.expect_eq(core.charted(d, key), "queued")
+		t.expect_eq(core.charted(d, key), "waiting", "already queued")
+		local got, forced = core.take(d, 100)
+		t.expect_eq(got, key, "read at 100")
+		t.expect_eq(forced, false, "from the event queue")
+		t.expect_eq(core.charted(d, key), "dirty", "charted while cooling")
+		t.expect_eq(core.charted(d, key), "dirty")
 		t.expect_eq(core.take(d, 101), nil, "nothing queued while it cools")
 		t.expect_eq(core.cooled(d, 100 + core.DEBOUNCE - 1), 0, "still cooling")
 		t.expect_eq(core.cooled(d, 100 + core.DEBOUNCE), 1, "the cool-down ends: queued again")
-		t.expect_eq(core.take(d, 100 + core.DEBOUNCE), item)
+		t.expect_eq(core.take(d, 100 + core.DEBOUNCE), key)
 		t.expect_eq(core.cooled(d, 100 + 2 * core.DEBOUNCE), 0, "not charted since: nothing to read")
 		t.expect_eq(next(d.cool), nil, "no cool-down left")
 		t.expect_eq(next(d.dirty), nil, "nothing dirty")
-		t.expect_eq(core.charted(d, item), "queued", "a quiet chunk is queued at once")
+		t.expect_eq(core.size(d.due) + core.size(d.due_t), 0, "the cool-down list is empty")
+		t.expect_eq(core.charted(d, key), "queued", "a quiet chunk is queued at once")
 	end)
 
 t.test("debounce: forced pushes skip the cool-down and the cap; the cap drops and counts event pushes", function()
-	local d = core.debounce()
 	local cap = core.CAP
 	core.CAP = 2
-	t.expect_eq(core.charted(d, { key = "a" }), "queued")
-	t.expect_eq(core.charted(d, { key = "b" }), "queued")
-	t.expect_eq(core.charted(d, { key = "c" }), "dropped")
-	t.expect_eq(d.drops, 1)
-	t.expect_eq(core.charted(d, { key = "c", forced = true }, true), "queued", "forced past the cap")
-	core.take(d, 0)
-	t.expect_eq(core.charted(d, { key = "a", forced = true }, true), "queued", "forced past the cool-down")
+	local d = core.debounce()
 	core.CAP = cap
+	t.expect_eq(core.charted(d, "a"), "queued")
+	t.expect_eq(core.charted(d, "b"), "queued")
+	t.expect_eq(core.charted(d, "c"), "dropped")
+	t.expect_eq(d.drops, 1)
+	t.expect_eq(core.charted(d, "c", true), "queued", "forced past the cap")
+	local key, forced = core.take(d, 0)
+	t.expect_eq(key, "c", "forced reads first")
+	t.expect_eq(forced, true)
+	t.expect_eq(core.charted(d, "c", true), "queued", "forced past the cool-down")
+	local sentinel = { resynced = 1 }
+	t.expect_eq(core.charted(d, sentinel, true), "queued", "the sentinel")
+	t.expect_eq(core.take(d, 1, "forced"), "c")
+	t.expect_eq(core.take(d, 1, "forced"), sentinel, "the sentinel comes back as it went in")
+	t.expect_eq(core.take(d, 1, "forced"), nil, "only forced reads asked for")
+	t.expect_eq(core.take(d, 1, "events"), "a")
 end)
 
 t.test("debounce: a chunk flickering every tick for an hour is read at most once per DEBOUNCE", function()
 	local d = core.debounce()
-	local item, n = { key = "hot" }, 0
+	local key, n = "hot", 0
 	for tick = 0, 216000 do
-		core.charted(d, item)
+		core.charted(d, key)
 		core.cooled(d, tick)
 		if core.take(d, tick) then
 			n = n + 1

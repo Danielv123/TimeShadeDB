@@ -339,7 +339,8 @@ function B.tick(api, cfg, t)
 			for i = 0, 200 do
 				flicker[(i * 7 % side) .. "," .. (i * 13 % side)] = 1
 			end
-			api.synthetic{ surface = SURFACE, x1 = 0, y1 = 0, x2 = side, y2 = side, flicker = flicker }
+			api.synthetic{ surface = SURFACE, x1 = 0, y1 = 0, x2 = side, y2 = side, flicker = flicker,
+				real = cfg.real_charts or nil }
 		end
 	end
 	for _, tr in ipairs(g.trains) do

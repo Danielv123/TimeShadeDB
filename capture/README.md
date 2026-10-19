@@ -119,9 +119,18 @@ start empty, which only changes what that peer would write.
 cd capture/test && npm ci
 npm test                          # unit tests: node run_unit.mjs (Lua 5.4 via wasmoon)
 node run_game.mjs                 # headless Factorio: standalone mod and Clusterio module
-node run_game.mjs --mode bench    # UPS benchmark (about 8 minutes)
+node run_game.mjs --mode bench    # UPS benchmark (about a minute)
 go test ./capture/...             # (from the repo root) real game output decodes into core types
 ```
+
+Options: `--keep` leaves the temporary directory; `--write-fixture` (test mode) rewrites
+`fixtures/game_envelopes.ndjson`, the Go test's input, from the run. The bench takes
+`--runs N` (interleaved pairs, 3), `--host clusterio` (bench the Clusterio module instead of
+the mod), `--compare <capture dir>` (run another version of `capture/`, for example an older
+checkout's, interleaved on the same save), `--real-charts <illisis export>` (use 509 charts
+cut from a real map instead of generated ones; standalone mod only, refused with
+`--host clusterio`), `--profile` (per-step LuaProfiler totals),
+`--micro` (per-operation timings), and `--trains`, `--charted`, `--chart-reads`.
 
 `run_game.mjs` needs a Factorio 2.x install (`--factorio <exe>` or `FACTORIO_EXE`; default:
 the Steam path). It works in a fresh temporary directory with its own write-data, mods and
@@ -155,38 +164,73 @@ patched save loads it, with a stub Clusterio API):
 `run_game.mjs --mode bench` builds 100 rail loops (24 straight rails a side, so about 30%
 of the track is curve) with a 4-carriage train each, driven at 0.5 tiles/tick (108 km/h),
 and feeds 20 chart events a tick over a virtual map of 50,176 charted chunks: a quarter on
-201 chunks that change every tick, the rest spread over the whole map, so almost every
-read finds a chart the capture has not sent yet (deflated and sent: 88 KB of output per
-game second). It runs the same save with and without the mod, interleaved, three times
-each; the run without loads a no-op stand-in for the capture's test interface, so the
-driver's remote calls cost the same in both. It compares Factorio's `--benchmark-verbose`
-timings over ticks 600 to 3,600, then a resync. It fails when the Lua delta
-(`scriptUpdate + luaGarbageIncremental`) or the whole-tick delta is over 0.3 ms/tick, and
-warns about the resync's cost, slow ticks and a baseline that moved between pairs (a busy
-machine).
+201 chunks that change every tick, the rest spread over the whole map. The event queue
+fills to its cap and almost every read finds a chart the capture has not sent yet, which it
+deflates and sends (88 KB of output per game second). It runs the same save with and
+without the capture, interleaved, three times each; the run without loads a no-op stand-in
+for the capture's test interface, so the driver's remote calls cost the same in both. It
+compares Factorio's `--benchmark-verbose` timings over ticks 600 to 3,600, then a resync.
+It fails when the Lua delta (`scriptUpdate + luaGarbageIncremental`) or the whole-tick delta
+is over 0.3 ms/tick, and warns about the resync's cost, slow ticks and a baseline that moved
+between pairs (a busy machine).
 
-Measured on 2026-10-19, Factorio 2.1.19, Ryzen 9 9950X3D, Windows 11, defaults (one chart
-read a tick), in a run where the baseline stayed within 4% across the three pairs:
+Timings move with the machine: on a shared one, pin the run to a few cores, for example
+`cmd /c start "" /affinity FF00 /wait /b node run_game.mjs --mode bench` (the Factorio
+processes inherit the mask), and use `--compare` to judge a change. Measured on 2026-10-19,
+Factorio 2.1.19, Ryzen 9 9950X3D, Windows 11, defaults (one chart read a tick), with other
+jobs running on the machine, mean of the steady state:
 
-| | Capture cost (ms/tick) |
+| | This version | v3 before (`--compare`) |
+|---|---|---|
+| Standalone mod, cores 4-7 (mask `FF00`), 5 pairs | 0.195 ms (pairs 0.189 to 0.201), whole tick 0.195 | 0.222 (0.210 to 0.257), whole tick 0.233 |
+| The same, cores 12-15 (mask `FF000000`), 3 quiet pairs of 4 | 0.200 to 0.211 | 0.227 to 0.293 |
+| Clusterio module (`--host clusterio`), cores 4-7, 3 pairs | 0.196 (0.191 to 0.204), whole tick 0.205 | 0.237, whole tick 0.256 |
+| Standalone, `--real-charts`, cores 4-7, 3 pairs | 0.203 (0.198 to 0.206) | |
+
+The median tick costs 0.157 ms and the 99th percentile 1.6 ms (the file write every 120
+ticks, the mover scan every 30). The slowest tick, 6.6 to 7.2 ms, comes once, when the event
+queue first reaches its cap (tick 1,429 at 20 events a tick, 2,875 at 10); its cause is not
+pinned down (table growth or a garbage collection step). During a resync (four reads a
+tick, three of them forced, each also listing the chunk's machines) the capture costs 0.39
+to 0.41 ms/tick, for about 3.5 minutes per 50,000 chunks.
+
+So the 0.3 ms/tick budget is met on quiet pinned runs, but the margin depends on the load
+on the machine: a later pinned standalone run on the same machine under load (cores 4-7, 5
+pairs) printed FAIL at 0.325 ms/tick, whole tick 0.385, while a pinned Clusterio run at the
+same time passed at 0.282 (two quiet pairs at about 0.21). Another pinned standalone run
+(cores 4-7, 5 pairs, `--compare`, the baseline's whole tick moving from 0.59 to 0.75 ms)
+printed FAIL at 0.308 ms/tick (pairs 0.271 to 0.330), whole tick 0.333, against 0.364 and
+0.406 for the earlier version, with the same 7,209,102 bytes written. Unpinned on the same
+busy machine the baseline tick itself varied 2.3 times between pairs, and the capture cost
+0.19 to 0.47 ms/tick (0.27 to 0.41 before). The improvement over the earlier version
+reproduces in every run; the absolute budget is not confirmed on a quiet machine or on
+Linux.
+
+Where a tick goes (`--profile`, which adds about 0.5 µs a wrapped call):
+
+| Step | µs/tick |
 |---|---|
-| Steady state, Lua, mean | 0.330 (pairs 0.328, 0.331, 0.330) |
-| Steady state, Lua, median | 0.271 |
-| Steady state, whole tick, mean | 0.384 |
-| During a resync (4 forced reads a tick) | 0.60 |
-| Slowest tick | 7.9 ms Lua (p99 2.1 ms) |
+| `helpers.encode_string` of the read chart (45 to 56 µs a call in the running game, 21 µs back to back) | 49 |
+| the rest of the chart read: the queue, the cool-downs, the seam, the cache | 21 |
+| train reads (11 a tick) and the mover scan | 52 |
+| flush: JSON (21), the line cut (4), the file buffer (1) | 29 |
+| 20 chart events, with the event tables the bench builds in Lua | 46 |
+| `helpers.write_file`, once every 120 ticks | 13 |
 
-The steady state is over the 0.3 ms budget (D9) in this scenario. One-run ablations show
-where it goes: the 100 trains alone (no chart events) cost 0.12; one chart event and one
-read a tick of a chart not yet sent add 0.09 to 0.11 (deflating 2 KiB with
-`helpers.encode_string` and sending it); the other 19 events a tick add about 0.11. With two
-chart reads a tick (the earlier default) the Lua mean was 0.44. A map whose charts mostly
-repeat what was sent costs less: an unchanged re-read skips the deflate (raw compare) or the
-send (cache hit). The earlier figure of 0.29 came from a chart generator that only reached
-about 1,000 chunks. Per operation (`run_game.mjs --mode bench --micro`): a queued chart
-event 0.4 to 0.8 µs, a new one 1.6 to 2.4 µs, a train read 4 µs, `helpers.encode_string`
-of a chart 22 µs, a 3-sample move message 13 µs to encode (`helpers.table_to_json`: 24 to
-33 µs).
+`helpers.write_file` costs about 1.3 ms a call on Windows whatever the size (measured over
+files from 0 to 4 MiB, and with the lines passed as a LocalisedString tree instead of one
+string: slower), so it is a slow tick every 2 s and 11 µs/tick on average. Charts made of
+real terrain deflate to fewer bytes than the generated ones but take longer to deflate.
+
+What changed since the 0.330 ms/tick recorded here before: a queued chart read
+is now the chunk's key alone, in a ring of 20,000 slots (it was a table per read in a table
+whose indexes drifted into its hash part), which halves the capture's Lua heap in this bench
+(19.8 to 9.4 MiB); chunk messages and move messages are encoded
+without escaping the base64 or building a string per sample; the chord test avoids square
+roots. The output is the same: the bench writes the same 7,209,102 bytes, and the game
+test's envelopes match field for field (apart from entity unit numbers, which differ by a
+run-dependent offset). Much of the earlier figure was the machine: the
+earlier version measures 0.21 to 0.29 ms/tick pinned in the runs above.
 
 ## Licence
 

@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"testing"
 
@@ -25,6 +26,18 @@ func strict(t *testing.T, raw []byte, v any) {
 	if err := dec.Decode(v); err != nil {
 		t.Fatalf("decode %T: %v\n%s", v, err, raw)
 	}
+}
+
+// headingOf is the orientation (0 north, 0.25 east) of the direction from a to b.
+func headingOf(a, b [3]float64) float64 {
+	o := math.Atan2(b[0]-a[0], a[1]-b[1]) / (2 * math.Pi)
+	return o - math.Floor(o)
+}
+
+// turn is the smaller angle between two orientations, in turns.
+func turn(a, b float64) float64 {
+	d := math.Abs(a-b) - math.Floor(math.Abs(a-b))
+	return math.Min(d, 1-d)
 }
 
 func TestGameEnvelopesDecode(t *testing.T) {
@@ -80,6 +93,15 @@ func TestGameEnvelopesDecode(t *testing.T) {
 							flags["car"]++
 							if len(e.Car) != e.N {
 								t.Fatalf("car lists %d carriages, n = %d", len(e.Car), e.N)
+							}
+							// h: from the second carriage towards the first (PROTOCOL.md 3.1)
+							if len(e.Car) >= 2 {
+								want := headingOf(e.Car[1], e.Car[0])
+								if turn(*e.H, want) > 0.003 {
+									t.Fatalf("train %s: h %.3f, but the second carriage points to the first at %.3f",
+										e.J, *e.H, want)
+								}
+								flags["h"]++
 							}
 						}
 						if e.ES {
@@ -138,7 +160,7 @@ func TestGameEnvelopesDecode(t *testing.T) {
 			t.Errorf("no %s message in the fixture", want)
 		}
 	}
-	for _, want := range []string{"car", "es", "stop", "tick", "gone", "vehicle"} {
+	for _, want := range []string{"car", "h", "es", "stop", "tick", "gone", "vehicle"} {
 		if flags[want] == 0 {
 			t.Errorf("no sample with %s in the fixture", want)
 		}
