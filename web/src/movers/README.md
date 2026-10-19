@@ -59,7 +59,11 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    heartbeat's run away from it until data resumes, minutes later. A train whose last two
    chord speeds show braking decelerates and stops (at most 40 tiles/s²) instead of running
    on at full speed, so a lost stop sample costs a few tiles, not heartbeat x speed. Never
-   towards a gone; across a known gap it holds.
+   towards a gone. Across a known gap (over 60 s) the mover holds when it is at the same
+   place afterwards (a parked train: the imported data has no parked heartbeats); when it
+   is somewhere else afterwards (an instance down, a save reloaded, without a gone), it is
+   hidden from a heartbeat after the last sample until the next one, since where it was
+   meanwhile is unknown, instead of standing still for minutes and then jumping.
 5. **Body.** The path is sampled every 0.5 tile back from the head along the same segment
    geometry. Carriage *i*'s bogies sit 2 tiles either side of its arc position; its centre
    is their midpoint and its angle points from the rear bogie to the front one. Pitches come

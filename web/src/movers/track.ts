@@ -742,6 +742,13 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
     return out;
   }
   if (!linked(tr, k)) {
+    if (t - s[k].t > HEARTBEAT_MS && !isEndSwitch(tr, k) && !stationary(tr, k)) {
+      // A data gap after which the mover is somewhere else (an instance down or a save
+      // reloaded without a gone): where it was meanwhile is unknown, and the capture would
+      // have sent a sample within a heartbeat had it still been here, so it is not drawn
+      // until the next sample instead of standing still and then jumping there.
+      return out;
+    }
     // A data gap or an end switch: hold until the next sample (it is known, so running on
     // along the old velocity would only have to jump back).
     extrapolate(tr, k, t, -Infinity, s[k].t, out);
@@ -759,6 +766,30 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
  * samples before a crossing are often far ahead of the gone row.
  */
 function bridge(tr: Track, a: number, b: number, t: number, out: Head): void {
+  const s = tr.s;
+  // A mover that stood still long before the gone (a parked train that then crossed or
+  // switched ends): hold at a and blend only over the handoff window before the gone.
+  // Blending over the whole time from a put the head most of the way to b the moment the
+  // resume became known: a jump of up to a train's length.
+  const start = s[a + 1].t - HANDOFF_MS;
+  if (s[a].t < start) {
+    const A = s[a];
+    const B = s[b];
+    const h = (B.t - start) / 1000;
+    const u = h > 0 ? Math.min(1, Math.max(0, (t - start) / 1000 / h)) : 1;
+    out.x = A.x + (B.x - A.x) * u;
+    out.y = A.y + (B.y - A.y) * u;
+    const moving = u > 0 && u < 1 && h > 0;
+    out.vx = moving ? (B.x - A.x) / h : 0;
+    out.vy = moving ? (B.y - A.y) / h : 0;
+    out.visible = true;
+    out.k = a;
+    out.to = b;
+    out.u = u;
+    out.moving = moving;
+    out.mode = "bridge";
+    return;
+  }
   interpolate(tr, a, b, t, out, motionConfig.bridge === "line");
   out.mode = "bridge";
 }

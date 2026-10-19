@@ -271,6 +271,7 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
   const sess = r.session(j);
   let fed = 0;
   let prev: { x: number; y: number; t: number } | undefined;
+  let prevCars: { x: number; y: number }[] = [];
   let prevKey = "";
   let prevDists: number[] = [];
   let prevHead = 0;
@@ -284,7 +285,9 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
     while (at + 1 < s.length && s[at + 1].t <= t) {
       at++;
     }
-    const p = sess.pose(t);
+    // History playback has loaded every sample up to t + lookahead (the viewer's history
+    // feed likewise reports the end of its loaded range as the data horizon).
+    const p = sess.pose(t, t + o.lookaheadMs);
     if (!p) {
       prev = undefined;
       continue;
@@ -341,7 +344,17 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
     prevHead = head;
     if (prev) {
       const dt = (t - prev.t) / 1000;
-      const disp = Math.hypot(p.x - prev.x, p.y - prev.y);
+      // The head's displacement, unless the drawn body is the previous one reversed (an end
+      // switch: the leading end changed but no carriage moved, so nothing jumped).
+      let disp = Math.hypot(p.x - prev.x, p.y - prev.y);
+      const n = p.cars.length;
+      if (n >= 2 && prevCars.length === n) {
+        let rev = 0;
+        for (let i = 0; i < n; i++) {
+          rev = Math.max(rev, Math.hypot(p.cars[i].x - prevCars[n - 1 - i].x, p.cars[i].y - prevCars[n - 1 - i].y));
+        }
+        disp = Math.min(disp, rev);
+      }
       const lo = Math.max(0, at - 1);
       const hi = Math.min(s.length - 1, at + 1);
       let v = 0;
@@ -360,6 +373,7 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
       }
     }
     prev = { x: p.x, y: p.y, t };
+    prevCars = p.cars;
   }
 }
 

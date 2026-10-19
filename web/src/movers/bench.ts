@@ -6,8 +6,9 @@
 // Samples go through what the v3 store keeps (FORMAT.md 7.4): positions in 1/16 tile,
 // u16 orientation, no velocity; a sample without a tick is flagged F_NO_TICK. Poses are what
 // the movers layer draws (MoverView.frame, carriages included). The data horizon is the
-// later of the newest sample fed and the pose time: the evaluator has fed every sample up to
-// the pose time plus its lookahead, so both are lower bounds of the true horizon.
+// one the evaluator passes (every sample up to it has been fed: in history playback the
+// pose time plus its lookahead, as the history feed reports the end of its loaded range),
+// else the later of the newest sample fed and the pose time, both lower bounds of it.
 
 import type { Carriage, MoverMeta } from "../api/types";
 import { F_END_SWITCH, F_GONE, F_NO_HEADING, F_NO_TICK, F_STOP, makeSample } from "./track";
@@ -44,7 +45,7 @@ export interface BenchPose {
 
 export interface BenchTrainSession {
   feed(s: BenchTrainSample): void;
-  pose(t: number): BenchPose | undefined;
+  pose(t: number, horizon?: number): BenchPose | undefined;
 }
 
 export interface BenchTrainRenderer {
@@ -97,8 +98,8 @@ class Session implements BenchTrainSession {
     this.newest = Math.max(this.newest, s.t);
   }
 
-  pose(t: number): BenchPose | undefined {
-    const m = this.view.frame(t, Math.max(this.newest, t), { bodies: true })[0];
+  pose(t: number, horizon?: number): BenchPose | undefined {
+    const m = this.view.frame(t, Math.max(this.newest, t, horizon ?? -Infinity), { bodies: true })[0];
     if (!m) {
       return undefined;
     }

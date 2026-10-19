@@ -455,3 +455,21 @@ test("held movers are not moving, so a paused view stops asking for frames", () 
   T.headAt(straightTrack(4, 10, 500), 700, Infinity, h);
   assert.equal(h.moving, true);
 });
+
+test("a known data gap: hidden when the mover is elsewhere afterwards, held when parked", () => {
+  const head = T.newHead();
+  // Moved: last seen at x=40 at t=2000, next seen 500 tiles away 120 s later.
+  const moved = straightTrack(5, 10, 500);
+  moved.insert(T.makeSample(meta, 122_000, 540, 0, 0.25));
+  T.headAt(moved, 2000 + 5000, Infinity, head);
+  assert.ok(head.visible, "held within a heartbeat of the last sample");
+  T.headAt(moved, 2000 + T.HEARTBEAT_MS + 1000, Infinity, head);
+  assert.ok(!head.visible, "hidden once the gap is past the heartbeat");
+  T.headAt(moved, 122_000, Infinity, head);
+  assert.ok(head.visible && Math.abs(head.x - 540) < 1e-6, "shown again at the next sample");
+  // Parked: the same place after the gap.
+  const parked = straightTrack(5, 10, 500);
+  parked.insert(T.makeSample(meta, 122_000, 20.5, 0, 0.25));
+  T.headAt(parked, 60_000, Infinity, head);
+  assert.ok(head.visible, "a parked train stays drawn across the gap");
+});

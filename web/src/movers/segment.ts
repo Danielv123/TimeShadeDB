@@ -31,6 +31,8 @@ const MAX_STRETCH = 1.5;
 const PARALLEL = 1e-3;
 /** Sub-chords of the fallback curve's arc-length table. */
 const TABLE = 16;
+/** Highest timing rate along a segment, as a multiple of the fastest of its end speeds and its mean speed. */
+const SPEED_CAP = 1.25;
 
 const tmp = new Float64Array(4);
 
@@ -73,6 +75,8 @@ export class Segment {
   private h = 0;
   private v0 = 0;
   private v1 = 0;
+  /** Weight of the cubic timing against constant speed (1: pure cubic). */
+  private lam = 1;
   // endpoints and unit tangents
   private p0x = 0;
   private p0y = 0;
@@ -113,10 +117,21 @@ export class Segment {
     const cx = bx - ax;
     const cy = by - ay;
     const chord = Math.hypot(cx, cy);
-    const s0 = Math.hypot(vax, vay);
-    const s1 = Math.hypot(vbx, vby);
+    let s0 = Math.hypot(vax, vay);
+    let s1 = Math.hypot(vbx, vby);
     [this.t0x, this.t0y] = unit(vax, vay, s0, dax, day, cx, cy, chord);
     [this.t1x, this.t1y] = unit(vbx, vby, s1, dbx, dby, cx, cy, chord);
+    if (chord >= 1e-6) {
+      // A tangent against the chord means the mover reversed at that end (or a sample
+      // glitched backwards): a curve honouring it hooks past the end and comes back,
+      // racing ahead of the train. Use the chord direction there, at rest.
+      if (this.t0x * cx + this.t0y * cy < 0) {
+        [this.t0x, this.t0y, s0] = [cx / chord, cy / chord, 0];
+      }
+      if (this.t1x * cx + this.t1y * cy < 0) {
+        [this.t1x, this.t1y, s1] = [cx / chord, cy / chord, 0];
+      }
+    }
     this.l0 = 0;
     this.r = 0;
     this.theta = 0;
@@ -181,6 +196,34 @@ export class Segment {
     const mean = this.length / this.h;
     this.v0 = Math.min(s0, 3 * mean);
     this.v1 = Math.min(s1, 3 * mean);
+    // Bounded speed: end speeds far below the mean (a stop row, or a neighbour that is
+    // inconsistent with this chord) make the cubic race in the middle, up to 1.5x the mean
+    // and beyond, faster than the train ever went. Blend towards constant speed so the
+    // peak stays within SPEED_CAP x the fastest of the end speeds and the mean.
+    this.lam = 1;
+    const peak = this.peakSpeed();
+    const cap = SPEED_CAP * Math.max(this.v0, this.v1, mean);
+    if (peak > cap && peak > mean) {
+      this.lam = Math.max(0, (cap - mean) / (peak - mean));
+    }
+  }
+
+  /** The cubic timing's highest rate (tiles/s) over the segment. */
+  private peakSpeed(): number {
+    const L = this.length;
+    const h = this.h;
+    // rate(u) = a u^2 + b u + c
+    const a = (-6 * L) / h + 3 * this.v0 + 3 * this.v1;
+    const b = (6 * L) / h - 4 * this.v0 - 2 * this.v1;
+    const c = this.v0;
+    let best = Math.max(c, a + b + c);
+    if (a < 0) {
+      const u = -b / (2 * a);
+      if (u > 0 && u < 1) {
+        best = Math.max(best, a * u * u + b * u + c);
+      }
+    }
+    return best;
   }
 
   /**
@@ -205,8 +248,9 @@ export class Segment {
     const u2 = u * u;
     const u3 = u2 * u;
     const L = this.length;
-    out[0] = (-2 * u3 + 3 * u2) * L + (u3 - 2 * u2 + u) * h * this.v0 + (u3 - u2) * h * this.v1;
-    out[1] = ((-6 * u2 + 6 * u) * L) / h + (3 * u2 - 4 * u + 1) * this.v0 + (3 * u2 - 2 * u) * this.v1;
+    const lam = this.lam;
+    out[0] = lam * ((-2 * u3 + 3 * u2) * L + (u3 - 2 * u2 + u) * h * this.v0 + (u3 - u2) * h * this.v1) + (1 - lam) * L * u;
+    out[1] = lam * (((-6 * u2 + 6 * u) * L) / h + (3 * u2 - 4 * u + 1) * this.v0 + (3 * u2 - 2 * u) * this.v1) + ((1 - lam) * L) / h;
     out[0] = Math.min(L, Math.max(0, out[0]));
   }
 

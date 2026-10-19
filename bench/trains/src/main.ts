@@ -101,6 +101,37 @@ const tMask = performance.now();
 console.error(`loaded ${journeys.length} journeys in ${((tLoad - t0) / 1000).toFixed(1)} s, rail mask (${mask.railTiles} tiles) in ${((tMask - tLoad) / 1000).toFixed(1)} s`);
 
 const r = renderer(rname);
+
+// --probe <journey id suffix> --probe-from <ms> --probe-to <ms>: print the drawn train
+// frame by frame (history playback, as renderJourney feeds it) with rail distances.
+const probe = arg("probe");
+if (probe) {
+  const j = journeys.find((x) => x.id.endsWith(probe));
+  if (!j) {
+    console.error("no journey " + probe);
+    process.exit(2);
+  }
+  const from = Number(arg("probe-from")), to = Number(arg("probe-to"));
+  const sess = r.session(j);
+  let fed = 0;
+  const step = 1000 / opts.hz;
+  const s = j.samples;
+  const first = s.find((x) => !x.gone)!;
+  for (let t = first.t; t <= Math.min(to, s[s.length - 1].t); t += step) {
+    while (fed < s.length && s[fed].t <= t + opts.lookaheadMs) {
+      sess.feed(s[fed]);
+      fed++;
+    }
+    const p = sess.pose(t, t + opts.lookaheadMs);
+    if (t < from) {
+      continue;
+    }
+    while (s.length && s[0].t < t - 5000) s.shift(), fed--;
+    const near = s.filter((x) => Math.abs(x.t - t) <= 1500).map((x) => `${x.t - t}:${x.gone ? "gone" : x.x + "," + x.y}`).join(" ");
+    console.log(Math.round(t), p ? `${p.x.toFixed(2)},${p.y.toFixed(2)} d=${mask.distance(p.x, p.y).toFixed(2)} cars=${p.cars.map((c) => mask.distance(c.x, c.y).toFixed(1)).join("/")}` : "-", "|", near);
+  }
+  process.exit(0);
+}
 const loo: LooResult = { all: [], curves: [] };
 const st = newRenderStats();
 let samples = 0;
