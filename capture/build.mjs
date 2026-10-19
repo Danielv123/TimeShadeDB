@@ -63,6 +63,9 @@ fs.mkdirSync(path.join(modDir, "lua"), { recursive: true });
 for (const f of libFiles()) {
 	fs.copyFileSync(path.join(lib, f), path.join(modDir, "lua", f));
 }
+// Ported from illisis/minimap under the Blue Oak Model License 1.0.0, whose notice rule asks that every copy carries it.
+const licence = path.join(here, "LICENSE-BlueOak-1.0.0.md");
+fs.copyFileSync(licence, path.join(modDir, "LICENSE-BlueOak-1.0.0.md"));
 if (test) {
 	fs.mkdirSync(path.join(modDir, "test"), { recursive: true });
 	for (const f of ["hooks.lua", "synthetic.lua"]) {
@@ -75,6 +78,7 @@ if (test) {
 const moduleDir = path.join(out, "clusterio_module");
 fs.rmSync(moduleDir, { recursive: true, force: true });
 copyTree(moduleSrc, moduleDir);
+fs.copyFileSync(licence, path.join(moduleDir, "LICENSE-BlueOak-1.0.0.md"));
 for (const f of libFiles()) {
 	if (fs.existsSync(path.join(moduleDir, f))) {
 		throw new Error(`library file ${f} would overwrite a module file`);

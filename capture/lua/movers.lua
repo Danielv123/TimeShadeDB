@@ -158,7 +158,7 @@ local function poll(st, j, t, how)
 	if m.kind == "t" then
 		local speed = r.speed
 		local fwd = core.forward(m.fwd, speed)
-		if not m.o or not (m.ef.valid and m.eb.valid) then
+		if not (m.o and m.ef and m.ef.valid and m.eb and m.eb.valid) then
 			shape(m, r)
 		end
 		-- a moving train is read again when it has gone core.STEP tiles; at rest it leaves the wheel

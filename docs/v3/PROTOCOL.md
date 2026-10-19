@@ -27,13 +27,21 @@ Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not
 ## 2. Transports
 
 - **Clusterio**: Lua prints `"\f$ipc:timeshade:out?j" .. json` lines, under 3,500 bytes
-  each, built from `helpers.table_to_json` per message and cut between messages (port of
-  illisis `tick.lua`; `send_json` is not used because it can desync clients). The instance
+  each, built from one JSON encoding per message and cut between messages (port of
+  illisis `tick.lua`; `send_json` is not used because it can desync clients). The capture
+  encodes with `capture/lua/json.lua`, which gives the same JSON as `helpers.table_to_json`
+  (key order aside) at about half the cost. The instance
   plugin parses the line, adds the forwarder fields and sends batches to the controller
   about once a second; the controller posts them to its sidecar.
 - **Standalone**: the `timeshade_capture` mod appends envelope lines with
-  `helpers.write_file("timeshade/<seq>.ndjson", line .. "\n", true)`, starting a new file
-  every 4 MiB or 60 s (`<seq>` is a zero-padded counter kept in `storage`). `timeshadedb
+  `helpers.write_file("timeshade/<seq>-<tick>.ndjson", lines, true)`, starting a new file
+  every 4 MiB or 60 s. `<seq>` is a counter kept in `storage` (raised every 3,600 ticks and
+  at install and configuration change, on every peer alike), `<tick>` the game tick when the
+  file was opened; both are zero-padded to 10 digits, so names sort in write order within a
+  game. Lines are buffered and appended every 120 ticks or 256 KiB (one `write_file` call
+  costs about 1 ms on Windows), so up to 2 s of lines are lost if the game exits. In
+  multiplayer only the server writes (`for_player = 0`). Loading the same save twice can
+  reuse a name and append to that file. `timeshadedb
   tail --dir <script-output>/timeshade --url ... --token ... --src standalone:<name> --map
   <key>` posts complete files in order and deletes each file once ingest returned 200
   (files are complete once a newer file exists or after 10 s without growth).
@@ -69,11 +77,12 @@ Gone: `{j, gone: true, tick?}`.
 | `k` | `t` train, `v` vehicle, `p` player |
 | `f`, `name` | force; leading carriage or vehicle prototype, or player name |
 | `x`, `y` | tiles; a train's leading carriage centre |
-| `h` | orientation 0..1 (0 north, 0.25 east); trains: second carriage towards the first. Absent: unknown. |
+| `h` | orientation 0..1 (0 north, 0.25 east), 3 decimals; trains: the leading carriage's orientation in the direction of travel (the tangent of its body, half a turn on when it faces backwards). Absent: unknown. |
 | `n`, `o`, `c` | train carriage count; kinds from the leading end (`L` loco, `C` cargo, `F` fluid, `A` artillery, lower case faces back; vehicles `S` spidertron or `C` car); colour `rrggbb` |
-| `stop` | at rest |
-| `es` | the leading end switched at this sample |
-| `car` | every carriage from the leading end as `[x, y, orientation]`; sent on stop, on start, at end switches and in resyncs |
+| `tick` | the game tick of the read, when it is not the envelope's: a train's chord vertex is sent one read late |
+| `stop` | at rest (also on the 600-tick heartbeat of a parked train) |
+| `es` | the leading end switched at this sample (also when a stopped train starts off the other way); the sample before it is the old leading end's last read |
+| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, on stop, on start, at end switches, after the train changed (join, split) and in resyncs |
 | `vx`, `vy` | legacy (illisis), ignored |
 
 ## 4. Clock anchors
@@ -120,13 +129,20 @@ forwarder retries are harmless (API.md 5).
 
 These are protocol-level requirements; the Lua is WP9's.
 
-- Never write game state from capture-only data (desync safety). Keep capture state in
-  file-local Lua tables, not `storage`, except the standalone file counter.
+- Never write game state from capture-only data (desync safety). What only decides what is
+  printed (the chart cache, the debounce, the outbox, a resync's progress) lives in
+  file-local Lua tables. Journeys, their `on_object_destroyed` registrations, the train read
+  schedule and each mover's last sample live in `storage` and change only in events, in
+  `on_tick` steps and in the config call, which run identically on every peer (as in
+  illisis). A resync only reads, so one peer may run it alone: the standalone mod resyncs
+  after every load.
 - Chart: on `on_chunk_charted` and on a debounce of N ticks (default 600) per changed chunk,
   send a `chunk` only when the chart differs from the last one sent. Keep the last sent
-  charts deflated in a capped LRU (bounded memory on any surface size).
+  charts deflated in a capped cache (bounded memory on any surface size; the capture uses
+  two generations of 8,192 charts, an approximate LRU).
 - Resync on start and reconnect: every charted chunk in the clip, every live mover with
-  `car`, every tag and recipe.
+  `car`, every tag and recipe. The walk of charted chunks keeps pace with the chart reads
+  (4 a tick while a resync runs), so 50,000 chunks take about 3.5 minutes.
 - Trains: emit when the chord error since the last sample exceeds 0.25 tile, when the
   orientation changed by more than about 2 degrees, or on a 600-tick heartbeat; always send
   the tick; send `car` on stop, start, end switch and resync; set `es` on end switches.

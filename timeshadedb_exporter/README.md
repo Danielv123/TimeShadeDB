@@ -1,5 +1,12 @@
 # TimeShadeDB Exporter
 
+> **Deprecated.** Use the v3 capture in [`capture/`](../capture/README.md) instead: the
+> `timeshade_capture` mod with `timeshadedb tail`, or the Clusterio module. This mod does
+> not run on Factorio 2.0: it calls `game.write_file` (`control.lua:81` and `:347`), which
+> 2.0 moved to `helpers.write_file`. It also stores a 4 KB hex string per chunk in `storage`,
+> draws only bare terrain (`get_tile`), and records each locomotive as one point. It is kept
+> unchanged until the v2 code is removed (decision D11).
+
 This Factorio mod writes charted chunk tile snapshots and adaptive moving-entity
 samples to:
 
