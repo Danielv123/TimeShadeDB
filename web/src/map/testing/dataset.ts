@@ -118,6 +118,22 @@ export interface MockDataset {
   now: number;
 }
 
+/** Moves every time in a dataset by `delta` ms (to make old test data look current). */
+export function shiftDataset(data: MockDataset, delta: number): void {
+  data.now += delta;
+  data.catalog.now += delta;
+  for (const st of data.stores.values()) {
+    st.ds.first += delta;
+    st.ds.last += delta;
+    st.ds.horizon += delta;
+    for (const tile of st.tiles.values()) {
+      for (const v of tile.versions) {
+        v.t += delta;
+      }
+    }
+  }
+}
+
 export function tk(z: number, x: number, y: number): string {
   return `${z}/${x}/${y}`;
 }

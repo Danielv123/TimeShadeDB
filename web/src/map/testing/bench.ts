@@ -8,6 +8,8 @@
 //   node src/map/testing/bench.ts --pw <dir>/node_modules/playwright-core --chrome <chrome.exe>
 //        --illisis <export root> [--map gw-bc41437d~2E1 --surface nauvis] [--runs 10]
 //        [--renderer auto|canvas2d] [--loader worker|direct] [--rtt 40] [--mbit 50]
+//        [--h2] (HTTP/2 over TLS, self-signed via openssl) [--static] (static export paths)
+//        [--diag] (print one cold load's request timeline to stderr)
 //
 // Prints a JSON report. Node only. WP11's Playwright suite is the authoritative harness;
 // this one exists so WP7 could measure before WP6 landed.
@@ -74,13 +76,20 @@ async function main(): Promise<void> {
     args: ["--use-angle=d3d11", "--enable-gpu-rasterization", "--ignore-gpu-blocklist", ...(tls ? ["--ignore-certificate-errors"] : [])],
   });
   const q = new URLSearchParams({ map: mapKey, surface, force: st.ds.force, x: "0", y: "0", s: "1", renderer, loader, layers: "" });
+  if (args.has("static")) {
+    // The static export layout under /static/ (timelines instead of view, no live tiles).
+    q.set("source", "static");
+    q.set("data", "/static/");
+  }
   const url = `${server.url}/?${q}`;
-  const report: Record<string, unknown> = { url, protocol: tls ? "h2" : "http/1.1", rtt, mbit, runs, renderer, loader, dataset: { ds: st.ds.id, tiles: st.tiles.size, palette: st.palette.length } };
+  const report: Record<string, unknown> = { url, source: args.has("static") ? "static" : "server", protocol: tls ? "h2" : "http/1.1", rtt, mbit, runs, renderer, loader, dataset: { ds: st.ds.id, tiles: st.tiles.size, palette: st.palette.length } };
 
   const throttle = async (cdp: import("playwright-core").CDPSession, cold: boolean): Promise<void> => {
     await cdp.send("Network.enable");
     await cdp.send("Network.setCacheDisabled", { cacheDisabled: cold });
-    await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: rtt, downloadThroughput: (mbit * 1e6) / 8, uploadThroughput: (mbit * 1e6) / 8 });
+    // --mbit 0 disables the bandwidth limit (-1 in CDP).
+    const bps = mbit > 0 ? (mbit * 1e6) / 8 : -1;
+    await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: rtt, downloadThroughput: bps, uploadThroughput: bps });
   };
   const waitFull = (page: import("playwright-core").Page, since: number, timeout = 30000) =>
     page.waitForFunction((s: number) => (window as unknown as { __tsdbPerf: { events: PerfEv[] } }).__tsdbPerf.events.some(e => e.name === "view.full" && e.t >= s), since, { timeout });
@@ -97,6 +106,14 @@ async function main(): Promise<void> {
     const page = await ctx.newPage();
     const cdp = await ctx.newCDPSession(page);
     await throttle(cdp, true);
+    const problems: string[] = [];
+    page.on("requestfailed", r => problems.push(`requestfailed ${r.failure()?.errorText} ${r.url().replace(server.url, "")}`));
+    page.on("console", m => {
+      if (m.type() === "error" || m.type() === "warning") {
+        problems.push(`console.${m.type()} ${m.text()}`);
+      }
+    });
+    page.on("pageerror", e => problems.push(`pageerror ${e.message}`));
     server.clearLog();
     await page.goto(url);
     try {
@@ -110,6 +127,10 @@ async function main(): Promise<void> {
       throw err;
     }
     cold.push(await page.evaluate(() => (window as unknown as { __tsdbPerf: { firstFullPaint: number } }).__tsdbPerf.firstFullPaint));
+    if (cold[cold.length - 1] > 1000 || problems.length > 0) {
+      const ev = await page.evaluate(() => (window as unknown as { __tsdbPerf: { events: PerfEv[] } }).__tsdbPerf.events.map(e => `${Math.round(e.t)} ${e.name} ${JSON.stringify(e.detail ?? {})}`));
+      console.error(`slow or noisy cold run ${i}: ${Math.round(cold[cold.length - 1])} ms`, JSON.stringify({ problems, server: server.log.map(l => `${Math.round(l.t)} ${l.status} ${l.bytes} ${l.path}`), events: ev }, null, 1));
+    }
     // Bytes on the wire (after Content-Encoding) as the server sent them, up to first full paint.
     coldBytes.push(server.log.reduce((n, l) => n + l.bytes, 0));
     if (i === 0) {

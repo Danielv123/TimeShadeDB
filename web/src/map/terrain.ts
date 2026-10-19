@@ -4,7 +4,7 @@
 // it draws an older version of the same tile, its nearest loaded ancestor (scaled up) or its
 // loaded descendants (scaled down), so the screen never goes black.
 
-import type { Catalog, CatalogDatastore, DataSource, LiveTileEvent, TimeMs, ViewResponse } from "../api/types";
+import type { Catalog, CatalogDatastore, DataSource, LiveTileEvent, TimelineResponse, TimeMs, ViewResponse } from "../api/types";
 import type { Camera, Viewport } from "./layer";
 import { decodePalette, decodeTile, decodeTileDelta } from "../api/wire.ts";
 import { tileSpan } from "../api/grid.ts";
@@ -281,6 +281,13 @@ export class TerrainEngine {
     }
   }
 
+  /** Seeds a timeline fetched ahead of time (history links, static exports). */
+  seedTimeline(res: TimelineResponse): void {
+    if (this.timeline && this.ds && res.ds === this.ds.id) {
+      this.timeline.seed(res);
+    }
+  }
+
   /** Re-fetches mutable version answers (catalog changed or the live stream reconnected). */
   refreshVersions(): void {
     this.resolver?.refresh();
@@ -517,6 +524,13 @@ export class TerrainEngine {
       }
     }
 
+    // A load whose texture is already in place may not have settled yet (its promise resolves
+    // after the redraw it triggered); it is finishing, not leaving the view.
+    for (const key of this.requestMeta.keys()) {
+      if (this.scheduler.isRunning(key) && this.textures.has(key)) {
+        wanted.add(key);
+      }
+    }
     this.scheduler.retain(wanted);
     for (const k of this.requestMeta.keys()) {
       if (!this.scheduler.has(k)) {

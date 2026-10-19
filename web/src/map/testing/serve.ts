@@ -3,6 +3,7 @@
 //   node src/map/testing/serve.ts [--port 0] [--latency ms] [--no-gzip]
 //        [--illisis <export root> --map gw-bc41437d~2E1 --surface nauvis --snapshots 4]
 //        [--synthetic WxH --versions n --step ms --changes chunks --coarse levels]
+//        [--shift-to-now] (move all times so the newest data is 30 s old)
 //
 // Prints "listening on http://127.0.0.1:<port>" once ready. The live API is under
 // /api/v3/, the same data as a static export under /static/ (open
@@ -10,11 +11,21 @@
 
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { syntheticDataset, type MockDataset } from "./dataset.ts";
+import { shiftDataset, syntheticDataset, type MockDataset } from "./dataset.ts";
 import { loadIllisisDataset } from "./illisis.ts";
 import { MockServer } from "./mockserver.ts";
 
 export async function loadDataset(args: Map<string, string>): Promise<MockDataset> {
+  const data = await loadRaw(args);
+  if (args.has("shift-to-now")) {
+    // Make the newest data 30 s old, as on a live server or a current export.
+    const st = [...data.stores.values()][0];
+    shiftDataset(data, Date.now() - 30_000 - st.ds.last);
+  }
+  return data;
+}
+
+async function loadRaw(args: Map<string, string>): Promise<MockDataset> {
   const root = args.get("illisis");
   if (root) {
     return loadIllisisDataset(root, {

@@ -138,6 +138,33 @@ export class TimelineVersions implements VersionResolver {
     }
   }
 
+  /** Adds a timeline fetched elsewhere (boot.ts), unless that day is already loaded. */
+  seed(res: TimelineResponse): void {
+    if (res.ds !== this.ds.id) {
+      return;
+    }
+    const key = `${res.z}/${res.date}`;
+    let e = this.entries.get(key);
+    if (e?.tiles) {
+      return;
+    }
+    if (!e) {
+      e = { date: res.date, z: res.z, tiles: null, final: false, loading: null, failedAt: -Infinity, stale: false };
+      this.entries.set(key, e);
+      this.trim();
+    }
+    e.loading?.abort();
+    e.loading = null;
+    const tiles = new Map<string, TimelineTile>();
+    for (const t of res.tiles) {
+      tiles.set(tileKey(res.z, t.x, t.y), t);
+    }
+    e.tiles = tiles;
+    e.final = res.final;
+    e.stale = false;
+    this.onChange();
+  }
+
   /** Loads the timeline of another day ahead of time (timelapse crossing midnight). */
   prefetch(z: number, t: TimeMs): void {
     const day = this.dayFor(t);

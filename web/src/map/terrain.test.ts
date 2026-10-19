@@ -353,3 +353,27 @@ test("switching datastores drops results of the old one", async () => {
   assert.equal(renderer.live().length, 0);
   assert.equal(engine.frame({ x: 0, y: 0, scale: 1 }, VP).visible, 0);
 });
+
+test("planning in a microtask on every redraw (as MapView does) aborts nothing that completes", async () => {
+  const data = syntheticDataset({ bounds: [-2, -1, 2, 1], versions: 2, coarse: 1 });
+  const server = await new MockServer(data).start();
+  servers.push(server);
+  const source = new ServerSource({ base: `${server.url}/api/v3/` });
+  const catalog = await source.catalog();
+  const ds = catalog.maps[0].surfaces[0].datastores[0];
+  const cam = { x: 0, y: 0, scale: 1 };
+  let engine!: TerrainEngine;
+  engine = new TerrainEngine({
+    source,
+    renderer: new FakeRenderer(),
+    loader: new DirectLoader(),
+    requestRedraw: () => queueMicrotask(() => engine.frame(cam, VP, { scheduleOnly: true })),
+  });
+  engines.push(engine);
+  perf().reset();
+  engine.setDatastore(catalog, ds);
+  const r = await settle(engine, cam);
+  assert.equal(r.full, r.visible);
+  assert.deepEqual(events("tile.abort"), []);
+  assert.equal(perf().counters.tilesAborted, 0);
+});

@@ -141,6 +141,13 @@ export class Canvas2DRenderer implements TileRenderer {
     }
   }
 
+  readPixels(): { width: number; height: number; rgba: Uint8Array } {
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const d = this.ctx.getImageData(0, 0, w, h).data;
+    return { width: w, height: h, rgba: new Uint8Array(d.buffer, d.byteOffset, d.byteLength) };
+  }
+
   dispose(): void {
     // Textures are released by the engine.
   }

@@ -8,7 +8,7 @@ import type { Catalog, CatalogDatastore, CatalogMap, CatalogSurface, DataSource,
 import type { Camera, FrameState, IconAtlas, LayerContext, LayerFactory, LayerHit, MapLayer, Viewport } from "./layer";
 import { perfEvent } from "../perf.ts";
 import { clampScale, fitCamera, screenToWorld, visibleWorld, worldToScreen, zoomAt } from "./camera.ts";
-import type { ViewSeed } from "./boot.ts";
+import type { Seed } from "./boot.ts";
 import { createLoader, DirectLoader, type TileLoader } from "./loader.ts";
 import { Canvas2DRenderer } from "./render_2d.ts";
 import { GLRenderer } from "./render_gl.ts";
@@ -61,11 +61,13 @@ export interface MapViewOptions {
   onHover?(hit: LayerHit | null, world: [number, number]): void;
   /** Called when the catalog was refreshed. */
   onCatalog?(c: Catalog): void;
-  /** A `view` answer fetched during start-up (boot.ts), used for the first selection. */
-  viewSeed?: Promise<ViewSeed | null>;
+  /** A version answer fetched during start-up (boot.ts), used for the first selection. */
+  viewSeed?: Promise<Seed | null>;
 }
 
 const CATALOG_POLL_MS = 10_000;
+/** Longest wait for the start-up version answer before planning without it. */
+const SEED_WAIT_MS = 150;
 
 function findSelection(c: Catalog, sel: Selection | null): { map: CatalogMap; surface: CatalogSurface; ds: CatalogDatastore | null } | null {
   if (!sel) {
@@ -129,6 +131,7 @@ export class MapView {
   private lastStateAt = 0;
   private stateDirty = true;
   private schedulePending = false;
+  private seedGate: Promise<void> | null = null;
   private stateTimer: ReturnType<typeof setTimeout> | null = null;
   private lastLayerTime = NaN;
   private lastResult: FrameResult | null = null;
@@ -223,11 +226,25 @@ export class MapView {
     this.engine.setDatastore(this.catalog, found?.ds ?? null);
     const seed = this.opts.viewSeed;
     if (seed && found?.ds) {
-      // Only the first selection can use the start-up answer.
+      // Only the first selection can use the start-up answer. Frames wait for it (at most
+      // SEED_WAIT_MS): planning before it arrives would request the same versions again.
       this.opts.viewSeed = undefined;
-      void seed.then(sd => {
+      const wait = Promise.race([seed, new Promise<null>(r => setTimeout(() => r(null), SEED_WAIT_MS))]);
+      const gate = wait.then(sd => {
         if (sd && !this.destroyed) {
-          this.engine.seedView(sd.res, sd.bbox);
+          if (sd.kind === "view") {
+            this.engine.seedView(sd.res, sd.bbox);
+          } else {
+            this.engine.seedTimeline(sd.res);
+          }
+        }
+      });
+      this.seedGate = gate;
+      void gate.finally(() => {
+        if (this.seedGate === gate) {
+          this.seedGate = null;
+          this.schedule();
+          this.invalidate();
         }
       });
     }
@@ -574,13 +591,13 @@ export class MapView {
    * wait for an animation frame; drawing still happens in the frame.
    */
   private schedule(): void {
-    if (this.schedulePending || this.destroyed) {
+    if (this.schedulePending || this.destroyed || this.seedGate) {
       return;
     }
     this.schedulePending = true;
     queueMicrotask(() => {
       this.schedulePending = false;
-      if (!this.destroyed) {
+      if (!this.destroyed && !this.seedGate) {
         this.engine.frame(this.camera, this.vp, { scheduleOnly: true });
       }
     });
@@ -616,7 +633,8 @@ export class MapView {
 
   private frame(now: number): void {
     this.raf = 0;
-    if (this.destroyed) {
+    if (this.destroyed || this.seedGate) {
+      // Waiting for the start-up version answer; the gate requests a frame when it opens.
       return;
     }
     const t0 = performance.now();
@@ -692,6 +710,19 @@ export class MapView {
         this.invalidate();
       }, 110);
     }
+  }
+
+  /**
+   * Renders the terrain now and reads it back (RGBA, top row first, device pixels), or null
+   * when the renderer cannot. For tests: it bypasses the compositor's colour handling.
+   */
+  readTerrainPixels(): { width: number; height: number; rgba: Uint8Array } | null {
+    if (!this.renderer.readPixels) {
+      return null;
+    }
+    const result = this.engine.frame(this.camera, this.vp);
+    this.engine.render(this.vp, result);
+    return this.renderer.readPixels();
   }
 
   state(): MapViewState {

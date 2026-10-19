@@ -59,6 +59,8 @@ export interface TileRenderer {
   render(viewport: Viewport, draws: readonly DrawCommand[]): void;
   /** Called by the renderer when every texture was lost (WebGL context loss). */
   onLost?: () => void;
+  /** Reads back the canvas (RGBA, top row first) right after render(); for tests. */
+  readPixels?(): { width: number; height: number; rgba: Uint8Array };
   dispose(): void;
 }
 

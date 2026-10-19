@@ -314,6 +314,20 @@ export class GLRenderer implements TileRenderer {
     }
   }
 
+  readPixels(): { width: number; height: number; rgba: Uint8Array } {
+    const gl = this.gl;
+    const w = this.canvas.width;
+    const h = this.canvas.height;
+    const buf = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+    // GL rows are bottom-up.
+    const out = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      out.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+    }
+    return { width: w, height: h, rgba: out };
+  }
+
   dispose(): void {
     for (const t of [...this.textures]) {
       this.deleteTexture(t);
