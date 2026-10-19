@@ -305,3 +305,24 @@ func TestReadLineLimits(t *testing.T) {
 		t.Fatalf("resp %+v", resp)
 	}
 }
+
+func TestDataClock(t *testing.T) {
+	dc := &DataClock{}
+	dc.Observe(5)
+	dc.Observe(3)
+	if dc.Now() != 5 {
+		t.Fatalf("clock %d", dc.Now())
+	}
+	maps, _ := OpenMaps(t.TempDir())
+	ter := memstore.NewTerrain()
+	in := New(Stores{Terrain: ter, Movers: memstore.NewMovers(), Overlays: memstore.NewOverlays(), Maps: maps}, Options{Clock: dc.Now, DataClock: dc})
+	// Recorded data far behind the wall clock: the data clock follows it, so nothing is
+	// clamped and the commit horizon can trail the data.
+	old := base - 30*core.Day
+	resp, err := in.Ingest(context.Background(), strings.NewReader(line(t, env{V: 1, Tick: 600, Src: "s", Map: "m", RecvMs: int64(old), Msgs: []any{
+		map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 0, "y": 0},
+	}})))
+	if err != nil || resp.Chunks.Accepted != 1 || dc.Now() != old || in.Stats().Clamped != 0 {
+		t.Fatalf("resp %+v err %v clock %d", resp, err, dc.Now())
+	}
+}
