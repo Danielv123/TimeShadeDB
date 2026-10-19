@@ -144,6 +144,44 @@ test("a long gap from one straight round a curve onto another keeps both straigh
   assert.notEqual(other.kind, G.SEG_PATH);
 });
 
+test("a long straight into a curve too tight for line+arc stays on the straight", () => {
+  // Test data, nauvis (-945, 173.8) -> (-943.9, 65.4), 1.9 s at 56 tiles/s: north along
+  // x = -945, then a curve to the east begins just before the end sample, whose captured
+  // heading (20 degrees off the straight) leads the curve.
+  // The derived start heading is half a degree off north (-89.49 degrees), which would need
+  // a 2.6-tile curve at the end.
+  const th0 = (-89.49 * Math.PI) / 180;
+  const th1 = (-69.5 * Math.PI) / 180;
+  const seg = new G.Segment().build(0, -945, 173.8, Math.cos(th0) * 56, Math.sin(th0) * 56, 0, 0, 1900, -943.9, 65.4, Math.cos(th1) * 56, Math.sin(th1) * 56, 0, 0, true);
+  assert.equal(seg.kind, G.SEG_PATH);
+  const o = [0, 0, 0, 0];
+  let worst = 0;
+  for (let i = 0; i <= 50; i++) {
+    seg.pointAt((seg.length * i) / 50, o);
+    if (o[1] > 75) {
+      worst = Math.max(worst, Math.abs(o[0] + 945));
+    }
+  }
+  assert.ok(worst < 1, `off the straight by ${worst}`);
+  const cubic = new G.Segment().build(0, -945, 173.8, Math.cos(th0) * 56, Math.sin(th0) * 56, 0, 0, 1900, -943.9, 65.4, Math.cos(th1) * 56, Math.sin(th1) * 56, 0, 0, false);
+  assert.equal(cubic.kind, G.SEG_HERMITE);
+  seg.pointAt(seg.length, o);
+  assert.ok(Math.hypot(o[0] + 943.9, o[1] - 65.4) < 1e-6, "ends at b");
+  // The same from the other end: an arc out of a curve onto a straight.
+  const rev = new G.Segment().build(0, -943.9, 65.4, -Math.cos(th1) * 56, -Math.sin(th1) * 56, 0, 0, 1900, -945, 173.8, -Math.cos(th0) * 56, -Math.sin(th0) * 56, 0, 0, true);
+  assert.equal(rev.kind, G.SEG_PATH);
+  rev.pointAt(0, o);
+  assert.ok(Math.hypot(o[0] + 943.9, o[1] - 65.4) < 1e-6, "starts at a");
+  rev.pointAt(rev.length, o);
+  assert.ok(Math.hypot(o[0] + 945, o[1] - 173.8) < 1e-6 && o[3] > 0.999, "ends at b going south");
+  for (let i = 0; i <= 50; i++) {
+    rev.pointAt((rev.length * i) / 50, o);
+    if (o[1] > 75) {
+      assert.ok(Math.abs(o[0] + 945) < 1, `reverse off the straight at ${o[1]}`);
+    }
+  }
+});
+
 test("segment timing is monotone and hits both ends", () => {
   const seg = new G.Segment().build(0, 0, 0, 0, 0, 1, 0, 2000, 10, 0, 20, 0, 0, 0);
   const o = [0, 0];

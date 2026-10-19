@@ -50,6 +50,8 @@ const RAIL_RADII = [RAIL_RADIUS, 9, 20, 30];
 const RAIL_MIN_CHORD = 30;
 /** Smallest angle (radians) between each end tangent and the chord for the two-curve rail path. */
 const RAIL_MIN_SKEW = (4 * Math.PI) / 180;
+/** Largest difference (radians) between the free end heading of a relaxed line+arc and the captured one. */
+const RAIL_FREE_HEADING = (15 * Math.PI) / 180;
 /** Smallest turn (radians) of the line, arc, line rail path. */
 const RAIL_MIN_TURN = (10 * Math.PI) / 180;
 /** A heading this close (radians) to one of the 16 rail directions lies on a straight. */
@@ -97,6 +99,33 @@ function lineArc(p0x: number, p0y: number, t0x: number, t0y: number, p1x: number
 
 function wrapAngle(a: number): number {
   return Math.atan2(Math.sin(a), Math.cos(a));
+}
+
+/**
+ * Heading (radians) of tangent t for the rail-shaped paths: the rail direction of the
+ * captured orientation d when d lies within 1 degree of one and within 15 degrees of t
+ * (on a straight the orientation, the chord from the second carriage to the first, is the
+ * track's direction, while the derived tangent bends towards neighbours across a long gap
+ * round a corner); else t's own heading.
+ */
+function railHeading(tx: number, ty: number, dx: number, dy: number): number {
+  const th = Math.atan2(ty, tx);
+  if (dx === 0 && dy === 0) {
+    return th;
+  }
+  let o = Math.atan2(dy, dx);
+  if (Math.abs(wrapAngle(o - th)) > Math.PI / 2) {
+    o = wrapAngle(o + Math.PI); // the orientation of a train running backwards
+  }
+  if (Math.abs(wrapAngle(o - th)) > (15 * Math.PI) / 180) {
+    return th;
+  }
+  for (const r of RAIL_DIRS) {
+    if (Math.abs(wrapAngle(o - r)) <= Math.PI / 180) {
+      return r;
+    }
+  }
+  return th;
 }
 
 /** Whether heading th (radians) is within RAIL_DIR_TOLERANCE of a rail direction. */
@@ -185,6 +214,10 @@ export class Segment {
   private p1y = 0;
   private t1x = 1;
   private t1y = 0;
+  // Rail mode: end headings (radians) for the rail-shaped paths: the tangents, or the
+  // captured orientation where it lies in a rail direction (a train on a straight).
+  private rth0 = 0;
+  private rth1 = 0;
   // line+arc parameters, in the frame of the line's start (reversed for arc+line)
   private l0 = 0;
   private r = 0;
@@ -239,6 +272,10 @@ export class Segment {
         [this.t1x, this.t1y, s1] = [cx / chord, cy / chord, 0];
       }
     }
+    if (rail) {
+      this.rth0 = railHeading(this.t0x, this.t0y, dax, day);
+      this.rth1 = railHeading(this.t1x, this.t1y, dbx, dby);
+    }
     this.l0 = 0;
     this.r = 0;
     this.theta = 0;
@@ -273,6 +310,8 @@ export class Segment {
       this.theta = pick.theta;
       this.length = pick.l0 + pick.r * Math.abs(pick.theta);
     } else if (rail && chord >= RAIL_MIN_CHORD && this.isS(cx, cy) && this.buildRailPath(chord, k0, k1)) {
+      this.kind = SEG_PATH;
+    } else if (rail && chord >= RAIL_MIN_CHORD && this.buildRelaxedLineArc()) {
       this.kind = SEG_PATH;
     } else {
       this.kind = SEG_HERMITE;
@@ -314,8 +353,8 @@ export class Segment {
    * gap instead of keeping the straights straight.
    */
   private buildLineArcLine(chord: number): boolean {
-    const th0 = Math.atan2(this.t0y, this.t0x);
-    const th1 = Math.atan2(this.t1y, this.t1x);
+    const th0 = this.rth0;
+    const th1 = this.rth1;
     const turn = wrapAngle(th1 - th0);
     if (Math.abs(turn) < RAIL_MIN_TURN || Math.abs(turn) > Math.PI / 2 || !onRailDir(th0) || !onRailDir(th1)) {
       return false;
@@ -334,6 +373,60 @@ export class Segment {
     }
     this.pieces.set([l1, 0, RAIL_RADIUS * Math.abs(turn), k, l2, 0, 0, 0]);
     this.setPieces(th0, len);
+    return true;
+  }
+
+  /**
+   * A single turn over a long gap whose line+arc would need a curve tighter than any rail
+   * (or does not exist), with one end on a straight in a rail direction: the line runs from
+   * that end and an arc of RAIL_RADIUS reaches the other end point, at whatever heading
+   * that gives (the captured heading there leads a curve: the orientation is corrected
+   * forward by its curvature). The heading kinks at that end instead of the path bulging
+   * off the straight for tens of tiles.
+   */
+  private buildRelaxedLineArc(): boolean {
+    const th0 = this.rth0;
+    const th1 = this.rth1;
+    const fromStart = onRailDir(th0);
+    if (!fromStart && !onRailDir(th1)) {
+      return false;
+    }
+    // In the frame of the straight end, going into the gap.
+    const ox = fromStart ? this.p0x : this.p1x;
+    const oy = fromStart ? this.p0y : this.p1y;
+    const tx = fromStart ? Math.cos(th0) : -Math.cos(th1);
+    const ty = fromStart ? Math.sin(th0) : -Math.sin(th1);
+    const dx = (fromStart ? this.p1x : this.p0x) - ox;
+    const dy = (fromStart ? this.p1y : this.p0y) - oy;
+    const f = dx * tx + dy * ty;
+    const h = tx * dy - ty * dx;
+    const ah = Math.abs(h);
+    if (f <= 0 || ah >= RAIL_RADIUS) {
+      return false;
+    }
+    const phi = Math.acos(1 - ah / RAIL_RADIUS);
+    const l0 = f - RAIL_RADIUS * Math.sin(phi);
+    if (l0 < 0 || phi > Math.PI / 2) {
+      return false;
+    }
+    const k = (h > 0 ? 1 : -1) / RAIL_RADIUS;
+    const arc = RAIL_RADIUS * phi;
+    // The free end's heading must still be about the captured one: a turn much larger
+    // than captured means the gap holds more than one curve.
+    const thFree = Math.atan2(ty, tx) + k * arc;
+    const thCaptured = fromStart ? Math.atan2(this.t1y, this.t1x) : Math.atan2(-this.t0y, -this.t0x);
+    if (Math.abs(wrapAngle(thFree - thCaptured)) > RAIL_FREE_HEADING) {
+      return false;
+    }
+    if (fromStart) {
+      this.pieces.set([l0, 0, arc, k, 0, 0, 0, 0]);
+      this.setPieces(th0, l0 + arc);
+    } else {
+      // Walked from p0: the arc first, turning the other way, then the line to p1.
+      const thStart = thFree + Math.PI;
+      this.pieces.set([arc, -k, l0, 0, 0, 0, 0, 0]);
+      this.setPieces(thStart, l0 + arc);
+    }
     return true;
   }
 
@@ -433,7 +526,11 @@ export class Segment {
       return this.theta > 0 ? 1 / this.r : -1 / this.r;
     }
     if (this.kind === SEG_PATH) {
-      return this.pieces[7];
+      let i = 3;
+      while (i > 0 && this.pieces[2 * i] <= 0) {
+        i--;
+      }
+      return this.pieces[2 * i + 1];
     }
     if (this.kind === SEG_HERMITE && this.length > 1e-6) {
       return Math.atan2(this.t0x * this.t1y - this.t0y * this.t1x, this.t0x * this.t1x + this.t0y * this.t1y) / this.length;

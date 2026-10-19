@@ -45,19 +45,25 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    chord is rejected as a loop. (Tangents of v x dt put timing into the shape: a braking
    train's curve overshot its end and came back, and walking it by curve parameter drew the
    head at up to 4x its speed. That caused 56 of the 61 jumps the first version had in
-   history mode.) Trains get two more shapes over gaps of 30 tiles or more (a sample gap
-   at speed, often at an instance crossing), where a cubic cuts corners by several tiles:
-   when both end tangents lie in one of the 16 rail directions (within 2 degrees) and turn
-   by 10 degrees or more, a line, an arc of radius 13 and a line, which keeps both
-   straights straight instead of spreading the curve over the gap; and when the end
-   tangents make an S (both at least 4 degrees to the same side of the chord), where no
-   line+arc fits, a line, arc, straight in a rail direction, arc (or arc, line, arc, line
-   when the mover turned harder before the gap than after it), radius 13, falling back to
-   9, 20 and 30 tiles, at most 1.2 times the chord. On the test data this took the
-   carriage-frames more than 2 tiles off the rails outside handoffs from 3,507 to 2,006
-   (one S at the y = 768 crossing on nauvis held 1,869 of them) with the same
-   leave-one-out error; allowed on chords of 15 tiles or more, the S shape made
-   leave-one-out p90 worse (0.574 -> 0.579).
+   history mode.) Trains get rail-shaped paths over gaps of 30 tiles or more (a sample
+   gap at speed, often at an instance crossing), where a cubic cuts corners by several
+   tiles. An end heading counts as a straight when it lies within 2 degrees of one of the
+   16 rail directions; the captured orientation is used for it when it lies within 1
+   degree of one (and 15 degrees of the derived tangent, which bends towards a neighbour
+   across a corner). Both ends straight and turning by 10 degrees or more: a line, an arc
+   of radius 13 and a line, which keeps both straights straight. End tangents that make
+   an S (both at least 4 degrees to the same side of the chord), where no line+arc fits:
+   a line, arc, straight in a rail direction, arc (or arc, line, arc, line when the mover
+   turned harder before the gap than after it), radius 13, falling back to 9, 20 and 30
+   tiles, at most 1.2 times the chord. Otherwise, when line+arc would need a curve tighter
+   than 3 tiles (or has no solution) and one end is straight: a line from that end and an
+   arc of radius 13 to the other end point, accepting a heading kink of up to 15 degrees
+   there (the captured heading leads a curve). On the test data, with the importer's
+   edge-crossing gones, this took the carriage-frames more than 2 tiles off the rails
+   outside handoffs from 3,507 to 1,830 (one S at the y = 768 crossing on nauvis held
+   1,869 of them), moving carriage-frames over 1 tile from 0.040% to 0.018%, and
+   leave-one-out p90 from 0.574 to about 0.56. Allowed on chords of 15 tiles or more, the
+   S shape made leave-one-out p90 worse (0.574 -> 0.579).
 4. **Extrapolation.** Past the newest sample the head runs on along its velocity. Inside
    the data horizon (every sample older than `now - p99 lag` has arrived) silence means the
    mover is still on its predicted line, up to the capture heartbeat (11 s), so it runs
