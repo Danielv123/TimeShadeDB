@@ -10,6 +10,7 @@ import type {
   ErrorResponse,
   IntervalKind,
   LiveHandlers,
+  LiveHello,
   OverlayResponse,
   TileCoord,
   TimelineResponse,
@@ -225,16 +226,146 @@ export class ServerSource extends HttpSource implements UrlSource {
   }
 
   /**
-   * Subscribes to live events over Server-Sent Events, parsed from a fetch stream so the
+   * Live events (API.md 5) over Server-Sent Events, parsed from a fetch stream so the
    * bearer header works. Reconnects with backoff; `hello` is delivered again after each
-   * reconnect, so callers resync there.
+   * reconnect, so callers resync there. Every subscription shares one event stream for
+   * the union of their topics (a stream holds a connection for good, one of six per host
+   * on HTTP/1.1): a change of the subscriber set reopens it after SUBSCRIBE_SETTLE_MS, and
+   * the new stream's `hello` reaches every subscriber, which resyncs as after a reconnect.
+   * A subscriber whose topics the open stream already covers is told its state instead:
+   * the last `hello` again while it is up, `error` while it is down.
+   * Tile events go to the subscribers of their datastore, mover events to those of their
+   * surface, everything else to all. A handler that throws is isolated: the error is
+   * logged and reported to that subscriber alone (`error`, then the last `hello` again so
+   * it resyncs), and the stream stays open for the others.
    */
   subscribe(topics: { ds: string[]; sfc: string[] }, handlers: LiveHandlers): () => void {
-    const q = [...topics.ds.map(d => `ds=${enc(d)}`), ...topics.sfc.map(s => `sfc=${enc(s)}`)];
-    const path = `live?${q.join("&")}`;
+    const sub: LiveSub = { ds: new Set(topics.ds), sfc: new Set(topics.sfc), handlers, synced: false };
+    this.subs.add(sub);
+    this.restartLive();
+    return () => {
+      if (this.subs.delete(sub)) {
+        this.restartLive();
+      }
+    };
+  }
+
+  private readonly subs = new Set<LiveSub>();
+  private liveStop: (() => void) | null = null;
+  private liveKey = "";
+  private liveTimer: ReturnType<typeof setTimeout> | null = null;
+  /** State of the open stream: connecting (no hello yet), up (since `lastHello`) or down (`lastErr`, in backoff). */
+  private liveState: "connecting" | "up" | "down" = "connecting";
+  private lastHello: LiveHello | null = null;
+  private lastErr: unknown = null;
+
+  /** Reopens the shared stream for the current subscribers (debounced). */
+  private restartLive(): void {
+    if (this.liveTimer) {
+      clearTimeout(this.liveTimer);
+    }
+    this.liveTimer = setTimeout(() => {
+      this.liveTimer = null;
+      const ds = new Set<string>();
+      const sfc = new Set<string>();
+      for (const s of this.subs) {
+        s.ds.forEach(d => ds.add(d));
+        s.sfc.forEach(x => sfc.add(x));
+      }
+      const q = [...[...ds].sort().map(d => `ds=${enc(d)}`), ...[...sfc].sort().map(x => `sfc=${enc(x)}`)];
+      const key = q.join("&");
+      if (key === this.liveKey && this.liveStop) {
+        // Same stream: tell new subscribers where it stands.
+        for (const s of [...this.subs]) {
+          if (!s.synced && this.liveState === "up" && this.lastHello) {
+            this.replayHello(s, this.lastHello);
+          } else if (!s.synced && this.liveState === "down") {
+            this.fail(s, this.lastErr);
+          }
+        }
+        return;
+      }
+      this.liveStop?.();
+      this.liveStop = null;
+      this.liveKey = key;
+      this.liveState = "connecting";
+      this.lastHello = null;
+      for (const s of this.subs) {
+        s.synced = false;
+      }
+      if (q.length > 0) {
+        this.liveStop = this.openLive(`live?${key}`);
+      }
+    }, this.subs.size > 0 ? SUBSCRIBE_SETTLE_MS : 0);
+  }
+
+  /** Reports a stream error (or a handler failure) to one subscriber. */
+  private fail(s: LiveSub, err: unknown): void {
+    s.synced = true;
+    try {
+      s.handlers.error?.(err);
+    } catch (e) {
+      console.error("live error handler", e);
+    }
+  }
+
+  /** Delivers a past hello to one subscriber (without observing its stale `now`). */
+  private replayHello(s: LiveSub, hello: LiveHello): void {
+    s.synced = true;
+    try {
+      s.handlers.hello?.(hello);
+    } catch (e) {
+      console.error("live hello handler", e);
+      this.fail(s, e);
+    }
+  }
+
+  /** Delivers one event to one subscriber, isolating a handler that throws. */
+  private deliver(s: LiveSub, event: string, msg: Record<string, unknown>): void {
+    if (event === "hello") {
+      s.synced = true;
+    }
+    try {
+      dispatchLive(event, msg, s.handlers, s);
+    } catch (err) {
+      console.error(`live ${event} handler`, err);
+      this.fail(s, err);
+      if (event !== "hello" && this.lastHello) {
+        // It missed this event: resync it as after a reconnect.
+        this.replayHello(s, this.lastHello);
+      }
+    }
+  }
+
+  private openLive(path: string): () => void {
     let stopped = false;
     let ctrl: AbortController | null = null;
     let backoff = 500;
+    const down = (err: unknown): void => {
+      this.liveState = "down";
+      this.lastErr = err;
+      for (const s of [...this.subs]) {
+        this.fail(s, err);
+      }
+    };
+    const dispatch = (event: string, data: string): void => {
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      if (typeof msg.now === "number") {
+        this.clock.observe(msg.now);
+      }
+      if (event === "hello") {
+        this.liveState = "up";
+        this.lastHello = msg as unknown as LiveHello;
+      }
+      for (const s of [...this.subs]) {
+        this.deliver(s, event, msg);
+      }
+    };
     const loop = async (): Promise<void> => {
       while (!stopped) {
         ctrl = new AbortController();
@@ -244,15 +375,19 @@ export class ServerSource extends HttpSource implements UrlSource {
             throw new Error("live: no body");
           }
           backoff = 500;
-          await readEvents(res.body, (event, data) => dispatchLive(event, data, handlers, this.clock));
+          await readEvents(res.body, (event, data) => {
+            if (!stopped) {
+              dispatch(event, data);
+            }
+          });
           if (!stopped) {
-            handlers.error?.(new Error("live: stream ended"));
+            down(new Error("live: stream ended"));
           }
         } catch (err) {
           if (stopped) {
             return;
           }
-          handlers.error?.(err);
+          down(err);
         }
         if (stopped) {
           return;
@@ -269,28 +404,35 @@ export class ServerSource extends HttpSource implements UrlSource {
   }
 }
 
-function dispatchLive(event: string, data: string, h: LiveHandlers, clock: DataClock): void {
-  let msg: Record<string, unknown>;
-  try {
-    msg = JSON.parse(data) as Record<string, unknown>;
-  } catch {
-    return;
-  }
-  if (typeof msg.now === "number") {
-    clock.observe(msg.now);
-  }
+/** One subscription to the shared event stream; `synced` once it was told the stream's state. */
+interface LiveSub {
+  ds: Set<string>;
+  sfc: Set<string>;
+  handlers: LiveHandlers;
+  synced: boolean;
+}
+
+/** Subscriptions within this long of each other share the first stream opening. */
+export const SUBSCRIBE_SETTLE_MS = 50;
+
+/** Calls the handler for one parsed event, filtered by the subscriber's topics. */
+function dispatchLive(event: string, msg: Record<string, unknown>, h: LiveHandlers, topics?: { ds: Set<string>; sfc: Set<string> }): void {
   switch (event) {
     case "hello":
       h.hello?.(msg as never);
       break;
     case "tile":
-      h.tile?.(msg as never);
+      if (!topics || topics.ds.has(msg.ds as string)) {
+        h.tile?.(msg as never);
+      }
       break;
     case "horizon":
       h.horizon?.(msg as never);
       break;
     case "movers":
-      h.movers?.(msg as never);
+      if (!topics || topics.sfc.has(msg.sfc as string)) {
+        h.movers?.(msg as never);
+      }
       break;
     case "catalog":
       h.catalog?.(msg as never);

@@ -3,7 +3,7 @@
 //
 // usage (from web/): node src/movers/eval/train_eval.mjs <trains.jsonl> <rail_mask.bin>
 //          [--surface nauvis] [--limit N] [--no-clamp-fix] [--skip-loo] [--skip-render]
-//          [--modes history,live] [--json out.json]
+//          [--modes history,live] [--extrap-turn radians] [--extrap-turn-inside] [--json out.json]
 // Inputs are research outputs (out/trains.jsonl from movers_stats.py --dump-trains, and
 // rail_mask.py); they are read as data only.
 import "./ts-resolve.mjs";
@@ -15,13 +15,19 @@ const { motionConfig } = await import("../track.ts");
 const args = process.argv.slice(2);
 const flag = name => args.includes(name);
 const opt = (name, def) => (args.includes(name) ? args[args.indexOf(name) + 1] : def);
-const pos = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--") && !["--no-clamp-fix", "--skip-loo", "--skip-render"].includes(args[i - 1])));
+const pos = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--") && !["--no-clamp-fix", "--skip-loo", "--skip-render", "--extrap-turn-inside"].includes(args[i - 1])));
 const [trainsPath, maskPath] = pos;
 if (!trainsPath || !maskPath) {
   console.error("usage: train_eval.mjs <trains.jsonl> <rail_mask.bin> [--surface nauvis] [--limit N]");
   process.exit(2);
 }
 const surface = opt("--surface", "nauvis");
+if (opt("--extrap-turn") !== undefined) {
+  motionConfig.extrapTurn = Number(opt("--extrap-turn"));
+}
+if (flag("--extrap-turn-inside")) {
+  motionConfig.extrapTurnInside = true;
+}
 const limit = Number(opt("--limit", "0"));
 let journeys = readFileSync(trainsPath, "utf8").trim().split("\n").map(parseJourney).filter(j => j.surface === surface);
 if (limit > 0) {

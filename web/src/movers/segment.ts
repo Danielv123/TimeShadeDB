@@ -183,6 +183,21 @@ export class Segment {
     this.v1 = Math.min(s1, 3 * mean);
   }
 
+  /**
+   * Signed curvature (1/tiles, positive turning counterclockwise) at the segment's end: the
+   * arc's for line+arc, 0 for a line or arc+line (the turn is behind it), and the mean turn
+   * per tile for the Hermite fallback.
+   */
+  endCurvature(): number {
+    if (this.kind === SEG_LINE_ARC) {
+      return this.theta > 0 ? 1 / this.r : -1 / this.r;
+    }
+    if (this.kind === SEG_HERMITE && this.length > 1e-6) {
+      return Math.atan2(this.t0x * this.t1y - this.t0y * this.t1x, this.t0x * this.t1x + this.t0y * this.t1y) / this.length;
+    }
+    return 0;
+  }
+
   /** Arc length travelled at time t (clamped to the segment), and its rate (tiles/s) in out[1]. */
   arcAt(t: number, out: Float64Array | number[]): void {
     const h = this.h;

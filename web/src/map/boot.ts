@@ -32,18 +32,15 @@ export interface BootResult {
  * `now` (Date.now()) names today's timeline.
  */
 export function seedRequest(params: URLSearchParams, viewport: { width: number; height: number; dpr: number }, isStatic: boolean, now: number): SeedRequest | null {
-  const map = params.get("map");
-  const surface = params.get("surface");
-  const force = params.get("force") ?? "player";
   const x = Number(params.get("x"));
   const y = Number(params.get("y"));
-  const s = Number(params.get("s"));
+  const s = urlScale(params);
   const tRaw = params.get("t");
   const t = tRaw !== null && tRaw !== "" ? Number(tRaw) : null;
-  if (!map || !surface || params.get("x") === null || !Number.isFinite(x) || !Number.isFinite(y) || !(s > 0) || (t !== null && !(Number.isFinite(t) && Math.abs(t) <= 8.64e15))) {
+  const ds = urlDatastore(params);
+  if (ds === null || params.get("x") === null || !Number.isFinite(x) || !Number.isFinite(y) || s === null || (t !== null && !(Number.isFinite(t) && Math.abs(t) <= 8.64e15))) {
     return null;
   }
-  const ds = datastoreId({ map, surface, force });
   const z = levelFor(s, viewport.dpr);
   if (t !== null || isStatic) {
     return { kind: "timeline", ds, z, date: utcDay(t ?? now) };
@@ -53,6 +50,41 @@ export function seedRequest(params: URLSearchParams, viewport: { width: number; 
     return null;
   }
   return { kind: "view", ds, z, bbox: [r.x0, r.y0, r.x1, r.y1] };
+}
+
+/**
+ * The datastore id a page URL names: `ds` (a datastore id as the catalog has it, e.g.
+ * "gw-bc41437d~2E1.nauvis.player"; docs/v3/README.md), else `map` + `surface` + `force`
+ * (default "player"); null when neither is complete. `ds` wins when both are present.
+ * index.html's early-start script repeats this rule.
+ */
+export function urlDatastore(params: URLSearchParams): string | null {
+  const ds = params.get("ds");
+  if (ds !== null && /^[^.]+\.[^.]+\.[^.]+$/.test(ds)) {
+    return ds;
+  }
+  const map = params.get("map");
+  const surface = params.get("surface");
+  if (!map || !surface) {
+    return null;
+  }
+  return datastoreId({ map, surface, force: params.get("force") || "player" });
+}
+
+/**
+ * The camera scale (CSS px per world tile) a page URL names: `s`, else the level `z`
+ * (2^z px per tile: z0 is one pixel per tile, z-4 sixteen tiles per pixel); null when
+ * neither is valid. `s` wins when both are present. index.html repeats this rule.
+ */
+export function urlScale(params: URLSearchParams): number | null {
+  const sRaw = params.get("s");
+  const s = sRaw !== null && sRaw.trim() !== "" ? Number(sRaw) : NaN;
+  if (s > 0 && Number.isFinite(s)) {
+    return s;
+  }
+  const zRaw = params.get("z");
+  const z = zRaw !== null && zRaw.trim() !== "" ? Number(zRaw) : NaN;
+  return Number.isFinite(z) && z >= -20 && z <= 10 ? 2 ** z : null;
 }
 
 /** Path of a seed request relative to the source base (the same on both sources). */

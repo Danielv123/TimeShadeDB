@@ -19,7 +19,7 @@ texture caching and tile deltas. Contracts: `docs/v3/API.md`, `docs/v3/FORMAT.md
 | `render_gl.ts` | WebGL2: R8UI (pal8) / R16UI (pal16, rgb565) textures, 256x256 RGBA palette texture, RGB565 expanded in the shader |
 | `render_2d.ts` | Canvas2D: 512x512 RGBA canvas per tile through a 65,536-entry lookup table |
 | `renderer.ts` | Renderer interface, lookup tables, pixel snapping |
-| `camera.ts`, `lru.ts`, `clock.ts` | Camera math, byte-bounded LRU, data clock (`X-TSDB-Now`, `catalog.now`) |
+| `camera.ts`, `lru.ts`, `clock.ts`, `delay.ts` | Camera math, byte-bounded LRU, data clock (`X-TSDB-Now`, `catalog.now`), the slewed live delay |
 | `testing/` | Node-only helpers (excluded from `tsc`): TSV3/TSD3/TSP3 encoders and synthetic data, a mock v3 server (live and static layouts, gzip, optional HTTP/2, holds, request log), an illisis-export loader, `serve.ts`, `bench.ts`, `browsercheck.ts` |
 
 ## How a frame works
@@ -51,7 +51,19 @@ texture caching and tile deltas. Contracts: `docs/v3/API.md`, `docs/v3/FORMAT.md
 
 Requests are planned in a microtask as soon as data arrives (not on the next animation
 frame); drawing happens in `requestAnimationFrame`. The live event stream opens after the
-first full paint (on HTTP/1.1 it would hold one of the six connections).
+first full paint (on HTTP/1.1 it would hold one of the six connections), and so do the
+layers (`MapLayer.attach`): their mover and overlay requests would take connections the
+first tiles need (measured: cold first paint p50 601 ms with layers attached at once, 393 ms
+deferred). `ServerSource` shares one event stream between all subscriptions (the map's
+datastore and the movers layer's surface), reopened when the set of topics changes. A
+subscriber whose topics the open stream already covers gets the last `hello` again while it
+is up, or `error` while it is down. A handler that throws is logged and reported to its own
+subscriber only (`error`, then the last `hello` so it resyncs); the stream stays open for the
+others. In live mode the displayed time trails the data clock by the largest
+`MapLayer.delay()`, or `liveDelayMs` before a layer reports one (default: the movers layer's
+starting delay, 2 s, or 2 x `live_ms` for static exports). Changes of that target are slewed
+(`delay.ts`: the displayed time runs at 0.8x to 1.05x), so attaching or turning off a layer
+does not make it jump.
 
 ## Using it
 
@@ -75,8 +87,13 @@ view.setTime(t); view.goLive(); view.play(3_600_000); view.setLayers(["movers"])
   an error notice. Loader:
   default is direct fetches for WebGL2 and the worker pool for Canvas2D (page:
   `?loader=worker|direct`); see the measurements below for why.
-- Page URL state: `map`, `surface`, `force`, `x`, `y`, `s` (CSS px per tile), `t` (absent =
-  live), `layers`, plus `source=static|server`, `data=<base>`, `token=<read token>`.
+- Page URL state: the datastore as `ds` (a catalog datastore id, e.g.
+  `gw-bc41437d~2E1.nauvis.player`, as the WP11 suite passes it) or as `map`, `surface`,
+  `force`; the camera as `x`, `y` and `s` (CSS px per tile) or `z` (a level: 2^z px per
+  tile); `t` (absent = live); `layers`; plus `source=static|server`, `data=<base>`,
+  `token=<read token>`. `ds` wins over `map`/`surface`/`force` and `s` over `z`
+  (`boot.ts` `urlDatastore`, `urlScale`; the `index.html` early start applies the same
+  rule). The URL is written back as `map`/`surface`/`force`/`s`.
 - `window.__tsdbMap` (tests, benchmarks): `setCamera(x, y, s)`, `setTime(t)`, `goLive()`,
   `play(speed)`, `pause()`, `fit()`, `state()`, `view` (the `MapView`;
   `view.readTerrainPixels()` reads back the drawn terrain).

@@ -22,6 +22,7 @@ import {
   type MockDataset,
   type MockDatastore,
 } from "./dataset.ts";
+import { moverRoute, type MoverDb } from "./moverdb.ts";
 
 export interface RequestLog {
   path: string;
@@ -43,6 +44,8 @@ export interface MockServerOptions {
   noDeltas?: boolean;
   /** Serve HTTP/2 over TLS (HTTP/1.1 is still accepted) with this key and certificate (PEM). */
   tls?: { key: string | Buffer; cert: string | Buffer };
+  /** Answer `movers/...` (day indexes, windows, keyframes) from a v3 database (moverdb.ts). */
+  moverDb?: MoverDb;
 }
 
 interface Hold {
@@ -139,6 +142,14 @@ export class MockServer {
     this.log.length = 0;
   }
 
+  /** Ends every open event stream (the clients see the stream end and reconnect). */
+  dropStreams(): void {
+    for (const c of this.sse) {
+      c.res.end();
+    }
+    this.sse.clear();
+  }
+
   /** Sends a live event to SSE clients subscribed to `ds`. */
   pushEvent(event: string, data: Record<string, unknown>, ds?: string): void {
     for (const c of this.sse) {
@@ -177,6 +188,7 @@ export class MockServer {
     }
     const r = this.route(rel, u.searchParams, mode, req, res);
     if (r === "sse") {
+      this.log.push({ path: path + u.search, t: performance.now(), status: 200, bytes: 0 });
       return;
     }
     const { status, body, type, cache, key } = r;
@@ -230,6 +242,10 @@ export class MockServer {
     }
     const store = (id: string): MockDatastore | undefined => this.data.stores.get(id);
     switch (parts[0]) {
+      case "movers": {
+        const m = this.opts.moverDb ? moverRoute(this.opts.moverDb, parts) : null;
+        return m ? { status: 200, ...m } : err(404, "not_found", "no mover data");
+      }
       case "palette": {
         const s = store(parts[1]);
         const n = Number(parts[2]?.replace(/\.bin$/, ""));

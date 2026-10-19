@@ -277,3 +277,49 @@ test("live: the resync payload after a reconnect does not count for the delay", 
   assert.equal((est as any).readyN, 0, "nor for readiness");
   feed.stop();
 });
+
+test("live: while the event stream is down the data horizon stays where it broke", async () => {
+  const { src, emit } = fakeSource({ subscribe: true });
+  let now = src.now();
+  src.now = () => now;
+  const view = new MoverView();
+  const est = new DelayEstimator(2000);
+  const feed = new MoverFeed(src, SFC, view, est, { changed() {}, error() {} }, () => HORIZON);
+  feed.setTime(now - 2000, true);
+  await tick();
+  const h0 = feed.horizon();
+  assert.equal(h0, est.horizon(now));
+  emit().error(new Error("dropped"));
+  now += 30_000;
+  assert.equal(feed.horizon(), h0, "frozen while down");
+  emit().hello({ now, horizon: {} });
+  assert.equal(feed.horizon(), est.horizon(now), "moves again after the reconnect");
+  feed.stop();
+});
+
+test("live without SSE: a failed poll freezes the horizon until a poll succeeds", async () => {
+  const { src } = fakeSource();
+  let now = src.now();
+  src.now = () => now;
+  const live = src.moverLive;
+  let fail = false;
+  src.moverLive = async () => {
+    if (fail) {
+      throw new Error("offline");
+    }
+    return live();
+  };
+  const est = new DelayEstimator(2000);
+  const feed = new MoverFeed(src, SFC, new MoverView(), est, { changed() {}, error() {} }, () => HORIZON, 20);
+  feed.setTime(now, true);
+  await settle(3);
+  fail = true;
+  await new Promise(r => setTimeout(r, 60));
+  const frozen = feed.horizon();
+  now += 30_000;
+  assert.equal(feed.horizon(), frozen);
+  fail = false;
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(feed.horizon(), est.horizon(now));
+  feed.stop();
+});

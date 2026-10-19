@@ -123,6 +123,14 @@ scrub and timelapse through it, and checks `view()` and `datastore()` before mea
 without it only the first-paint numbers can be measured. The suite opens the viewer with
 the query parameters `ds`, `x`, `y`, `z` and `t` (datastore id, centre in world tiles,
 level, map-clock time). `web/src/map/control.ts` implements `window.__tsdbControl` over
-the WP7 map view. The viewer's page URL currently uses `map`, `surface`, `force`, `x`, `y`,
-`s` (CSS pixels per tile) and `t` instead (`web/src/map/README.md`); `ds` and `z` are not
-read yet, so the suite selects the view through `setView` and checks `datastore()`.
+the WP7 map view. The viewer reads `ds` and `z` next to its own `map`, `surface`, `force`
+and `s` (CSS pixels per tile); `ds` wins over `map`/`surface`/`force` and `s` over `z`
+(`web/src/map/README.md`).
+
+The bundle is built with relative asset URLs (Vite `base: "./"`), so it works at `/`,
+under a sub-path and from a static export prefix. Its state lives in the query string
+only: open it at its directory (`/`, `/prefix/`), not at a deeper path. The current Go
+fallback (`newSPAFileServer` in `cmd/timeshadedb/serve.go`) answers any missing path with
+`index.html`, so a deep path such as `/foo/bar` loads the page but its `./assets/*`
+resolve under `/foo/` and also come back as `index.html`: a blank page. WP6 should answer
+missing paths under `assets/` (or with a file extension) with 404 instead.

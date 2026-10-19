@@ -20,6 +20,9 @@ function keepDistPlaceholder(): Plugin {
 }
 
 export default defineConfig({
+  // Relative asset URLs, so the same bundle works at / (embedded server), under a sub-path
+  // (a static export prefix, the Clusterio plugin's proxy) and from a file listing.
+  base: "./",
   plugins: [react(), keepDistPlaceholder()],
   server: {
     port: 5173,
