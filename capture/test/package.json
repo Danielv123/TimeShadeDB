@@ -1,0 +1,14 @@
+{
+	"name": "timeshade-capture-test",
+	"private": true,
+	"type": "module",
+	"description": "Tests for the TimeShadeDB v3 capture Lua (unit tests in wasmoon, game tests in headless Factorio)",
+	"scripts": {
+		"test": "node run_unit.mjs",
+		"game": "node run_game.mjs",
+		"bench": "node run_game.mjs --bench"
+	},
+	"devDependencies": {
+		"wasmoon": "1.16.0"
+	}
+}
