@@ -6,6 +6,8 @@ import { layers as layerFactories } from "./layers/index";
 import type { LayerHit } from "./map/layer";
 import { createLoader, DirectLoader } from "./map/loader";
 import type { BootResult } from "./map/boot";
+import { createControl } from "./map/control";
+import { perfEvent } from "./perf";
 import { defaultSelection, MapView, type MapViewState, type RendererChoice, type Selection } from "./map/view";
 
 export type Boot = BootResult;
@@ -194,9 +196,16 @@ export function App({ boot }: { boot: Promise<Boot> }) {
       fit: () => v.fit(),
       state: () => v.state(),
     };
+    // The TsdbControl contract (web/src/api/types.ts) the WP11 benchmark drives.
+    const hostEl = host.current;
+    window.__tsdbControl = createControl(v, {
+      size: () => ({ width: hostEl.clientWidth, height: hostEl.clientHeight }),
+      onSeek: t => perfEvent("time.change", t === undefined ? { live: true } : { t }),
+    });
     return () => {
       v.destroy();
       view.current = null;
+      delete window.__tsdbControl;
       if (urlTimer.current) {
         clearTimeout(urlTimer.current);
         urlTimer.current = null;

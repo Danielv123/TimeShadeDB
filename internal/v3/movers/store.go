@@ -22,8 +22,8 @@ import (
 
 // ErrOverloaded is returned by Append when accepting the batch would exceed
 // Options.MaxOpenRows. Nothing of the batch is applied; the caller retries after the
-// next Commit (the HTTP ingest answers 503).
-var ErrOverloaded = errors.New("movers: open-window row limit reached")
+// next Commit (the HTTP ingest answers 503). It wraps core.ErrOverloaded.
+var ErrOverloaded = fmt.Errorf("movers: open-window row limit reached: %w", core.ErrOverloaded)
 
 // Options tunes a Store. Zero values select the defaults.
 type Options struct {

@@ -80,6 +80,10 @@ view.setTime(t); view.goLive(); view.play(3_600_000); view.setLayers(["movers"])
 - `window.__tsdbMap` (tests, benchmarks): `setCamera(x, y, s)`, `setTime(t)`, `goLive()`,
   `play(speed)`, `pause()`, `fit()`, `state()`, `view` (the `MapView`;
   `view.readTerrainPixels()` reads back the drawn terrain).
+- `window.__tsdbControl`: the `TsdbControl` contract (`web/src/api/types.ts`) that the WP11
+  Playwright suite drives, adapted from `MapView` in `control.ts`. Its scale is world tiles
+  per CSS pixel (the inverse of the camera's) and its timelapse speed is data ms per browser
+  ms; `seek` records a `time.change` perf event.
 - Perf counters (`window.__tsdbPerf.counters`): `textureBytes` is set to the bytes the texture
   LRU holds on every frame (absolute, so it is right again after `reset()`);
   `tilesFromCache` counts visible tiles shown from an already loaded texture, once per view
