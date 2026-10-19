@@ -1,0 +1,9 @@
+{
+	"name": "timeshade_capture_null",
+	"version": "0.1.0",
+	"title": "TimeShadeDB capture benchmark baseline",
+	"author": "TimeShadeDB",
+	"factorio_version": "2.0",
+	"description": "The UPS benchmark's baseline (capture/test/run_game.mjs --mode bench): the capture's test interface with every function a no-op. Not for play.",
+	"dependencies": ["base >= 2.0.0"]
+}
