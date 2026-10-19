@@ -144,7 +144,9 @@ type DatastoreInfo struct {
 //
 // Versions effective before the datastore Horizon never change once served: new versions
 // become effective at or after the Horizon, except in offline builds (import, pyramid
-// rebuild) that run before the database is served.
+// rebuild) that run before the database is served. Coarse levels are built after the
+// commit that moves the Horizon, so for z < 0 the bound is min(Horizon, the pyramid's
+// BuiltUpTo): VersionAt(t) for t in [BuiltUpTo, Horizon) can still change (API.md "view").
 //
 // Every method returns ErrBadTile for tiles outside the grid or level, ErrUnknownDatastore
 // for unknown datastores and ErrNoTile for valid tiles that hold no data, and must not

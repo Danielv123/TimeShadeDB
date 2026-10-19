@@ -86,16 +86,21 @@ reference, at least the latest).
 ### `GET view/{ds}/{z}?bbox=x0,y0,x1,y1&t=`
 
 `core.ViewResponse`: the state of every tile holding data in the inclusive tile rectangle at
-level z, at time t. Each tile has `v` (version effective at t), and at z0 `live` and `ls`
-(live sequence) when live content applies. At most 4,096 tiles per request (400 otherwise).
-Tiles without data are omitted. Cache: immutable when t < horizon, else live.
+level z, at time t. Each tile has `v` (version effective at t), and `live` and `ls`
+(live sequence) when live content applies (z0: open-window updates; z < 0: z0 changes not
+yet in a coarse version, FORMAT.md 4). At most 4,096 tiles per request (400 otherwise).
+Tiles without data are omitted. Cache: immutable when t < horizon, else live. At z < 0 the
+bound is min(horizon, `Pyramid.BuiltUpTo`): coarse versions are built after the commit
+that moves the horizon, so between a commit and the next build (or after a failed build)
+answers for t in [BuiltUpTo, horizon) can still change and are served as live.
 Static: no (use `timeline`).
 
 ### `GET timeline/{ds}/{z}/{date}.json`
 
 `core.TimelineResponse`: for every tile at level z, `v0` (version at the start of the UTC
 day) and `points` `[[t, v], ...]` (versions that became effective that day). `final` is
-true once the horizon passed the end of the day. Cache: immutable when final, else short.
+true once the horizon (at z < 0: min(horizon, `Pyramid.BuiltUpTo`)) passed the end of the
+day. Cache: immutable when final, else short.
 Static: yes.
 
 ### `GET tile/{ds}/{z}/{x}/{y}/{ver}.bin`
@@ -103,12 +108,13 @@ Static: yes.
 TSV3 for that exact version (version 0 is all uncharted). Cache: immutable. 404 for a
 version above the latest. Static: yes.
 
-### `GET tile/{ds}/0/{x}/{y}/live.bin`
+### `GET tile/{ds}/{z}/{x}/{y}/live.bin`
 
-TSV3 with the live flag: committed content plus the newest open-window update per chunk
-(FORMAT.md 4, rule 6); `version` is the committed version underneath. If the tile has no
-open updates, it equals the latest version with the live flag set. Cache: none.
-Static: no.
+TSV3 with the live flag; `version` is the committed version underneath. At z0: committed
+content plus the newest open-window update per chunk (FORMAT.md 4, rule 6). At z < 0: the
+coarse live latest, the average of the committed z0 content not yet in a coarse version
+(FORMAT.md 4). If the tile has nothing pending, it equals the latest version with the live
+flag set. Cache: none. Static: no.
 
 ### `GET tiledelta/{ds}/{x}/{y}/{from}-{to}.bin`
 
