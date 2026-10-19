@@ -130,8 +130,8 @@ and `s` (CSS pixels per tile); `ds` wins over `map`/`surface`/`force` and `s` ov
 
 The bundle is built with relative asset URLs (Vite `base: "./"`), so it works at `/`,
 under a sub-path and from a static export prefix. Its state lives in the query string
-only: open it at its directory (`/`, `/prefix/`), not at a deeper path. The current Go
-fallback (`newSPAFileServer` in `cmd/timeshadedb/serve.go`) answers any missing path with
-`index.html`, so a deep path such as `/foo/bar` loads the page but its `./assets/*`
-resolve under `/foo/` and also come back as `index.html`: a blank page. WP6 should answer
-missing paths under `assets/` (or with a file extension) with 404 instead.
+only: open it at its directory (`/`, `/prefix/`), not at a deeper path. `serve-v3`
+answers every missing path with 404 (`internal/v3/api/web.go`). The legacy `serve`
+(`newSPAFileServer` in `cmd/timeshadedb/serve.go`) still answers missing routes with
+`index.html`, but answers missing paths under `assets/` or with a file extension with 404,
+so a page opened at a deep path fails visibly instead of loading `index.html` as a script.

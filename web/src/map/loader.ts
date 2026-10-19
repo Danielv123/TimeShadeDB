@@ -118,6 +118,18 @@ export type WorkerResponse =
   | { id: number; ok: true; buffer: ArrayBuffer; ms: number; rgba?: ArrayBuffer }
   | { id: number; ok: false; status?: number; code?: string; name?: string; message: string };
 
+/** `url` resolved against the page, when there is a page; unchanged otherwise. */
+export function absoluteUrl(url: string): string {
+  if (typeof location === "undefined" || !location.href) {
+    return url;
+  }
+  try {
+    return new URL(url, location.href).href;
+  } catch {
+    return url;
+  }
+}
+
 export class WorkerLoader implements TileLoader {
   readonly kind = "worker" as const;
   private readonly workers: Worker[];
@@ -186,7 +198,10 @@ export class WorkerLoader implements TileLoader {
       signal.addEventListener("abort", onAbort, { once: true });
       this.pending.set(id, { resolve, reject, worker: wi, signal, onAbort });
       this.load[wi]++;
-      this.workers[wi].postMessage({ type: "fetch", id, url, headers, cache: opts?.cache, expand: opts?.expand } satisfies WorkerRequest);
+      // A worker resolves relative URLs against its own script (assets/), not the page, so a
+      // relative source base ("./", a static export) is made absolute here.
+      const abs = absoluteUrl(url);
+      this.workers[wi].postMessage({ type: "fetch", id, url: abs, headers, cache: opts?.cache, expand: opts?.expand } satisfies WorkerRequest);
     });
   }
 

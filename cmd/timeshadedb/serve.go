@@ -171,6 +171,10 @@ func newViteDevProxy(rawURL string) (http.Handler, error) {
 	return proxy, nil
 }
 
+// newSPAFileServer serves the bundle and answers other routes with index.html. A
+// missing asset (under assets/ or with a file extension) is a 404, so a page opened
+// at a deep path with relative asset URLs fails visibly instead of loading index.html
+// as its scripts.
 func newSPAFileServer(fsys fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rel := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
@@ -178,6 +182,10 @@ func newSPAFileServer(fsys fs.FS) http.Handler {
 			rel = "index.html"
 		}
 		if stat, err := fs.Stat(fsys, rel); err != nil || stat.IsDir() {
+			if strings.HasPrefix(rel, "assets/") || strings.Contains(rel, "/assets/") || path.Ext(rel) != "" {
+				http.NotFound(w, r)
+				return
+			}
 			rel = "index.html"
 		}
 		http.ServeFileFS(w, r, fsys, rel)

@@ -598,6 +598,15 @@ func TestStaticWebAppServesExternalAssets(t *testing.T) {
 	if got, want := fallbackResp.Body.String(), "index"; got != want {
 		t.Fatalf("fallback body = %q, want %q", got, want)
 	}
+
+	for _, target := range []string{"/assets/missing-1.js", "/foo/assets/index-1.js", "/missing.css"} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", target, resp.Code)
+		}
+	}
 }
 
 func BenchmarkTileEndpointFullDB(b *testing.B) {
