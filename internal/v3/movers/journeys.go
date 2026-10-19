@@ -21,6 +21,11 @@ import (
 //     A gone from the owner clears the owner, so the next source to sample the journey
 //     owns it: a train crossing between gridworld instances keeps its id, and the gone
 //     followed by a sample within core.HandoffWindow becomes a handoff in the store.
+//     For core.HandoffWindow after its gone (by sample time) the old owner cannot take
+//     the journey back while no other source has claimed it: a stale sample it still
+//     sends would otherwise make it the owner again and lock out the instance the
+//     journey moved to (Stats.Quarantined). The same source can resume the journey
+//     after that window, or at once once another source has owned it.
 //   - Gones carry no meta on the wire (PROTOCOL.md 5); Journeys fills in the journey's
 //     last meta and surface. Gones of journeys it does not know are dropped (as illisis
 //     drops gones of journeys without an owner).
@@ -53,6 +58,9 @@ type JourneyStats struct {
 	SurfaceChanges int64
 	// Evicted are journeys forgotten because of the bound.
 	Evicted int64
+	// Quarantined are samples dropped because their source sent the journey's gone
+	// less than core.HandoffWindow earlier and no other source has claimed it yet.
+	Quarantined int64
 }
 
 type journey struct {
@@ -62,6 +70,10 @@ type journey struct {
 	meta  core.MoverMeta
 	known bool // sfc and meta are set (a sample was seen)
 	lastT core.TimeMs
+	// goneBy is the source whose gone cleared the owner, at goneT; it cannot reclaim
+	// the journey before goneT + HandoffWindow unless another source owned it since.
+	goneBy string
+	goneT  core.TimeMs
 }
 
 // NewJourneys returns a tracker of at most max journeys (default 100,000 when max <= 0).
@@ -114,8 +126,12 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			out = append(out, goneOf(j, s.T, s.Tick, s.Flags))
 			// The owner's gone clears the owner; meta and surface are kept so a resumed
 			// journey carries forward its train details.
-			j.owner = ""
+			j.owner, j.goneBy, j.goneT = "", src, s.T
 			j.lastT = s.T
+			continue
+		}
+		if j != nil && j.owner == "" && j.goneBy == src && s.T < j.goneT+core.HandoffWindow {
+			js.stats.Quarantined++
 			continue
 		}
 		if j == nil {
@@ -139,6 +155,7 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			}
 		}
 		j.owner, j.sfc, j.meta, j.known, j.lastT = src, s.Surface, s.Meta, true, s.T
+		j.goneBy = ""
 		if seen := js.seen[src]; seen != nil {
 			seen[s.Meta.ID] = true
 		}
@@ -155,7 +172,7 @@ func (js *Journeys) Adopt(src, id string) string {
 		j = js.add(id)
 	}
 	prev := j.owner
-	j.owner = src
+	j.owner, j.goneBy = src, ""
 	return prev
 }
 
