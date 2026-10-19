@@ -331,6 +331,19 @@ if (viewer === "illisis") {
     const t0 = Math.max(first, end - 24 * 3600_000);
     since = await page.evaluate((t) => { const s = performance.now(); window.__tsdbControl.seek(t); return s; }, t0);
     await nextPaint(page, since, "timelapse start");
+    // The browser's own frame rate on this page (requestAnimationFrame callbacks per second
+    // over 2 s): a viewer that draws on every animation frame cannot exceed it. With a
+    // WebGL canvas, headless Chromium paces frames to the GPU's presentation rate.
+    metrics["web.raf_hz"] = await page.evaluate(() => new Promise((done) => {
+      let n = 0;
+      const start = performance.now();
+      const step = () => {
+        n++;
+        if (performance.now() - start < 2000) requestAnimationFrame(step);
+        else done(n / ((performance.now() - start) / 1000));
+      };
+      requestAnimationFrame(step);
+    }));
     const before = await page.evaluate(() => ({ frames: window.__tsdbPerf.counters.framesDrawn, long: window.__tsdbPerf.counters.longTasks, t: performance.now() }));
     await page.evaluate(() => window.__tsdbControl.play(3600));
     await page.waitForTimeout(10_000);
@@ -340,6 +353,10 @@ if (viewer === "illisis") {
     });
     const secs = (after.t - before.t) / 1000;
     metrics["web.timelapse_fps"] = (after.frames - before.frames) / secs;
+    if (metrics["web.raf_hz"] > 0) {
+      metrics["web.timelapse_frame_share"] = metrics["web.timelapse_fps"] / metrics["web.raf_hz"];
+      notes.push(`timelapse: ${metrics["web.timelapse_fps"].toFixed(1)} frames drawn per second against ${metrics["web.raf_hz"].toFixed(1)} animation frames per second on the same page (the browser's frame rate bounds the fps of a viewer that draws on animation frames)`);
+    }
     metrics["web.timelapse_longtasks_per_10s"] = ((after.long - before.long) * 10) / secs;
 
     // Memory: JS heap plus the viewer's own texture/canvas estimate.
