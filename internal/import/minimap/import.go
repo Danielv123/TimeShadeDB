@@ -30,6 +30,10 @@ type Options struct {
 	Maps []string
 	// Surfaces, when non-empty, restricts the import to these raw surface names.
 	Surfaces []string
+	// AfterTerrain, when set, runs as soon as the terrain import has succeeded, while
+	// movers and overlays may still be importing (for example to build the pyramid).
+	// Its error is returned by Import; it does not stop the other parts.
+	AfterTerrain func(ctx context.Context) error
 }
 
 func (o *Options) defaults() {
@@ -81,6 +85,7 @@ type Report struct {
 	OverlayApply core.ApplyResult `json:"overlay_apply"`
 
 	// Wall-clock durations in milliseconds. The three parts run in parallel.
+	// TerrainMs does not include Options.AfterTerrain.
 	TerrainMs  int64 `json:"terrain_ms"`
 	MoversMs   int64 `json:"movers_ms"`
 	OverlaysMs int64 `json:"overlays_ms"`
@@ -123,6 +128,9 @@ func Import(ctx context.Context, d *Dataset, opt Options) (*Report, error) {
 			t0 := time.Now()
 			rep.Terrain, rep.TerrainApply, errT = importTerrain(ctx, d, &opt, opt.Terrain)
 			rep.TerrainMs = time.Since(t0).Milliseconds()
+			if errT == nil && opt.AfterTerrain != nil {
+				errT = opt.AfterTerrain(ctx)
+			}
 		}()
 	}
 	if opt.Movers != nil {

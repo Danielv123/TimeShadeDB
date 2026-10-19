@@ -117,9 +117,11 @@ func TestImportMinimapIntoDB(t *testing.T) {
 	}
 	checkReopenedDB(t, db)
 
-	// A second import into the same database finds the pyramid built and flushes it.
-	if err := runImportMinimap(context.Background(), &bytes.Buffer{}, []string{"--db", db, "--no-movers", "--no-overlays", exp.Root}); err != nil {
-		t.Fatalf("second import: %v", err)
+	// A second import into the same database would drop everything before the horizon
+	// as late, so it is refused and the database is left as it was.
+	err := runImportMinimap(context.Background(), &bytes.Buffer{}, []string{"--db", db, "--no-movers", "--no-overlays", exp.Root})
+	if err == nil || !strings.Contains(err.Error(), "already holds") {
+		t.Fatalf("second import: %v, want a refusal", err)
 	}
 	checkReopenedDB(t, db)
 }

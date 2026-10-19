@@ -60,7 +60,8 @@ timeshadedb import-minimap --db v3db --verify D:\minimap-export
 
 Without `--db` it imports into in-memory stores, which only checks the export.
 `--verify` compares the imported state with the export and reads the movers and
-overlays back.
+overlays back. An import cannot resume or add to a database: `--db` must be empty
+(or not exist yet), and the command fails if a store dropped any update as late.
 
 ## Factorio export
 
