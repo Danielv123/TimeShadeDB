@@ -125,13 +125,12 @@ func TestReplayTestdata(t *testing.T) {
 	window := core.TimeMs(envInt("TSDB_REPLAY_WINDOW", 60)) * core.Second
 	batch := envInt("TSDB_REPLAY_BATCH", 1024)
 	opt := Options{
-		Window:          window,
-		KeyframeFactor:  envFloat("TSDB_REPLAY_KF", 0),
-		MaxChain:        envInt("TSDB_REPLAY_CAP", 0),
-		Level:           zstd.EncoderLevel(envInt("TSDB_REPLAY_LEVEL", 0)),
-		NoSync:          os.Getenv("TSDB_REPLAY_NOSYNC") == "1",
-		NoWAL:           os.Getenv("TSDB_REPLAY_NOWAL") == "1",
-		OpenWindowBytes: -1,
+		Window:         window,
+		KeyframeFactor: envFloat("TSDB_REPLAY_KF", 0),
+		MaxChain:       envInt("TSDB_REPLAY_CAP", 0),
+		Level:          zstd.EncoderLevel(envInt("TSDB_REPLAY_LEVEL", 0)),
+		NoSync:         os.Getenv("TSDB_REPLAY_NOSYNC") == "1",
+		NoWAL:          os.Getenv("TSDB_REPLAY_NOWAL") == "1",
 	}
 	dir := os.Getenv("TSDB_REPLAY_DB")
 	if dir == "" {
@@ -284,7 +283,7 @@ func TestReplayTestdata(t *testing.T) {
 	// Startup: reopen (reads every tile index, replays the empty WAL).
 	runtime.GC()
 	t0 = hrNow()
-	s, err = Open(dir, Options{OpenWindowBytes: -1})
+	s, err = Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +292,7 @@ func TestReplayTestdata(t *testing.T) {
 	// files has been seen to be much slower on Windows).
 	s.Close()
 	t0 = hrNow()
-	if s, err = Open(dir, Options{OpenWindowBytes: -1}); err != nil {
+	if s, err = Open(dir, Options{}); err != nil {
 		t.Fatal(err)
 	}
 	rep.StartupMs2 = float64(hrSince(t0).Microseconds()) / 1000

@@ -48,9 +48,10 @@ func (c *decodedCache) get(k cacheKey) *core.TileImage {
 		return nil
 	}
 	c.moveFront(n)
+	im := n.im // read under the lock: put may replace it
 	c.mu.Unlock()
 	c.hits.Add(1)
-	return n.im
+	return im
 }
 
 // has reports whether k is cached without counting a hit or miss.
@@ -67,7 +68,7 @@ func (c *decodedCache) put(k cacheKey, im *core.TileImage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if n := c.m[k]; n != nil {
-		n.im = im
+		// Same key, same content: keep the cached image.
 		c.moveFront(n)
 		return
 	}

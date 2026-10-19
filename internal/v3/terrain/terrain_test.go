@@ -2,14 +2,17 @@ package terrain
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
 	"sync"
 	"testing"
 
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/coretest"
+	"timeshadedb/internal/v3/core/memstore"
 )
 
 func openTemp(t testing.TB, opt Options) *Store {
@@ -254,8 +257,8 @@ func TestOverBudget(t *testing.T) {
 	if _, err := s.Apply(ctx, ups); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Apply(ctx, ups[:1]); !errors.Is(err, ErrOverBudget) {
-		t.Fatalf("err = %v, want ErrOverBudget", err)
+	if _, err := s.Apply(ctx, ups[:1]); !errors.Is(err, ErrOverBudget) || !errors.Is(err, core.ErrOverloaded) {
+		t.Fatalf("err = %v, want ErrOverBudget wrapping core.ErrOverloaded", err)
 	}
 	if err := s.Commit(ctx, core.Minute); err != nil {
 		t.Fatal(err)
@@ -266,16 +269,39 @@ func TestOverBudget(t *testing.T) {
 	if _, err := s.Apply(ctx, []core.ChunkUpdate{{DS: ds, Chunk: core.ChunkCoord{}, T: core.Minute + 1, Pixels: coretest.Fill(9)}}); err != nil {
 		t.Fatal(err)
 	}
+	// A batch is counted at its worst case before it is applied: 1 chunk in use plus
+	// 10 new ones is over the budget of 10, so nothing of it is applied.
+	for i := range ups {
+		ups[i].T = core.Minute + 2
+	}
+	if _, err := s.Apply(ctx, ups[:10]); !errors.Is(err, ErrOverBudget) {
+		t.Fatalf("err = %v, want ErrOverBudget", err)
+	}
+	if st := s.Stats(); st.OpenWindowBytes != openChunkBytes || st.Accepted != 13 {
+		t.Fatalf("rejected batch was applied: %+v", st)
+	}
+	if _, err := s.Apply(ctx, ups[:9]); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestConcurrentReadsDuringIngest runs readers against a store that is ingesting and
-// committing, and checks every committed read against the oracle afterwards (run with
-// -race to check the locking).
+// committing. Every committed read (live=false) records the version and a hash of the
+// pixels it returned; afterwards each is checked against the oracle's content of that
+// version, which never changes. Live reads are only checked for errors. Run with -race
+// to check the locking.
 func TestConcurrentReadsDuringIngest(t *testing.T) {
 	ctx := context.Background()
 	s := openTemp(t, Options{MaxChain: 5, DecodedCacheBytes: 8 * imageBytes})
 	defer s.Close()
+	want := memstore.NewTerrain()
 	ds := coretest.DS
+	type seen struct {
+		tile core.TileCoord
+		v    core.Version
+		sum  uint64
+	}
+	reads := make([][]seen, 4)
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	for g := 0; g < 4; g++ {
@@ -290,10 +316,14 @@ func TestConcurrentReadsDuringIngest(t *testing.T) {
 				default:
 				}
 				tc := core.TileCoord{X: int32(r.Intn(3) - 1), Y: int32(r.Intn(3) - 1)}
-				_, _, err := s.ReadTile(ctx, ds, tc, core.TimeMs(r.Int63n(int64(200*core.Minute))), r.Intn(2) == 0)
+				live := r.Intn(2) == 0
+				im, st, err := s.ReadTile(ctx, ds, tc, core.TimeMs(r.Int63n(int64(200*core.Minute))), live)
 				if err != nil && !errors.Is(err, core.ErrNoTile) && !errors.Is(err, core.ErrUnknownDatastore) {
 					t.Error(err)
 					return
+				}
+				if err == nil && !live && len(reads[g]) < 5000 {
+					reads[g] = append(reads[g], seen{tc, st.Version, hashImage(im)})
 				}
 				s.Datastores(ctx)
 				s.ListTiles(ctx, ds, 0)
@@ -305,17 +335,47 @@ func TestConcurrentReadsDuringIngest(t *testing.T) {
 	for i := 0; i < 3000; i++ {
 		now += core.TimeMs(r.Intn(5000))
 		px := coretest.Fill(uint16(r.Intn(5)))
-		if _, err := s.Apply(ctx, []core.ChunkUpdate{{DS: ds, Chunk: core.ChunkCoord{X: int32(r.Intn(48) - 24), Y: int32(r.Intn(48) - 24)}, T: now, Pixels: px}}); err != nil {
+		batch := []core.ChunkUpdate{{DS: ds, Chunk: core.ChunkCoord{X: int32(r.Intn(48) - 24), Y: int32(r.Intn(48) - 24)}, T: now, Pixels: px}}
+		if _, err := s.Apply(ctx, batch); err != nil {
 			t.Fatal(err)
 		}
+		want.Apply(ctx, batch)
 		if i%40 == 0 {
 			if err := s.Commit(ctx, now); err != nil {
 				t.Fatal(err)
 			}
+			want.Commit(ctx, now)
 		}
 	}
 	close(stop)
 	wg.Wait()
+	checked := 0
+	for _, rs := range reads {
+		for _, x := range rs {
+			wi, err := want.ReadVersion(ctx, ds, x.tile, x.v)
+			if err != nil {
+				t.Fatalf("oracle %v v%d: %v", x.tile, x.v, err)
+			}
+			if hashImage(wi) != x.sum {
+				t.Fatalf("committed read of %v v%d differs from the oracle", x.tile, x.v)
+			}
+			checked++
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no committed reads were checked")
+	}
+	t.Logf("checked %d committed reads", checked)
+}
+
+func hashImage(im *core.TileImage) uint64 {
+	h := fnv.New64a()
+	var b [2]byte
+	for _, c := range im.Pix {
+		binary.LittleEndian.PutUint16(b[:], c)
+		h.Write(b[:])
+	}
+	return h.Sum64()
 }
 
 // TestPaletteCoversLiveContent checks that colours of open-window updates are in the

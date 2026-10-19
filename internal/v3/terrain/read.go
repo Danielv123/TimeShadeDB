@@ -66,6 +66,12 @@ func (tl *tileState) snap() tileSnap {
 
 // state computes the tile state at t.
 func (s *Store) state(d *dsState, tl *tileState, t core.TimeMs) (core.TileState, error) {
+	st, _, err := s.stateSnap(d, tl, t)
+	return st, err
+}
+
+// stateSnap is state that also returns the tile summary it used.
+func (s *Store) stateSnap(d *dsState, tl *tileState, t core.TimeMs) (core.TileState, tileSnap, error) {
 	d.mu.RLock()
 	horizon, last := d.horizon, d.last
 	d.mu.RUnlock()
@@ -79,7 +85,7 @@ func (s *Store) state(d *dsState, tl *tileState, t core.TimeMs) (core.TileState,
 	default:
 		h, err := s.series.OpenSeries(tl.name, false)
 		if err != nil {
-			return st, err
+			return st, sn, err
 		}
 		v := h.VersionAt(t)
 		h.Close()
@@ -89,7 +95,7 @@ func (s *Store) state(d *dsState, tl *tileState, t core.TimeMs) (core.TileState,
 		st.Live = true
 		st.LiveSeq = sn.liveSeq
 	}
-	return st, nil
+	return st, sn, nil
 }
 
 // image returns the (immutable, shared) content of version v. h may be nil.
@@ -185,35 +191,52 @@ func (s *Store) ReadTile(ctx context.Context, key core.DatastoreKey, tile core.T
 	if err != nil {
 		return nil, core.TileState{}, err
 	}
-	st, err := s.state(d, tl, t)
-	if err != nil {
-		return nil, st, err
-	}
-	base, err := s.image(d, tl, nil, st.Version)
-	if err != nil {
-		return nil, st, err
-	}
-	im := base.Clone()
-	if !live || !st.Live {
-		st.Live, st.LiveSeq = false, 0
-		return im, st, nil
-	}
-	tl.mu.Lock()
-	var newest [core.TileBlocks]*openChunk
-	for _, win := range tl.open {
-		for b, oc := range win.chunks {
-			if cur := newest[b]; cur == nil || oc.t > cur.t || (oc.t == cur.t && oc.arrival > cur.arrival) {
-				newest[b] = oc
+	for {
+		st, sn, err := s.stateSnap(d, tl, t)
+		if err != nil {
+			return nil, st, err
+		}
+		if !live || !st.Live {
+			base, err := s.image(d, tl, nil, st.Version)
+			if err != nil {
+				return nil, st, err
+			}
+			st.Live, st.LiveSeq = false, 0
+			return base.Clone(), st, nil
+		}
+		// Live at t means t is at or after every accepted update, so the content is the
+		// newest committed version plus the open windows. (st.Version can be older only
+		// while a commit is publishing tiles before it raises the horizon.)
+		base, err := s.image(d, tl, nil, core.Version(sn.versions))
+		if err != nil {
+			return nil, st, err
+		}
+		im := base.Clone()
+		tl.mu.Lock()
+		if tl.versions != sn.versions {
+			// A commit published a new version (and dropped the windows it closed)
+			// after the snapshot: the overlay would miss those windows. Retry; a tile
+			// is committed at most once per commit.
+			tl.mu.Unlock()
+			continue
+		}
+		var newest [core.TileBlocks]*openChunk
+		for _, win := range tl.open {
+			for b, oc := range win.chunks {
+				if cur := newest[b]; cur == nil || oc.t > cur.t || (oc.t == cur.t && oc.arrival > cur.arrival) {
+					newest[b] = oc
+				}
 			}
 		}
-	}
-	for b, oc := range newest {
-		if oc != nil {
-			im.SetBlock(uint8(b), &oc.px)
+		for b, oc := range newest {
+			if oc != nil {
+				im.SetBlock(uint8(b), &oc.px)
+			}
 		}
+		st.LiveSeq = tl.liveSeq // the sequence of the content returned
+		tl.mu.Unlock()
+		return im, st, nil
 	}
-	tl.mu.Unlock()
-	return im, st, nil
 }
 
 // History implements core.TileSource.

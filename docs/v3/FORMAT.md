@@ -244,10 +244,13 @@ positions, both rebuildable from the log. The format is WP4's choice; only the A
 
 ### 5.7 Terrain state and WAL (WP2)
 
-`state.json` holds `{"horizon": ms, "first": ms, "last": ms, "has_data": bool}`: the
-committed horizon and the accepted update time range. It is rewritten (tmp + rename) at the
-end of every commit that moves the horizon, after the records of that commit are fsynced.
-`horizon` is absent until the first commit. `meta.json` is written once and never changes.
+`state.json` holds `{"horizon": ms, "committing": ms, "first": ms, "last": ms, "has_data":
+bool}`: the committed horizon, the target of a commit that has not finished, and the
+accepted update time range. It is rewritten (tmp + rename, fsynced) when a commit that has
+tiles to write starts, with `committing` set to its target horizon, and again at the end of
+every commit that moves the horizon, after the records of that commit are fsynced.
+`horizon` is absent until the first commit; `committing` is absent when no commit is
+pending. `meta.json` is written once and never changes.
 
 `wal/<seq>.wal` (16-digit decimal seq) holds the updates of open windows. A segment is a
 sequence of frames:
@@ -260,14 +263,24 @@ sequence of frames:
 
 Decompressed, a payload is `uvarint n` followed by n updates of `varint T`, `varint cx`,
 `varint cy`, `u8 flags` (bit 0 deleted) and, unless deleted, 1,024 RGB565 pixels (u16 LE).
-Late updates are not logged. Frames are written during `Apply` and fsynced by a group
-commit (default every second). A commit that moves the horizon starts a new segment and
-deletes the segments whose updates are all older than the new horizon. On open, frames are
-replayed in order; updates older than the horizon are dropped; a torn or corrupt frame ends
-its segment, which is truncated there. If a crash interrupted a commit after some tiles
-were written but before `state.json` was updated, the replay brings those windows back; a
-tile skips every window that ends at or before its last record's `t_end`, so nothing is
-written twice.
+A frame holds at most 1,024 updates (about 2.1 MB decompressed, under the 64 MiB decoder
+limit); `Apply` splits a larger batch into several frames, written with one write, so a
+batch is logged whole or not at all. Late updates are not logged. Frames are fsynced by a
+group commit (default every second). A commit that moves the horizon starts a new segment
+and deletes the segments whose updates are all older than the new horizon.
+
+On open, frames are read one at a time and replayed in order; updates older than the
+horizon are dropped. A torn tail (an incomplete header or frame, a zero or oversized
+length, a checksum mismatch) ends its segment, which is truncated there, and the
+truncation is logged. A frame whose checksum is valid but that does not decode is not a
+torn write: open fails with an error naming the segment and offset, and nothing is
+truncated.
+
+If a crash interrupted a commit after some tiles were written but before `state.json`
+recorded the new horizon, the replay brings those windows back; a tile skips every window
+that ends at or before its last record's `t_end`, so nothing is written twice. Open then
+finishes that commit (to `committing`) before it accepts any update, so an update for one
+of those windows is late for every tile, as it was while the commit ran.
 
 ## 6. Version and compatibility rules
 

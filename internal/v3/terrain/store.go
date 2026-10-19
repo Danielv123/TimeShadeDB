@@ -46,15 +46,21 @@ const (
 	encoderWindow = 256 << 10
 )
 
-// walScratch holds WAL frame build buffers (about 2 KiB per update).
+// walScratch holds WAL frame build buffers (about 2 KiB per update, at most
+// walFrameUpdates updates).
 var walScratch = sync.Pool{New: func() any { return new([]byte) }}
+
+// decoderMaxMemory caps one decoded zstd frame: a terrain record (a keyframe is at most
+// 512 KiB) or a WAL frame (walMaxRaw, about 2.1 MB).
+const decoderMaxMemory = 64 << 20
 
 // openChunkBytes is the accounted size of one open-window chunk entry.
 const openChunkBytes = core.ChunkPixelCount*2 + 64
 
-// ErrOverBudget is returned by Apply when the open-window buffers are over their byte
-// budget. Nothing from the batch was applied; the caller should retry later (HTTP 503).
-var ErrOverBudget = errors.New("terrain: open-window budget exceeded")
+// ErrOverBudget is returned by Apply when the open-window buffers would go over their
+// byte budget. Nothing from the batch was applied; the caller should retry later (HTTP
+// 503). It wraps core.ErrOverloaded.
+var ErrOverBudget = fmt.Errorf("terrain: open-window budget exceeded: %w", core.ErrOverloaded)
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -67,7 +73,11 @@ type Options struct {
 	// DecodedCacheBytes bounds the decoded-tile LRU (default 64 MiB; < 0 disables it).
 	DecodedCacheBytes int64
 	// OpenWindowBytes is the budget for open-window buffers (default 64 MiB; < 0 means
-	// unlimited). Apply returns ErrOverBudget while it is exceeded.
+	// unlimited). Apply counts every valid update of a batch as a new open chunk (the
+	// worst case) and returns ErrOverBudget, applying nothing, when that would go over
+	// the budget. A batch is always admitted when no window is open, so the budget can
+	// be exceeded by at most one batch; callers keep batches small (WP6: at most a few
+	// thousand updates).
 	OpenWindowBytes int64
 	// MaxOpenSeries bounds the idle series (indexes and file handles) kept open
 	// (default 256).
@@ -154,6 +164,7 @@ type Store struct {
 	ds     map[core.DatastoreKey]*dsState
 
 	openBytes atomic.Int64
+	reserved  atomic.Int64 // worst-case bytes of batches being applied
 	stats     counters
 
 	stopSync chan struct{}
@@ -174,12 +185,14 @@ type dsState struct {
 	dir    string
 	window core.TimeMs
 
-	// mu guards tiles, the horizons, first/last and arrival. Apply holds it for a batch;
-	// readers hold it only to look things up.
+	// mu guards tiles, the horizons, first/last and arrival. Apply holds it for the WAL
+	// write and the in-memory update of a batch (palette growth and frame encoding happen
+	// before); readers hold it only to look things up.
 	mu sync.RWMutex
-	// applyHorizon is the late threshold. A commit raises it before it starts writing,
-	// so Apply never touches a window that is being committed. horizon is the published
-	// horizon readers see; it is raised when the commit finished.
+	// applyHorizon is the late threshold. A commit raises it before it starts writing
+	// (and records it in state.json as "committing"), so Apply never touches a window
+	// that is being committed, even across a restart. horizon is the published horizon
+	// readers see; it is raised when the commit finished.
 	applyHorizon core.TimeMs
 	horizon      core.TimeMs
 	first, last  core.TimeMs
@@ -229,12 +242,16 @@ type dsMeta struct {
 	FormatVersion int               `json:"format_version"`
 }
 
-// dsPersist is state.json: the committed horizon and the update time range.
+// dsPersist is state.json: the committed horizon, the late threshold of a commit that
+// has not finished, and the update time range.
 type dsPersist struct {
 	Horizon *int64 `json:"horizon,omitempty"`
-	First   int64  `json:"first"`
-	Last    int64  `json:"last"`
-	HasData bool   `json:"has_data"`
+	// Committing is set while a commit to that horizon is running or was interrupted:
+	// some tiles may already hold its records. Open finishes it before accepting updates.
+	Committing *int64 `json:"committing,omitempty"`
+	First      int64  `json:"first"`
+	Last       int64  `json:"last"`
+	HasData    bool   `json:"has_data"`
 }
 
 type rootMarker struct {
@@ -286,7 +303,7 @@ func Open(dir string, opt Options) (*Store, error) {
 	}
 	dec, err := zstd.NewReader(nil,
 		zstd.WithDecoderConcurrency(min(runtime.GOMAXPROCS(0), maxDecoders)),
-		zstd.WithDecoderMaxMemory(64<<20))
+		zstd.WithDecoderMaxMemory(decoderMaxMemory))
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +437,7 @@ func newDS(key core.DatastoreKey, dir string, w core.TimeMs) *dsState {
 
 // loadDS opens an existing datastore directory: meta, palette, state, tile summaries,
 // then the WAL replay.
-func (s *Store) loadDS(id string) (*dsState, error) {
+func (s *Store) loadDS(id string) (d *dsState, err error) {
 	dir := filepath.Join(s.dir, "datastores", id)
 	raw, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	if err != nil {
@@ -439,7 +456,8 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 	if m.GridOrigin != core.GridOriginTiles {
 		return nil, fmt.Errorf("grid origin %d is not supported", m.GridOrigin)
 	}
-	d := newDS(m.Key, dir, core.TimeMs(m.WindowMs))
+	d = newDS(m.Key, dir, core.TimeMs(m.WindowMs))
+	pending := noHorizon // horizon of an unfinished commit
 	if raw, err := os.ReadFile(filepath.Join(dir, "state.json")); err == nil {
 		var p dsPersist
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -449,6 +467,9 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 			d.horizon = core.TimeMs(*p.Horizon)
 			d.applyHorizon = d.horizon
 		}
+		if p.Committing != nil {
+			pending = core.TimeMs(*p.Committing)
+		}
 		d.first, d.last, d.hasData = core.TimeMs(p.First), core.TimeMs(p.Last), p.HasData
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -456,6 +477,14 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 	if d.pal, err = openPalette(filepath.Join(dir, "palette.bin"), s.opt.NoSync); err != nil {
 		return nil, err
 	}
+	defer func(d *dsState) { // the returned d is nil on error, so pass it in
+		if err != nil {
+			if d.wal != nil {
+				d.wal.close()
+			}
+			d.pal.close()
+		}
+	}(d)
 	ents, err := os.ReadDir(filepath.Join(dir, "tiles"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -485,7 +514,7 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 			return nil, err
 		}
 		var palErr error
-		err := d.wal.replay(s.dec, func(ups []walUpdate) {
+		err := d.wal.replay(s.dec, s.opt.Logf, func(ups []walUpdate) {
 			for i := range ups {
 				u := &ups[i]
 				tc, block := u.chunk.Tile()
@@ -507,6 +536,17 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 		}
 		if err := d.wal.start(); err != nil {
 			return nil, err
+		}
+	}
+	if pending > d.horizon {
+		// A commit to pending was interrupted after it may have written some tiles.
+		// Finish it now, before any Apply: an update for a window it closes would be
+		// dropped by the replay skip rule on the tiles already written but kept on the
+		// others. The replayed windows hold exactly what the interrupted commit saw,
+		// because Apply refused updates below pending while it ran.
+		s.opt.Logf("terrain: %s: finishing the interrupted commit to %d", id, pending)
+		if err := s.commitDS(context.Background(), d, pending); err != nil {
+			return nil, fmt.Errorf("finishing the interrupted commit: %w", err)
 		}
 	}
 	return d, nil
@@ -586,15 +626,7 @@ func (s *Store) Apply(ctx context.Context, updates []core.ChunkUpdate) (core.App
 	if closed {
 		return res, core.ErrClosed
 	}
-	if lim := s.opt.OpenWindowBytes; lim > 0 && s.openBytes.Load() >= lim {
-		return res, ErrOverBudget
-	}
-	// Group valid updates by datastore, keeping their order.
-	type group struct {
-		d   *dsState
-		ups []*core.ChunkUpdate
-	}
-	var groups []group
+	valid := make([]*core.ChunkUpdate, 0, len(updates))
 	for i := range updates {
 		u := &updates[i]
 		if u.DS.Validate() != nil || (!u.Deleted && u.Pixels == nil) {
@@ -605,6 +637,28 @@ func (s *Store) Apply(ctx context.Context, updates []core.ChunkUpdate) (core.App
 			res.Invalid++
 			continue
 		}
+		valid = append(valid, u)
+	}
+	if len(valid) == 0 {
+		return res, nil
+	}
+	// Budget: count every update as a new open chunk (the worst case) and reserve that
+	// until the batch is applied, so concurrent batches cannot overshoot together.
+	if lim := s.opt.OpenWindowBytes; lim > 0 {
+		need := int64(len(valid)) * openChunkBytes
+		used := s.reserved.Add(need)
+		defer s.reserved.Add(-need)
+		if inUse := s.openBytes.Load() + used - need; inUse > 0 && inUse+need > lim {
+			return core.ApplyResult{}, ErrOverBudget
+		}
+	}
+	// Group by datastore, keeping their order.
+	type group struct {
+		d   *dsState
+		ups []*core.ChunkUpdate
+	}
+	var groups []group
+	for _, u := range valid {
 		gi := -1
 		for j := range groups {
 			if groups[j].d.key == u.DS {
@@ -632,25 +686,45 @@ func (s *Store) Apply(ctx context.Context, updates []core.ChunkUpdate) (core.App
 	return res, nil
 }
 
-// applyDS applies one datastore's updates under its lock. Late updates are not logged.
-func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, error) {
-	var res core.ApplyResult
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	keep := ups[:0:0]
+// notLate returns the updates at or after the late threshold h.
+func notLate(ups []*core.ChunkUpdate, h core.TimeMs) []*core.ChunkUpdate {
+	keep := make([]*core.ChunkUpdate, 0, len(ups))
+	for _, u := range ups {
+		if u.T >= h {
+			keep = append(keep, u)
+		}
+	}
+	return keep
+}
+
+// walBatch encodes the WAL frames of ups (at most walFrameUpdates updates per frame)
+// into one buffer and returns it with the newest update time.
+func (s *Store) walBatch(ups []*core.ChunkUpdate) ([]byte, core.TimeMs) {
 	maxT := noHorizon
 	for _, u := range ups {
-		if u.T < d.applyHorizon {
-			res.Late++
-			continue
-		}
-		keep = append(keep, u)
 		maxT = max(maxT, u.T)
 	}
-	if len(keep) == 0 {
-		s.stats.late.Add(uint64(res.Late))
-		return res, nil
+	bp := walScratch.Get().(*[]byte)
+	defer walScratch.Put(bp)
+	var out []byte
+	for len(ups) > 0 {
+		n := min(len(ups), walFrameUpdates)
+		out, *bp = appendWALFrame(out, s.walEnc, ups[:n], *bp)
+		ups = ups[n:]
 	}
+	return out, maxT
+}
+
+// applyDS applies one datastore's updates. Late updates are not logged. Work that
+// needs no ordering (new palette colours, WAL frame encoding) is done before taking
+// d.mu, so readers of the datastore wait only for the WAL write and the in-memory
+// update.
+func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, error) {
+	var res core.ApplyResult
+	d.mu.RLock()
+	h := d.applyHorizon
+	d.mu.RUnlock()
+	keep := notLate(ups, h)
 	for _, u := range keep {
 		if !u.Deleted {
 			if err := d.pal.ensure(u.Pixels[:]); err != nil {
@@ -658,12 +732,29 @@ func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, 
 			}
 		}
 	}
+	var frames []byte
+	var maxT core.TimeMs
+	if d.wal != nil && len(keep) > 0 {
+		frames, maxT = s.walBatch(keep)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.applyHorizon != h {
+		// A commit raised the late threshold meanwhile (rare): filter and encode again.
+		if again := notLate(keep, d.applyHorizon); len(again) != len(keep) {
+			keep = again
+			if d.wal != nil && len(keep) > 0 {
+				frames, maxT = s.walBatch(keep)
+			}
+		}
+	}
+	res.Late = len(ups) - len(keep)
+	s.stats.late.Add(uint64(res.Late))
+	if len(keep) == 0 {
+		return res, nil
+	}
 	if d.wal != nil {
-		bp := walScratch.Get().(*[]byte)
-		var frame []byte
-		frame, *bp = encodeWALFrame(s.walEnc, keep, *bp)
-		walScratch.Put(bp)
-		if err := d.wal.append(frame, maxT); err != nil {
+		if err := d.wal.append(frames, maxT); err != nil {
 			return res, err
 		}
 	}
@@ -672,7 +763,6 @@ func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, 
 		s.acceptLocked(d, tc, block, u.T, u.Deleted, u.Pixels)
 		res.Accepted++
 	}
-	s.stats.late.Add(uint64(res.Late))
 	s.stats.accepted.Add(uint64(res.Accepted))
 	return res, nil
 }
@@ -780,6 +870,14 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 	}
 	d.mu.Unlock()
 
+	if len(work) > 0 {
+		// Record the target horizon before any tile is written, so that a restart
+		// finishes this commit before it accepts updates again (loadDS).
+		if err := s.writeState(d); err != nil {
+			return err
+		}
+	}
+
 	// Encode and append per tile, in parallel.
 	errs := make([]error, len(work))
 	sem := make(chan struct{}, s.opt.Workers)
@@ -802,11 +900,8 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 
 	d.mu.Lock()
 	d.horizon = newH
-	persist := dsPersist{First: int64(d.first), Last: int64(d.last), HasData: d.hasData}
 	d.mu.Unlock()
-	h := int64(newH)
-	persist.Horizon = &h
-	if err := writeJSON(filepath.Join(d.dir, "state.json"), persist, !s.opt.NoSync); err != nil {
+	if err := s.writeState(d); err != nil {
 		return err
 	}
 	s.stats.commits.Add(1)
@@ -816,6 +911,24 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 		}
 	}
 	return nil
+}
+
+// writeState writes state.json from the datastore's current state. Only commitDS
+// (holding d.commitMu) and loadDS call it.
+func (s *Store) writeState(d *dsState) error {
+	d.mu.RLock()
+	p := dsPersist{First: int64(d.first), Last: int64(d.last), HasData: d.hasData}
+	horizon, apply := d.horizon, d.applyHorizon
+	d.mu.RUnlock()
+	if horizon != noHorizon {
+		h := int64(horizon)
+		p.Horizon = &h
+	}
+	if apply > horizon {
+		c := int64(apply)
+		p.Committing = &c
+	}
+	return writeJSON(filepath.Join(d.dir, "state.json"), p, !s.opt.NoSync)
 }
 
 type byStart closingTile
@@ -846,12 +959,10 @@ func (s *Store) commitTile(d *dsState, ct *closingTile) (err error) {
 	if err != nil {
 		return err
 	}
-	// Every colour of the open windows is in the palette (Apply added it). Hold the
-	// palette's read lock while using its LUT; Apply takes the write lock only to add
-	// a colour.
-	d.pal.mu.RLock()
-	defer d.pal.mu.RUnlock()
-	pal := d.pal.lut
+	// Every colour of the open windows is in the palette: Apply published it before it
+	// accepted the update, and this commit collected the windows after that (under
+	// d.mu). The snapshot is immutable, so no lock is held while encoding.
+	pal := d.pal.state().lut
 	versions, firstT, lastT := tl.versions, tl.firstT, tl.lastT
 	sinceBase, bytesSinceBase, refLen := tl.sinceBase, tl.bytesSinceBase, tl.refLen
 	owned := false

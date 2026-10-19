@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,7 +28,8 @@ import (
 // A new segment starts at every commit that moves the horizon; a segment is deleted
 // once every update in it is older than the horizon (its windows are committed). So the
 // log is bounded by the window length times the ingest rate. Frames are written to the
-// OS at Apply and fsynced by the store's syncer about once per SyncInterval (group
+// OS at Apply (a batch is split into frames of at most walFrameUpdates updates, written
+// with one write) and fsynced by the store's syncer about once per SyncInterval (group
 // commit).
 type wal struct {
 	dir    string
@@ -89,34 +89,66 @@ type walUpdate struct {
 	px      core.ChunkPixels
 }
 
-// replay decodes every segment in order and calls fn for each frame. A torn or corrupt
-// frame ends its segment: the segment is truncated there.
-func (w *wal) replay(dec *zstd.Decoder, fn func([]walUpdate)) error {
+// replay decodes every segment in order and calls fn for each frame (the slice is
+// reused after fn returns). Frames are read one at a time into reused buffers. A torn
+// tail (an incomplete frame, a zero or oversized length, a checksum mismatch) ends its
+// segment, which is truncated there and logged. A frame whose checksum is valid but
+// that does not decode is not a torn write: replay returns an error and changes
+// nothing, rather than dropping acknowledged updates.
+func (w *wal) replay(dec *zstd.Decoder, logf func(string, ...any), fn func([]walUpdate)) error {
+	var payload, raw []byte
+	var ups []walUpdate
 	for i := range w.segs {
 		sg := &w.segs[i]
-		f, err := os.OpenFile(w.path(sg.seq), os.O_RDWR, 0)
+		path := w.path(sg.seq)
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
 		if err != nil {
 			return err
 		}
-		data, err := io.ReadAll(f)
+		st, err := f.Stat()
 		if err != nil {
 			f.Close()
 			return err
 		}
-		pos := 0
-		for pos+walFrameHeader <= len(data) {
-			n := int(binary.LittleEndian.Uint32(data[pos:]))
-			sum := binary.LittleEndian.Uint32(data[pos+4:])
-			if n > len(data)-pos-walFrameHeader {
+		size := st.Size()
+		var pos int64
+		var hdr [walFrameHeader]byte
+		reason := ""
+		for pos < size {
+			if pos+walFrameHeader > size {
+				reason = "incomplete frame header"
 				break
 			}
-			payload := data[pos+walFrameHeader : pos+walFrameHeader+n]
+			if _, err := f.ReadAt(hdr[:], pos); err != nil {
+				f.Close()
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			n := int64(binary.LittleEndian.Uint32(hdr[0:]))
+			sum := binary.LittleEndian.Uint32(hdr[4:])
+			if n == 0 || n > walMaxPayload {
+				reason = fmt.Sprintf("bad frame length %d", n)
+				break
+			}
+			if pos+walFrameHeader+n > size {
+				reason = "incomplete frame"
+				break
+			}
+			if int64(cap(payload)) < n {
+				payload = make([]byte, n)
+			}
+			payload = payload[:n]
+			if _, err := f.ReadAt(payload, pos+walFrameHeader); err != nil {
+				f.Close()
+				return fmt.Errorf("%s: %w", path, err)
+			}
 			if crcC(payload) != sum {
+				reason = "frame checksum mismatch"
 				break
 			}
-			ups, err := decodeWALFrame(dec, payload)
+			ups, raw, err = decodeWALFrame(dec, payload, raw, ups)
 			if err != nil {
-				break
+				f.Close()
+				return fmt.Errorf("%s: the frame at offset %d has a valid checksum but does not decode: %w (move the segment aside to open without it)", path, pos, err)
 			}
 			for j := range ups {
 				if ups[j].t > sg.maxT {
@@ -126,13 +158,14 @@ func (w *wal) replay(dec *zstd.Decoder, fn func([]walUpdate)) error {
 			fn(ups)
 			pos += walFrameHeader + n
 		}
-		if pos < len(data) {
-			if err := f.Truncate(int64(pos)); err != nil {
+		if pos < size {
+			logf("terrain: wal %s: %s at offset %d, truncating %d bytes", path, reason, pos, size-pos)
+			if err := f.Truncate(pos); err != nil {
 				f.Close()
 				return err
 			}
 		}
-		sg.size = int64(pos)
+		sg.size = pos
 		f.Close()
 	}
 	return nil
@@ -158,7 +191,9 @@ func (w *wal) openSegLocked(seq uint64) error {
 	return nil
 }
 
-// append writes one frame (already encoded by encodeWALFrame) whose newest update is maxT.
+// append writes frames (encoded by appendWALFrame) whose newest update is maxT, with
+// one write. On failure the segment is cut back, so a batch is logged whole or not at
+// all.
 func (w *wal) append(frame []byte, maxT core.TimeMs) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -262,8 +297,18 @@ func (w *wal) close() error {
 	return err
 }
 
-// encodeWALFrame builds a frame for the updates (raw is scratch space).
-func encodeWALFrame(enc *zstd.Encoder, ups []*core.ChunkUpdate, raw []byte) (frame, rawOut []byte) {
+// WAL frame limits. Apply splits a batch into frames of at most walFrameUpdates
+// updates, so a decoded frame is at most walMaxRaw bytes, well under the decoder's
+// memory limit (decoderMaxMemory), and a stored payload is at most walMaxPayload.
+const (
+	walFrameUpdates = 1024
+	walMaxRaw       = binary.MaxVarintLen64 + walFrameUpdates*(3*binary.MaxVarintLen64+1+2*core.ChunkPixelCount)
+	walMaxPayload   = 2 * walMaxRaw
+)
+
+// appendWALFrame appends a frame for the updates (at most walFrameUpdates) to dst. raw
+// is scratch space.
+func appendWALFrame(dst []byte, enc *zstd.Encoder, ups []*core.ChunkUpdate, raw []byte) (out, rawOut []byte) {
 	raw = binary.AppendUvarint(raw[:0], uint64(len(ups)))
 	for _, u := range ups {
 		raw = binary.AppendVarint(raw, int64(u.T))
@@ -278,54 +323,57 @@ func encodeWALFrame(enc *zstd.Encoder, ups []*core.ChunkUpdate, raw []byte) (fra
 			raw = binary.LittleEndian.AppendUint16(raw, c)
 		}
 	}
-	frame = make([]byte, walFrameHeader, walFrameHeader+len(raw)/4+64)
-	frame = enc.EncodeAll(raw, frame)
-	p := frame[walFrameHeader:]
-	binary.LittleEndian.PutUint32(frame[0:], uint32(len(p)))
-	binary.LittleEndian.PutUint32(frame[4:], crcC(p))
-	return frame, raw
+	start := len(dst)
+	dst = append(dst, make([]byte, walFrameHeader)...)
+	dst = enc.EncodeAll(raw, dst)
+	p := dst[start+walFrameHeader:]
+	binary.LittleEndian.PutUint32(dst[start:], uint32(len(p)))
+	binary.LittleEndian.PutUint32(dst[start+4:], crcC(p))
+	return dst, raw
 }
 
-func decodeWALFrame(dec *zstd.Decoder, payload []byte) ([]walUpdate, error) {
-	raw, err := dec.DecodeAll(payload, nil)
+// decodeWALFrame decodes one payload. raw and out are reused buffers.
+func decodeWALFrame(dec *zstd.Decoder, payload, raw []byte, out []walUpdate) ([]walUpdate, []byte, error) {
+	raw, err := dec.DecodeAll(payload, raw[:0])
 	if err != nil {
-		return nil, err
+		return out[:0], raw, err
 	}
-	n, k := binary.Uvarint(raw)
-	if k <= 0 || n > uint64(len(raw)) {
-		return nil, errPayload
+	buf := raw
+	n, k := binary.Uvarint(buf)
+	if k <= 0 || n > uint64(len(buf)) || n > walFrameUpdates {
+		return out[:0], raw, errPayload
 	}
-	raw = raw[k:]
-	out := make([]walUpdate, 0, n)
+	buf = buf[k:]
+	out = out[:0]
 	for i := uint64(0); i < n; i++ {
-		var u walUpdate
 		var vals [3]int64
 		for j := range vals {
-			v, k := binary.Varint(raw)
+			v, k := binary.Varint(buf)
 			if k <= 0 {
-				return nil, errPayload
+				return out[:0], raw, errPayload
 			}
 			vals[j] = v
-			raw = raw[k:]
+			buf = buf[k:]
 		}
+		if len(buf) < 1 {
+			return out[:0], raw, errPayload
+		}
+		out = append(out, walUpdate{})
+		u := &out[len(out)-1]
 		u.t, u.chunk = core.TimeMs(vals[0]), core.ChunkCoord{X: int32(vals[1]), Y: int32(vals[2])}
-		if len(raw) < 1 {
-			return nil, errPayload
-		}
-		flags := raw[0]
-		raw = raw[1:]
+		flags := buf[0]
+		buf = buf[1:]
 		if flags&1 != 0 {
 			u.deleted = true
 		} else {
-			if len(raw) < 2*core.ChunkPixelCount {
-				return nil, errPayload
+			if len(buf) < 2*core.ChunkPixelCount {
+				return out[:0], raw, errPayload
 			}
 			for j := range u.px {
-				u.px[j] = binary.LittleEndian.Uint16(raw[2*j:])
+				u.px[j] = binary.LittleEndian.Uint16(buf[2*j:])
 			}
-			raw = raw[2*core.ChunkPixelCount:]
+			buf = buf[2*core.ChunkPixelCount:]
 		}
-		out = append(out, u)
 	}
-	return out, nil
+	return out, raw, nil
 }

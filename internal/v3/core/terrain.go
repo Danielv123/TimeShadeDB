@@ -19,6 +19,10 @@ var (
 	ErrNoVersion = errors.New("no such version")
 	// ErrClosed: the store was closed.
 	ErrClosed = errors.New("store closed")
+	// ErrOverloaded: a write was refused for backpressure (for example the terrain
+	// open-window buffers are over their byte budget). Nothing from the call was
+	// applied; retry later, with smaller batches if the error says so. HTTP 503.
+	ErrOverloaded = errors.New("overloaded")
 )
 
 // Version identifies one committed state of one tile. At z0 it counts the tile's

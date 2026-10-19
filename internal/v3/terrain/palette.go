@@ -21,22 +21,28 @@ var errClosedPalette = errors.New("terrain: palette closed")
 // a published palette entry never changes, even after a crash. New colours are rare
 // after the first minutes of a map, so the fsync is rare too.
 //
-// Readers use snapshot(), which never blocks: entries are never changed, so an old
-// slice stays valid. The presence bitmap is read and written only under the
-// datastore's lock (the Apply path); the LUT is written under mu and read by commits
-// under mu.RLock.
+// The colours, the RGB565 -> index LUT and the presence bitmap are published together
+// as an immutable snapshot (copy-on-write). Readers, commits and the Apply fast path
+// load it without a lock; only ensure, when it adds colours, takes mu, writes the file
+// and swaps in a new snapshot.
 type palette struct {
 	path   string
 	noSync bool
 
-	present [1 << 10]uint64 // bit c set when colour c is in the palette
-
-	mu     sync.RWMutex
+	mu     sync.Mutex // writers: ensure, close
 	f      *os.File
-	lut    lut
-	colors []uint16
-	snap   atomic.Pointer[[]uint16]
+	colors []uint16 // backing array of the snapshots; only appended under mu
+	snap   atomic.Pointer[palSnap]
 }
+
+// palSnap is one immutable palette state.
+type palSnap struct {
+	colors  []uint16 // len == cap: appends never show through
+	lut     lut
+	present *[1 << 10]uint64 // bit c set when colour c is in the palette
+}
+
+func (ps *palSnap) has(c uint16) bool { return ps.present[c>>6]&(1<<(c&63)) != 0 }
 
 func openPalette(path string, noSync bool) (*palette, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
@@ -48,7 +54,7 @@ func openPalette(path string, noSync bool) (*palette, error) {
 		f.Close()
 		return nil, err
 	}
-	p := &palette{path: path, noSync: noSync, f: f, lut: newLUT()}
+	p := &palette{path: path, noSync: noSync, f: f}
 	switch {
 	case len(raw) < 8:
 		// New (or torn before the header was complete): write the header and entry 0.
@@ -88,41 +94,35 @@ func openPalette(path string, noSync bool) (*palette, error) {
 	}
 	n := len(body) / 2
 	p.colors = make([]uint16, n, max(n, 64))
+	ps := &palSnap{lut: newLUT(), present: new([1 << 10]uint64)}
 	for i := range p.colors {
 		c := binary.LittleEndian.Uint16(body[2*i:])
 		p.colors[i] = c
-		if p.lut[c] == 0 {
-			p.lut[c] = uint32(i + 1)
+		if ps.lut[c] == 0 {
+			ps.lut[c] = uint32(i + 1)
 		}
-		p.present[c>>6] |= 1 << (c & 63)
+		ps.present[c>>6] |= 1 << (c & 63)
 	}
 	if p.colors[0] != 0 {
 		f.Close()
 		return nil, fmt.Errorf("terrain: %s: entry 0 is %#04x, not 0", path, p.colors[0])
 	}
-	p.publish()
+	ps.colors = p.colors[:n:n]
+	p.snap.Store(ps)
 	return p, nil
 }
 
-func (p *palette) publish() {
-	s := p.colors[:len(p.colors):len(p.colors)]
-	p.snap.Store(&s)
-}
+// snapshot returns the current palette colours. The slice must not be modified.
+func (p *palette) snapshot() []uint16 { return p.snap.Load().colors }
 
-// snapshot returns the current palette. The slice must not be modified.
-func (p *palette) snapshot() []uint16 { return *p.snap.Load() }
+// state returns the current immutable palette state (colours and LUT).
+func (p *palette) state() *palSnap { return p.snap.Load() }
 
 // ensure makes every colour of px part of the palette, appending and fsyncing new
-// ones. Caller holds the datastore lock.
+// ones before it returns. It is safe for concurrent use; the common case (all colours
+// known) takes no lock.
 func (p *palette) ensure(px []uint16) error {
-	missing := false
-	for _, c := range px {
-		if p.present[c>>6]&(1<<(c&63)) == 0 {
-			missing = true
-			break
-		}
-	}
-	if !missing {
+	if p.covers(p.snap.Load(), px) {
 		return nil
 	}
 	p.mu.Lock()
@@ -130,45 +130,61 @@ func (p *palette) ensure(px []uint16) error {
 	if p.f == nil {
 		return errClosedPalette
 	}
+	old := p.snap.Load()
+	if p.covers(old, px) {
+		return nil // added by a concurrent ensure
+	}
 	first := len(p.colors)
+	nl := make(lut, len(old.lut))
+	copy(nl, old.lut)
 	for _, c := range px {
-		if p.lut[c] != 0 {
+		if nl[c] != 0 {
 			continue
 		}
 		if len(p.colors) >= 1<<16 {
-			p.rollback(first)
+			p.colors = p.colors[:first]
 			return fmt.Errorf("terrain: palette full")
 		}
 		p.colors = append(p.colors, c)
-		p.lut[c] = uint32(len(p.colors))
+		nl[c] = uint32(len(p.colors))
 	}
 	buf := make([]byte, 2*(len(p.colors)-first))
 	for i, c := range p.colors[first:] {
 		binary.LittleEndian.PutUint16(buf[2*i:], c)
 	}
-	if _, err := p.f.WriteAt(buf, int64(8+2*first)); err != nil {
-		p.rollback(first)
+	if err := p.write(buf, first); err != nil {
+		p.colors = p.colors[:first]
+		_ = p.f.Truncate(int64(8 + 2*first))
 		return err
 	}
-	if !p.noSync {
-		if err := p.f.Sync(); err != nil {
-			p.rollback(first)
-			return err
-		}
-	}
+	np := &palSnap{lut: nl, present: new([1 << 10]uint64)}
+	*np.present = *old.present
 	for _, c := range p.colors[first:] {
-		p.present[c>>6] |= 1 << (c & 63)
+		np.present[c>>6] |= 1 << (c & 63)
 	}
-	p.publish()
+	n := len(p.colors)
+	np.colors = p.colors[:n:n]
+	p.snap.Store(np)
 	return nil
 }
 
-func (p *palette) rollback(n int) {
-	for _, c := range p.colors[n:] {
-		p.lut[c] = 0
+func (p *palette) covers(ps *palSnap, px []uint16) bool {
+	for _, c := range px {
+		if !ps.has(c) {
+			return false
+		}
 	}
-	p.colors = p.colors[:n]
-	_ = p.f.Truncate(int64(8 + 2*n))
+	return true
+}
+
+func (p *palette) write(buf []byte, first int) error {
+	if _, err := p.f.WriteAt(buf, int64(8+2*first)); err != nil {
+		return err
+	}
+	if !p.noSync {
+		return p.f.Sync()
+	}
+	return nil
 }
 
 func (p *palette) close() error {

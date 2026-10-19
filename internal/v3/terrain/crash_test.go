@@ -248,6 +248,92 @@ func TestCommitInterrupted(t *testing.T) {
 	t.Logf("%d batches, %d interrupted commits", batches, interrupted)
 }
 
+// compareHistoryAndChanges compares History over sub-ranges (bounds at, between and
+// around the version times) and ChangedChunks for every version pair of a tile (or a
+// deterministic sample of pairs when there are many versions).
+func compareHistoryAndChanges(s *Store, want *memstore.Terrain, ds core.DatastoreKey, ti core.TileInfo, hist []core.VersionPoint) error {
+	ctx := context.Background()
+	var bounds []core.TimeMs
+	for _, p := range hist {
+		bounds = append(bounds, p.T-1, p.T, p.T+1)
+	}
+	for i := 0; i+1 < len(bounds); i += 2 {
+		t0, t1 := bounds[i], bounds[len(bounds)-1-i]
+		hw, _ := want.History(ctx, ds, ti.Tile, t0, t1)
+		hg, err := s.History(ctx, ds, ti.Tile, t0, t1)
+		if err != nil {
+			return err
+		}
+		if fmt.Sprint(hw) != fmt.Sprint(hg) {
+			return fmt.Errorf("%v %v: history [%d,%d) %v, oracle %v", ds, ti.Tile, t0, t1, hg, hw)
+		}
+	}
+	r := rand.New(rand.NewSource(int64(ti.Tile.X)*7919 + int64(ti.Tile.Y)))
+	n := int(ti.Version)
+	pairs := n * (n + 1) / 2
+	for k := 0; k < min(pairs, 40); k++ {
+		from := core.Version(r.Intn(n))
+		to := from + 1 + core.Version(r.Intn(n-int(from)))
+		cw, errW := want.ChangedChunks(ctx, ds, ti.Tile, from, to)
+		cg, errG := s.ChangedChunks(ctx, ds, ti.Tile, from, to)
+		if (errW == nil) != (errG == nil) {
+			return fmt.Errorf("%v %v changes %d-%d: err %v, oracle %v", ds, ti.Tile, from, to, errG, errW)
+		}
+		if len(cw) != len(cg) {
+			return fmt.Errorf("%v %v changes %d-%d: %d blocks, oracle %d", ds, ti.Tile, from, to, len(cg), len(cw))
+		}
+		for j := range cw {
+			if cw[j].Block != cg[j].Block || cw[j].Pixels != cg[j].Pixels {
+				return fmt.Errorf("%v %v changes %d-%d: block %d differs", ds, ti.Tile, from, to, cw[j].Block)
+			}
+		}
+	}
+	return nil
+}
+
+// TestDifferentialHistory feeds the crash workload (several datastores, flicker,
+// deletes, late updates) to the store and the oracle without crashes and compares
+// History (sub-ranges) and ChangedChunks (version pairs) as well as every version's
+// content, after every few commits.
+func TestDifferentialHistory(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t, Options{MaxChain: 4, DecodedCacheBytes: 4 * imageBytes})
+	defer s.Close()
+	want := memstore.NewTerrain()
+	next := crashOpsWith(21, 40, 12)
+	commits := 0
+	var last core.TimeMs
+	for i := 0; i < 2000; i++ {
+		op := next()
+		if op.batch == nil {
+			if err := s.Commit(ctx, op.commit); err != nil {
+				t.Fatal(err)
+			}
+			want.Commit(ctx, op.commit)
+			last = op.commit
+			if commits++; commits%20 == 0 {
+				if err := compareStores(s, want, last); err != nil {
+					t.Fatalf("after %d commits: %v", commits, err)
+				}
+			}
+			continue
+		}
+		a, err := s.Apply(ctx, op.batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := want.Apply(ctx, op.batch); a != b {
+			t.Fatalf("apply %+v, oracle %+v", a, b)
+		}
+	}
+	far := core.TimeMs(1_900_000_000_000)
+	s.Commit(ctx, far)
+	want.Commit(ctx, far)
+	if err := compareStores(s, want, far); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func compareStores(s *Store, want *memstore.Terrain, far core.TimeMs) error {
 	ctx := context.Background()
 	for _, ds := range crashKeys {
@@ -265,6 +351,9 @@ func compareStores(s *Store, want *memstore.Terrain, far core.TimeMs) error {
 			if fmt.Sprint(hw) != fmt.Sprint(hg) {
 				return fmt.Errorf("%v %v: history differs", ds, wt[i].Tile)
 			}
+			if err := compareHistoryAndChanges(s, want, ds, wt[i], hw); err != nil {
+				return err
+			}
 			for v := core.Version(0); v <= wt[i].Version; v++ {
 				a, _ := want.ReadVersion(ctx, ds, wt[i].Tile, v)
 				b, err := s.ReadVersion(ctx, ds, wt[i].Tile, v)
@@ -278,4 +367,85 @@ func compareStores(s *Store, want *memstore.Terrain, far core.TimeMs) error {
 		}
 	}
 	return nil
+}
+
+// TestApplyAfterInterruptedCommit: a commit fails after the first of two tiles was
+// written, the store is reopened, and new updates for both tiles arrive in the window
+// that commit was closing (a tailer resending). Both tiles must treat them the same way
+// as the oracle, which saw the commit finish: late. Before the fix, the written tile
+// dropped them through the replay skip rule while the other tile kept them.
+func TestApplyAfterInterruptedCommit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	opt := Options{NoSync: true, Workers: 1}
+	s, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := memstore.NewTerrain()
+	ds := coretest.DS
+	a := core.ChunkCoord{X: 0, Y: 0}
+	b := core.ChunkCoord{X: 1000, Y: 1000} // another tile
+	first := []core.ChunkUpdate{
+		{DS: ds, Chunk: a, T: 10_000, Pixels: coretest.Fill(1)},
+		{DS: ds, Chunk: b, T: 10_000, Pixels: coretest.Fill(1)},
+	}
+	for _, st := range []core.TerrainStore{s, want} {
+		if _, err := st.Apply(ctx, first); err != nil {
+			t.Fatal(err)
+		}
+	}
+	left := 1
+	commitTileHook = func(string) error {
+		if left == 0 {
+			return fmt.Errorf("injected failure")
+		}
+		left--
+		return nil
+	}
+	err = s.Commit(ctx, core.Minute)
+	commitTileHook = nil
+	if err == nil {
+		t.Fatal("commit was not interrupted")
+	}
+	want.Commit(ctx, core.Minute)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = Open(dir, opt); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	second := []core.ChunkUpdate{
+		{DS: ds, Chunk: a, T: 20_000, Pixels: coretest.Fill(2)},
+		{DS: ds, Chunk: b, T: 20_000, Pixels: coretest.Fill(2)},
+	}
+	gr, err := s.Apply(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wr, _ := want.Apply(ctx, second)
+	if gr != wr {
+		t.Fatalf("apply after reopen %+v, oracle %+v", gr, wr)
+	}
+	far := core.TimeMs(10 * core.Minute)
+	if err := s.Commit(ctx, far); err != nil {
+		t.Fatal(err)
+	}
+	want.Commit(ctx, far)
+	for _, c := range []core.ChunkCoord{a, b} {
+		tc, blk := c.Tile()
+		gi, gs, err := s.ReadTile(ctx, ds, tc, far, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wi, ws, _ := want.ReadTile(ctx, ds, tc, far, false)
+		if !gi.Equal(wi) || gs != ws {
+			t.Fatalf("tile %v: block %v state %+v, oracle block %v state %+v", tc, gi.Block(blk)[0], gs, wi.Block(blk)[0], ws)
+		}
+	}
+	infos, _ := s.Datastores(ctx)
+	if len(infos) != 1 || infos[0].Horizon != core.Minute*10 {
+		t.Fatalf("datastores %+v", infos)
+	}
 }
