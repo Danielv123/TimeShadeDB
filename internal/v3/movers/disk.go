@@ -19,9 +19,9 @@ import (
 const FormatVersion = 1
 
 var (
-	encOnce sync.Once
-	enc     *zstd.Encoder
-	dec     *zstd.Decoder
+	encOnce  sync.Once
+	enc      *zstd.Encoder
+	dec      *zstd.Decoder
 	codecErr error
 )
 

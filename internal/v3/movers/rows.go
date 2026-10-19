@@ -163,11 +163,23 @@ func buildWindow(sfc core.SurfaceKey, kind core.WindowKind, start, length core.T
 		index int
 	}
 	entries := map[core.MoverMeta]*entry{}
-	for _, r := range rows {
-		e := entries[*r.meta]
+	// byPtr caches the entry per meta pointer: rows share interned pointers, and
+	// hashing a pointer is much cheaper than hashing the strings of a MoverMeta.
+	byPtr := map[*core.MoverMeta]*entry{}
+	lookup := func(p *core.MoverMeta) *entry {
+		if e := byPtr[p]; e != nil {
+			return e
+		}
+		e := entries[*p]
 		if e == nil {
-			entries[*r.meta] = &entry{meta: *r.meta, first: r.t}
-		} else if r.t < e.first {
+			e = &entry{meta: *p, first: math.MaxInt64}
+			entries[*p] = e
+		}
+		byPtr[p] = e
+		return e
+	}
+	for _, r := range rows {
+		if e := lookup(r.meta); r.t < e.first {
 			e.first = r.t
 		}
 	}
@@ -192,7 +204,7 @@ func buildWindow(sfc core.SurfaceKey, kind core.WindowKind, start, length core.T
 	}
 	w.Rows = make([]core.MoverRow, 0, len(rows))
 	for _, r := range rows {
-		w.Rows = append(w.Rows, r.coreRow(entries[*r.meta].index))
+		w.Rows = append(w.Rows, r.coreRow(lookup(r.meta).index))
 	}
 	sort.Slice(w.Rows, func(i, j int) bool {
 		a, b := w.Rows[i], w.Rows[j]

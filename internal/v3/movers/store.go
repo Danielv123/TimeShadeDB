@@ -920,22 +920,26 @@ func (s *surface) liveFromMemory(now core.TimeMs) *core.MoverWindow {
 		rows = append(rows, s.trail[i])
 		inTrail[s.trail[i].meta.ID] = true
 	}
-	// Open rows up to now, deduped (last arrival wins), and the newest per journey.
-	var open []*row
+	// Open rows up to now: the newest per journey, and the trail rows, deduped (for
+	// equal (journey, t) the last arrival wins). One pass; only trail rows are sorted.
+	newest := map[string]*row{}
+	var cand []*row
 	for k := range s.open {
-		if s.open[k].t <= now {
-			open = append(open, &s.open[k])
+		r := &s.open[k]
+		if r.t > now {
+			continue
+		}
+		if cur := newest[r.meta.ID]; cur == nil || r.t > cur.t || (r.t == cur.t && r.seq > cur.seq) {
+			newest[r.meta.ID] = r
+		}
+		if r.t > cut {
+			cand = append(cand, r)
 		}
 	}
-	sortByJourney(open)
-	open = dedupe(open)
-	newest := map[string]*row{}
-	for _, r := range open {
-		if r.t > cut {
-			rows = append(rows, r)
-			inTrail[r.meta.ID] = true
-		}
-		newest[r.meta.ID] = r // sorted by t within a journey
+	sortByJourney(cand)
+	for _, r := range dedupe(cand) {
+		rows = append(rows, r)
+		inTrail[r.meta.ID] = true
 	}
 	for id, r := range s.live {
 		if _, ok := newest[id]; !ok && !inTrail[id] {
