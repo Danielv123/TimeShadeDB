@@ -130,7 +130,9 @@ PLAN.md / STATUS.md, and WP9 should confirm the capture side of the first one.
   uses, so a superseded seek shares the in-flight index instead of caching it as missing.
   There are no timers.
 - **Live.** The first payload and the resync after a reconnect (`hello`) do not count for
-  the delay statistics: their rows piled up while nobody was listening.
+  the delay statistics: their rows piled up while nobody was listening. While the event
+  stream is down (or, without one, polls of `live.bin` fail) the data horizon stays where
+  it broke, so the silence is not read as "still on its line" or as a missed heartbeat.
 
 ## Evaluating
 

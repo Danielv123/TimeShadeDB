@@ -122,7 +122,10 @@ export class MoverFeed {
    */
   horizon(): number {
     if (this.live) {
-      return this.delay.horizon(this.source.now());
+      const h = this.delay.horizon(this.source.now());
+      // While the live feed is down nothing new is known: freeze the horizon where it broke,
+      // so silence is not taken for "still on its line" (or for a missed heartbeat).
+      return Number.isNaN(this.downSince) ? h : Math.min(h, this.delay.horizon(this.downSince));
     }
     return Number.isNaN(this.to) ? -Infinity : this.to;
   }
@@ -191,7 +194,17 @@ export class MoverFeed {
     this.seekT = NaN;
     this.newest = -Infinity;
     this.lastLiveFetch = -Infinity;
+    this.downSince = NaN;
     this.view.clear();
+  }
+
+  /** Data-clock time the live feed broke (event stream error, failed poll), NaN while it works. */
+  private downSince = NaN;
+
+  private markDown(): void {
+    if (Number.isNaN(this.downSince)) {
+      this.downSince = this.source.now();
+    }
   }
 
   private startLive(): void {
@@ -201,7 +214,12 @@ export class MoverFeed {
       const handlers: LiveHandlers = {
         // A resync after a reconnect: its rows piled up during the outage, so their
         // arrival lags say nothing about the steady-state delay (like the first payload).
-        hello: () => void this.fetchLive(gen, false),
+        hello: () => {
+          if (gen === this.gen) {
+            this.downSince = NaN;
+          }
+          void this.fetchLive(gen, false);
+        },
         movers: e => {
           if (gen !== this.gen || e.sfc !== this.sfc) {
             return;
@@ -210,7 +228,12 @@ export class MoverFeed {
           this.view.addLive(e, (t, prevT) => this.see(t, arrived, true, prevT));
           this.events.changed();
         },
-        error: err => this.events.error?.(err),
+        error: err => {
+          if (gen === this.gen) {
+            this.markDown();
+          }
+          this.events.error?.(err);
+        },
       };
       this.unsubscribe = this.source.subscribe({ ds: [], sfc: [this.sfc] }, handlers);
     } else {
@@ -226,11 +249,18 @@ export class MoverFeed {
         return;
       }
       const w = decodeMoverWindow(body);
+      if (!this.source.subscribe) {
+        this.downSince = NaN;
+      }
       const arrived = Math.max(w.start, this.source.now());
       this.view.addWindow(w, (t, prevT) => this.see(t, arrived, count, prevT));
       this.events.changed();
     } catch (err) {
       if (gen === this.gen && !isAbort(err)) {
+        if (!this.source.subscribe) {
+          // A failed poll (the event stream has its own error signal).
+          this.markDown();
+        }
         this.events.error?.(err);
       }
     }
