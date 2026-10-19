@@ -298,7 +298,7 @@ function B.tick(api, cfg, t)
 	local g = storage.t
 	if t == 1 then
 		if api.config then
-			api.config{ forces = { "player" } }
+			api.config{ forces = { "player" }, charts = cfg.chart_reads }
 		end
 		if api.synthetic then
 			local side = math.floor(math.sqrt(cfg.chunks or 50176))
@@ -330,6 +330,9 @@ function B.tick(api, cfg, t)
 			end
 		end
 		api.charted(SURFACE, "player", list)
+	end
+	if t == cfg.resync_tick and api.resync then
+		api.resync("bench")
 	end
 	if t == (cfg.report_tick or 3000) then
 		local res = { stats = api.stats and api.stats(), lua_kb = api.memory and api.memory(), trains = #g.trains }

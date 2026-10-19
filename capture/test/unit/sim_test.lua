@@ -420,3 +420,66 @@ t.test("overlays: tags and recipes; removal through mined events; the rail layer
 	run(capture2, 1, 1)
 	t.expect_eq(#of_type(log2, "rail"), 0, "rails off by default")
 end)
+
+t.test("resync: the walk keeps pace with the reads; the queue stays short with 10,000 charted chunks", function()
+	local capture, world, log = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	for x = 0, 99 do
+		for y = 0, 99 do
+			fake.chart(s, f, x, y, chart(x * 100 + y))
+		end
+	end
+	local core = capture.core
+	capture.resync("big")
+	local peak, ticks = 0, 0
+	for tick = 1, 5000 do
+		game.tick = tick
+		capture.on_tick({ tick = tick })
+		peak = math.max(peak, core.size(capture.terrain.state().debounce.queue))
+		log.msgs, log.lines = {}, {}
+		ticks = tick
+		if not capture.resyncing() then
+			break
+		end
+	end
+	t.expect_true(capture.resyncing() == nil, "finished")
+	t.expect_eq(capture.terrain.state().reads, 10000)
+	t.expect_true(peak <= core.RESYNC_QUEUE + core.RESYNC_CHUNKS, "queue peak " .. peak)
+	t.expect_true(ticks <= 10000 / core.RESYNC_CHARTS + 50, "ticks " .. ticks)
+	print(string.format("    resync of 10,000 chunks: %d ticks, queue peak %d", ticks, peak))
+end)
+
+t.test("terrain: an unchanged re-read at the end of a cool-down skips encode_string; raw charts stay bounded", function()
+	local capture, world, log = boot()
+	local s, f = world.surfaces.nauvis, game.forces.player
+	local core = capture.core
+	-- 50 chunks charted every tick for 6,000 ticks, unchanged
+	for x = 0, 49 do
+		fake.chart(s, f, x, 0, chart(x))
+	end
+	local peak = 0
+	run(capture, 1, 6000, function()
+		for x = 0, 49 do
+			charted(capture, s, x, 0)
+		end
+		local n = 0
+		for _ in pairs(capture.terrain.state().debounce.raw) do
+			n = n + 1
+		end
+		peak = math.max(peak, n)
+	end)
+	local st = capture.terrain.state()
+	t.expect_eq(#of_type(log, "chunk"), 50, "each chunk sent once")
+	t.expect_eq(world.encodes, 50, "encoded once each: the re-reads compared raw charts")
+	t.expect_true(st.skipped >= 400, "re-reads skipped: " .. st.skipped)
+	t.expect_true(peak <= core.CHARTS * core.DEBOUNCE, "raw charts held at most " .. peak)
+	-- a change is still seen
+	fake.chart(s, f, 7, 0, chart(99))
+	run(capture, 6001, 6700, function()
+		charted(capture, s, 7, 0)
+	end)
+	t.expect_eq(#of_type(log, "chunk"), 51, "the changed chunk is sent")
+	-- a quiet chunk's raw chart is dropped when its cool-down ends
+	run(capture, 6701, 8000)
+	t.expect_eq(next(capture.terrain.state().debounce.raw), nil, "no raw chart left")
+end)

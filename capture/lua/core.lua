@@ -19,6 +19,8 @@ core.DEBOUNCE = 600 -- ticks from one read of a chunk to the next (a chunk chart
 core.CACHE = 16384 -- last sent charts kept (deflated); a miss only re-sends an unchanged chart
 core.RESYNC_READS = 64 -- chunk positions the resync walk reads a tick
 core.RESYNC_CHUNKS = 16 -- the walk stops for the tick once this many charted chunks are queued
+core.RESYNC_QUEUE = 64 -- the walk waits while this many chart reads are queued, so the queue stays short
+core.RESYNC_CHARTS = 4 -- chart reads a tick while a resync runs (50,000 chunks in about 210 s)
 core.MACHINES = 8 -- resync machines and rails sent a tick
 
 -- Movers.
@@ -90,9 +92,19 @@ function core.planet(s)
 	return s.planet and s.planet.name
 end
 
---- A chunk's key, per surface and force index.
+-- A chunk's key, per surface and force index, as one number: si * 2^40 + fi * 2^34 + (x + 2^16) * 2^17 + (y + 2^16).
+-- Chunk coordinates stay within +-31,250 (the 1,000,000-tile map limit), so x and y take 17 bits each; forces stay below
+-- 64 (6 bits) and surfaces below 2^13, so the key stays below 2^53 and is exact in Lua 5.2's doubles. A number, not a
+-- string: this runs for every chart event, and making a string costs more than the rest of the handler.
+local K40, K34, K17, K16 = 2 ^ 40, 2 ^ 34, 2 ^ 17, 2 ^ 16
+
 function core.key(si, fi, x, y)
-	return int(si) .. ":" .. int(fi) .. ":" .. int(x) .. "," .. int(y)
+	return si * K40 + fi * K34 + (x + K16) * K17 + (y + K16)
+end
+
+--- The surface index of a key.
+function core.key_surface(key)
+	return math.floor(key / K40)
 end
 
 --- A FIFO: items at [head, tail].
@@ -183,9 +195,13 @@ end
 -- is not queued twice; one charted while cooling is marked dirty and queued when its cool-down ends. The cool-down list
 -- is a FIFO, because every read adds now + DEBOUNCE with now never decreasing, so the state holds at most the chunks read
 -- in the last DEBOUNCE ticks plus the queue (bounded by core.CAP).
+--
+-- raw[key] keeps the raw chart of an event read while its chunk cools down, so the re-read at the end of the cool-down
+-- can skip helpers.encode_string when nothing changed (deflating 2 KiB is most of a read's cost). It is dropped when a
+-- cool-down ends with no new event, so it holds at most core.CHARTS x core.DEBOUNCE charts (2.4 MiB at the defaults).
 
 function core.debounce()
-	return { queue = core.queue(), pending = {}, cool = {}, dirty = {}, due = core.queue(), drops = 0 }
+	return { queue = core.queue(), pending = {}, cool = {}, dirty = {}, due = core.queue(), raw = {}, drops = 0 }
 end
 
 --- An on_chunk_charted for item ({ key, ... }). forced items (resync, deletion) skip the cool-down and the cap.
@@ -247,7 +263,11 @@ function core.cooled(d, now)
 			d.dirty[head.key] = nil
 			if core.charted(d, item) == "queued" then
 				n = n + 1
+			else
+				d.raw[head.key] = nil
 			end
+		else
+			d.raw[head.key] = nil
 		end
 	end
 end

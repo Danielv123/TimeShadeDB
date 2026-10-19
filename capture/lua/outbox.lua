@@ -11,6 +11,7 @@
 local name = ...
 local P = type(name) == "string" and name:match("^(.*[./])[^./]*$") or ""
 local core = require(P .. "core")
+local json = require(P .. "json")
 
 local outbox = {}
 
@@ -19,9 +20,13 @@ local queue, moves, oversize, lines_out, bytes_out = {}, {}, 0, 0, 0
 --- sink(line, tick): where each line goes. The host sets it before the first flush.
 outbox.sink = function(_) end
 
---- encode(table) -> JSON text. helpers.table_to_json in the game; the unit tests set their own.
+--- encode(table) -> JSON text: json.lua, with its fast path for move messages (helpers.table_to_json does the same
+--- several times slower).
 outbox.encode = function(msg)
-	return helpers.table_to_json(msg)
+	if msg.type == "move" then
+		return json.encode_move(msg)
+	end
+	return json.encode(msg)
 end
 
 --- Queue one message for this tick's flush. Samples queued after it start a new move message, so every message keeps

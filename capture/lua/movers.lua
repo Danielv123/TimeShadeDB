@@ -55,11 +55,13 @@ local function hex(e)
 		math.floor(c.b * 255 + 0.5))
 end
 
---- Train tr's carriage kinds from its front (upper case when the carriage faces the front) and the colours of its first
---- locomotive from the front and from the back, into mover m.
+--- Train tr's carriage kinds from its front (upper case when the carriage faces the front), the colours of its first
+--- locomotive from the front and from the back, and what each end's carriage is (name, facing) and the force, into
+--- mover m. Read again whenever the train changes (core.claim clears m.o), so a read needs no carriage list.
 local function shape(m, tr)
 	local kinds, first, last = {}, nil, nil
-	for i, c in ipairs(tr.carriages) do
+	local cars = tr.carriages
+	for i, c in ipairs(cars) do
 		if i <= core.KINDS_MAX then
 			local k = KINDS[c.type] or "C"
 			kinds[i] = c.is_headed_to_trains_front and k or k:lower()
@@ -69,6 +71,10 @@ local function shape(m, tr)
 		end
 	end
 	m.o, m.cf, m.cb = table.concat(kinds), first and hex(first), last and hex(last)
+	local f, b = cars[1], cars[#cars]
+	m.ef, m.eb = f, b
+	m.nf, m.nb, m.hf, m.hb = f.name, b.name, f.is_headed_to_trains_front, b.is_headed_to_trains_front
+	m.force, m.n = f.force.name, #cars
 end
 
 --- Every carriage from the leading end as { x, y, orientation }, at most core.CAR_MAX.
@@ -104,24 +110,36 @@ function movers.gone(st, j)
 	core.forget(st, j)
 end
 
---- What a train looks like now: its leading end (front_stock while running forwards), position, surface, heading.
+--- What a train looks like now: its leading carriage (front_stock while running forwards), position, surface and
+--- heading: that carriage's orientation in the direction of travel (half a turn on when it faces the other way).
+--- m must be shaped.
 local function train_view(m, r, fwd)
-	local e = fwd and r.front_stock or r.back_stock
-	local pos = e.position
-	local cars = r.carriages
-	local second = cars[fwd and 2 or #cars - 1]
-	local sp = second and second.position
-	local h = core.heading(pos.x, pos.y, sp and sp.x, sp and sp.y, e.orientation, not fwd)
-	return e, pos, e.surface_index, h
+	local e = fwd and m.ef or m.eb
+	local headed = fwd and m.hf or m.hb
+	local h = core.round(e.orientation + ((headed == fwd) and 0 or 0.5), 3) % 1
+	return e, e.position, e.surface_index, h
 end
 
---- The fields every sample of mover m carries, from its source entity src and leading end.
+--- The fields every sample of mover m carries. Trains take the leading carriage's name and the force from the shape;
+--- vehicles and players read them from src.
 local function sample(j, m, src, x, y, h, fwd)
 	local o, c = m.o, m.cf
-	if m.kind == "t" and not fwd and o then
-		o, c = core.flip_kinds(o), m.cb
+	if m.kind == "t" then
+		local name = m.nf
+		if not fwd then
+			o, c, name = o and core.flip_kinds(o), m.cb, m.nb
+		end
+		return { j = j, k = "t", f = m.force, name = name, x = x, y = y, h = h, n = m.n, o = o, c = c }
 	end
 	return { j = j, k = m.kind, f = src.force.name, name = src.name, x = x, y = y, h = h, n = m.n, o = o, c = c }
+end
+
+--- The name of surface index si for mover m, read only when it changes.
+local function surface_name(m, si)
+	if m.ssi ~= si or not m.s then
+		m.s, m.ssi = game.get_surface(si).name, si
+	end
+	return m.s
 end
 
 --- One poll of journey j. A train reads its leading end, a vehicle its position, a player its physical controller. A
@@ -140,7 +158,7 @@ local function poll(st, j, t, how)
 	if m.kind == "t" then
 		local speed = r.speed
 		local fwd = core.forward(m.fwd, speed)
-		if not m.o then
+		if not m.o or not (m.ef.valid and m.eb.valid) then
 			shape(m, r)
 		end
 		-- a moving train is read again when it has gone core.STEP tiles; at rest it leaves the wheel
@@ -160,7 +178,7 @@ local function poll(st, j, t, how)
 		if #emits == 0 then
 			return 0
 		end
-		m.s = game.get_surface(si).name
+		surface_name(m, si)
 		for _, emit in ipairs(emits) do
 			local v = emit.read
 			local s = sample(j, m, e, v.x, v.y, v.h, v.fwd)
@@ -194,7 +212,7 @@ local function poll(st, j, t, how)
 	if not core.poll(m, pos.x, pos.y, si, t, how) then
 		return 0
 	end
-	m.s = game.get_surface(si).name
+	surface_name(m, si)
 	local s = sample(j, m, src, pos.x, pos.y, h, true)
 	if m.kind == "p" then
 		s.name, s.f = r.name, r.force.name
@@ -324,16 +342,11 @@ function movers.resync(st, t)
 			local s
 			if m.kind == "t" then
 				local fwd = core.forward(m.fwd, r.speed)
-				local e, pos, si, h = train_view(m, r, fwd)
-				if m.o then
-					s = sample(j, m, e, pos.x, pos.y, h, fwd)
-				else
-					-- kinds not read yet: read them into a copy, so the mover itself is left as it is
-					local tmp = { kind = "t", n = #r.carriages }
-					shape(tmp, r)
-					s = sample(j, tmp, e, pos.x, pos.y, h, fwd)
-				end
-				s.n = #r.carriages
+				-- shaped into a copy, so the mover itself is left as it is
+				local tmp = { kind = "t" }
+				shape(tmp, r)
+				local e, pos, si, h = train_view(tmp, r, fwd)
+				s = sample(j, tmp, e, pos.x, pos.y, h, fwd)
 				s.car = car_list(r, fwd)
 				s.stop = r.speed == 0 or nil
 				s.surface = game.get_surface(si).name

@@ -25,7 +25,7 @@ local host = {}
 local resync = nil -- the running resync: { trace, chunks, movers, tags, machines, rails?, chunks_done }
 
 -- Tunables a config may set. Only output-side ones: the mover rules stay fixed, so every peer runs the same ones.
-local TUNABLES = { debounce = "DEBOUNCE", charts = "CHARTS", cache = "CACHE" }
+local TUNABLES = { debounce = "DEBOUNCE", charts = "CHARTS", cache = "CACHE", resync_charts = "RESYNC_CHARTS" }
 
 local function apply(cfg)
 	for key, const in pairs(TUNABLES) do
@@ -84,7 +84,8 @@ local function names(v)
 	return true
 end
 
---- Configure the capture and start it. c: { tile?, rails?, forces?, debounce?, charts?, cache? }. tile is gridworld's
+--- Configure the capture and start it. c: { tile?, rails?, forces?, debounce?, charts?, cache?, resync_charts? }.
+--- tile is gridworld's
 --- { world, x, y, size, surface, exclude? }; forces names forces captured without a player; rails turns on the rail
 --- layer. Every field read is checked; a bad one raises. Writes storage: run it on every peer.
 function capture.config(c)
@@ -100,7 +101,7 @@ function capture.config(c)
 		extra[n] = true
 	end
 	st.extra_forces = extra
-	st.cfg = { debounce = c.debounce, charts = c.charts, cache = c.cache }
+	st.cfg = { debounce = c.debounce, charts = c.charts, cache = c.cache, resync_charts = c.resync_charts }
 	st.rails = c.rails and true or false
 	apply(st.cfg)
 	terrain.refresh_forces(st)
@@ -194,7 +195,12 @@ function capture.build_events()
 	on({ "on_surface_created" }, function(e)
 		terrain.on_surface_created(storage.timeshade, e)
 	end)
-	on({ "on_surface_deleted" }, terrain.on_surface_deleted)
+	on({ "on_surface_deleted" }, function(e)
+		terrain.on_surface_deleted(e)
+	end)
+	on({ "on_surface_renamed", "on_surface_imported" }, function()
+		terrain.forget_surfaces()
+	end)
 	on({ "on_player_created", "on_player_changed_force", "on_player_removed", "on_forces_merged" }, function()
 		terrain.refresh_forces(storage.timeshade)
 	end)
@@ -239,7 +245,12 @@ function capture.stats()
 	for _ in pairs(st and st.movers or {}) do
 		nm = nm + 1
 	end
-	return { reads = t.reads, sent = t.sent, queued = core.size(t.debounce.queue), drops = t.debounce.drops,
+	local raw = 0
+	for _ in pairs(t.debounce.raw) do
+		raw = raw + 1
+	end
+	return { reads = t.reads, sent = t.sent, skipped = t.skipped, raw = raw, queued = core.size(t.debounce.queue),
+		drops = t.debounce.drops,
 		cached = core.cache_count(t.cache), lines = lines, bytes = bytes, oversize = outbox.oversize(), movers = nm,
 		resyncing = resync and resync.trace or nil }
 end

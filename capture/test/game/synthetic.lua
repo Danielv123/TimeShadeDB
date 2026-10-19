@@ -2,19 +2,47 @@
 -- syntheticChart in capture/test/run_game.mjs, which checks every chunk message the capture wrote.
 local synthetic = {}
 
---- A 2,048-byte RGB565 LE chart for chunk (x, y) at phase p: a base colour per chunk with a stripe every 4th row whose
---- colour depends on p.
-function synthetic.chart(x, y, p)
-	local base = ((x * 31 + y * 17) % 2048) * 32 + 7
-	local alt = (base + 0x0841 * (1 + p % 3)) % 65536
-	local b1, b2 = string.char(base % 256, math.floor(base / 256)), string.char(alt % 256, math.floor(alt / 256))
-	local row1 = string.rep(b1, 24) .. string.rep(b2, 8)
-	local row2 = string.rep(b1, 32)
-	local rows = {}
-	for r = 1, 32 do
-		rows[r] = (r % 4 == 0) and row1 or row2
+local M = 2147483647 -- the Park-Miller generator: products stay below 2^53, exact in doubles (Lua 5.2) and in JS
+
+local VARIANTS = 509 -- distinct charts; a chunk's chart is variant (x * 31 + y * 17 + p * 7) % VARIANTS
+local variants = {}
+
+--- Variant v: runs of 1 to 12 pixels in one of 6 colours of a palette, from a generator seeded by v. It deflates to
+--- several hundred bytes, like a real chart.
+local function build(v)
+	local seed = v * 7919 % (M - 1) + 1
+	local base = (v * 97 % 2048) * 32 + 7
+	local palette = {}
+	for i = 1, 6 do
+		local c = (base + (i - 1) * 0x0841) % 65536
+		palette[i] = string.char(c % 256, math.floor(c / 256))
 	end
-	return table.concat(rows)
+	local px, n = {}, 0
+	while n < 1024 do
+		seed = seed * 16807 % M
+		local run = 1 + seed % 12
+		seed = seed * 16807 % M
+		local col = palette[1 + seed % 6]
+		for _ = 1, run do
+			if n < 1024 then
+				n = n + 1
+				px[n] = col
+			end
+		end
+	end
+	return table.concat(px)
+end
+
+--- The 2,048-byte RGB565 LE chart of chunk (x, y) at phase p. The variants are built once, so the seam costs about
+--- what the native get_chunk_chart does (a table lookup instead of a copy).
+function synthetic.chart(x, y, p)
+	local v = (x * 31 + y * 17 + p * 7) % VARIANTS
+	local c = variants[v]
+	if not c then
+		c = build(v)
+		variants[v] = c
+	end
+	return c
 end
 
 --- spec = { surface, x1, y1, x2, y2, flicker = { ["x,y"] = ticks per phase } }: chunks [x1, x2) x [y1, y2) of the

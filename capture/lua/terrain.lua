@@ -19,7 +19,7 @@ local terrain = {}
 local deb = core.debounce()
 local cache = core.cache(core.CACHE)
 local walk = nil -- the running resync's walk, see terrain.resync
-local reads, sent = 0, 0
+local reads, sent, skipped = 0, 0, 0
 
 --- seam(force, surface, position) -> chart or nil, or nil for the engine. Headless servers never chart, so the game
 --- tests stand it in for get_chunk_chart and is_chunk_charted.
@@ -48,7 +48,7 @@ end
 
 --- The file-local state, for tests and the stats command.
 function terrain.state()
-	return { debounce = deb, cache = cache, walk = walk, reads = reads, sent = sent }
+	return { debounce = deb, cache = cache, walk = walk, reads = reads, sent = sent, skipped = skipped }
 end
 
 --- Only forces with a player are captured (plus any the host names: the standalone mod's setting, the test seam). Read
@@ -73,11 +73,12 @@ end
 
 --- A deleted surface's index can be reused, so the next surface must not inherit its last-sent charts.
 function terrain.on_surface_deleted(e)
-	local prefix = string.format("%d:", e.surface_index)
+	surface_info = {}
+	local si = e.surface_index
 	for _, gen in ipairs({ cache.young, cache.old }) do
 		local keys = {}
 		for key in pairs(gen) do
-			if key:sub(1, #prefix) == prefix then
+			if core.key_surface(key) == si then
 				keys[#keys + 1] = key
 			end
 		end
@@ -87,19 +88,45 @@ function terrain.on_surface_deleted(e)
 	end
 end
 
+-- Surface names and planets by index, for the clip (only read with a gridworld tile). Cleared whenever a surface is
+-- created, deleted, renamed or imported.
+local surface_info = {}
+
+function terrain.forget_surfaces()
+	surface_info = {}
+end
+
 --- on_chunk_charted: a captured chunk of a captured force joins the queue through the debounce. A forced push (a
---- deletion, a resync) skips the debounce and the cap.
+--- deletion, a resync) skips the debounce and the cap. This runs for every chart refresh of every chunk, so it touches
+--- the game as little as it can: the force index, and the surface only when a gridworld tile clips.
 function terrain.on_chunk_charted(st, e, forced)
-	if not (st and st.configured and st.forces[e.force.index]) then
-		return
-	end
-	local p, s = e.position, game.get_surface(e.surface_index)
-	if not (s and core.captured(st.tile, st.bounds, s.name, p.x, p.y, core.planet(s))) then
+	if not (st and st.configured) then
 		return
 	end
 	local fi = e.force.index
-	core.charted(deb, { key = core.key(e.surface_index, fi, p.x, p.y), si = e.surface_index, fi = fi, x = p.x, y = p.y,
-		forced = forced }, forced)
+	if not st.forces[fi] then
+		return
+	end
+	local p, si = e.position, e.surface_index
+	if st.tile then
+		local info = surface_info[si]
+		if not info then
+			local s = game.get_surface(si)
+			if not s then
+				return
+			end
+			info = { name = s.name, planet = core.planet(s) }
+			surface_info[si] = info
+		end
+		if not core.captured(st.tile, st.bounds, info.name, p.x, p.y, info.planet) then
+			return
+		end
+	end
+	local key = core.key(si, fi, p.x, p.y)
+	if not forced and deb.pending[key] then
+		return
+	end
+	core.charted(deb, { key = key, si = si, fi = fi, x = p.x, y = p.y, forced = forced }, forced)
 end
 
 --- A deleted chunk is read again for each captured force, and its nil chart sends a chunk message without d. Forced:
@@ -124,8 +151,19 @@ local function read(st, item, r)
 	local pos = { x = item.x, y = item.y }
 	local chart = chart_of(force, surface, pos)
 	reads = reads + 1
-	if item.forced and r then
-		overlays.chunk_resync(st, surface, force, pos, r)
+	if item.forced then
+		deb.raw[item.key] = nil
+		if r then
+			overlays.chunk_resync(st, surface, force, pos, r)
+		end
+	else
+		-- the same raw chart as this chunk's last event read: unchanged, nothing to encode
+		local raw = deb.raw[item.key]
+		deb.raw[item.key] = chart
+		if raw ~= nil and raw == chart then
+			skipped = skipped + 1
+			return
+		end
 	end
 	local d = chart and helpers.encode_string(chart) or false
 	if not item.forced and core.cache_get(cache, item.key) == d then
@@ -136,12 +174,13 @@ local function read(st, item, r)
 	outbox.send{ type = "chunk", s = surface.name, f = force.name, x = item.x, y = item.y, d = d or nil }
 end
 
---- The per-tick step: end due cool-downs, then read up to core.CHARTS queued chunks. The resync's sentinel marks its
---- chunks done. Returns the number of reads.
+--- The per-tick step: end due cool-downs, then read up to core.CHARTS queued chunks (core.RESYNC_CHARTS while a resync
+--- runs). The resync's sentinel marks its chunks done. Returns the number of reads.
 function terrain.step(st, tick, r)
 	core.cooled(deb, tick)
 	local n = 0
-	while n < core.CHARTS do
+	local limit = r and math.max(core.CHARTS, core.RESYNC_CHARTS) or core.CHARTS
+	while n < limit do
 		local item = core.take(deb, tick)
 		if not item then
 			break
@@ -173,6 +212,7 @@ end
 
 --- A surface made mid-game is listed before its first chunk, in a surfaces message of its own flagged created.
 function terrain.on_surface_created(st, e)
+	surface_info = {}
 	local s = game.get_surface(e.surface_index)
 	if st and st.configured and s then
 		outbox.send{ type = "surfaces", list = { { name = s.name, tile = core.tiled(st.tile, s.name, core.planet(s)) } },
@@ -191,11 +231,15 @@ function terrain.resync(st, r)
 end
 
 --- Advance the walk: at most core.RESYNC_READS chunk positions a tick, stopping once core.RESYNC_CHUNKS charted chunks
---- are queued. Each surface is walked with its own get_chunks() iterator, kept across ticks.
+--- are queued, and not at all while core.RESYNC_QUEUE reads wait. Each surface is walked with its own get_chunks()
+--- iterator, kept across ticks.
 function terrain.walk(st, r)
 	local w = walk
 	if not (w and r and w.trace == r.trace) then
 		return
+	end
+	if core.size(deb.queue) >= core.RESYNC_QUEUE then
+		return -- the reads catch up first: a walk ahead of them would only grow the queue
 	end
 	local positions, pushed = 0, 0
 	while positions < core.RESYNC_READS and pushed < core.RESYNC_CHUNKS do
@@ -239,7 +283,7 @@ end
 
 --- Forget the file-local state (tests).
 function terrain.reset()
-	deb, cache, walk, reads, sent = core.debounce(), core.cache(core.CACHE), nil, 0, 0
+	deb, cache, walk, reads, sent, skipped = core.debounce(), core.cache(core.CACHE), nil, 0, 0, 0
 end
 
 return terrain

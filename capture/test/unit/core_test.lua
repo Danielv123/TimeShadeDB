@@ -51,10 +51,16 @@ t.test("bounds and the clip: [x1, x2) per axis in chunks, only on the tile's sur
 	t.expect_true(core.captured(nil, nil, "nauvis", 1000000, -1000000), "no config: no clipping")
 end)
 
-t.test("chunk keys differ per surface and force, and print integers on any Lua", function()
-	t.expect_eq(core.key(1, 1, -3, 4), "1:1:-3,4")
-	t.expect_eq(core.key(2.0, 1.0, 64 / 2, -1.0), "2:1:32,-1", "floats with integer values")
-	t.expect_true(core.key(1, 1, 1, 23) ~= core.key(1, 1, 12, 3), "no digit run-together")
+t.test("chunk keys differ per surface and force", function()
+	local seen = {}
+	for _, k in ipairs({ { 1, 1, -3, 4 }, { 1, 1, 4, -3 }, { 2, 1, -3, 4 }, { 1, 2, -3, 4 }, { 1, 1, 31250, -31250 },
+		{ 1, 1, -31250, 31250 }, { 8191, 63, 31250, 31250 }, { 1, 1, 1, 23 }, { 1, 1, 12, 3 } }) do
+		local key = core.key(k[1], k[2], k[3], k[4])
+		t.expect_true(not seen[key], "distinct: " .. table.concat(k, ","))
+		seen[key] = true
+		t.expect_eq(core.key_surface(key), k[1], "the surface back from the key")
+		t.expect_true(key < 2 ^ 53, "exact in a double")
+	end
 end)
 
 t.test("the FIFO: order kept; the cap refuses event pushes; a push without a cap passes it", function()

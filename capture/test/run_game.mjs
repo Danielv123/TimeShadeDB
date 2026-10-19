@@ -144,13 +144,24 @@ function buildCapture(out) {
 
 // Mirrors capture/test/game/synthetic.lua.
 function syntheticChart(x, y, p) {
-	const base = (((x * 31 + y * 17) % 2048 + 2048) % 2048) * 32 + 7;
-	const alt = (base + 0x0841 * (1 + p % 3)) % 65536;
+	const M = 2147483647;
+	const v = (((x * 31 + y * 17 + p * 7) % 509) + 509) % 509;
+	let seed = v * 7919 % (M - 1) + 1;
+	const base = (v * 97 % 2048) * 32 + 7;
+	const palette = [];
+	for (let i = 1; i <= 6; i++) {
+		palette.push((base + (i - 1) * 0x0841) % 65536);
+	}
 	const buf = Buffer.alloc(2048);
-	for (let r = 1; r <= 32; r++) {
-		for (let c = 0; c < 32; c++) {
-			const v = (r % 4 === 0 && c >= 24) ? alt : base;
-			buf.writeUInt16LE(v, ((r - 1) * 32 + c) * 2);
+	let n = 0;
+	while (n < 1024) {
+		seed = seed * 16807 % M;
+		const run = 1 + seed % 12;
+		seed = seed * 16807 % M;
+		const col = palette[seed % 6];
+		for (let k = 0; k < run && n < 1024; k++) {
+			buf.writeUInt16LE(col, 2 * n);
+			n++;
 		}
 	}
 	return buf;
@@ -441,24 +452,22 @@ function runClusterio() {
 	check(start, "clusterio: the start resync finished");
 }
 
+/** Rows of every run in a --benchmark-verbose output (one header per run). */
 function parseVerbose(stdout) {
 	const lines = stdout.split(/\r?\n/);
-	const h = lines.findIndex(l => l.startsWith("tick,timestamp,wholeUpdate"));
-	if (h < 0) {
-		return null;
-	}
-	const cols = lines[h].split(",");
-	const idx = (n) => cols.indexOf(n);
 	const rows = [];
-	for (const l of lines.slice(h + 1)) {
-		if (!/^t\d+,/.test(l)) {
-			break;
+	let idx = null;
+	for (const l of lines) {
+		if (l.startsWith("tick,timestamp,wholeUpdate")) {
+			const cols = l.split(",");
+			idx = (n) => cols.indexOf(n);
+		} else if (idx && /^t\d+,/.test(l)) {
+			const v = l.split(",");
+			rows.push({ tick: Number(v[0].slice(1)), whole: Number(v[idx("wholeUpdate")]),
+				script: Number(v[idx("scriptUpdate")]), gc: Number(v[idx("luaGarbageIncremental")]) });
 		}
-		const v = l.split(",");
-		rows.push({ tick: Number(v[0].slice(1)), whole: Number(v[idx("wholeUpdate")]), script: Number(v[idx("scriptUpdate")]),
-			gc: Number(v[idx("luaGarbageIncremental")]) });
 	}
-	return rows;
+	return rows.length ? rows : null;
 }
 
 function stats(values) {
@@ -470,11 +479,16 @@ function stats(values) {
 
 function runBench() {
 	const trains = Number(option("--trains", 100));
-	const ticks = Number(option("--bench-ticks", 4200));
+	const ticks = Number(option("--bench-ticks", 4800));
 	const warm = 600;
-	console.log(`== bench: ${trains} moving trains, 50,176 virtual charted chunks, ${ticks} ticks (first ${warm} skipped)`);
+	// steady state from warm to resyncTick, then a resync over the generated chunks (about 1,800) to the end
+	const resyncTick = ticks - 1200;
+	console.log(`== bench: ${trains} moving trains, 50,176 virtual charted chunks, ${ticks} ticks (first ${warm} skipped), `
+		+ `a resync at ${resyncTick}`);
 	const build = buildCapture(path.join(root, "build-bench"));
-	const cfg = { mode: "bench", trains, chunks: 50176, charted: Number(option("--charted", 20)), report_tick: ticks - 10 };
+	const cfg = { mode: "bench", trains, chunks: 50176, charted: Number(option("--charted", 20)), report_tick: ticks - 10,
+		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, micro: flag("--micro") ? 700 : false,
+		chart_reads: Number(option("--chart-reads", 2)) };
 	const box = sandbox("bench", {
 		timeshade_capture: (dst) => copyTree(build.modDir, dst),
 		timeshade_capture_testdriver: (dst) => {
@@ -489,28 +503,45 @@ function runBench() {
 	run(box, ["--create", save], "create");
 	const runs = Number(option("--runs", 3));
 	const result = {};
-	for (const [label, enabled] of [["without", false], ["with", true]]) {
-		setEnabled(box, "timeshade_capture", enabled);
-		const per = [];
-		for (let r = 0; r < runs; r++) {
+	// interleaved (without, with, without, with, ...) so a burst of load on the machine hits both alike
+	const per = { without: [], with: [] };
+	for (let r = 0; r < runs; r++) {
+		for (const [label, enabled] of [["without", false], ["with", true]]) {
+			setEnabled(box, "timeshade_capture", enabled);
 			const res = run(box, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
 				`bench-${label}-${r}`);
+			if (enabled && r === 0) {
+				for (const m of res.stdout.matchAll(/TSTEST (?:prof|micro) (.*)/g)) {
+					note(`bench profile (ticks 1-${resyncTick - 1}): ${m[1].trim()}`);
+				}
+			}
 			const rows = parseVerbose(res.stdout);
 			if (!check(rows && rows.length > warm, `bench ${label}: verbose timings parsed`)) {
 				return;
 			}
-			per.push(...rows.filter(x => x.tick >= warm));
+			per[label].push(...rows.filter(x => x.tick >= warm));
 		}
+	}
+	for (const label of ["without", "with"]) {
+		const steady = per[label].filter(x => x.tick < resyncTick);
+		const resync = per[label].filter(x => x.tick >= resyncTick && x.tick < resyncTick + 400);
 		result[label] = {
-			lua: stats(per.map(x => (x.script + x.gc) / 1e6)),
-			whole: stats(per.map(x => x.whole / 1e6)),
+			lua: stats(steady.map(x => (x.script + x.gc) / 1e6)),
+			script: stats(steady.map(x => x.script / 1e6)),
+			gc: stats(steady.map(x => x.gc / 1e6)),
+			whole: stats(steady.map(x => x.whole / 1e6)),
+			resyncLua: stats(resync.map(x => (x.script + x.gc) / 1e6)),
 		};
 	}
 	const benchJson = path.join(box.write, "script-output", "timeshade-test", "bench.json");
 	const fmt = (s) => `mean ${s.mean.toFixed(4)} ms, p50 ${s.p50.toFixed(4)}, p99 ${s.p99.toFixed(4)}, max ${s.max.toFixed(3)}`;
 	note(`bench without capture: Lua ${fmt(result.without.lua)}; whole tick ${fmt(result.without.whole)}`);
 	note(`bench with capture:    Lua ${fmt(result.with.lua)}; whole tick ${fmt(result.with.whole)}`);
+	note(`bench: scriptUpdate mean ${result.without.script.mean.toFixed(4)} -> ${result.with.script.mean.toFixed(4)} ms, `
+		+ `luaGarbageIncremental mean ${result.without.gc.mean.toFixed(4)} -> ${result.with.gc.mean.toFixed(4)} ms`);
 	const delta = result.with.lua.mean - result.without.lua.mean;
+	const deltaP50 = result.with.lua.p50 - result.without.lua.p50;
+	note(`bench: capture costs ${deltaP50.toFixed(4)} ms/tick of Lua time by the medians`);
 	const deltaWhole = result.with.whole.mean - result.without.whole.mean;
 	note(`bench: capture costs ${delta.toFixed(4)} ms/tick of Lua time (scriptUpdate + luaGarbageIncremental, mean), `
 		+ `${deltaWhole.toFixed(4)} ms/tick of the whole tick; budget 0.3 ms`);
@@ -520,6 +551,9 @@ function runBench() {
 	const files = fs.readdirSync(path.join(box.write, "script-output", "timeshade")).sort();
 	const bytes = files.reduce((n, f) => n + fs.statSync(path.join(box.write, "script-output", "timeshade", f)).size, 0);
 	note(`bench: ${files.length} files, ${(bytes / runs / (ticks / 60)).toFixed(0)} bytes per game second written`);
+	const deltaResync = result.with.resyncLua.mean - result.without.resyncLua.mean;
+	note(`bench: during a resync (400 ticks from tick ${resyncTick}): Lua ${fmt(result.with.resyncLua)} with, `
+		+ `${fmt(result.without.resyncLua)} without; capture costs ${deltaResync.toFixed(4)} ms/tick`);
 	check(delta <= 0.3, `bench: capture Lua cost ${delta.toFixed(4)} ms/tick within the 0.3 ms budget`);
 }
 
