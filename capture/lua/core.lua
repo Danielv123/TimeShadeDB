@@ -534,7 +534,7 @@ function core.claim(st, j, kind, key, ref, n, register)
 		index(st, m.kind)[m.key] = nil
 	end
 	-- the train's kinds and colours are read again at its next sample; its geometry changed, so that sample carries car
-	m.ref, m.key, m.n, m.o = ref, key, n, nil
+	m.ref, m.key, m.n, m.o, m.ob = ref, key, n, nil, nil
 	m.reshape = true
 	m.reg = register(ref)
 	st.reg[m.reg] = j

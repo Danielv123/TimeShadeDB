@@ -71,6 +71,7 @@ local function shape(m, tr)
 		end
 	end
 	m.o, m.cf, m.cb = table.concat(kinds), first and hex(first), last and hex(last)
+	m.ob = core.flip_kinds(m.o) -- the kinds read from the back end, for samples while it leads
 	local f, b = cars[1], cars[#cars]
 	m.ef, m.eb = f, b
 	-- the carriage behind each end, for the heading (nil for a single carriage)
@@ -139,7 +140,7 @@ local function sample(j, m, src, x, y, h, fwd)
 	if m.kind == "t" then
 		local name = m.nf
 		if not fwd then
-			o, c, name = o and core.flip_kinds(o), m.cb, m.nb
+			o, c, name = m.ob or (o and core.flip_kinds(o)), m.cb, m.nb
 		end
 		return { j = j, k = "t", f = m.force, name = name, x = x, y = y, h = h, n = m.n, o = o, c = c }
 	end
@@ -169,7 +170,12 @@ local function poll(st, j, t, how)
 	end
 	if m.kind == "t" then
 		local speed = r.speed
-		local fwd = core.forward(m.fwd, speed)
+		local fwd -- core.forward, inlined: this runs for every train read
+		if speed ~= 0 then
+			fwd = speed > 0
+		else
+			fwd = m.fwd ~= false
+		end
 		if not (m.o and m.ef and m.ef.valid and m.eb and m.eb.valid and (m.sf == nil or m.sf.valid)) then
 			shape(m, r)
 		end
