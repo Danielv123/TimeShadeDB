@@ -1,0 +1,14 @@
+{
+  "name": "timeshadedb-bench-trains",
+  "private": true,
+  "type": "module",
+  "description": "Train rendering evaluator (PLAN.md section 4.8 and 5): leave-one-out error, carriage distance to rail pixels, frame-to-frame jumps.",
+  "scripts": {
+    "build": "node build.mjs",
+    "eval": "node build.mjs && node dist/eval.mjs",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}

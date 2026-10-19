@@ -39,6 +39,7 @@ func main() {
 	slices := flag.Int("slices", 10, "row slices for the flatness measurement")
 	hours := flag.Float64("hours", 0, "override the time span (hours) used for B/chunk-hour")
 	restarts := flag.Int("restarts", 3, "restart the server this many times after ingest to measure startup (0: skip)")
+	shift := flag.Int64("time-shift-ms", 0, "add this to every input row time (replay the same data later, to grow a history)")
 	settle := flag.Duration("settle", 2*time.Second, "wait after ingest before measuring disk and memory (lets windows flush)")
 	flag.Parse()
 
@@ -80,6 +81,12 @@ func main() {
 		chunkRows, err = benchlib.ReadAllTSV(paths, *surface)
 		if err != nil {
 			benchlib.Fatal(err)
+		}
+		if *shift != 0 {
+			for i := range chunkRows {
+				chunkRows[i].T += *shift
+			}
+			res.Param("time_shift_ms", *shift)
 		}
 		totalChunks = len(chunkRows)
 	} else {

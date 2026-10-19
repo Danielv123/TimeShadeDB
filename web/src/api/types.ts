@@ -405,8 +405,33 @@ export interface TsdbPerf {
   reset(): void;
 }
 
+/**
+ * Control surface the viewer exposes as window.__tsdbControl, so the WP11 Playwright suite
+ * (bench/web/run.mjs) can drive zoom, scrub and timelapse the same way in every viewer.
+ * Calls behave as the matching user action; each paint they cause is reported through
+ * __tsdbPerf (view.fallback / view.full).
+ */
+export interface TsdbControl {
+  /** True once the catalog is loaded and a datastore is selected. */
+  ready(): boolean;
+  /** Centre in world tiles and scale in world tiles per CSS pixel (1 = z0, 16 = z-4). */
+  setView(x: number, y: number, s: number): void;
+  view(): { x: number; y: number; s: number; width: number; height: number };
+  /** Show map-clock time t, or live with undefined. Records a time.change event. */
+  seek(t?: TimeMs): void;
+  /** Timelapse speed in data ms per browser ms (3600 = 1 h/s); 0 pauses. */
+  play(speed: number): void;
+  /** The time shown. */
+  time(): TimeMs;
+  /** [first, end] time of the selected datastore, as the time slider spans it. */
+  range(): [TimeMs, TimeMs];
+  /** World-tile box [x0, y0, x1, y1] of the selected datastore's data. */
+  surfaceBounds(): [number, number, number, number];
+}
+
 declare global {
   interface Window {
     __tsdbPerf?: TsdbPerf;
+    __tsdbControl?: TsdbControl;
   }
 }
