@@ -78,6 +78,7 @@ func init() {
 | `import-minimap` | `cmd_import_minimap.go` | WP5 |
 | `migrate-v3` | `cmd_migrate.go` | WP1 |
 | `publish` | `cmd_publish.go` | WP12 |
+| `publish-serve` (serves a `publish --dir` export for testing) | `cmd_publish.go` | WP12 |
 
 The legacy commands (`serve`, `import-csv`, `tail-chunk-tsv`, ...) stay in
 `cmd_legacy.go` until v3 replaces them (decision D11).

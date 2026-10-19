@@ -76,6 +76,20 @@ It listens on loopback by default; any other address needs `--ingest-token`. A s
 game with the `timeshade_capture` mod is forwarded with
 `timeshadedb tail --dir <factorio>/script-output/timeshade --map <key> --url http://127.0.0.1:8080`.
 
+## Publishing a static map
+
+`timeshadedb publish` exports a v3 database as static files (the API subset of
+`docs/v3/API.md` section 6 plus the viewer) to a directory or an S3/R2 bucket, storing each
+immutable file once and mutable files only when they change:
+
+```powershell
+timeshadedb publish --db v3db --dir C:\www\map
+timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-bucket map --state publish-state
+```
+
+See `internal/v3/publish/README.md` for the flags, the tile versions it exports and the
+durable upload queue.
+
 ## Factorio export
 
 The `timeshadedb_exporter` mod writes Factorio export files under
