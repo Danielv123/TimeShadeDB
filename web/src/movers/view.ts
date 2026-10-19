@@ -1,7 +1,9 @@
 // The movers of one surface at a displayed time: tracks fed from MVW3 windows, keyframes,
 // live payloads and live events, evaluated per frame into drawable movers (head, heading,
 // a train's carriages). A frame never snaps: when new data changes where a drawn mover or
-// any of its carriages would have been, the difference is blended out over CORRECTION_MS.
+// any of its carriages would have been, the difference is blended out over CORRECTION_MS, or
+// longer for a large difference so the blend never moves a mover faster than
+// CORRECTION_RATE on top of its own motion.
 //
 // DOM-free; the mover layer draws what `frame` returns.
 
@@ -25,8 +27,12 @@ import {
   placeCarriages,
 } from "./track";
 
-/** New data that moves a drawn mover is blended in over this long. */
+/** New data that moves a drawn mover is blended in over at least this long. */
 export const CORRECTION_MS = 400;
+/** A blend moves a mover by at most this (tiles/s) on top of its own motion... */
+export const CORRECTION_RATE = 15;
+/** ...unless that would take longer than this. */
+export const MAX_CORRECTION_MS = 2000;
 /** A correction larger than this is a teleport and is not blended. */
 export const MAX_CORRECTION = 30;
 /** Samples older than this behind the displayed time are dropped (body history needs less). */
@@ -69,6 +75,8 @@ interface RenderState {
   cy: number;
   cc: number[];
   ct: number;
+  /** Duration of the current blend (ms). */
+  cd: number;
 }
 
 export interface FrameOptions {
@@ -100,20 +108,24 @@ export class MoverView {
     this.lastFrameT = NaN;
   }
 
-  /** Adds the rows of a decoded MVW3 window, keyframe or live payload; `onRow` sees each new row's time. */
-  addWindow(w: MoverWindow, onRow?: (t: number) => void): void {
+  /**
+   * Adds the rows of a decoded MVW3 window, keyframe or live payload. `onRow` sees each new
+   * row's time and, when the row extends a moving mover's track, the previous sample's time
+   * (else NaN): the segment between them became known with this row (readiness, clock.ts).
+   */
+  addWindow(w: MoverWindow, onRow?: (t: number, prevT: number) => void): void {
     for (const r of w.rows) {
       const meta = w.movers[r.mover];
       const o = (r.flags & F_NO_HEADING) !== 0 ? NaN : r.o;
       const tick = (r.flags & F_NO_TICK) !== 0 ? null : r.tick;
       if (this.add(meta, makeSample(meta, r.t, r.x, r.y, o, r.flags, r.carriages, tick)) && onRow) {
-        onRow(r.t);
+        onRow(r.t, this.prevT);
       }
     }
   }
 
   /** Adds the rows of a live `movers` event. */
-  addLive(e: LiveMoversEvent, onRow?: (t: number) => void): void {
+  addLive(e: LiveMoversEvent, onRow?: (t: number, prevT: number) => void): void {
     for (const [entry, t, tick, x, y, o, flags, car] of e.rows) {
       const meta = e.movers[entry];
       if (!meta) {
@@ -122,13 +134,20 @@ export class MoverView {
       const carriages = car ? car.map(([cx, cy, co]) => ({ x: cx, y: cy, o: co })) : null;
       const s = makeSample(meta, t, x, y, (flags & F_NO_HEADING) !== 0 ? NaN : o, flags, carriages, tick);
       if (this.add(meta, s) && onRow) {
-        onRow(t);
+        onRow(t, this.prevT);
       }
     }
   }
 
+  /**
+   * Set by `add`: when the added sample became the newest of its track and the one before it
+   * is a different position of the same run (no gone in between), that sample's time; else NaN.
+   */
+  prevT = NaN;
+
   /** Adds one sample; returns false when the track already had this row. */
   add(meta: MoverMeta, s: Sample): boolean {
+    this.prevT = NaN;
     let tr = this.tracks.get(meta.id);
     if (!tr) {
       tr = new Track(meta.id, meta);
@@ -142,6 +161,13 @@ export class MoverView {
       }
     }
     tr.insert(s);
+    const n = tr.s.length;
+    if (n >= 2 && tr.s[n - 1] === s) {
+      const p = tr.s[n - 2];
+      if (((p.flags | s.flags) & F_GONE) === 0 && (p.x !== s.x || p.y !== s.y)) {
+        this.prevT = p.t;
+      }
+    }
     return true;
   }
 
@@ -281,6 +307,7 @@ export class MoverView {
       st.cy = 0;
       st.cc.length = 0;
     }
+    st.cd = Math.min(MAX_CORRECTION_MS, Math.max(CORRECTION_MS, (1000 * max) / CORRECTION_RATE));
   }
 }
 
@@ -320,7 +347,7 @@ function weight(st: RenderState, t: number): number {
   if (st.cx === 0 && st.cy === 0 && st.cc.length === 0) {
     return 0;
   }
-  return Math.max(0, 1 - (t - st.ct) / CORRECTION_MS);
+  return Math.max(0, 1 - (t - st.ct) / st.cd);
 }
 
 function newState(tr: Track): RenderState {
@@ -341,5 +368,6 @@ function newState(tr: Track): RenderState {
     cy: 0,
     cc: [],
     ct: 0,
+    cd: CORRECTION_MS,
   };
 }

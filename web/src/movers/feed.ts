@@ -16,6 +16,8 @@ export const WINDOW_MS = 300_000;
 export const LOOKAHEAD_MS = 60_000;
 /** Above this playback speed (data ms per real ms) movers are not loaded (1 h/s). */
 export const MAX_SPEED = 3600;
+/** History is trimmed at most once per this much data time. */
+export const TRIM_EVERY_MS = 10_000;
 /** A time unchanged for this long (real ms) counts as stopped, whatever the last speed. */
 export const QUIET_MS = 250;
 
@@ -45,6 +47,7 @@ export class MoverFeed {
   private newest = -Infinity;
   private lastT = NaN;
   private lastPerf = NaN;
+  private lastTrim = NaN;
   /** Data ms per real ms of the last time changes (1 when following live). */
   speed = 1;
   private readonly source: DataSource;
@@ -121,7 +124,7 @@ export class MoverFeed {
       }
     }
     if (live) {
-      this.view.trim(t);
+      this.trim(t);
       return;
     }
     if (!this.active) {
@@ -132,6 +135,13 @@ export class MoverFeed {
 
   stop(): void {
     this.reset();
+  }
+
+  private trim(t: number): void {
+    if (Number.isNaN(this.lastTrim) || Math.abs(t - this.lastTrim) >= TRIM_EVERY_MS) {
+      this.lastTrim = t;
+      this.view.trim(t);
+    }
   }
 
   private reset(): void {
@@ -162,7 +172,7 @@ export class MoverFeed {
             return;
           }
           const arrived = Math.max(e.now, this.source.now());
-          this.view.addLive(e, t => this.see(t, arrived, true));
+          this.view.addLive(e, (t, prevT) => this.see(t, arrived, true, prevT));
           this.events.changed();
         },
         error: err => this.events.error?.(err),
@@ -182,7 +192,7 @@ export class MoverFeed {
       }
       const w = decodeMoverWindow(body);
       const arrived = Math.max(w.start, this.source.now());
-      this.view.addWindow(w, t => this.see(t, arrived, count));
+      this.view.addWindow(w, (t, prevT) => this.see(t, arrived, count, prevT));
       this.events.changed();
     } catch (err) {
       if (gen === this.gen && !isAbort(err)) {
@@ -191,7 +201,10 @@ export class MoverFeed {
     }
   }
 
-  private see(t: number, arrived: number, count: boolean): void {
+  private see(t: number, arrived: number, count: boolean, prevT: number): void {
+    if (count && Number.isFinite(this.newest) && !Number.isNaN(prevT)) {
+      this.delay.observeReady(arrived - prevT);
+    }
     if (t > this.newest) {
       if (count && Number.isFinite(this.newest)) {
         this.delay.observe(arrived - t);
@@ -203,7 +216,7 @@ export class MoverFeed {
   private history(t: TimeMs): void {
     const covered = !Number.isNaN(this.from) && t >= this.from && t < this.to;
     if (covered) {
-      this.view.trim(t);
+      this.trim(t);
       if (t + LOOKAHEAD_MS > this.to && !this.loading) {
         // Playing forward: append the next window.
         this.loading = this.extend(this.gen, this.to, t + LOOKAHEAD_MS).finally(() => {

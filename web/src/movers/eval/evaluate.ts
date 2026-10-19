@@ -440,7 +440,9 @@ export function renderEval(journeys: Journey[], mask: RailMask, opts: RenderOpti
       let horizon = Infinity;
       if (live) {
         while (fed < samples.length && arrival(samples[fed].t) <= now) {
-          view.add(meta, { ...samples[fed] });
+          if (view.add(meta, { ...samples[fed] }) && !Number.isNaN(view.prevT)) {
+            est.observeReady(now - view.prevT);
+          }
           est.observe(now - samples[fed].t);
           fed++;
         }
@@ -450,7 +452,8 @@ export function renderEval(journeys: Journey[], mask: RailMask, opts: RenderOpti
         tv = now - est.delay(perf);
         horizon = est.horizon(now);
         ti = now - (opts.illisisDelay ?? 2000);
-        if (perf % 60_000 === 0) {
+        // As the live feed does (feed.ts TRIM_EVERY_MS).
+        if (perf % 10_000 === 0) {
           view.trim(tv);
         }
       }

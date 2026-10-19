@@ -4,9 +4,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-const { MoverView, CORRECTION_MS } = await import("./view.ts");
+const { MoverView, CORRECTION_MS, CORRECTION_RATE, MAX_CORRECTION_MS } = await import("./view.ts");
 const T = await import("./track.ts");
-const { DelayEstimator, DataClock, MIN_DELAY_MS, MAX_DELAY_MS } = await import("./clock.ts");
+const { DelayEstimator, DataClock, MIN_DELAY_MS, MAX_DELAY_MS, delayConfig } = await import("./clock.ts");
 const { decodeMoverWindow } = await import("../api/wire.ts");
 
 const fixture = (name: string) => decodeMoverWindow(new Uint8Array(readFileSync(new URL(`../../fixtures/${name}`, import.meta.url))));
@@ -107,6 +107,32 @@ test("new data never makes a drawn train jump: head and carriages blend", () => 
   assert.ok(Math.hypot(prev.x - h.x, prev.y - h.y) < 1e-9);
 });
 
+test("a large correction blends no faster than CORRECTION_RATE", () => {
+  const v = new MoverView();
+  for (let i = 0; i < 6; i++) {
+    v.add(meta, T.makeSample(meta, i * 500, i * 5, 0, 0.25)); // 10 tiles/s east
+  }
+  let px = v.frame(2500, 2600)[0].x;
+  for (let t = 2600; t <= 4000; t += 100) {
+    px = v.frame(t, 4100)[0].x; // extrapolated to x = 40 at t=4000
+  }
+  // the train actually stopped at x = 28: a 12-tile correction
+  v.add(meta, T.makeSample(meta, 2800, 28, 0, 0.25, T.F_STOP));
+  v.add(meta, T.makeSample(meta, 4500, 28, 0, 0.25, T.F_STOP));
+  const expected = Math.min(MAX_CORRECTION_MS, (1000 * 12) / CORRECTION_RATE);
+  let steps = 0;
+  for (let t = 4100; t <= 4000 + expected + 200; t += 100) {
+    const m = v.frame(t, 5000)[0];
+    assert.ok(Math.abs(m.x - px) <= (CORRECTION_RATE * 100) / 1000 + 1e-6, `step at ${t}: ${m.x - px}`);
+    if (m.x !== px) {
+      steps++;
+    }
+    px = m.x;
+  }
+  assert.ok(Math.abs(px - 28) < 1e-9, `settles on the new data: ${px}`);
+  assert.ok(steps >= 7, `blended over ${steps} frames`);
+});
+
 test("a seek does not blend", () => {
   const v = new MoverView();
   for (let i = 0; i < 6; i++) {
@@ -140,15 +166,45 @@ test("delay estimator: p99 lag + 0.5 s, clamped, changing smoothly", () => {
   }
   assert.ok(Math.abs(d.target() - (1140 + 500)) <= 10, `target ${d.target()}`);
   d.delay(0);
-  const after100 = d.delay(100); // at most 20 ms per 100 ms
-  assert.ok(Math.abs(after100 - 1980) < 1e-9, `slewed ${after100}`);
+  const after100 = d.delay(100); // shrinks by at most 5 ms per 100 ms (time runs at most 1.05x)
+  assert.ok(Math.abs(after100 - 1995) < 1e-9, `slewed ${after100}`);
   const later = d.delay(100_000);
   assert.ok(Math.abs(later - d.target()) < 1e-9);
   assert.ok(Math.abs(d.horizon(10_000) - (10_000 - 1140)) <= 10);
+  // grows by at most 20 ms per 100 ms (time slows to 0.8x)
+  for (let i = 0; i < 1000; i++) {
+    d.observe(3000);
+  }
+  const grown = d.delay(100_100);
+  assert.ok(Math.abs(grown - (later + 20)) < 1e-9, `grew ${grown - later}`);
   const tiny = new DelayEstimator(0);
   assert.equal(tiny.current, MIN_DELAY_MS);
   const huge = new DelayEstimator(1e9);
   assert.equal(huge.current, MAX_DELAY_MS);
+});
+
+test("delay estimator: hysteresis, and readiness of moving movers raises the delay up to its cap", () => {
+  const d = new DelayEstimator(2000);
+  for (let i = 0; i < 1000; i++) {
+    d.observe(150 + (i % 100) * 10);
+  }
+  const base = d.target();
+  // a small drop of the estimate does not move the target
+  for (let i = 0; i < 1024; i++) {
+    d.observe(150 + (i % 100) * 9); // p99 about 1040: 100 ms lower
+  }
+  assert.equal(d.target(), base, "within the hysteresis");
+  // samples of moving trains arrive up to 2 s after the sample before them
+  for (let i = 0; i < 1000; i++) {
+    d.observeReady(500 + (i % 100) * 15); // 500..1985 ms, p90 about 1835
+  }
+  const ready = d.readyQuantile(delayConfig.readyQuantile);
+  assert.ok(Math.abs(d.target() - (ready + delayConfig.readyMarginMs)) < 1e-9, `readiness target ${d.target()}`);
+  // capped
+  for (let i = 0; i < 1024; i++) {
+    d.observeReady(20_000);
+  }
+  assert.equal(d.target(), delayConfig.readyCapMs);
 });
 
 test("data clock never goes back", () => {
