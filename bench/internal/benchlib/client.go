@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"timeshadedb/internal/v3/core"
@@ -27,7 +28,7 @@ var ErrUnsupported = errors.New("not supported by this target")
 // ChunkRow is one chunk state update, as a capture would send it.
 type ChunkRow struct {
 	// T is Unix milliseconds on the map clock (the test data's clock). v2 stores it as
-	// its "tick" (to_stream.py --tick ms).
+	// its "tick" (as measure stream writes it).
 	T                   int64
 	Map, Surface, Force string
 	CX, CY              int32
@@ -49,6 +50,8 @@ type Body struct {
 	ContentType string
 	Data        []byte
 	Rows        int
+	// Kind is "chunks" or "movers": which IngestResponse counts belong to Rows.
+	Kind string
 }
 
 // DSInfo is one terrain datastore as a target's catalog describes it.
@@ -184,7 +187,7 @@ func NewTarget(kind string, c *Client) (Target, error) {
 // V2 talks to the legacy chunk API of TimeShadeDB master (cmd/timeshadedb/serve.go):
 // POST /api/ingest/chunk/{uuid} with TSV rows, GET /api/chunk/saves and
 // GET /api/chunk/tiles/{uuid}/{force}/{surface}/{z}/{x}/{y}.png?tick=. The map key is
-// used as the savefile UUID, as research/scripts/to_stream.py does.
+// used as the savefile UUID, as the stream files are named.
 type V2 struct{ C *Client }
 
 func (v *V2) Kind() string { return "v2" }
@@ -228,6 +231,7 @@ func (v *V2) EncodeChunks(rows []ChunkRow) ([]Body, error) {
 			ContentType: "text/tab-separated-values",
 			Data:        byMap[m].Bytes(),
 			Rows:        counts[m],
+			Kind:        "chunks",
 		})
 	}
 	return out, nil
@@ -240,6 +244,7 @@ func EncodeV2Raw(mapKey string, lines []string) Body {
 		ContentType: "text/tab-separated-values",
 		Data:        []byte(strings.Join(lines, "\n") + "\n"),
 		Rows:        len(lines),
+		Kind:        "chunks",
 	}
 }
 
@@ -316,35 +321,59 @@ func (v *V2) HostileURL(rng *rand.Rand, known []DSInfo) string {
 // ---------------------------------------------------------------- v3
 
 // V3 talks to the v3 API (docs/v3/API.md) and posts capture envelopes
-// (docs/v3/PROTOCOL.md).
+// (docs/v3/PROTOCOL.md). Its encoders may be called from several goroutines.
 type V3 struct {
 	C   *Client
 	Src string
 	// T0 anchors the synthetic game tick: tick = (T - T0) * 60 / 1000. Set from the first
-	// row encoded.
+	// row encoded, minus T0Margin, so rows encoded later but older than the first one
+	// (encoders run in parallel) still get positive ticks.
 	T0    int64
+	mu    sync.Mutex
 	t0Set bool
 	seq   int64
 }
+
+// Size caps for v3 ingest bodies. API.md 5 limits a line to 4 MiB (longer lines are
+// counted in bad_lines) and a body to 32 MiB; the encoders stay well under both.
+var (
+	MaxEnvelopeBytes = 1 << 20
+	MaxBodyBytes     = 16 << 20
+	// MaxMoveMsgBytes caps one move message, so a large mover batch spreads over
+	// several messages and envelopes.
+	MaxMoveMsgBytes = 256 << 10
+)
+
+// T0Margin is how far before the first encoded row the tick epoch is placed.
+const T0Margin = 30 * 24 * 3600 * 1000
 
 func (v *V3) Kind() string { return "v3" }
 
 // tickOf converts map-clock ms to a 60 UPS tick relative to T0, so the server's clock
 // anchor (PROTOCOL.md 4) maps it back to T within rounding (at most 8 ms).
 func (v *V3) tickOf(t int64) int64 {
+	v.mu.Lock()
 	if !v.t0Set {
-		v.T0, v.t0Set = t, true
+		v.T0, v.t0Set = t-T0Margin, true
 	}
-	d := t - v.T0
+	t0 := v.T0
+	v.mu.Unlock()
+	d := t - t0
 	if d < 0 {
 		return 0
 	}
 	return (d*60 + 500) / 1000
 }
 
-func (v *V3) envelope(mapKey string, lastT int64, msgs []json.RawMessage) ([]byte, error) {
+func (v *V3) nextSeq() int64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.seq++
-	seq := v.seq
+	return v.seq
+}
+
+func (v *V3) envelope(mapKey string, lastT int64, msgs []json.RawMessage) ([]byte, error) {
+	seq := v.nextSeq()
 	env := core.Envelope{
 		V: 1, Tick: v.tickOf(lastT), Msgs: msgs,
 		Src: v.Src + ":" + mapKey, Map: mapKey, RecvMs: core.TimeMs(lastT), Seq: &seq,
@@ -352,19 +381,81 @@ func (v *V3) envelope(mapKey string, lastT int64, msgs []json.RawMessage) ([]byt
 	return json.Marshal(env)
 }
 
-func (v *V3) EncodeChunks(rows []ChunkRow) ([]Body, error) {
-	type group struct {
-		msgs  []json.RawMessage
-		lastT int64
-		n     int
+// v3Msg is one encoded message with its latest row time and row count.
+type v3Msg struct {
+	raw  json.RawMessage
+	t    int64
+	rows int
+}
+
+// envelopeOverhead bounds the envelope fields around the messages.
+const envelopeOverhead = 512
+
+// pack puts the messages of each map (in order) into envelopes of at most
+// MaxEnvelopeBytes, and the envelopes into bodies of at most MaxBodyBytes.
+func (v *V3) pack(kind string, order []string, byMap map[string][]v3Msg) ([]Body, error) {
+	var out []Body
+	var buf bytes.Buffer
+	rows := 0
+	closeBody := func() {
+		if buf.Len() == 0 {
+			return
+		}
+		out = append(out, Body{Path: "/api/v3/ingest", ContentType: "application/x-ndjson", Data: append([]byte(nil), buf.Bytes()...), Rows: rows, Kind: kind})
+		buf.Reset()
+		rows = 0
 	}
-	groups := map[string]*group{}
+	for _, m := range order {
+		var msgs []json.RawMessage
+		var lastT int64
+		n, size := 0, envelopeOverhead+len(m)+len(v.Src)
+		flush := func() error {
+			if len(msgs) == 0 {
+				return nil
+			}
+			line, err := v.envelope(m, lastT, msgs)
+			if err != nil {
+				return err
+			}
+			if len(line) > MaxEnvelopeBytes+envelopeOverhead {
+				return fmt.Errorf("envelope of %d bytes exceeds the cap", len(line))
+			}
+			if buf.Len() > 0 && buf.Len()+len(line)+1 > MaxBodyBytes {
+				closeBody()
+			}
+			buf.Write(line)
+			buf.WriteByte('\n')
+			rows += n
+			msgs, lastT, n, size = nil, 0, 0, envelopeOverhead+len(m)+len(v.Src)
+			return nil
+		}
+		for _, msg := range byMap[m] {
+			if len(msgs) > 0 && size+len(msg.raw)+1 > MaxEnvelopeBytes {
+				if err := flush(); err != nil {
+					return nil, err
+				}
+			}
+			msgs = append(msgs, msg.raw)
+			size += len(msg.raw) + 1
+			lastT = max(lastT, msg.t)
+			n += msg.rows
+		}
+		if err := flush(); err != nil {
+			return nil, err
+		}
+	}
+	closeBody()
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func (v *V3) EncodeChunks(rows []ChunkRow) ([]Body, error) {
+	byMap := map[string][]v3Msg{}
 	var order []string
 	for _, r := range rows {
-		g := groups[r.Map]
-		if g == nil {
-			g = &group{}
-			groups[r.Map] = g
+		if _, ok := byMap[r.Map]; !ok {
 			order = append(order, r.Map)
 		}
 		tick := v.tickOf(r.T)
@@ -377,42 +468,16 @@ func (v *V3) EncodeChunks(rows []ChunkRow) ([]Body, error) {
 		if err != nil {
 			return nil, err
 		}
-		g.msgs = append(g.msgs, b)
-		if r.T > g.lastT {
-			g.lastT = r.T
-		}
-		g.n++
+		byMap[r.Map] = append(byMap[r.Map], v3Msg{raw: b, t: r.T, rows: 1})
 	}
-	return v.bodies(order, func(m string) ([]json.RawMessage, int64, int) {
-		g := groups[m]
-		return g.msgs, g.lastT, g.n
-	})
-}
-
-func (v *V3) bodies(order []string, get func(string) ([]json.RawMessage, int64, int)) ([]Body, error) {
-	var buf bytes.Buffer
-	rows := 0
-	for _, m := range order {
-		msgs, lastT, n := get(m)
-		line, err := v.envelope(m, lastT, msgs)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(line)
-		buf.WriteByte('\n')
-		rows += n
-	}
-	if rows == 0 {
-		return nil, nil
-	}
-	return []Body{{Path: "/api/v3/ingest", ContentType: "application/x-ndjson", Data: buf.Bytes(), Rows: rows}}, nil
+	return v.pack("chunks", order, byMap)
 }
 
 func (v *V3) EncodeMovers(rows []MoverRow) ([]Body, error) {
 	type key struct{ m, s string }
 	type group struct {
-		entries []core.MoveEntry
-		lastT   int64
+		entries [][]byte
+		lastT   []int64
 	}
 	groups := map[key]*group{}
 	var order []key
@@ -427,30 +492,44 @@ func (v *V3) EncodeMovers(rows []MoverRow) ([]Body, error) {
 		e := r.Entry
 		tick := v.tickOf(r.T)
 		e.Tick = &tick
-		g.entries = append(g.entries, e)
-		if r.T > g.lastT {
-			g.lastT = r.T
-		}
-	}
-	// One envelope per map, one move message per surface.
-	byMap := map[string][]json.RawMessage{}
-	lastT := map[string]int64{}
-	counts := map[string]int{}
-	var maps []string
-	for _, k := range order {
-		g := groups[k]
-		b, err := json.Marshal(core.MoveMsg{Type: "move", S: k.s, M: g.entries})
+		b, err := json.Marshal(e)
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := byMap[k.m]; !ok {
-			maps = append(maps, k.m)
-		}
-		byMap[k.m] = append(byMap[k.m], b)
-		lastT[k.m] = max(lastT[k.m], g.lastT)
-		counts[k.m] += len(g.entries)
+		g.entries = append(g.entries, b)
+		g.lastT = append(g.lastT, r.T)
 	}
-	return v.bodies(maps, func(m string) ([]json.RawMessage, int64, int) { return byMap[m], lastT[m], counts[m] })
+	// Move messages of at most MaxMoveMsgBytes per surface; pack spreads them over
+	// envelopes per map.
+	byMap := map[string][]v3Msg{}
+	var maps []string
+	for _, k := range order {
+		g := groups[k]
+		sb, _ := json.Marshal(k.s)
+		head := `{"type":"move","s":` + string(sb) + `,"m":[`
+		i := 0
+		for i < len(g.entries) {
+			var msg bytes.Buffer
+			msg.WriteString(head)
+			var lastT int64
+			n := 0
+			for i < len(g.entries) && (n == 0 || msg.Len()+len(g.entries[i])+3 <= MaxMoveMsgBytes) {
+				if n > 0 {
+					msg.WriteByte(',')
+				}
+				msg.Write(g.entries[i])
+				lastT = max(lastT, g.lastT[i])
+				n++
+				i++
+			}
+			msg.WriteString("]}")
+			if _, ok := byMap[k.m]; !ok {
+				maps = append(maps, k.m)
+			}
+			byMap[k.m] = append(byMap[k.m], v3Msg{raw: msg.Bytes(), t: lastT, rows: n})
+		}
+	}
+	return v.pack("movers", maps, byMap)
 }
 
 func (v *V3) Datastores(ctx context.Context) ([]DSInfo, error) {

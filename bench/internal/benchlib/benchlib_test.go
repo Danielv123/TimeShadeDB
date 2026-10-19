@@ -1,7 +1,6 @@
 package benchlib
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -28,6 +27,9 @@ func TestMain(m *testing.M) {
 		return
 	case "v2":
 		fakeV2(os.Args[len(os.Args)-1])
+		return
+	case "fatal", "orphan":
+		fakeParent(os.Getenv("BENCHLIB_FAKE"))
 		return
 	}
 	os.Exit(m.Run())
@@ -72,15 +74,30 @@ func fakeV3() {
 		w.Write(make([]byte, 100))
 	})
 	mux.HandleFunc("/api/v3/ingest", func(w http.ResponseWriter, r *http.Request) {
-		sc := bufio.NewScanner(r.Body)
-		sc.Buffer(make([]byte, 1<<20), 64<<20)
+		// API.md 5: 200 with counts even for bad lines and rejected messages; a line
+		// over 4 MiB is a bad line; a body over 32 MiB is 413.
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 32<<20+1))
+		if len(body) > 32<<20 {
+			w.WriteHeader(413)
+			io.WriteString(w, `{"error":"too large","code":"too_large"}`)
+			return
+		}
 		var resp core.IngestResponse
-		for sc.Scan() {
+		for _, line := range bytes.Split(body, []byte("\n")) {
+			if len(line) == 0 {
+				continue
+			}
 			var env core.Envelope
-			if err := json.Unmarshal(sc.Bytes(), &env); err != nil || env.Src == "" || env.RecvMs == 0 {
+			if len(line) > 4<<20 || json.Unmarshal(line, &env) != nil || env.Src == "" || env.RecvMs == 0 {
 				resp.BadLines++
 				continue
 			}
+			if strings.Contains(env.Src, "busy") {
+				w.WriteHeader(503)
+				io.WriteString(w, `{"error":"busy","code":"overloaded"}`)
+				return
+			}
+			reject := strings.Contains(env.Src, "reject")
 			resp.Envelopes++
 			for _, m := range env.Msgs {
 				var h core.MsgHeader
@@ -91,11 +108,15 @@ func fakeV3() {
 					json.Unmarshal(m, &c)
 					if c.D != nil {
 						if _, err := core.DecodeChart(*c.D); err != nil {
-							resp.BadLines++
+							resp.Chunks.Invalid++
 							continue
 						}
 					}
-					resp.Chunks.Accepted++
+					if reject {
+						resp.Chunks.Late++
+					} else {
+						resp.Chunks.Accepted++
+					}
 				case "move":
 					var mv core.MoveMsg
 					json.Unmarshal(m, &mv)
@@ -103,12 +124,27 @@ func fakeV3() {
 				}
 			}
 		}
-		if resp.BadLines > 0 {
-			w.WriteHeader(400)
-		}
 		json.NewEncoder(w).Encode(resp)
 	})
 	http.Serve(l, mux)
+}
+
+// fakeParent is a bench tool in miniature: it starts a fake v3 server, prints its pid,
+// and then exits through Fatal ("fatal") or straight through os.Exit ("orphan", which
+// skips StopAll and relies on the child being tied to this process).
+func fakeParent(mode string) {
+	exe, _ := os.Executable()
+	os.Setenv("BENCHLIB_FAKE", "v3")
+	s, err := StartServer(ServerSpec{Binary: exe, Args: []string{"-test.run=^$", "{listen}"}, Timeout: 20 * time.Second})
+	if err != nil {
+		fmt.Println("error", err)
+		os.Exit(2)
+	}
+	fmt.Printf("pid %d\n", s.PID)
+	if mode == "orphan" {
+		os.Exit(3)
+	}
+	Fatal(fmt.Errorf("simulated tool failure"))
 }
 
 // fakeV2 serves the master routes on the address given as the last argument.
@@ -302,25 +338,25 @@ func TestFakeV3EndToEnd(t *testing.T) {
 	ctx := context.Background()
 	synth := NewSynth(DefaultSynth())
 	n := 0
-	st, err := SendPipeline(ctx, c, 1, 4, func() ([]ChunkRow, bool) {
+	st, err := SendPipeline(ctx, c, 1, 4, PipelineOptions{}, func() ([]ChunkRow, bool) {
 		if n >= 5 {
 			return nil, false
 		}
 		n++
 		return synth.NextChunks(500), true
 	}, tgt.EncodeChunks)
-	if err != nil || st.Rows != 2500 || st.Requests != 5 || len(st.Progress) != 5 {
+	if err != nil || st.Rows != 2500 || st.Requests != 5 || len(st.Progress) != 5 || st.Outcome.Accepted != 2500 {
 		t.Fatalf("chunks %+v %v", st, err)
 	}
 	m := 0
-	mst, err := SendPipeline(ctx, c, 2, 2, func() ([]MoverRow, bool) {
+	mst, err := SendPipeline(ctx, c, 2, 2, PipelineOptions{}, func() ([]MoverRow, bool) {
 		if m >= 3 {
 			return nil, false
 		}
 		m++
 		return synth.NextMovers(1000), true
 	}, tgt.EncodeMovers)
-	if err != nil || mst.Rows != 3000 {
+	if err != nil || mst.Rows != 3000 || mst.Outcome.Accepted != 3000 {
 		t.Fatalf("movers %+v %v", mst, err)
 	}
 	dss, err := tgt.Datastores(ctx)
@@ -350,7 +386,7 @@ func TestFakeV2EndToEnd(t *testing.T) {
 	}
 	synth := NewSynth(DefaultSynth())
 	n := 0
-	st, err := SendPipeline(context.Background(), c, 1, 2, func() ([]ChunkRow, bool) {
+	st, err := SendPipeline(context.Background(), c, 1, 2, PipelineOptions{}, func() ([]ChunkRow, bool) {
 		if n >= 2 {
 			return nil, false
 		}

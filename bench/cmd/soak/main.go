@@ -14,7 +14,6 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
-	"os"
 	"strings"
 	"time"
 
@@ -36,7 +35,9 @@ func main() {
 	readTiles := flag.Int("read-tiles", 8, "tiles read per second (0: none)")
 	memEvery := flag.Duration("mem-every", 5*time.Second, "memory sampling interval")
 	maxRSS := flag.Float64("max-rss-mib", 8192, "stop when the server RSS exceeds this")
+	allowRejected := flag.Bool("allow-rejected", false, "record rows the server did not store instead of failing")
 	flag.Parse()
+	ing := soakIngest{allowRejected: *allowRejected}
 
 	res := sf.NewResult("soak")
 	res.Param("duration_s", duration.Seconds())
@@ -121,7 +122,7 @@ func main() {
 				batch = append(batch, synth.NextChunks(1)...)
 			}
 		}
-		if err := post(ctx, client, target.EncodeChunks, batch); err != nil {
+		if err := post(ctx, client, target.EncodeChunks, batch, &ing); err != nil {
 			benchlib.Fatal(fmt.Errorf("chunks: %w", err))
 		}
 		rows += len(batch)
@@ -133,7 +134,7 @@ func main() {
 			}
 			if n > 0 {
 				mb := synth.NextMovers(n)
-				if err := post(ctx, client, target.EncodeMovers, mb); err != nil {
+				if err := post(ctx, client, target.EncodeMovers, mb, &ing); err != nil {
 					benchlib.Fatal(fmt.Errorf("movers: %w", err))
 				}
 				samples += len(mb)
@@ -179,6 +180,12 @@ func main() {
 	res.Set("soak.data_hours", elapsed.Seconds()*(*speed)/3600)
 	res.Set("soak.chunk_rows", float64(rows))
 	res.Set("soak.mover_samples", float64(samples))
+	res.Set("soak.rows_stored", float64(ing.outcome.Accepted))
+	res.Set("soak.retries_503", float64(ing.retries))
+	res.Set("soak.retry_wait_s", ing.wait.Seconds())
+	if o := ing.outcome; o.Late+o.Invalid+o.BadLines > 0 {
+		res.Note("server did not store some rows: late %d, invalid %d, bad lines %d", o.Late, o.Invalid, o.BadLines)
+	}
 	res.SetSummary("soak.tile_ms", benchlib.Summarize(tileLat))
 	if tileErrs > 0 {
 		res.Set("soak.tile_errors", float64(tileErrs))
@@ -224,31 +231,37 @@ func main() {
 		}
 	}
 	if err := res.Write(sf.Out); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		benchlib.Fatal(err)
 	}
 }
 
-func post[B any](ctx context.Context, c *benchlib.Client, enc func(B) ([]benchlib.Body, error), batch B) error {
+// post encodes and sends a batch. Every row must be stored: a v3 server answers 200 even
+// when it rejected rows, so the IngestResponse counts are checked.
+func post[B any](ctx context.Context, c *benchlib.Client, enc func(B) ([]benchlib.Body, error), batch B, st *soakIngest) error {
 	bodies, err := enc(batch)
 	if err != nil {
 		return err
 	}
 	for _, b := range bodies {
-		for attempt := 0; ; attempt++ {
-			r, err := c.Post(ctx, b)
-			if err != nil {
+		_, o, retries, waited, err := benchlib.PostIngest(ctx, c, b, benchlib.MaxRetryWait)
+		st.retries += retries
+		st.wait += waited
+		if err != nil {
+			return err
+		}
+		st.outcome.Add(o)
+		if !st.allowRejected {
+			if err := o.Shortfall(b.Rows); err != nil {
 				return err
 			}
-			if r.Status == 503 && attempt < 50 {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			if r.Status != 200 {
-				return fmt.Errorf("HTTP %d: %.200s", r.Status, r.Body)
-			}
-			break
 		}
 	}
 	return nil
+}
+
+type soakIngest struct {
+	allowRejected bool
+	retries       int
+	wait          time.Duration
+	outcome       benchlib.IngestOutcome
 }

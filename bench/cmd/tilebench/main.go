@@ -14,7 +14,6 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +33,7 @@ func main() {
 	histTiles := flag.Int("hist-tiles", 16, "z0 tiles per historical time (random subset of the tiles with data)")
 	tFirst := flag.Int64("t-first", 0, "first data time for historical sampling (default: catalog first, or last-7d for v2)")
 	levels := flag.String("levels", "-1,-2,-3,-4,-5", "coarse levels to fetch at the latest time")
+	minCold := flag.Int("min-cold", 20, "cold samples per coarse level: the cold pass is repeated after restarts until it has this many (levels with few tiles)")
 	restart := flag.Bool("restart-cold", true, "restart the server before each cold phase (needs a server started by tilebench)")
 	startups := flag.Int("startups", 3, "startup measurements on the database (0: skip)")
 	seed := flag.Int64("seed", 1, "random seed")
@@ -101,17 +101,19 @@ func main() {
 	res.Param("datastore", ds.ID)
 	res.Param("bounds", ds.Bounds)
 
-	fetch := func(t benchlib.Target, refs []benchlib.TileRef, name string) {
-		c := clientOf(t)
-		lat, bytes, bad := fetchAll(ctx, c, refs, *conc)
+	record := func(name string, lat, bytes []float64, bad, n int) {
 		res.SetSummary("tile."+name+"_ms", benchlib.Summarize(lat))
 		if len(bytes) > 0 {
 			res.Set("tile."+name+"_bytes_mean", benchlib.Summarize(bytes).Mean)
 		}
 		if bad > 0 {
 			res.Set("tile."+name+"_errors", float64(bad))
-			res.Note("%s: %d of %d requests did not answer 200", name, bad, len(refs))
+			res.Note("%s: %d of %d requests did not answer 200", name, bad, n)
 		}
+	}
+	fetch := func(t benchlib.Target, refs []benchlib.TileRef, name string) {
+		lat, bytes, bad := fetchAll(ctx, clientOf(t), refs, *conc)
+		record(name, lat, bytes, bad, len(refs))
 	}
 
 	// 1. z0 latest: cold, then warm.
@@ -126,8 +128,9 @@ func main() {
 	if viewDur > 0 {
 		res.Set("tile.view_latest_ms", benchlib.Ms(viewDur))
 	}
-	// withData already fetched every tile once (that is the cold pass for v3, whose
-	// view lists only tiles with data); repeat the cold pass after a restart for both.
+	// For v2, withData fetched every tile once to find the ones with data, so the cold
+	// pass needs a restart; v3's view lists only tiles with data and withData fetches
+	// nothing. Both restart here so the cold pass starts from empty caches.
 	restartIfOwned()
 	target = newTarget()
 	if sf.Target == "v3" {
@@ -156,6 +159,7 @@ func main() {
 	target = newTarget()
 	var histRefs []benchlib.TileRef
 	var viewMs []float64
+	seen := map[string]bool{}
 	for i := 0; i < *histTimes; i++ {
 		t := first + rng.Int63n(max(1, ds.Last-first))
 		trefs, vd, err := target.Tiles(ctx, ds, 0, &t)
@@ -166,8 +170,15 @@ func main() {
 			viewMs = append(viewMs, benchlib.Ms(vd))
 		}
 		trefs = intersect(trefs, refs)
+		// The same (tile, version) can be effective at several of the random times; a
+		// repeat would hit the encoded cache, so each URL is fetched once.
+		trefs = unseen(trefs, seen)
 		rng.Shuffle(len(trefs), func(a, b int) { trefs[a], trefs[b] = trefs[b], trefs[a] })
-		histRefs = append(histRefs, trefs[:min(len(trefs), *histTiles)]...)
+		trefs = trefs[:min(len(trefs), *histTiles)]
+		for _, r := range trefs {
+			seen[r.URL] = true
+		}
+		histRefs = append(histRefs, trefs...)
 	}
 	res.Param("hist_first", first)
 	res.Param("hist_last", ds.Last)
@@ -196,7 +207,24 @@ func main() {
 		}
 		name := fmt.Sprintf("zm%d_latest", -z)
 		res.Set("tile."+name+"_tiles", float64(len(zrefs)))
-		fetch(target, zrefs, name+"_cold")
+		// Few tiles cover a coarse level, so one cold pass is too few samples for a p95:
+		// repeat it after restarts until there are -min-cold samples.
+		var lat, sizes []float64
+		bad, n, rounds := 0, 0, 0
+		for len(zrefs) > 0 && (rounds == 0 || (len(lat) < *minCold && srv != nil && *restart && rounds < 50)) {
+			if rounds > 0 {
+				restartIfOwned()
+				target = newTarget()
+			}
+			l, b, e := fetchAll(ctx, clientOf(target), zrefs, *conc)
+			lat, sizes, bad, n = append(lat, l...), append(sizes, b...), bad+e, n+len(zrefs)
+			rounds++
+		}
+		record(name+"_cold", lat, sizes, bad, n)
+		res.Set("tile."+name+"_cold_rounds", float64(rounds))
+		if len(lat) < *minCold {
+			res.Note("%s: only %d cold samples (no restarts possible or too few tiles)", name, len(lat))
+		}
 		fetch(target, zrefs, name+"_warm")
 		if z < deepest {
 			deepest = z
@@ -210,8 +238,7 @@ func main() {
 		}
 	}
 	if err := res.Write(sf.Out); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		benchlib.Fatal(err)
 	}
 }
 
@@ -304,6 +331,19 @@ func withData(ctx context.Context, c *benchlib.Client, refs []benchlib.TileRef, 
 		}
 	}
 	return keep
+}
+
+// unseen drops refs whose URL is in seen, and duplicates within refs.
+func unseen(refs []benchlib.TileRef, seen map[string]bool) []benchlib.TileRef {
+	var out []benchlib.TileRef
+	local := map[string]bool{}
+	for _, r := range refs {
+		if !seen[r.URL] && !local[r.URL] {
+			local[r.URL] = true
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // intersect keeps refs whose (x, y) is among the tiles with data.

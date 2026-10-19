@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -120,10 +122,11 @@ func StartServer(spec ServerSpec) (*Server, error) {
 	}
 	cmd.Stderr = logw
 	start := time.Now()
-	if err := cmd.Start(); err != nil {
+	if err := StartTied(cmd); err != nil {
 		return nil, err
 	}
 	s := &Server{Spec: spec, PID: cmd.Process.Pid, cmd: cmd, done: make(chan struct{})}
+	track(s)
 	addrCh := make(chan string, 1)
 	go func() {
 		r := bufio.NewReader(stdout)
@@ -229,6 +232,7 @@ func (s *Server) Stop() error {
 	if s == nil || s.cmd == nil || s.cmd.Process == nil {
 		return nil
 	}
+	defer untrack(s)
 	if !s.Exited() {
 		_ = s.cmd.Process.Kill()
 	}
@@ -236,6 +240,63 @@ func (s *Server) Stop() error {
 	case <-s.done:
 	case <-time.After(30 * time.Second):
 		return errors.New("server did not exit after kill")
+	}
+	return nil
+}
+
+// Every server StartServer started and Stop has not stopped yet, so that Fatal and an
+// interrupt can stop them: deferred Stop calls do not run on os.Exit.
+var (
+	liveMu  sync.Mutex
+	live    = map[*Server]bool{}
+	sigOnce sync.Once
+)
+
+func track(s *Server) {
+	liveMu.Lock()
+	live[s] = true
+	liveMu.Unlock()
+	sigOnce.Do(func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			sig := <-ch
+			fmt.Fprintf(os.Stderr, "%v: stopping servers\n", sig)
+			StopAll()
+			os.Exit(130)
+		}()
+	})
+}
+
+func untrack(s *Server) {
+	liveMu.Lock()
+	delete(live, s)
+	liveMu.Unlock()
+}
+
+// StopAll stops every server this process started that is still running.
+func StopAll() {
+	liveMu.Lock()
+	all := make([]*Server, 0, len(live))
+	for s := range live {
+		all = append(all, s)
+	}
+	liveMu.Unlock()
+	for _, s := range all {
+		s.Stop()
+	}
+}
+
+// StartTied starts cmd so that it cannot outlive this process: on Windows the child joins
+// a kill-on-close Job Object, on Linux it gets SIGKILL when this process dies. If tying
+// fails the child still runs (the caller stops it) and a warning is printed.
+func StartTied(cmd *exec.Cmd) error {
+	prepareChild(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if err := adoptChild(cmd); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: child %d is not tied to this process: %v\n", cmd.Process.Pid, err)
 	}
 	return nil
 }

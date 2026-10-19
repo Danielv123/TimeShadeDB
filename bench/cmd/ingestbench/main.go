@@ -2,7 +2,7 @@
 // second, whether the rate stays flat as history grows, server memory while ingesting,
 // the database size per chunk-hour, and the restart time of the resulting database.
 //
-// Inputs are either chunk TSV files from research/scripts/to_stream.py (real test data)
+// Inputs are either chunk TSV files from `measure stream` (real test data)
 // or the synthetic workload (benchlib.Synth). Targets: v2 (TimeShadeDB master's
 // /api/ingest/chunk) and v3 (POST /api/v3/ingest with PROTOCOL.md envelopes).
 //
@@ -15,7 +15,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -25,7 +24,7 @@ import (
 func main() {
 	var sf benchlib.ServerFlags
 	sf.Register(flag.CommandLine)
-	input := flag.String("input", "", "comma-separated chunk TSV files (to_stream.py output); empty uses -synth")
+	input := flag.String("input", "", "comma-separated chunk TSV files (measure stream output); empty uses -synth")
 	surface := flag.String("surface", "", "only rows of this surface (with -input)")
 	synthN := flag.Int("synth", 0, "synthetic chunk updates to send (with no -input); default 200000")
 	synthChunks := flag.Int("synth-chunks", 8000, "charted chunks in the synthetic workload")
@@ -41,7 +40,10 @@ func main() {
 	restarts := flag.Int("restarts", 3, "restart the server this many times after ingest to measure startup (0: skip)")
 	shift := flag.Int64("time-shift-ms", 0, "add this to every input row time (replay the same data later, to grow a history)")
 	settle := flag.Duration("settle", 2*time.Second, "wait after ingest before measuring disk and memory (lets windows flush)")
+	allowRejected := flag.Bool("allow-rejected", false, "record rows the server did not store (late, invalid, bad lines) instead of failing; rates then count stored rows only")
+	retryWait := flag.Duration("max-retry-wait", benchlib.MaxRetryWait, "longest total wait on 503 answers for one request")
 	flag.Parse()
+	popt := benchlib.PipelineOptions{AllowRejected: *allowRejected, MaxRetryWait: *retryWait}
 
 	res := sf.NewResult("ingestbench")
 	if sf.Base == "" {
@@ -124,16 +126,18 @@ func main() {
 		memBefore, _ = srv.Memory()
 		res.Set("mem.start_rss_mib", benchlib.MiB(memBefore.RSS))
 	}
-	st, err := benchlib.SendPipeline(ctx, client, *conc, *workers, gen, target.EncodeChunks)
+	st, err := benchlib.SendPipeline(ctx, client, *conc, *workers, popt, gen, target.EncodeChunks)
 	if err != nil {
 		benchlib.Fatal(fmt.Errorf("chunk ingest: %w", err))
 	}
 	res.Set("ingest.chunk_rows", float64(st.Rows))
 	res.Set("ingest.chunk_requests", float64(st.Requests))
 	res.Set("ingest.chunk_seconds", st.Wall.Seconds())
-	res.Set("ingest.chunk_rows_per_s", st.Rate())
+	res.Set("ingest.chunk_rows_per_s", st.StoredRate())
 	res.Set("ingest.chunk_client_starved_s", st.Starved.Seconds())
 	res.Set("ingest.chunk_retries_503", float64(st.Retries))
+	res.Set("ingest.chunk_retry_wait_s", st.RetryWait.Seconds())
+	recordOutcome(res, "ingest.chunk", st)
 	res.SetSummary("ingest.chunk_request_ms", benchlib.Summarize(st.Latencies))
 	rates := st.SliceRates(*slices)
 	for i, r := range rates {
@@ -168,7 +172,7 @@ func main() {
 			msent += n
 			return synth.NextMovers(n), true
 		}
-		mst, err := benchlib.SendPipeline(ctx, client, *conc, *workers, mgen, target.EncodeMovers)
+		mst, err := benchlib.SendPipeline(ctx, client, *conc, *workers, popt, mgen, target.EncodeMovers)
 		switch {
 		case err == benchlib.ErrUnsupported || (err != nil && strings.Contains(err.Error(), benchlib.ErrUnsupported.Error())):
 			res.Note("mover ingest: not supported by target %s", sf.Target)
@@ -177,8 +181,10 @@ func main() {
 		default:
 			res.Set("ingest.mover_samples", float64(mst.Rows))
 			res.Set("ingest.mover_seconds", mst.Wall.Seconds())
-			res.Set("ingest.mover_samples_per_s", mst.Rate())
+			res.Set("ingest.mover_samples_per_s", mst.StoredRate())
 			res.Set("ingest.mover_retries_503", float64(mst.Retries))
+			res.Set("ingest.mover_retry_wait_s", mst.RetryWait.Seconds())
+			recordOutcome(res, "ingest.mover", mst)
 			res.Set("ingest.mover_client_starved_s", mst.Starved.Seconds())
 			mr := mst.SliceRates(*slices)
 			for i, r := range mr {
@@ -269,7 +275,20 @@ func main() {
 		}
 	}
 	if err := res.Write(sf.Out); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		benchlib.Fatal(err)
+	}
+}
+
+// recordOutcome stores the server's account of the rows: stored, late, invalid and bad
+// lines (all rows count as stored for v2, which rejects bad rows with an error status).
+func recordOutcome(res *benchlib.Result, prefix string, st benchlib.SendStats) {
+	o := st.Outcome
+	res.Set(prefix+"_stored", float64(o.Accepted))
+	if o.Late+o.Invalid+o.BadLines > 0 {
+		res.Set(prefix+"_late", float64(o.Late))
+		res.Set(prefix+"_invalid", float64(o.Invalid))
+		res.Set(prefix+"_bad_lines", float64(o.BadLines))
+		res.Note("%s: the server did not store %d of %d rows (late %d, invalid %d, bad lines %d); rates count stored rows",
+			prefix, st.Rows-o.Accepted, st.Rows, o.Late, o.Invalid, o.BadLines)
 	}
 }

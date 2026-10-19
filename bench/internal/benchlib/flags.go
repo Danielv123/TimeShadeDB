@@ -124,8 +124,10 @@ func (f *ServerFlags) Start() (*Server, string, error) {
 	return s, s.BaseURL, nil
 }
 
-// Fatal prints an error and exits.
+// Fatal prints an error, stops every server this process started (os.Exit skips
+// deferred Stop calls) and exits with status 1.
 func Fatal(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
+	StopAll()
 	os.Exit(1)
 }

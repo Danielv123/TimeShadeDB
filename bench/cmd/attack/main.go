@@ -3,16 +3,26 @@
 // behind and how fast they are answered (PLAN.md §4.3 G2, §5 "Hostile tile requests":
 // 1 M random coordinates add < 2 MB, each answered in < 1 ms).
 //
+// Memory is read several times before and after (the median of -mem-readings, after
+// -settle), as the commit charge (private bytes, the target metric), as RSS, and as the
+// Go heap from /metrics when the server exports go_memstats_heap_inuse_bytes. A single
+// working-set reading moves by more than the 2 MiB budget on its own.
+//
 // A guard stops the run when the server's RSS passes -max-rss-mib or after
-// -max-duration; the growth per million requests is then extrapolated and flagged.
+// -max-duration. The growth per million requests is extrapolated only from at least
+// -min-extrapolate requests, or when the growth is already far past the budget
+// (-clear-growth-mib); both cases are noted in the result.
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"math/rand"
-	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +39,10 @@ func main() {
 	maxRSS := flag.Float64("max-rss-mib", 8192, "stop when the server RSS exceeds this (protects the machine)")
 	warm := flag.Int("warm", 2000, "valid-looking warm-up requests before the baseline memory reading")
 	seed := flag.Int64("seed", 1, "random seed")
+	readings := flag.Int("mem-readings", 5, "memory readings before and after (the median is used)")
+	settle := flag.Duration("settle", 2*time.Second, "wait before the readings after the run")
+	minExtrap := flag.Int("min-extrapolate", 100000, "fewest requests to extrapolate the growth per million from")
+	clearGrowth := flag.Float64("clear-growth-mib", 64, "growth (MiB) that is reported per million even from fewer requests, because it is far past the budget")
 	flag.Parse()
 
 	res := sf.NewResult("attack")
@@ -76,10 +90,14 @@ func main() {
 		}
 	}
 	time.Sleep(time.Second)
-	var before benchlib.MemInfo
+	var before memReading
 	if srv != nil {
-		before, _ = srv.Memory()
-		res.Set("attack.rss_before_mib", benchlib.MiB(before.RSS))
+		before = readMem(ctx, srv, client, sf.Target, *readings)
+		res.Set("attack.rss_before_mib", before.rss)
+		res.Set("attack.private_before_mib", before.private)
+		if before.heap >= 0 {
+			res.Set("attack.heap_before_mib", before.heap)
+		}
 	}
 
 	var sent, stopped atomic.Int64
@@ -171,24 +189,90 @@ func main() {
 		res.Note("stopped early after %d of %d requests: %s", done, *n, stopReason)
 	}
 	if srv != nil {
-		time.Sleep(2 * time.Second)
-		if after, err := srv.Memory(); err == nil {
-			growth := benchlib.MiB(after.RSS) - benchlib.MiB(before.RSS)
-			res.Set("attack.rss_after_mib", benchlib.MiB(after.RSS))
-			res.Set("attack.rss_growth_mib", growth)
+		time.Sleep(*settle)
+		if srv.Exited() {
+			res.Note("server exited; no memory after")
+		} else {
+			after := readMem(ctx, srv, client, sf.Target, *readings)
+			res.Set("attack.rss_after_mib", after.rss)
+			res.Set("attack.private_after_mib", after.private)
+			res.Set("attack.rss_growth_mib", after.rss-before.rss)
+			res.Set("attack.private_growth_mib", after.private-before.private)
+			if after.heap >= 0 && before.heap >= 0 {
+				res.Set("attack.heap_growth_mib", after.heap-before.heap)
+			}
 			if done > 0 {
-				per1M := growth * 1e6 / float64(done)
-				res.Set("attack.rss_growth_mib_per_1m", per1M)
-				if done < 1000000 {
-					res.Note("rss_growth_mib_per_1m is extrapolated linearly from %d requests", done)
+				per := func(name string, growth float64) {
+					switch {
+					case done >= *minExtrap:
+						res.Set("attack."+name+"_growth_mib_per_1m", growth*1e6/float64(done))
+						if done < 1000000 {
+							res.Note("%s_growth_mib_per_1m is extrapolated linearly from %d requests", name, done)
+						}
+					case growth > *clearGrowth:
+						res.Set("attack."+name+"_growth_mib_per_1m", growth*1e6/float64(done))
+						res.Note("%s_growth_mib_per_1m is extrapolated from only %d requests because %.0f MiB is already far past the budget", name, done, growth)
+					default:
+						res.Note("%s growth %.2f MiB after %d requests: too few requests to extrapolate per million", name, growth, done)
+					}
+				}
+				per("private", after.private-before.private)
+				per("rss", after.rss-before.rss)
+				if after.heap >= 0 && before.heap >= 0 {
+					per("heap", after.heap-before.heap)
 				}
 			}
-		} else {
-			res.Note("memory after: %v", err)
 		}
 	}
 	if err := res.Write(sf.Out); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		benchlib.Fatal(err)
 	}
+}
+
+type memReading struct {
+	rss, private float64
+	// heap is go_memstats_heap_inuse_bytes from /metrics in MiB, or -1.
+	heap float64
+}
+
+// readMem takes n readings 250 ms apart and returns the medians.
+func readMem(ctx context.Context, srv *benchlib.Server, c *benchlib.Client, target string, n int) memReading {
+	var rss, priv, heap []float64
+	for i := 0; i < max(1, n); i++ {
+		if i > 0 {
+			time.Sleep(250 * time.Millisecond)
+		}
+		if mi, err := srv.Memory(); err == nil {
+			rss = append(rss, benchlib.MiB(mi.RSS))
+			priv = append(priv, benchlib.MiB(mi.Private))
+		}
+		if target == "v3" {
+			if h, ok := goHeap(ctx, c); ok {
+				heap = append(heap, h)
+			}
+		}
+	}
+	m := memReading{rss: benchlib.Median(rss), private: benchlib.Median(priv), heap: -1}
+	if len(heap) > 0 {
+		m.heap = benchlib.Median(heap)
+	}
+	return m
+}
+
+// goHeap reads go_memstats_heap_inuse_bytes from the server's /metrics, if exported.
+func goHeap(ctx context.Context, c *benchlib.Client) (float64, bool) {
+	r, err := c.Get(ctx, "/metrics", true, nil)
+	if err != nil || r.Status != 200 {
+		return 0, false
+	}
+	sc := bufio.NewScanner(bytes.NewReader(r.Body))
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		if v, ok := strings.CutPrefix(sc.Text(), "go_memstats_heap_inuse_bytes "); ok {
+			if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				return f / (1 << 20), true
+			}
+		}
+	}
+	return 0, false
 }
