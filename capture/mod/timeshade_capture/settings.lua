@@ -1,0 +1,52 @@
+-- Runtime-global settings: map settings, the same on every peer, so changing them runs capture.config everywhere.
+data:extend({
+	{
+		type = "bool-setting",
+		name = "timeshade-capture-enabled",
+		setting_type = "runtime-global",
+		default_value = true,
+		order = "a",
+	},
+	{
+		type = "int-setting",
+		name = "timeshade-capture-debounce",
+		setting_type = "runtime-global",
+		default_value = 600,
+		minimum_value = 1,
+		maximum_value = 216000,
+		order = "b",
+	},
+	{
+		type = "int-setting",
+		name = "timeshade-capture-chart-reads",
+		setting_type = "runtime-global",
+		default_value = 2,
+		minimum_value = 1,
+		maximum_value = 64,
+		order = "c",
+	},
+	{
+		type = "int-setting",
+		name = "timeshade-capture-cache",
+		setting_type = "runtime-global",
+		default_value = 16384,
+		minimum_value = 16,
+		maximum_value = 1048576,
+		order = "d",
+	},
+	{
+		type = "bool-setting",
+		name = "timeshade-capture-rails",
+		setting_type = "runtime-global",
+		default_value = false,
+		order = "e",
+	},
+	{
+		type = "string-setting",
+		name = "timeshade-capture-forces",
+		setting_type = "runtime-global",
+		default_value = "",
+		allow_blank = true,
+		order = "f",
+	},
+})

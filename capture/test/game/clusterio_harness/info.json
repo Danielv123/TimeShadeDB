@@ -1,0 +1,9 @@
+{
+	"name": "timeshade_clusterio_harness",
+	"version": "0.1.0",
+	"title": "TimeShadeDB Clusterio module harness",
+	"author": "TimeShadeDB",
+	"factorio_version": "2.0",
+	"description": "Loads the Clusterio save-patch module 'timeshade' as a patched save would, with a stub Clusterio API, and runs the game-test scenario (capture/test/run_game.mjs). Not for play.",
+	"dependencies": ["base >= 2.0.0"]
+}
