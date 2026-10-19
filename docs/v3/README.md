@@ -53,6 +53,9 @@ incomplete, the WP makes the smallest additive change and lists it in its report
 | WP11 benchmarks and acceptance | `bench/` (`bench/cmd/{ingestbench,soak,tilebench,attack}/`, `bench/web/`, `bench/trains/`, `bench/run_acceptance.{ps1,sh}`, `bench/REPORT.md`) | Reads `window.__tsdbPerf` and `/metrics`. |
 | WP12 static export and S3 | `internal/v3/publish/`, `cmd/timeshadedb/cmd_publish.go` | Writes the API.md static subset. |
 
+`cmd/timeshadedb/v3stores.go` (the file-backed v3 stores, pyramid build and icon copy
+used by `import-minimap` and the command tests) is shared wiring, changed at integration.
+
 `web/package.json` and `web/package-lock.json` are shared: WP7 and WP8 may add
 dependencies; merge conflicts there are resolved at merge time. WP0 added only the `test`
 script.
@@ -69,7 +72,7 @@ func init() {
 ```
 
 `Run` receives the arguments after the command name and parses them with its own
-`flag.FlagSet`. `timeshadedb help` lists every command. Planned v3 commands:
+`flag.FlagSet`. `timeshadedb help` lists every command. The v3 commands:
 
 | Command | File | WP |
 |---|---|---|

@@ -309,8 +309,9 @@ func (t *tailer) postLines(ctx context.Context, lines []byte) (int, error) {
 }
 
 // post sends one batch of envelope lines with the forwarder fields added. It retries
-// network errors, 5xx and 429 (honouring Retry-After) until ingest answers 200 or ctx
-// ends; any other status is returned as a *statusError.
+// network errors, 5xx, 429 and 408 (the body arrived too slowly) with backoff, honouring
+// Retry-After, until ingest answers 200 or ctx ends; any other status is returned as a
+// *statusError.
 func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
 	recv := core.FromTime(t.now())
 	var body bytes.Buffer
@@ -353,7 +354,7 @@ func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
 			return 0, ctx.Err()
 		}
 		var se *statusError
-		if errors.As(err, &se) && se.code != http.StatusTooManyRequests && se.code < 500 {
+		if errors.As(err, &se) && se.code != http.StatusTooManyRequests && se.code != http.StatusRequestTimeout && se.code < 500 {
 			return 0, se
 		}
 		wait := backoff

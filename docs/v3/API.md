@@ -329,7 +329,7 @@ loses open-window updates until the chunk changes again or the next resync.
 `src`, `map`, `instance`, `recv_ms` and an increasing `seq` to every line, posts gzip
 bodies of up to `--batch-bytes` (1 MiB), deletes a file once all of it was acknowledged
 and a newer file exists, and posts the newest file up to its last complete line without
-deleting it. Network errors, 5xx and 429 are retried with backoff (honouring
+deleting it. Network errors, 5xx, 429 and 408 are retried with backoff (honouring
 `Retry-After`); a 400 or 413 splits the batch, and a single line that is still refused is
 skipped and logged; any other status (401, 403, 404, 415) stops the tailer with an error.
 The acknowledged offsets are kept in a state file (`--state`, default

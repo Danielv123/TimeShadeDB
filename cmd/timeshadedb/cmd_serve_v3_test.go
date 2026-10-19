@@ -396,6 +396,13 @@ func TestTailerFiles(t *testing.T) {
 		t.Fatalf("%d envelopes after split and skip", got)
 	}
 	fi.maxEnvs = 0
+	// 408 (the body arrived too slowly) is retried like 503.
+	fi.codes = []int{408}
+	before = len(fi.envs)
+	write("b.ndjson", env(15))
+	if n, err := tl.pass(ctx); err != nil || n != 1 || len(fi.envs)-before != 1 {
+		t.Fatalf("408 retry: %d %v", n, err)
+	}
 	fi.codes = []int{401}
 	write("b.ndjson", env(14))
 	if _, err := tl.pass(ctx); err == nil || !strings.Contains(err.Error(), "401") {
