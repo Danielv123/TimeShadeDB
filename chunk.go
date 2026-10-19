@@ -1438,9 +1438,10 @@ func (db *DB) writeChunkTileGroupLocked(writes []chunkWrite) error {
 	first := writes[0]
 	ds := first.ds
 	tile := chunkTileCoordForChunk(first.coord)
-	if err := db.ensureChunkDatastoreFilesLocked(ds); err != nil {
-		return err
-	}
+	// The datastore's directories and metadata exist: ingestChunkRows creates them
+	// under db.chunkMu before it starts the tile workers. Calling
+	// ensureChunkDatastoreFilesLocked here, with only tile locks held, raced on its
+	// flags between workers.
 	dataPath := chunkTileDataPath(db.path, ds.key, tile)
 	newFile := false
 	if _, err := os.Stat(dataPath); errors.Is(err, os.ErrNotExist) {
