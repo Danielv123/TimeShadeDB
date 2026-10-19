@@ -33,6 +33,15 @@ local function build(v)
 	return table.concat(px)
 end
 
+--- Use these 2,048-byte charts as the variants instead of generated ones (the UPS bench's --real-charts: charts cut
+--- from a real map, which deflate differently from the generated runs). Bench only: the game tests check the generated
+--- bytes.
+function synthetic.use(list)
+	for v = 0, VARIANTS - 1 do
+		variants[v] = list[v % #list + 1]
+	end
+end
+
 --- The 2,048-byte RGB565 LE chart of chunk (x, y) at phase p. The variants are built once, so the seam costs about
 --- what the native get_chunk_chart does (a table lookup instead of a copy).
 function synthetic.chart(x, y, p)

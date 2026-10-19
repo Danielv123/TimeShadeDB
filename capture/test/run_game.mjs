@@ -1,6 +1,9 @@
 // Headless Factorio tests of the capture (docs/v3/PROTOCOL.md section 6). Needs a Factorio 2.x install; nothing else.
 //
 //   node run_game.mjs [--mode test|clusterio|bench|all] [--factorio <factorio.exe>] [--keep] [--ticks N]
+//   test options: [--write-fixture] (rewrite fixtures/game_envelopes.ndjson from this run)
+//   bench options: [--runs N] [--trains N] [--charted N] [--chart-reads N] [--profile] [--micro]
+//                  [--real-charts <illisis export dir>] [--compare <another capture/ dir>]
 //
 // test       the standalone mod (test build) and the driver mod run scenario.lua; the envelopes it wrote to
 //            script-output/timeshade are validated line by line, chart bytes are recomputed, train samples are checked
@@ -427,6 +430,46 @@ function runTest() {
 	}
 	const types = new Set(msgs.map(m => m.type));
 	note(`test: message types seen: ${[...types].sort().join(", ")}`);
+	if (flag("--write-fixture")) {
+		writeFixture(lines, results);
+	}
+}
+
+/**
+ * --write-fixture: rewrite fixtures/game_envelopes.ndjson (the Go decode test's input) from this run: the first line,
+ * then each line that shows something no earlier pick did (a message type, a sample flag, a vehicle, a gone, the
+ * scheduled train), in game order.
+ */
+function writeFixture(lines, results) {
+	const seen = new Set();
+	const picked = [];
+	lines.forEach((line, i) => {
+		const features = new Set();
+		for (const m of JSON.parse(line).msgs) {
+			features.add(`type:${m.type}`);
+			if (m.type === "chunk" && m.d === undefined) {
+				features.add("deleted");
+			}
+			for (const e of m.type === "move" ? m.m : []) {
+				for (const f of ["car", "es", "stop", "tick", "gone"]) {
+					if (e[f] !== undefined) {
+						features.add(`${e.k ?? ""}:${f}`);
+					}
+				}
+				features.add(`kind:${e.k ?? "gone"}`);
+				if (results.c_id && e.j?.endsWith(`.${results.c_id}`)) {
+					features.add("scheduled train");
+				}
+			}
+		}
+		if (i === 0 || [...features].some(f => !seen.has(f))) {
+			picked.push(line);
+			features.forEach(f => seen.add(f));
+		}
+	});
+	const out = path.join(here, "fixtures", "game_envelopes.ndjson");
+	fs.writeFileSync(out, picked.map(l => l + "\n").join(""));
+	note(`test: wrote ${picked.length} of ${lines.length} lines to ${out} (${[...seen].sort().join(", ")})`);
 }
 
 function runClusterio() {
@@ -465,6 +508,53 @@ function runClusterio() {
 	check(start, "clusterio: the start resync finished");
 }
 
+/**
+ * `max` distinct 2,048-byte charts from an illisis/minimap export (--real-charts <dir>): the whole-block records
+ * (a chunk's full chart) of the level-0 change files (MMC1: "MMC1", then per record u32 dt, u8 block, u16 n, and
+ * n = 0 means 1,024 RGB565 LE pixels follow, else n x (u16 pos, u16 colour)). The export is only read as data. Returns
+ * a Lua module source: a list of helpers.encode_string-format strings (zlib, base64) for helpers.decode_string.
+ */
+function realCharts(dir, max = 509, scan = 20000) {
+	const seen = new Set();
+	const out = [];
+	const walk = (d, depth) => {
+		for (const entry of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+			if (out.length >= scan) {
+				return;
+			}
+			const p = path.join(d, entry.name);
+			if (entry.isDirectory() && depth < 6) {
+				walk(p, depth + 1);
+			} else if (entry.isFile() && entry.name.endsWith(".c.gz") && /[\\/]0[\\/][-\d]+_[-\d]+$/.test(d)) {
+				const b = zlib.gunzipSync(fs.readFileSync(p));
+				if (b.subarray(0, 4).toString("latin1") !== "MMC1") {
+					continue;
+				}
+				for (let o = 4; o + 7 <= b.length && out.length < scan;) {
+					const n = b.readUInt16LE(o + 5);
+					o += 7;
+					if (n === 0) {
+						const chart = b.subarray(o, o + 2048);
+						o += 2048;
+						const key = chart.toString("base64");
+						if (chart.length === 2048 && !seen.has(key) && chart.some(v => v !== 0)) {
+							seen.add(key);
+							out.push(zlib.deflateSync(chart).toString("base64"));
+						}
+					} else {
+						o += 4 * n;
+					}
+				}
+			}
+		}
+	};
+	walk(dir, 0);
+	// every k-th of the first `scan` found, so the sample spreads over the export's maps, surfaces and areas
+	const step = Math.max(1, Math.floor(out.length / max));
+	const pick = out.filter((_, i) => i % step === 0).slice(0, max);
+	return "return {\n" + pick.map(s => `\t"${s}",\n`).join("") + "}\n";
+}
+
 /** Rows of every run in a --benchmark-verbose output (one header per run). */
 function parseVerbose(stdout) {
 	const lines = stdout.split(/\r?\n/);
@@ -501,9 +591,15 @@ function runBench() {
 	const build = buildCapture(path.join(root, "build-bench"));
 	const cfg = { mode: "bench", trains, chunks: 50176, charted: Number(option("--charted", 20)), report_tick: ticks - 10,
 		resync_tick: resyncTick, profile: flag("--profile") ? resyncTick - 1 : false, profile_start: warm, micro: flag("--micro") ? 700 : false,
-		chart_reads: Number(option("--chart-reads", 1)) };
+		chart_reads: Number(option("--chart-reads", 1)), real_charts: Boolean(option("--real-charts", null)) };
+	const realLua = cfg.real_charts ? realCharts(option("--real-charts")) : null;
 	const box = sandbox("bench", {
-		timeshade_capture: (dst) => copyTree(build.modDir, dst),
+		timeshade_capture: (dst) => {
+			copyTree(build.modDir, dst);
+			if (realLua) {
+				fs.writeFileSync(path.join(dst, "test", "real_charts.lua"), realLua);
+			}
+		},
 		timeshade_capture_testdriver: (dst) => {
 			copyTree(path.join(here, "game", "testdriver"), dst);
 			for (const f of ["scenario.lua", "synthetic.lua"]) {
@@ -518,17 +614,47 @@ function runBench() {
 	const save = path.join(box.dir, "bench.zip");
 	setEnabled(box, { timeshade_capture_null: false }); // both define the test interface
 	run(box, ["--create", save], "create");
+	// --compare <capture dir>: another version of the capture (an older checkout's capture/), built the same way and run
+	// on the same save in its own sandbox, interleaved with the others, so both versions see the same machine load
+	const compareDir = option("--compare", null);
+	let altBox = null;
+	if (compareDir) {
+		const altOut = path.join(root, "build-alt");
+		execFileSync(process.execPath, [path.join(compareDir, "build.mjs"), "--out", altOut, "--test", "--no-zip",
+			"--factorio-version", majorMinor()], { encoding: "utf8" });
+		const altInfo = JSON.parse(fs.readFileSync(path.join(compareDir, "mod", "timeshade_capture", "info.json"), "utf8"));
+		altBox = sandbox("bench-alt", {
+			timeshade_capture: (dst) => copyTree(path.join(altOut, `${altInfo.name}_${altInfo.version}`), dst),
+			timeshade_capture_testdriver: (dst) => {
+				copyTree(path.join(here, "game", "testdriver"), dst);
+				for (const f of ["scenario.lua", "synthetic.lua"]) {
+					fs.copyFileSync(path.join(here, "game", f), path.join(dst, f));
+				}
+			},
+			timeshade_capture_null: (dst) => copyTree(path.join(here, "game", "nullcapture"), dst),
+		}, cfg);
+		fs.rmSync(path.join(altBox.modsDir, "timeshade_capture", "config.lua"));
+		fs.rmSync(path.join(altBox.modsDir, "timeshade_capture_null", "config.lua"));
+		setEnabled(altBox, { timeshade_capture: true, timeshade_capture_null: false });
+		note(`bench: comparing with the capture in ${compareDir} ("alt")`);
+	}
 	const runs = Number(option("--runs", 3));
 	const result = {};
-	// interleaved (without, with, without, with, ...) so a burst of load on the machine hits both alike
-	const per = { without: [], with: [] };
+	// interleaved (without, with[, alt], without, with[, alt], ...) so a burst of load on the machine hits each alike
+	const per = { without: [], with: [], alt: [] };
 	const pairs = [];
+	const variants = [["without", box, false], ["with", box, true]];
+	if (altBox) {
+		variants.push(["alt", altBox, true]);
+	}
 	for (let r = 0; r < runs; r++) {
-		for (const [label, enabled] of [["without", false], ["with", true]]) {
-			setEnabled(box, { timeshade_capture: enabled, timeshade_capture_null: !enabled });
-			const res = run(box, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
+		for (const [label, vbox, enabled] of variants) {
+			if (vbox === box) {
+				setEnabled(box, { timeshade_capture: enabled, timeshade_capture_null: !enabled });
+			}
+			const res = run(vbox, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
 				`bench-${label}-${r}`);
-			if (enabled && r === 0) {
+			if (label === "with" && r === 0) {
 				for (const m of res.stdout.matchAll(/TSTEST (?:prof|micro) (.*)/g)) {
 					note(`bench profile (ticks ${warm}-${resyncTick - 1}): ${m[1].trim()}`);
 				}
@@ -550,7 +676,16 @@ function runBench() {
 		const base = meanOf(p.without, x => x.whole / 1e6);
 		baselines.push(base);
 		note(`bench pair ${r}: capture Lua cost ${(meanOf(p.with, lua) - meanOf(p.without, lua)).toFixed(4)} ms/tick `
+			+ (p.alt ? `(alt ${(meanOf(p.alt, lua) - meanOf(p.without, lua)).toFixed(4)}) ` : "")
 			+ `(baseline Lua ${meanOf(p.without, lua).toFixed(4)} ms, whole tick ${base.toFixed(4)} ms)`);
+	}
+	if (altBox) {
+		const steadyOf = (label) => per[label].filter(x => x.tick < resyncTick);
+		const luaMean = (label) => meanOf(steadyOf(label), x => (x.script + x.gc) / 1e6);
+		const wholeMean = (label) => meanOf(steadyOf(label), x => x.whole / 1e6);
+		note(`bench compare: capture Lua cost ${(luaMean("with") - luaMean("without")).toFixed(4)} ms/tick, alt `
+			+ `${(luaMean("alt") - luaMean("without")).toFixed(4)}; whole tick ${(wholeMean("with") - wholeMean("without"))
+				.toFixed(4)}, alt ${(wholeMean("alt") - wholeMean("without")).toFixed(4)}`);
 	}
 	if (Math.max(...baselines) > 1.2 * Math.min(...baselines)) {
 		note(`WARN bench: the baseline's whole tick moved from ${Math.min(...baselines).toFixed(3)} to `

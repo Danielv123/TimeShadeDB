@@ -355,8 +355,10 @@ function core.next_read(speed)
 	return math.min(core.SLOW, math.max(1, math.ceil(core.STEP / math.abs(speed))))
 end
 
+local SCALE = { [0] = 1, 10, 100, 1000 }
+
 function core.round(v, places)
-	local m = 10 ^ places
+	local m = SCALE[places] or 10 ^ places
 	return math.floor(v * m + 0.5) / m
 end
 
@@ -415,23 +417,29 @@ end
 --- Whether some buffered read lies too far from the chord e -> c: more than core.CHORD_EPS off the line, or more than
 --- core.SED_EPS off where linear motion in time along the chord puts it (synchronised distance).
 function core.off_chord(e, buf, c)
-	local dx, dy, dt = c.x - e.x, c.y - e.y, c.t - e.t
-	local len = math.sqrt(dx * dx + dy * dy)
+	local ex0, ey0, et0 = e.x, e.y, e.t
+	local dx, dy, dt = c.x - ex0, c.y - ey0, c.t - et0
+	local len2 = dx * dx + dy * dy
+	-- squared distances against squared limits: the same test without a square root per read (this runs for every
+	-- buffered read at every train read)
+	local chord2, sed2 = core.CHORD_EPS * core.CHORD_EPS, core.SED_EPS * core.SED_EPS
+	local lim = chord2 * len2
 	for i = 1, #buf do
 		local p = buf[i]
-		local px, py = p.x - e.x, p.y - e.y
-		local perp
-		if len < 1e-6 then
-			perp = math.sqrt(px * px + py * py)
+		local px, py = p.x - ex0, p.y - ey0
+		if len2 < 1e-12 then
+			if px * px + py * py > chord2 then
+				return true
+			end
 		else
-			perp = math.abs(dx * py - dy * px) / len
+			local cross = dx * py - dy * px
+			if cross * cross > lim then
+				return true
+			end
 		end
-		if perp > core.CHORD_EPS then
-			return true
-		end
-		local f = dt > 0 and (p.t - e.t) / dt or 0
-		local ex, ey = px - dx * f, py - dy * f
-		if math.sqrt(ex * ex + ey * ey) > core.SED_EPS then
+		local f = dt > 0 and (p.t - et0) / dt or 0
+		local qx, qy = px - dx * f, py - dy * f
+		if qx * qx + qy * qy > sed2 then
 			return true
 		end
 	end
