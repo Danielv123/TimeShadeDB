@@ -312,71 +312,97 @@ func (w *discardWriter) WriteHeader(s int)           { w.status = s }
 // coordinates inside and outside the grid, versions that do not exist) and checks that
 // they leave less than 2 MB behind (PLAN.md §4.3 G2, §5 "Hostile tile requests") and
 // answer quickly.
+// hostilePath returns a random request path: mostly invalid ids, levels, coordinates and
+// versions (valid false), or valid ids and levels with coordinates, versions and dates
+// near the fixture's data, so that many requests find real tiles.
+func hostilePath(rng *rand.Rand, valid bool) string {
+	ids := []string{dsID, dsID, "gw-x.nauvis.player", "nope", "gw-test~2E1.nauvis.enemy", "A.B.C", "x~zz.y.z"}
+	id := ids[rng.IntN(len(ids))]
+	z := -rng.IntN(13)
+	x := rng.IntN(10000) - 5000
+	y := rng.IntN(10000) - 5000
+	if rng.IntN(2) == 0 {
+		x, y = rng.IntN(9)-4, rng.IntN(9)-4
+	}
+	v := rng.IntN(1000)
+	if valid {
+		id = dsID
+		x, y = rng.IntN(7)-3, rng.IntN(3)-1
+		v = rng.IntN(5)
+	}
+	switch rng.IntN(7) {
+	case 0, 1:
+		return fmt.Sprintf("/api/v3/tile/%s/%d/%d/%d/%d.bin", id, z, x, y, v)
+	case 2:
+		return fmt.Sprintf("/api/v3/tile/%s/%d/%d/%d/%d.png", id, z, x, y, v)
+	case 3:
+		return fmt.Sprintf("/api/v3/tile/%s/%d/%d/%d/live.bin", id, z, x, y)
+	case 4:
+		return fmt.Sprintf("/api/v3/tiledelta/%s/%d/%d/%d-%d.bin", id, x, y, v, v+rng.IntN(5))
+	case 5:
+		return fmt.Sprintf("/api/v3/timeline/%s/%d/2026-10-%02d.json", id, z, 10+rng.IntN(10))
+	default:
+		return fmt.Sprintf("/api/v3/view/%s/%d?bbox=%d,%d,%d,%d&t=%d", id, z, x, y, x+rng.IntN(70), y+rng.IntN(70), int64(day0)+rng.Int64N(int64(2*core.Day)))
+	}
+}
+
+// TestHostileTileRequests answers a flood of requests with a fresh random path each
+// (mostly invalid ones, then valid ones near the data) and checks that the heap does not
+// grow and that each answer is quick. The fixture holds only a few tiles and versions,
+// so after the warm-up the valid requests that find data are answered from the caches;
+// a flood of distinct valid tiles on a large database is bounded by the cache budgets
+// instead, which this test does not measure.
 func TestHostileTileRequests(t *testing.T) {
 	f := newFixture(t, fixtureOpt{})
 	n := 1_000_000
 	if testing.Short() {
 		n = 100_000
 	}
-	rng := rand.New(rand.NewPCG(1, 2))
-	ids := []string{dsID, dsID, "gw-x.nauvis.player", "nope", "gw-test~2E1.nauvis.enemy", "A.B.C", "x~zz.y.z"}
-	paths := make([]string, 4096)
-	for i := range paths {
-		id := ids[rng.IntN(len(ids))]
-		z := -rng.IntN(13)
-		x := rng.IntN(10000) - 5000
-		y := rng.IntN(10000) - 5000
-		if rng.IntN(2) == 0 {
-			x, y = rng.IntN(9)-4, rng.IntN(9)-4
-		}
-		v := rng.IntN(1000)
-		switch rng.IntN(4) {
-		case 0:
-			paths[i] = fmt.Sprintf("/api/v3/tile/%s/%d/%d/%d/%d.bin", id, z, x, y, v)
-		case 1:
-			paths[i] = fmt.Sprintf("/api/v3/tile/%s/%d/%d/%d/live.bin", id, z, x, y)
-		case 2:
-			paths[i] = fmt.Sprintf("/api/v3/tiledelta/%s/%d/%d/%d-%d.bin", id, x, y, v, v+rng.IntN(5))
-		default:
-			paths[i] = fmt.Sprintf("/api/v3/view/%s/%d?bbox=%d,%d,%d,%d", id, z, x, y, x+rng.IntN(70), y+rng.IntN(70))
-		}
-	}
-	run := func(count int) (time.Duration, map[int]int) {
+	run := func(rng *rand.Rand, count int, valid bool) (time.Duration, map[int]int) {
 		codes := map[int]int{}
 		var worst time.Duration
 		w := &discardWriter{h: http.Header{}}
-		for i := range count {
-			p := paths[i%len(paths)]
-			req := httptest.NewRequest(http.MethodGet, p, nil)
+		for range count {
+			req := httptest.NewRequest(http.MethodGet, hostilePath(rng, valid), nil)
 			clear(w.h)
 			w.status = 200
 			t0 := time.Now()
 			f.srv.ServeHTTP(w, req)
-			if d := time.Since(t0); d > worst && i > len(paths) {
+			if d := time.Since(t0); d > worst {
 				worst = d
 			}
 			codes[w.status]++
 		}
 		return worst, codes
 	}
-	run(2 * len(paths)) // warm caches, metrics and the encoder pools
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	t0 := time.Now()
-	worst, codes := run(n)
-	elapsed := time.Since(t0)
-	runtime.GC()
-	runtime.GC()
-	runtime.ReadMemStats(&after)
-	grew := int64(after.HeapInuse) - int64(before.HeapInuse)
-	t.Logf("%d requests in %v (%.1f µs each, worst %v), codes %v, heap in use %+d bytes", n, elapsed, float64(elapsed.Microseconds())/float64(n), worst, codes, grew)
-	if grew > 2<<20 {
-		t.Fatalf("heap grew %d bytes over %d hostile requests", grew, n)
-	}
-	if per := elapsed / time.Duration(n); per > time.Millisecond {
-		t.Fatalf("mean %v per request", per)
+	for _, valid := range []bool{false, true} {
+		count := n
+		if valid {
+			count = n / 5
+		}
+		rng := rand.New(rand.NewPCG(1, uint64(len(fmt.Sprint(valid)))))
+		run(rng, 20_000, valid) // warm caches, metrics and the encoder pools
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		t0 := time.Now()
+		worst, codes := run(rng, count, valid)
+		elapsed := time.Since(t0)
+		runtime.GC()
+		runtime.GC()
+		runtime.ReadMemStats(&after)
+		grew := int64(after.HeapInuse) - int64(before.HeapInuse)
+		t.Logf("valid=%v: %d requests in %v (%.1f µs each, worst %v), codes %v, heap in use %+d bytes", valid, count, elapsed, float64(elapsed.Microseconds())/float64(count), worst, codes, grew)
+		if valid && codes[200] < count/20 {
+			t.Fatalf("only %d of %d valid requests found data", codes[200], count)
+		}
+		if grew > 2<<20 {
+			t.Fatalf("heap grew %d bytes over %d requests (valid=%v)", grew, count, valid)
+		}
+		if per := elapsed / time.Duration(count); per > time.Millisecond {
+			t.Fatalf("mean %v per request", per)
+		}
 	}
 }
 
