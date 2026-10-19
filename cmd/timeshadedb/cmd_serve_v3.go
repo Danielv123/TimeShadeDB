@@ -207,7 +207,8 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 
 	// About 72 bytes per open mover row (WP4); an eighth of the budget.
 	maxRows := int(o.memBudget / 8 / 72)
-	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: refClock, Logf: logf})
+	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: refClock, Logf: logf,
+		LightEncoder: true})
 	if err != nil {
 		return fail(fmt.Errorf("movers: %w", err))
 	}
@@ -310,11 +311,12 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 	}
 
 	// The budget covers caches and buffers; the collector works harder as the process
-	// nears it plus a margin for the rest of the heap, so RSS stays within PLAN.md §5's
-	// mem-budget + 64 MiB (the margin leaves room for the executable's pages and the
-	// runtime's own memory). GOMEMLIMIT overrides.
+	// nears it plus a margin, so RSS stays within PLAN.md §5's mem-budget + 64 MiB: the
+	// runtime keeps its mapped memory near the limit under load, and on Windows the working
+	// set measured 15-30 MiB above it (the executable's pages, heap not yet returned).
+	// GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(o.memBudget + 48<<20)
+		debug.SetMemoryLimit(o.memBudget + 32<<20)
 	}
 	v, err := openV3Server(ctx, o, logf)
 	if err != nil {

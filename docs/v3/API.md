@@ -307,7 +307,7 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
   after a longer gap in the data the clock catches up over a few envelopes, whose
   message times are clamped meanwhile.
 
-The process sets a soft memory limit of `--mem-budget` plus 48 MiB (Go's `GOMEMLIMIT`,
+The process sets a soft memory limit of `--mem-budget` plus 32 MiB (Go's `GOMEMLIMIT`,
 which takes precedence when set), so garbage collection works harder before the process
 grows past its budget and RSS stays within the budget plus 64 MiB (PLAN.md §5). The
 caches get about 80% of the budget (terrain 3/8, encoded tiles 3/16, coarse images 3/32,
