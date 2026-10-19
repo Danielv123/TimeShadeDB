@@ -48,6 +48,7 @@ func main() {
 	maxDur := flag.Duration("max-duration", 10*time.Minute, "stop after this long")
 	maxRSS := flag.Float64("max-rss-mib", 8192, "stop when the server RSS exceeds this (protects the machine)")
 	warm := flag.Int("warm", 2000, "valid-looking warm-up requests before the baseline memory reading")
+	warmHostile := flag.Int("warm-hostile", 200000, "hostile warm-up requests (at -conc) before the baseline memory reading, not counted")
 	seed := flag.Int64("seed", 1, "random seed")
 	readings := flag.Int("mem-readings", 5, "memory readings before and after (the median is used)")
 	settle := flag.Duration("settle", 2*time.Second, "wait before the readings after the run")
@@ -126,6 +127,27 @@ func main() {
 		if _, err := client.Get(ctx, path, false, nil); err != nil {
 			benchlib.Fatal(err)
 		}
+	}
+	// Hostile warm-up at the measured concurrency: the first requests grow per-connection
+	// goroutine stacks and runtime caches once (a step of about 8 MiB of private bytes on
+	// Windows that further millions of requests do not repeat), which is not memory the
+	// requests retain. Without it the per-million growth measured that step.
+	if *warmHostile > 0 {
+		var wsent atomic.Int64
+		var wwg sync.WaitGroup
+		for w := 0; w < *conc; w++ {
+			wwg.Add(1)
+			go func() {
+				defer wwg.Done()
+				for wsent.Add(1) <= int64(*warmHostile) {
+					if _, err := client.Get(ctx, nextURL(), false, nil); err != nil {
+						return
+					}
+				}
+			}()
+		}
+		wwg.Wait()
+		res.Param("warm_hostile", *warmHostile)
 	}
 	time.Sleep(time.Second)
 	var before memReading
