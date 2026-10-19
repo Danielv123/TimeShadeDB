@@ -21,6 +21,10 @@ const wireHasCarriages = 1 << 6
 // MoverColumns is the number of row columns after the mover table.
 const MoverColumns = 8
 
+// MaxCarriages is the largest carriage count of one row that DecodeMoverWindow accepts.
+// Stores must reject samples with more, or they write windows they cannot read back.
+const MaxCarriages = 10000
+
 func zigzag(v int64) uint64   { return uint64(v<<1) ^ uint64(v>>63) }
 func unzigzag(u uint64) int64 { return int64(u>>1) ^ -int64(u&1) }
 
@@ -247,7 +251,7 @@ func DecodeMoverWindow(b []byte, sfc core.SurfaceKey) (*core.MoverWindow, error)
 			}
 			if f&wireHasCarriages != 0 {
 				nc := int(cCar.uvarint())
-				if nc > 10000 {
+				if nc > MaxCarriages {
 					return nil, fmt.Errorf("%w: %d carriages", ErrFormat, nc)
 				}
 				r.Carriages = make([]core.Carriage, nc)

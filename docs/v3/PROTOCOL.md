@@ -78,21 +78,41 @@ Gone: `{j, gone: true, tick?}`.
 
 ## 4. Clock anchors
 
-The map clock is wall-clock milliseconds (PLAN.md §4.1). Ingest keeps one anchor per `src`:
+The map clock is wall-clock milliseconds (PLAN.md §4.1). Ingest keeps one anchor per `src`.
+Every envelope is a point `(tick, recv_ms)`; its arrival lag is never negative, so the true
+clock is a line on or under every point. The anchor fits that line, with a slope (ms per
+tick) measured rather than assumed, because a busy server runs below 60 UPS:
 
 ```
-tps        = 60 * (speed or 1)
-obs        = recv_ms - tick * 1000 / tps          (one value per envelope)
-offset     = min(obs) over the last 60 s of envelopes from src (the lowest-latency observation)
-t_ms(tick) = round(offset + tick * 1000 / tps)
+nominal    = 1000 / (60 * (speed or 1))                        ms per tick
+ms_per_tick = least-squares slope through the lowest-latency envelope of each of 12
+              equal tick ranges of the last 3 minutes, once the window spans 5 s and
+              4 envelopes and the slope is within [0.95, 30] * nominal; else nominal
+offset     = min(recv_ms - tick * ms_per_tick) over the last 60 s of envelopes from src
+t_ms(tick) = round(offset + tick * ms_per_tick)
 ```
 
-- On the first envelope of a source the offset is its `obs`.
-- If `obs` jumps by more than 5 s (save reloaded, game paused, host clock stepped) or the
-  tick goes backwards, the window resets and the offset re-fits from the new observations.
+At exactly 60 UPS this is the minimum of `obs = recv_ms - tick * 1000 / tps` over 60 s.
+
+- On the first envelope of a source the offset is its `obs` at the nominal rate.
+- If an envelope's distance above the line changes by more than 5 s from the previous
+  envelope's (save reloaded, game paused, host clock stepped), if it is more than 30 s off
+  the line, or if the tick goes backwards, the window resets and the line re-fits from the
+  new observations.
+- If the slope over the last 60 s differs from the 3-minute slope by more than 1%, the UPS
+  changed: envelopes older than 60 s are dropped. If every envelope of the last 5 s (at
+  least 3) is more than 500 ms above the line, the server slowed down faster than that:
+  the window keeps only the last 10 s.
+- A game speed change re-bases the anchor at the current tick (`tick - base` replaces
+  `tick` above) and continues the clock where it is.
 - Every message time is `t_ms(message tick or envelope tick)`. Mover samples also keep the
   raw tick, so velocity is exact below 60 UPS.
 - `tsdb_clock_anchor_offset_ms{src}` exports the current offset.
+- Measured with 20-400 ms arrival lag and 2% stalls of +3 s (TestAnchorSlowServer): after the
+  first minute the error stays under 150 ms at 1 envelope/s (mostly 60-90 ms) and 45 ms at 4/s, at any
+  rate from 3 to 60 UPS. In the first 10 s of a source (or after a reset) the nominal rate is
+  used, so a slow server is off by up to `(1 - ups/60) * 10 s`; an abrupt UPS drop from 60 to
+  40 is off by up to about 3 s for the following minute.
 
 ## 5. Mapping to stored data
 
