@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -42,10 +44,10 @@ func cmdServeV3(ctx context.Context, args []string) error {
 
 // v3ServerOptions are the parsed serve-v3 flags.
 type v3ServerOptions struct {
-	db, listen, ingestToken, readToken, pprof, webDir      string
-	memBudget                                              int64
-	window, commitEvery, terrainGrace, moverGrace, slowLog time.Duration
-	noViewer, stdinExit, salvageOverlays, quiet            bool
+	db, listen, ingestToken, readToken, pprof, webDir, clock string
+	memBudget                                                int64
+	window, commitEvery, terrainGrace, moverGrace, slowLog   time.Duration
+	noViewer, stdinExit, salvageOverlays, quiet              bool
 }
 
 func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
@@ -62,6 +64,7 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	fs.DurationVar(&o.terrainGrace, "terrain-grace", 10*time.Second, "how far behind the clock terrain windows close")
 	fs.DurationVar(&o.moverGrace, "mover-grace", 15*time.Second, "how far behind the clock mover windows close (at least 10s)")
 	fs.DurationVar(&o.slowLog, "slow-log", 0, "log requests slower than this (0: off)")
+	fs.StringVar(&o.clock, "clock", "wall", "map clock: wall (live capture) or data (the newest ingested recv_ms, for replaying recorded captures)")
 	fs.StringVar(&o.pprof, "pprof", "", "serve net/http/pprof on this separate address")
 	fs.StringVar(&o.webDir, "web-dir", "", "serve the viewer from this directory instead of the embedded bundle")
 	fs.BoolVar(&o.noViewer, "no-viewer", false, "do not serve the viewer")
@@ -88,6 +91,21 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	}
 	if o.memBudget < 32<<20 {
 		return nil, errors.New("serve-v3: --mem-budget must be at least 32 MiB")
+	}
+	if o.clock != "wall" && o.clock != "data" {
+		return nil, fmt.Errorf("serve-v3: bad --clock %q (wall or data)", o.clock)
+	}
+	if o.clock == "data" {
+		// A replay posts recorded data, often several bodies at once, so bodies arrive out
+		// of order by tens of seconds; close windows further behind the data.
+		set := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		if !set["terrain-grace"] {
+			o.terrainGrace = 2 * time.Minute
+		}
+		if !set["mover-grace"] {
+			o.moverGrace = 2 * time.Minute
+		}
 	}
 	host, _, err := net.SplitHostPort(o.listen)
 	if err != nil {
@@ -140,9 +158,16 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v := &v3Server{}
 	fail := func(err error) (*v3Server, error) { return nil, errors.Join(err, v.Close()) }
 	clock := ingest.WallClock
+	var dataClock *ingest.DataClock
+	if o.clock == "data" {
+		dataClock = &ingest.DataClock{}
+		clock = dataClock.Now
+	}
 
 	topt := terrain.SplitBudget(o.memBudget / 2)
 	topt.Window = core.TimeMs(o.window.Milliseconds())
+	// Each commit worker holds decoded tiles and an encoder; bound them for memory.
+	topt.Workers = min(runtime.GOMAXPROCS(0), 8)
 	topt.Logf = logf
 	ter, err := terrain.Open(o.db, topt)
 	if err != nil {
@@ -186,6 +211,19 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v.ovl = ovl
 	v.closers = append(v.closers, ovl.Close)
 
+	if dataClock != nil {
+		// Start from the newest data in the database.
+		if infos, err := ter.Datastores(ctx); err == nil {
+			for _, info := range infos {
+				dataClock.Observe(info.LastT)
+			}
+		}
+		if sfcs, err := mov.Surfaces(ctx); err == nil {
+			for _, si := range sfcs {
+				dataClock.Observe(si.LastT)
+			}
+		}
+	}
 	maps, err := ingest.OpenMaps(o.db)
 	if err != nil {
 		return fail(err)
@@ -223,9 +261,10 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		return fail(err)
 	}
 	in := ingest.New(ingest.Stores{Terrain: ter, Movers: mov, Overlays: ovl, Maps: maps}, ingest.Options{
-		Clock:    clock,
-		Notifier: srv.Notifier(),
-		Logf:     logf,
+		Clock:     clock,
+		DataClock: dataClock,
+		Notifier:  srv.Notifier(),
+		Logf:      logf,
 	})
 	srv.SetIngester(in)
 	v.api = srv
@@ -257,6 +296,11 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 		}()
 	}
 
+	// The budget covers caches and buffers; let the GC work harder before the process
+	// grows far past it (PLAN.md §5: RSS <= mem-budget + 64 MiB). GOMEMLIMIT overrides.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(o.memBudget + o.memBudget/2 + 64<<20)
+	}
 	v, err := openV3Server(ctx, o, logf)
 	if err != nil {
 		return err

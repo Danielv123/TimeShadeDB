@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"runtime"
 	"strconv"
 	"sync"
@@ -58,12 +59,15 @@ type Options struct {
 	MaxAhead core.TimeMs
 	// Clock returns the server's map clock (default: wall clock).
 	Clock func() core.TimeMs
+	// DataClock, if set, observes every valid envelope's recv_ms before its messages are
+	// timed (pass DataClock.Now as Clock too, for a server replaying recorded captures).
+	DataClock *DataClock
 	// MaxSources bounds the clock anchors (default 4,096).
 	MaxSources int
 	// MaxJourneys bounds the tracked journeys per map (default 100,000), MaxMaps the maps
 	// with a journey tracker (default 256; the least recently used is forgotten).
 	MaxJourneys, MaxMaps int
-	// Workers decode charts in parallel (default GOMAXPROCS).
+	// Workers decode charts in parallel (default min(GOMAXPROCS, 8)).
 	Workers int
 	// Notifier receives what was applied (optional).
 	Notifier Notifier
@@ -142,7 +146,7 @@ func New(st Stores, opt Options) *Ingester {
 		opt.MaxMaps = 256
 	}
 	if opt.Workers <= 0 {
-		opt.Workers = runtime.GOMAXPROCS(0)
+		opt.Workers = min(runtime.GOMAXPROCS(0), 8)
 	}
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
@@ -193,47 +197,247 @@ func (in *Ingester) AnchorOffsets(fn func(src string, offset float64)) {
 func (in *Ingester) Ingest(ctx context.Context, body io.Reader) (core.IngestResponse, error) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	b := &batch{in: in}
-	resp := &b.resp
-	resp.Errors = []string{}
+	b := &batch{in: in, ap: in.startApplier(ctx)}
+	b.resp.Errors = []string{}
+	err := b.read(ctx, body)
+	if err == nil {
+		err = b.flush()
+	}
+	// The applier finishes the batches already handed over; its error wins, because
+	// the reader only stops early when the applier failed.
+	aerr := b.ap.finish()
+	b.resp.Chunks.Add(b.ap.res.chunks)
+	b.resp.Samples.Add(b.ap.res.samples)
+	b.resp.Overlays.Add(b.ap.res.overlays)
+	if aerr != nil {
+		return b.resp, aerr
+	}
+	return b.resp, err
+}
+
+// read reads, parses and queues the body's lines, handing full batches to the applier.
+func (b *batch) read(ctx context.Context, body io.Reader) error {
+	in := b.in
 	br := bufio.NewReaderSize(body, 64<<10)
-	line := make([]byte, 0, 64<<10)
+	seg := &segment{}
 	lineNo := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return *resp, err
+			return err
 		}
-		var tooLong bool
-		var err error
-		line, tooLong, err = readLine(br, line[:0], in.opt.MaxLine)
+		line, tooLong, err := readLine(br, seg.next(), in.opt.MaxLine)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return *resp, err
+			return err
 		}
 		eof := errors.Is(err, io.EOF)
 		if len(line) > 0 || tooLong {
 			lineNo++
 			in.stats.bytes.Add(int64(len(line)))
-			if tooLong {
-				b.badLine(lineNo, fmt.Errorf("line longer than %d bytes", in.opt.MaxLine))
-			} else if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
-				if err := b.envelope(trimmed); err != nil {
-					b.badLine(lineNo, err)
-				}
+			seg.add(lineNo, line, tooLong)
+		}
+		if seg.full() || (eof && len(seg.lines) > 0) {
+			// Parse the segment's lines in parallel (no shared state), then apply them in
+			// order.
+			seg.parse(in.opt.Workers)
+			for i := range seg.lines {
+				b.apply(&seg.lines[i])
 				if b.full() {
-					if err := b.flush(ctx); err != nil {
-						return *resp, err
+					if err := b.flush(); err != nil {
+						return err
 					}
 				}
 			}
+			seg.reset()
 		}
 		if eof {
-			break
+			return nil
 		}
 	}
-	if err := b.flush(ctx); err != nil {
-		return *resp, err
+}
+
+// segment holds raw lines of a body that are parsed together.
+type segment struct {
+	lines []parsedLine
+	bytes int
+	pool  [][]byte // line buffers for reuse
+}
+
+// Segment bounds: lines parse in parallel in groups of up to this many lines or bytes.
+const (
+	segmentLines = 1024
+	segmentBytes = 8 << 20
+)
+
+// parsedLine is one body line and, after parse, its envelope.
+type parsedLine struct {
+	no      int
+	raw     []byte
+	tooLong bool
+	env     core.Envelope
+	msgs    []wireMsg
+	err     error // the line is not a valid envelope
+}
+
+func (s *segment) next() []byte {
+	if n := len(s.pool); n > 0 {
+		b := s.pool[n-1][:0]
+		s.pool = s.pool[:n-1]
+		return b
 	}
-	return *resp, nil
+	return make([]byte, 0, 4096)
+}
+
+func (s *segment) add(no int, line []byte, tooLong bool) {
+	s.lines = append(s.lines, parsedLine{no: no, raw: line, tooLong: tooLong})
+	s.bytes += len(line)
+}
+
+func (s *segment) full() bool { return len(s.lines) >= segmentLines || s.bytes >= segmentBytes }
+
+func (s *segment) reset() {
+	for i := range s.lines {
+		if cap(s.lines[i].raw) <= 1<<20 {
+			s.pool = append(s.pool, s.lines[i].raw)
+		}
+		s.lines[i] = parsedLine{}
+	}
+	s.lines, s.bytes = s.lines[:0], 0
+}
+
+// parse decodes the segment in two parallel passes: the envelopes of every line, then
+// every message of every line (forwarders may pack hundreds of messages in one line).
+func (s *segment) parse(workers int) {
+	parallel(workers, len(s.lines), 1, func(i int) { s.lines[i].parseEnvelope() })
+	type ref struct{ line, msg int }
+	var refs []ref
+	for i := range s.lines {
+		l := &s.lines[i]
+		for j := range l.msgs {
+			refs = append(refs, ref{i, j})
+		}
+	}
+	parallel(workers, len(refs), 64, func(k int) {
+		r := refs[k]
+		l := &s.lines[r.line]
+		l.msgs[r.msg] = decodeMsg(l.env.Msgs[r.msg])
+	})
+	for i := range s.lines {
+		s.lines[i].env.Msgs = nil
+	}
+}
+
+// parallel runs fn(0..n-1) on up to workers goroutines, at least per items each.
+func parallel(workers, n, per int, fn func(i int)) {
+	if n == 0 {
+		return
+	}
+	workers = min(workers, max(1, n/per))
+	if workers == 1 {
+		for i := range n {
+			fn(i)
+		}
+		return
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= n {
+					return
+				}
+				fn(i)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// wireMsg is the union of every message type's fields (PROTOCOL.md 3), so a message is
+// decoded once. Chunk coordinates arrive as integers in X and Y.
+type wireMsg struct {
+	Type    string              `json:"type"`
+	S       string              `json:"s"`
+	F       string              `json:"f"`
+	X       *float64            `json:"x"`
+	Y       *float64            `json:"y"`
+	D       *string             `json:"d"`
+	Tick    *int64              `json:"tick"`
+	M       []core.MoveEntry    `json:"m"`
+	J       string              `json:"j"`
+	Trace   string              `json:"trace"`
+	N       int64               `json:"n"`
+	U       int64               `json:"u"`
+	Icon    string              `json:"icon"`
+	Text    string              `json:"text"`
+	R       string              `json:"r"`
+	Q       string              `json:"q"`
+	Name    string              `json:"name"`
+	Dir     uint8               `json:"dir"`
+	List    []core.SurfaceEntry `json:"list"`
+	Created bool                `json:"created"`
+	Counts  map[string]int64    `json:"counts"`
+	Op      string              `json:"op"`
+	Phase   string              `json:"phase"`
+	Level   string              `json:"level"`
+	Info    *core.MapInfo       `json:"info"`
+	err     error
+}
+
+func knownType(t string) bool {
+	switch t {
+	case core.MsgChunk, core.MsgMove, core.MsgAdopt, core.MsgTag, core.MsgRecipe, core.MsgRail,
+		core.MsgSurfaces, core.MsgResynced, core.MsgTrace, core.MsgMap:
+		return true
+	}
+	return false
+}
+
+// parseEnvelope decodes the line's envelope and sizes its messages; the messages are
+// decoded by decodeMsg. It touches no shared state.
+func (l *parsedLine) parseEnvelope() {
+	if l.tooLong {
+		return
+	}
+	line := bytes.TrimSpace(l.raw)
+	if len(line) == 0 {
+		return
+	}
+	env := &l.env
+	if err := json.Unmarshal(line, env); err != nil {
+		l.err = fmt.Errorf("not an envelope: %w", err)
+		return
+	}
+	switch {
+	case env.V != core.ProtocolVersion:
+		l.err = fmt.Errorf("protocol version %d, want %d", env.V, core.ProtocolVersion)
+	case env.Src == "" || env.Map == "" || env.RecvMs == 0:
+		l.err = errors.New("envelope without src, map or recv_ms")
+	case len(env.Src) > 512 || len(env.Map) > core.MaxNameBytes:
+		l.err = errors.New("src or map too long")
+	case env.Speed < 0 || env.Speed > 1000:
+		l.err = fmt.Errorf("bad speed %v", env.Speed)
+	}
+	if l.err != nil {
+		return
+	}
+	l.msgs = make([]wireMsg, len(env.Msgs))
+}
+
+// decodeMsg decodes one message.
+func decodeMsg(raw json.RawMessage) wireMsg {
+	var m wireMsg
+	if err := json.Unmarshal(raw, &m); err != nil {
+		var h core.MsgHeader
+		if json.Unmarshal(raw, &h) == nil && !knownType(h.Type) {
+			return wireMsg{Type: h.Type} // unknown types are ignored, whatever their fields
+		}
+		return wireMsg{Type: h.Type, err: err}
+	}
+	return m
 }
 
 // readLine reads one line (without its newline) into buf. A line longer than max is
@@ -276,6 +480,7 @@ type pendingChunk struct {
 // batch collects the decoded values of one body between flushes.
 type batch struct {
 	in      *Ingester
+	ap      *applier
 	resp    core.IngestResponse
 	chunks  []pendingChunk
 	samples []core.MoverSample
@@ -306,30 +511,28 @@ func (b *batch) badMessage(env *core.Envelope, i int, err error) {
 	b.addError(fmt.Errorf("src %q tick %d message %d: %w", env.Src, env.Tick, i, err))
 }
 
-// envelope decodes one line and queues its messages.
-func (b *batch) envelope(line []byte) error {
-	var env core.Envelope
-	if err := json.Unmarshal(line, &env); err != nil {
-		return fmt.Errorf("not an envelope: %w", err)
+// apply queues one parsed line's messages, updating the anchors and journeys.
+func (b *batch) apply(l *parsedLine) {
+	switch {
+	case l.tooLong:
+		b.badLine(l.no, fmt.Errorf("line longer than %d bytes", b.in.opt.MaxLine))
+		return
+	case l.err != nil:
+		b.badLine(l.no, l.err)
+		return
+	case l.msgs == nil && l.env.V == 0:
+		return // blank line
 	}
-	if env.V != core.ProtocolVersion {
-		return fmt.Errorf("protocol version %d, want %d", env.V, core.ProtocolVersion)
-	}
-	if env.Src == "" || env.Map == "" || env.RecvMs == 0 {
-		return errors.New("envelope without src, map or recv_ms")
-	}
-	if len(env.Src) > 512 || len(env.Map) > core.MaxNameBytes {
-		return errors.New("src or map too long")
-	}
-	if env.Speed < 0 || env.Speed > 1000 {
-		return fmt.Errorf("bad speed %v", env.Speed)
-	}
+	env := &l.env
 	in := b.in
 	in.stats.envelopes.Add(1)
 	b.resp.Envelopes++
 	if env.Seq != nil && (b.resp.Seq == nil || *env.Seq > *b.resp.Seq) {
 		s := *env.Seq
 		b.resp.Seq = &s
+	}
+	if in.opt.DataClock != nil {
+		in.opt.DataClock.Observe(env.RecvMs)
 	}
 	anchor := in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed)
 	now := in.opt.Clock()
@@ -345,60 +548,51 @@ func (b *batch) envelope(line []byte) error {
 		}
 		return t
 	}
-	for i, raw := range env.Msgs {
-		var h core.MsgHeader
-		if err := json.Unmarshal(raw, &h); err != nil {
-			b.badMessage(&env, i, err)
+	for i := range l.msgs {
+		m := &l.msgs[i]
+		if m.err != nil {
+			b.badMessage(env, i, m.err)
 			continue
 		}
 		var err error
-		switch h.Type {
+		switch m.Type {
 		case core.MsgChunk:
-			err = b.chunk(&env, raw, timeOf)
+			err = b.chunk(env, m, timeOf)
 		case core.MsgMove:
-			err = b.move(&env, raw, timeOf)
+			err = b.move(env, m, timeOf)
 		case core.MsgAdopt:
-			var m core.AdoptMsg
-			if err = json.Unmarshal(raw, &m); err == nil {
-				if m.J == "" {
-					err = errors.New("adopt without j")
-				} else {
-					b.journeys(env.Map).Adopt(env.Src, m.J)
-				}
+			if m.J == "" {
+				err = errors.New("adopt without j")
+			} else {
+				b.journeys(env.Map).Adopt(env.Src, m.J)
 			}
 		case core.MsgTag, core.MsgRecipe, core.MsgRail:
-			err = b.overlay(&env, h.Type, raw, timeOf(nil))
+			err = b.overlay(env, m, timeOf(nil))
 		case core.MsgSurfaces:
-			var m core.SurfacesMsg
-			if err = json.Unmarshal(raw, &m); err == nil && !m.Created {
+			if !m.Created {
 				// A resync starts by listing the surfaces (capture.resync): journeys the
 				// source does not re-send before "resynced" are ended there.
 				b.journeys(env.Map).Begin(env.Src)
 			}
 		case core.MsgResynced:
-			var m core.ResyncedMsg
-			if err = json.Unmarshal(raw, &m); err == nil {
-				b.samples = b.journeys(env.Map).Resynced(env.Src, timeOf(nil), b.samples)
-				in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
-			}
+			b.samples = b.journeys(env.Map).Resynced(env.Src, timeOf(nil), b.samples)
+			in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
 		case core.MsgTrace:
-			var m core.TraceMsg
-			if err = json.Unmarshal(raw, &m); err == nil {
-				in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
-			}
+			in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
 		case core.MsgMap:
-			var m core.MapMsg
-			if err = json.Unmarshal(raw, &m); err == nil {
-				err = b.mapInfo(&env, m.Info)
+			if m.Info == nil {
+				err = errors.New("map message without info")
+			} else {
+				err = b.mapInfo(env, *m.Info)
 			}
 		default:
 			// Unknown types are ignored (forward compatibility).
 		}
 		if err != nil {
-			b.badMessage(&env, i, err)
+			b.badMessage(env, i, err)
 		}
 	}
-	return nil
+
 }
 
 func (b *batch) journeys(mapKey string) *movers.Journeys {
@@ -423,21 +617,24 @@ func (b *batch) journeys(mapKey string) *movers.Journeys {
 	return mj.js
 }
 
-func (b *batch) chunk(env *core.Envelope, raw json.RawMessage, timeOf func(*int64) core.TimeMs) error {
-	var m core.ChunkMsg
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return err
-	}
+func (b *batch) chunk(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.TimeMs) error {
 	ds := core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}
 	if err := ds.Validate(); err != nil {
 		return err
 	}
-	pc := pendingChunk{u: core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: m.X, Y: m.Y}, T: timeOf(m.Tick)}}
+	if m.X == nil || m.Y == nil {
+		return errors.New("chunk without x or y")
+	}
+	cx, cy := *m.X, *m.Y
+	if cx != math.Trunc(cx) || cy != math.Trunc(cy) || math.Abs(cx) > 1<<30 || math.Abs(cy) > 1<<30 {
+		return fmt.Errorf("bad chunk coordinates %v,%v", cx, cy)
+	}
+	pc := pendingChunk{u: core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: int32(cx), Y: int32(cy)}, T: timeOf(m.Tick)}}
 	if m.D == nil {
 		pc.u.Deleted = true
 	} else {
 		if len(*m.D) == 0 || len(*m.D) > 64<<10 {
-			return fmt.Errorf("chunk %d,%d: chart of %d bytes", m.X, m.Y, len(*m.D))
+			return fmt.Errorf("chunk %v: chart of %d bytes", pc.u.Chunk, len(*m.D))
 		}
 		pc.d = *m.D
 	}
@@ -445,11 +642,7 @@ func (b *batch) chunk(env *core.Envelope, raw json.RawMessage, timeOf func(*int6
 	return nil
 }
 
-func (b *batch) move(env *core.Envelope, raw json.RawMessage, timeOf func(*int64) core.TimeMs) error {
-	var m core.MoveMsg
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return err
-	}
+func (b *batch) move(env *core.Envelope, m *wireMsg, timeOf func(*int64) core.TimeMs) error {
 	sfc := core.SurfaceKey{Map: env.Map, Surface: m.S}
 	if err := sfc.Validate(); err != nil {
 		return err
@@ -495,50 +688,38 @@ func (b *batch) move(env *core.Envelope, raw json.RawMessage, timeOf func(*int64
 	return nil
 }
 
-func (b *batch) overlay(env *core.Envelope, typ string, raw json.RawMessage, t core.TimeMs) error {
-	ev := core.OverlayEvent{T: t}
-	ev.Interval.Instance = env.Instance
-	inst := strconv.FormatInt(env.Instance, 10)
-	switch typ {
-	case core.MsgTag:
-		var m core.TagMsg
-		if err := json.Unmarshal(raw, &m); err != nil {
-			return err
-		}
-		ev.DS = core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}
-		ev.Interval.Kind, ev.Interval.Key = core.OverlayTag, inst+"/"+strconv.FormatInt(m.N, 10)
-		if m.X == nil || m.Y == nil {
-			ev.Close = true
-		} else {
-			ev.Interval.X, ev.Interval.Y, ev.Interval.Icon, ev.Interval.Text = *m.X, *m.Y, m.Icon, m.Text
-		}
-	case core.MsgRecipe:
-		var m core.RecipeMsg
-		if err := json.Unmarshal(raw, &m); err != nil {
-			return err
-		}
-		ev.DS = core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}
-		ev.Interval.Kind, ev.Interval.Key = core.OverlayRecipe, inst+"/"+strconv.FormatInt(m.U, 10)
-		if m.R == "" || m.X == nil || m.Y == nil {
-			ev.Close = true
-		} else {
-			ev.Interval.X, ev.Interval.Y, ev.Interval.Recipe, ev.Interval.Quality = *m.X, *m.Y, m.R, m.Q
-		}
-	case core.MsgRail:
-		var m core.RailMsg
-		if err := json.Unmarshal(raw, &m); err != nil {
-			return err
-		}
-		ev.DS = core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}
-		ev.Interval.Kind, ev.Interval.Key = core.OverlayRail, inst+"/"+strconv.FormatInt(m.U, 10)
-		if m.Name == "" || m.X == nil || m.Y == nil {
-			ev.Close = true
-		} else {
-			ev.Interval.X, ev.Interval.Y, ev.Interval.Name, ev.Interval.Direction = *m.X, *m.Y, m.Name, m.Dir
-		}
-	}
+func (b *batch) overlay(env *core.Envelope, m *wireMsg, t core.TimeMs) error {
+	ev := core.OverlayEvent{T: t, DS: core.DatastoreKey{Map: env.Map, Surface: m.S, Force: m.F}}
 	if err := ev.DS.Validate(); err != nil {
 		return err
+	}
+	iv := &ev.Interval
+	iv.Instance = env.Instance
+	inst := strconv.FormatInt(env.Instance, 10)
+	open := m.X != nil && m.Y != nil
+	switch m.Type {
+	case core.MsgTag:
+		iv.Kind, iv.Key = core.OverlayTag, inst+"/"+strconv.FormatInt(m.N, 10)
+		if open {
+			iv.Icon, iv.Text = m.Icon, m.Text
+		}
+	case core.MsgRecipe:
+		iv.Kind, iv.Key = core.OverlayRecipe, inst+"/"+strconv.FormatInt(m.U, 10)
+		open = open && m.R != ""
+		if open {
+			iv.Recipe, iv.Quality = m.R, m.Q
+		}
+	case core.MsgRail:
+		iv.Kind, iv.Key = core.OverlayRail, inst+"/"+strconv.FormatInt(m.U, 10)
+		open = open && m.Name != ""
+		if open {
+			iv.Name, iv.Direction = m.Name, m.Dir
+		}
+	}
+	if open {
+		iv.X, iv.Y = *m.X, *m.Y
+	} else {
+		ev.Close = true
 	}
 	b.events = append(b.events, ev)
 	return nil
@@ -566,62 +747,121 @@ func (b *batch) mapInfo(env *core.Envelope, info core.MapInfo) error {
 	return nil
 }
 
-// flush decodes the queued charts and applies everything queued to the stores.
-func (b *batch) flush(ctx context.Context) error {
-	in := b.in
+// flush decodes the queued charts and hands everything queued to the applier. It fails
+// when the applier failed on an earlier batch (the reader then stops).
+func (b *batch) flush() error {
+	if b.ap.failed.Load() {
+		return errApplierFailed
+	}
+	var job applyJob
 	if len(b.chunks) > 0 {
-		updates := b.decodeCharts()
+		job.updates = b.decodeCharts()
 		b.chunks = b.chunks[:0]
-		if len(updates) > 0 {
-			if in.st.Terrain == nil {
-				b.resp.Chunks.Invalid += len(updates)
-			} else {
-				res, err := in.st.Terrain.Apply(ctx, updates)
-				if err != nil {
-					if errors.Is(err, core.ErrOverloaded) {
-						in.stats.overloaded.Add(1)
-					}
-					return fmt.Errorf("terrain: %w", err)
+	}
+	job.samples, b.samples = b.samples, nil
+	job.events, b.events = b.events, nil
+	if len(job.updates)+len(job.samples)+len(job.events) == 0 {
+		return nil
+	}
+	b.ap.jobs <- job
+	return nil
+}
+
+var errApplierFailed = errors.New("ingest: an earlier batch failed")
+
+// applyJob is one batch from the reader to the applier.
+type applyJob struct {
+	updates []core.ChunkUpdate
+	samples []core.MoverSample
+	events  []core.OverlayEvent
+}
+
+// applier applies batches to the stores in order on its own goroutine, so the stores'
+// work overlaps reading, parsing and chart decoding of the next batch. At most one batch
+// waits while another is applied.
+type applier struct {
+	in     *Ingester
+	ctx    context.Context
+	jobs   chan applyJob
+	done   chan struct{}
+	failed atomic.Bool
+	err    error // set by the applier goroutine; read after done
+	res    struct{ chunks, samples, overlays core.ApplyResult }
+}
+
+func (in *Ingester) startApplier(ctx context.Context) *applier {
+	a := &applier{in: in, ctx: ctx, jobs: make(chan applyJob, 1), done: make(chan struct{})}
+	go func() {
+		defer close(a.done)
+		for job := range a.jobs {
+			if a.err != nil {
+				continue // drain after a failure
+			}
+			if err := a.apply(job); err != nil {
+				a.err = err
+				a.failed.Store(true)
+			}
+		}
+	}()
+	return a
+}
+
+// finish waits for the queued batches and returns the first failure.
+func (a *applier) finish() error {
+	close(a.jobs)
+	<-a.done
+	return a.err
+}
+
+func (a *applier) apply(job applyJob) error {
+	in, ctx := a.in, a.ctx
+	if len(job.updates) > 0 {
+		if in.st.Terrain == nil {
+			a.res.chunks.Invalid += len(job.updates)
+		} else {
+			res, err := in.st.Terrain.Apply(ctx, job.updates)
+			if err != nil {
+				if errors.Is(err, core.ErrOverloaded) {
+					in.stats.overloaded.Add(1)
 				}
-				b.resp.Chunks.Add(res)
-				in.stats.chunks.add(res)
-				if in.opt.Notifier != nil {
-					in.opt.Notifier.ChunksApplied(updates)
-				}
+				return fmt.Errorf("terrain: %w", err)
+			}
+			a.res.chunks.Add(res)
+			in.stats.chunks.add(res)
+			if in.opt.Notifier != nil {
+				in.opt.Notifier.ChunksApplied(job.updates)
 			}
 		}
 	}
-	if len(b.samples) > 0 {
+	if len(job.samples) > 0 {
 		if in.st.Movers == nil {
-			b.resp.Samples.Invalid += len(b.samples)
+			a.res.samples.Invalid += len(job.samples)
 		} else {
-			res, err := in.st.Movers.Append(ctx, b.samples)
+			res, err := in.st.Movers.Append(ctx, job.samples)
 			if err != nil {
 				if errors.Is(err, core.ErrOverloaded) {
 					in.stats.overloaded.Add(1)
 				}
 				return fmt.Errorf("movers: %w", err)
 			}
-			b.resp.Samples.Add(res)
+			a.res.samples.Add(res)
 			in.stats.samples.add(res)
 			if in.opt.Notifier != nil {
-				in.opt.Notifier.SamplesApplied(b.samples)
+				in.opt.Notifier.SamplesApplied(job.samples)
 			}
 		}
-		b.samples = b.samples[:0]
 	}
-	if len(b.events) > 0 {
+	if len(job.events) > 0 {
 		if in.st.Overlays == nil {
-			b.resp.Overlays.Invalid += len(b.events)
+			a.res.overlays.Invalid += len(job.events)
 		} else {
-			res, err := in.st.Overlays.Apply(ctx, b.events)
+			res, err := in.st.Overlays.Apply(ctx, job.events)
 			if err != nil {
 				return fmt.Errorf("overlays: %w", err)
 			}
-			b.resp.Overlays.Add(res)
+			a.res.overlays.Add(res)
 			in.stats.overlays.add(res)
 		}
-		b.events = b.events[:0]
 	}
 	return nil
 }
@@ -631,7 +871,8 @@ func (b *batch) flush(ctx context.Context) error {
 func (b *batch) decodeCharts() []core.ChunkUpdate {
 	pcs := b.chunks
 	errs := make([]error, len(pcs))
-	pixels := make([]*core.ChunkPixels, len(pcs))
+	// One slab for the batch's pixels; the terrain store copies them.
+	slab := make([]core.ChunkPixels, len(pcs))
 	workers := min(b.in.opt.Workers, max(1, len(pcs)/64))
 	var next atomic.Int64
 	var wg sync.WaitGroup
@@ -647,7 +888,7 @@ func (b *batch) decodeCharts() []core.ChunkUpdate {
 				if pcs[i].u.Deleted {
 					continue
 				}
-				pixels[i], errs[i] = core.DecodeChart(pcs[i].d)
+				errs[i] = decodeChart(pcs[i].d, &slab[i])
 			}
 		}()
 	}
@@ -662,7 +903,7 @@ func (b *batch) decodeCharts() []core.ChunkUpdate {
 			continue
 		}
 		u := pcs[i].u
-		u.Pixels = pixels[i]
+		u.Pixels = &slab[i]
 		out = append(out, u)
 	}
 	return out
