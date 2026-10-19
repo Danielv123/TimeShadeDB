@@ -51,7 +51,7 @@ Status and body `{"error": "...", "code": "..."}` (`core.ErrorResponse`):
 | 401 | `unauthorized` | missing or wrong token |
 | 404 | `not_found` | unknown datastore or surface, tile without data, version, window, keyframe or day that does not exist (`ErrUnknownDatastore`, `ErrNoTile`, `ErrNoVersion`) |
 | 413 | `too_large` | ingest body over the cap |
-| 503 | `overloaded` | ingest backpressure; `Retry-After` seconds given |
+| 503 | `overloaded` | ingest backpressure (`core.ErrOverloaded`); `Retry-After` seconds given |
 | 500 | `internal` | anything else |
 
 **Hostile requests** (PLAN.md §4.3 G2): parameter validation, the grid bound check and the

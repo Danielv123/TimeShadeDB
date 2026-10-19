@@ -105,6 +105,7 @@ the database is served.
   datastores/<datastore id>/
     meta.json                            {"key":{...},"window_ms":60000,"grid_origin":-256,"format_version":1}
     palette.bin                          append-only palette (5.2)
+    state.json                           committed horizon and update time range (5.7, WP2)
     tiles/<x>_<y>.blk, .idx              z0 terrain series, one per tile (5.1, 5.3)
     pyramid/<z>/<x>_<y>.blk, .idx        coarse snapshots, z = -1, -2, ... (5.4, WP3)
     wal/                                 write-ahead log of open windows (WP2, tunable)
@@ -209,6 +210,11 @@ Keyframe rule (tunable, WP2): write a keyframe when the delta bytes since the la
 reach 2x the size of that keyframe, and at most every 256 records of chain. The prototype
 measured keyframes as 55% of the bytes at a 256-record cap, so this rule should be tuned
 against the §5 disk target.
+WP2 measured the rule on the test-data replay (60 s windows, zstd default level): factor 2
+gives 3.31 B per chunk-hour over the whole map with a cold read p95 of 1.07 ms, factor 4
+3.08 B and 1.09 ms, factor 8 2.79 B and 1.30 ms. The store's default is factor 4 with the
+256-record cap. Before the first keyframe of a tile, the size of record 0 (the first delta,
+which holds the whole content) stands in for the keyframe size.
 
 Indices refer to the datastore palette (5.2). A record uses the wide flag if any index in it
 is above 255.
@@ -235,6 +241,46 @@ surface by count.
 An append-only log of `core.OverlayEvent` records plus a per-tile index of interval
 positions, both rebuildable from the log. The format is WP4's choice; only the API output
 (API.md "overlays") is a contract.
+
+### 5.7 Terrain state and WAL (WP2)
+
+`state.json` holds `{"horizon": ms, "committing": ms, "first": ms, "last": ms, "has_data":
+bool}`: the committed horizon, the target of a commit that has not finished, and the
+accepted update time range. It is rewritten (tmp + rename, fsynced) when a commit that has
+tiles to write starts, with `committing` set to its target horizon, and again at the end of
+every commit that moves the horizon, after the records of that commit are fsynced.
+`horizon` is absent until the first commit; `committing` is absent when no commit is
+pending. `meta.json` is written once and never changes.
+
+`wal/<seq>.wal` (16-digit decimal seq) holds the updates of open windows. A segment is a
+sequence of frames:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | payload length u32 |
+| 4 | 4 | CRC-32C of the payload |
+| 8 | | payload: one zstd frame |
+
+Decompressed, a payload is `uvarint n` followed by n updates of `varint T`, `varint cx`,
+`varint cy`, `u8 flags` (bit 0 deleted) and, unless deleted, 1,024 RGB565 pixels (u16 LE).
+A frame holds at most 1,024 updates (about 2.1 MB decompressed, under the 64 MiB decoder
+limit); `Apply` splits a larger batch into several frames, written with one write, so a
+batch is logged whole or not at all. Late updates are not logged. Frames are fsynced by a
+group commit (default every second). A commit that moves the horizon starts a new segment
+and deletes the segments whose updates are all older than the new horizon.
+
+On open, frames are read one at a time and replayed in order; updates older than the
+horizon are dropped. A torn tail (an incomplete header or frame, a zero or oversized
+length, a checksum mismatch) ends its segment, which is truncated there, and the
+truncation is logged. A frame whose checksum is valid but that does not decode is not a
+torn write: open fails with an error naming the segment and offset, and nothing is
+truncated.
+
+If a crash interrupted a commit after some tiles were written but before `state.json`
+recorded the new horizon, the replay brings those windows back; a tile skips every window
+that ends at or before its last record's `t_end`, so nothing is written twice. Open then
+finishes that commit (to `committing`) before it accepts any update, so an update for one
+of those windows is late for every tile, as it was while the commit ran.
 
 ## 6. Version and compatibility rules
 
