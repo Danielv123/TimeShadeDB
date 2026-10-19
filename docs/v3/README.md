@@ -123,6 +123,6 @@ scrub and timelapse through it, and checks `view()` and `datastore()` before mea
 without it only the first-paint numbers can be measured. The suite opens the viewer with
 the query parameters `ds`, `x`, `y`, `z` and `t` (datastore id, centre in world tiles,
 level, map-clock time). `web/src/map/control.ts` implements `window.__tsdbControl` over
-the WP7 map view. The viewer's page URL currently uses `map`, `surface`, `force`, `x`, `y`,
-`s` (CSS pixels per tile) and `t` instead (`web/src/map/README.md`); `ds` and `z` are not
-read yet, so the suite selects the view through `setView` and checks `datastore()`.
+the WP7 map view. The viewer reads `ds` and `z` next to its own `map`, `surface`, `force`
+and `s` (CSS pixels per tile); `ds` wins over `map`/`surface`/`force` and `s` over `z`
+(`web/src/map/README.md`).

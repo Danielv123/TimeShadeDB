@@ -137,6 +137,14 @@ export class MapView {
   private lastResult: FrameResult | null = null;
   private unsubscribe: (() => void) | null = null;
   private pendingSubscribe = false;
+  /**
+   * Layers wait for the first full paint (or 3 s) before they attach: their requests
+   * (mover day indexes and windows, overlay tiles) would otherwise take connections the
+   * first tiles need (six per host on HTTP/1.1).
+   */
+  private layersReady = false;
+  private layersPending = false;
+  private layersTimer: ReturnType<typeof setTimeout> | null = null;
   private subscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private catalogTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -288,6 +296,13 @@ export class MapView {
   }
 
   private attachLayers(): void {
+    if (!this.layersReady) {
+      this.layersPending = true;
+      if (!this.layersTimer) {
+        this.layersTimer = setTimeout(() => this.releaseLayers(), 3000);
+      }
+      return;
+    }
     for (const l of this.active) {
       try {
         l.detach();
@@ -320,6 +335,23 @@ export class MapView {
       } catch (err) {
         console.error(`layer ${l.id} attach`, err);
       }
+    }
+  }
+
+  /** Lets layers attach (after the first full paint, or 3 s). */
+  private releaseLayers(): void {
+    if (this.layersTimer) {
+      clearTimeout(this.layersTimer);
+      this.layersTimer = null;
+    }
+    if (this.layersReady || this.destroyed) {
+      return;
+    }
+    this.layersReady = true;
+    if (this.layersPending) {
+      this.layersPending = false;
+      this.attachLayers();
+      this.invalidate();
     }
   }
 
@@ -691,6 +723,9 @@ export class MapView {
     }
     this.lastResult = result;
     this.engine.render(this.vp, result);
+    if (!this.layersReady && result.full === result.visible && result.visible > 0) {
+      this.releaseLayers();
+    }
     if (this.pendingSubscribe && result.full === result.visible && result.visible > 0) {
       this.pendingSubscribe = false;
       if (this.subscribeTimer) {
@@ -794,6 +829,9 @@ export class MapView {
     this.unsubscribe?.();
     if (this.subscribeTimer) {
       clearTimeout(this.subscribeTimer);
+    }
+    if (this.layersTimer) {
+      clearTimeout(this.layersTimer);
     }
     if (this.catalogTimer) {
       clearInterval(this.catalogTimer);
