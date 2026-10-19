@@ -11,10 +11,11 @@ import (
 // Run drives the commit loop until ctx ends: every CommitEvery it commits terrain up to
 // the clock minus TerrainGrace, updates the pyramid, commits movers up to the clock
 // minus MoverGrace, then publishes live events for what changed. It returns ctx's error.
+// The first step runs one period after the start, so a freshly started server serves its
+// first requests without competing with the catch-up commit and pyramid build.
 func (s *Server) Run(ctx context.Context) error {
 	t := time.NewTicker(s.cfg.CommitEvery)
 	defer t.Stop()
-	s.Step(ctx)
 	for {
 		select {
 		case <-ctx.Done():
