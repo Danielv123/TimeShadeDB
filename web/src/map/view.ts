@@ -10,6 +10,7 @@ import { perfEvent } from "../perf.ts";
 import { clampScale, fitCamera, screenToWorld, visibleWorld, worldToScreen, zoomAt } from "./camera.ts";
 import type { Seed } from "./boot.ts";
 import { createLoader, DirectLoader, type TileLoader } from "./loader.ts";
+import { defaultLiveDelay, LiveDelay } from "./delay.ts";
 import { Canvas2DRenderer } from "./render_2d.ts";
 import { GLRenderer } from "./render_gl.ts";
 import type { TileRenderer } from "./renderer.ts";
@@ -52,7 +53,7 @@ export interface MapViewOptions {
   layers?: LayerFactory[];
   /** Enabled layer ids (default: each factory's defaultOn). */
   enabledLayers?: Iterable<string>;
-  /** Movers are drawn this far behind live (ms). */
+  /** Live mode trails the data clock this far (ms) while no layer reports a delay (default: what the movers layer starts from, delay.ts). */
   liveDelayMs?: number;
   camera?: Camera;
   /** Called (at most ~10 times a second) when the camera, time or loading state changes. */
@@ -126,6 +127,7 @@ export class MapView {
   private playing = false;
   private speed = 3600_000;
   private liveDelay: number;
+  private delaySlew = new LiveDelay();
   private raf = 0;
   private lastFrameAt = 0;
   private lastStateAt = 0;
@@ -158,7 +160,7 @@ export class MapView {
     this.source = opts.source;
     this.catalog = opts.catalog;
     this.container = opts.container;
-    this.liveDelay = opts.liveDelayMs ?? 2000;
+    this.liveDelay = opts.liveDelayMs ?? defaultLiveDelay(opts.catalog);
     this.factories = opts.layers ?? [];
     this.enabled = new Set(opts.enabledLayers ?? this.factories.filter(f => f.defaultOn).map(f => f.id));
     this.camera = opts.camera ?? { x: 0, y: 0, scale: 1 };
@@ -471,9 +473,14 @@ export class MapView {
   /**
    * How far live mode trails the data clock: the largest MapLayer.delay() of the enabled
    * layers (the movers layer's adaptive delay, PLAN §4.8 step 1), or `liveDelayMs` when no
-   * layer reports one.
+   * layer reports one. Changes of that target (a layer attaching, a layer turned off) are
+   * slewed, so the displayed time never jumps by seconds (delay.ts).
    */
   liveDelayNow(): number {
+    return this.delaySlew.next(this.liveDelayTarget(), performance.now());
+  }
+
+  private liveDelayTarget(): number {
     let d = -1;
     for (const l of this.active) {
       const v = l.delay?.();
@@ -505,6 +512,7 @@ export class MapView {
   goLive(): void {
     this.live = true;
     this.playing = false;
+    this.delaySlew = new LiveDelay();
     this.engine.setTime("latest", false);
     this.markState();
     this.invalidate();
