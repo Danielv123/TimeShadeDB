@@ -6,7 +6,8 @@ import { readFileSync } from "node:fs";
 import { after, before, test } from "node:test";
 import { runInNewContext } from "node:vm";
 
-import { boot, requestedSource, seedPath, seedRequest, type EarlyRequests } from "./boot.ts";
+import { datastoreId } from "../api/grid.ts";
+import { boot, requestedSource, seedPath, seedRequest, urlDatastore, urlScale, type EarlyRequests } from "./boot.ts";
 import { syntheticDataset } from "./testing/dataset.ts";
 import { MockServer } from "./testing/mockserver.ts";
 
@@ -56,6 +57,21 @@ test("index.html early requests equal boot.ts seedRequest/seedPath", () => {
     if (i % 4 === 1) {
       p.set("t", String(1791630000000 + Math.floor(r(7) * 1e9)));
     }
+    // WP11's parameters: ds instead of map/surface/force, z instead of s (or both).
+    if (i % 7 === 3) {
+      p.set("ds", datastoreId({ map: p.get("map")!, surface: p.get("surface")!, force: p.get("force") ?? "player" }));
+      if (i % 2 === 0) {
+        p.delete("map");
+        p.delete("surface");
+        p.delete("force");
+      }
+    }
+    if (i % 6 === 4) {
+      p.set("z", String(i % 12 === 4 ? Math.round(r(4) * 10 - 10) : r(4) * 12 - 10));
+      if (i % 12 === 4) {
+        p.delete("s");
+      }
+    }
     const kind = i % 5 === 2 ? "static" : "server";
     const viaMeta = kind === "static" && i % 2 === 0;
     if (kind === "static" && !viaMeta) {
@@ -82,6 +98,33 @@ test("index.html early requests equal boot.ts seedRequest/seedPath", () => {
   assert.equal(runEarly("?map=a&surface=b&x=1&y=2&s=1&t=1e300", { width: 800, height: 600, dpr: 1 }).early?.seed, null);
   assert.equal(runEarly("?data=https://x.example/api", { width: 800, height: 600, dpr: 1 }).early?.base, "https://x.example/api/");
   assert.equal(seedRequest(new URLSearchParams("map=a&surface=b&x=1&y=2&s=1&t=1e300"), { width: 800, height: 600, dpr: 1 }, false, 0), null);
+  // A ds with characters a path needs escaped is sent escaped by both.
+  const odd = runEarly("?ds=a%20b.c.d&x=0&y=0&z=0", { width: 800, height: 600, dpr: 1 }).early?.seed?.path;
+  assert.equal(odd, seedPath(seedRequest(new URLSearchParams("ds=a%20b.c.d&x=0&y=0&z=0"), { width: 800, height: 600, dpr: 1 }, false, 0)!));
+  assert.ok(odd?.startsWith("view/a%20b.c.d/0?"));
+});
+
+test("URL parameters: ds and z (WP11) next to map/surface/force and s", () => {
+  const q = (s: string) => new URLSearchParams(s);
+  assert.equal(urlDatastore(q("ds=gw-bc41437d~2E1.nauvis.player")), "gw-bc41437d~2E1.nauvis.player");
+  assert.equal(urlDatastore(q("map=gw-bc41437d.1&surface=nauvis")), "gw-bc41437d~2E1.nauvis.player");
+  assert.equal(urlDatastore(q("map=m&surface=s&force=enemy")), "m.s.enemy");
+  assert.equal(urlDatastore(q("ds=m.s.f&map=x&surface=y")), "m.s.f", "ds wins");
+  assert.equal(urlDatastore(q("ds=bad&map=x&surface=y")), "x.y.player", "a malformed ds is ignored");
+  assert.equal(urlDatastore(q("ds=a..b")), null);
+  assert.equal(urlDatastore(q("map=x")), null);
+  assert.equal(urlScale(q("s=0.25")), 0.25);
+  assert.equal(urlScale(q("z=0")), 1);
+  assert.equal(urlScale(q("z=-4")), 1 / 16);
+  assert.equal(urlScale(q("s=2&z=-4")), 2, "s wins");
+  assert.equal(urlScale(q("s=0&z=-1")), 0.5, "an invalid s falls back to z");
+  assert.equal(urlScale(q("z=abc")), null);
+  assert.equal(urlScale(q("")), null);
+  const vp = { width: 1920, height: 1080, dpr: 1 };
+  const a = seedRequest(q("ds=m.s.player&x=0&y=0&z=0"), vp, false, 0);
+  const b = seedRequest(q("map=m&surface=s&x=0&y=0&s=1"), vp, false, 0);
+  assert.deepEqual(a, b);
+  assert.equal(seedRequest(q("ds=m.s.player&x=0&y=0&z=-4"), vp, false, 0)?.z, -4);
 });
 
 const data = syntheticDataset({ bounds: [-2, -1, 2, 1], versions: 2, coarse: 1 });

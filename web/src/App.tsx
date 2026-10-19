@@ -5,7 +5,8 @@ import type { Catalog, TimeMs } from "./api/types";
 import { layers as layerFactories } from "./layers/index";
 import type { LayerHit } from "./map/layer";
 import { createLoader, DirectLoader } from "./map/loader";
-import type { BootResult } from "./map/boot";
+import { urlDatastore, urlScale, type BootResult } from "./map/boot";
+import { parseDatastoreId } from "./api/grid";
 import { createControl } from "./map/control";
 import { perfEvent } from "./perf";
 import { defaultSelection, MapView, type MapViewState, type RendererChoice, type Selection } from "./map/view";
@@ -27,6 +28,11 @@ interface UrlState {
   layers: string[] | null;
 }
 
+/**
+ * Page URL state. Datastore: `ds` (a catalog datastore id, as the WP11 suite passes it) or
+ * `map` + `surface` + `force`; camera: `x`, `y` and `s` (CSS px per tile) or `z` (a level,
+ * 2^z px per tile); `t` (absent = live); `layers`. See boot.ts urlDatastore/urlScale.
+ */
 function readUrl(): UrlState {
   const p = new URLSearchParams(location.search);
   const num = (k: string): number | null => {
@@ -37,22 +43,31 @@ function readUrl(): UrlState {
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
   };
-  const map = p.get("map");
-  const surface = p.get("surface");
-  const force = p.get("force") ?? "player";
+  const ds = urlDatastore(p);
   const x = num("x");
   const y = num("y");
-  const s = num("s");
+  const s = urlScale(p);
   return {
-    sel: map && surface ? { map, surface, force } : null,
-    camera: x !== null && y !== null && s !== null && s > 0 ? { x, y, scale: s } : null,
+    sel: ds ? selectionOf(ds) : null,
+    camera: x !== null && y !== null && s !== null ? { x, y, scale: s } : null,
     t: num("t"),
     layers: p.has("layers") ? (p.get("layers") ?? "").split(",").filter(Boolean) : null,
   };
 }
 
+function selectionOf(ds: string): Selection | null {
+  try {
+    return parseDatastoreId(ds);
+  } catch {
+    return null;
+  }
+}
+
 function writeUrl(s: MapViewState, layers: string[]): void {
   const p = new URLSearchParams(location.search);
+  // Written back in one form: map/surface/force and s (ds and z are only read).
+  p.delete("ds");
+  p.delete("z");
   if (s.selection) {
     p.set("map", s.selection.map);
     p.set("surface", s.selection.surface);

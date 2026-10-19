@@ -26,15 +26,26 @@
             return fetch(base + path, { headers: headers, cache: "no-cache" });
           };
           var early = { kind: kind, base: base, catalog: get(kind === "static" ? "catalog.json" : "catalog"), seed: null };
+          var num = function (k) {
+            var v = p.get(k);
+            return v !== null && v.trim() !== "" ? Number(v) : NaN;
+          };
+          // Datastore: ds, else map + surface + force; scale: s, else 2^z (boot.ts urlDatastore, urlScale).
+          var ds = p.get("ds");
+          if (ds === null || !/^[^.]+\.[^.]+\.[^.]+$/.test(ds)) ds = null;
           var map = p.get("map");
           var sfc = p.get("surface");
           var force = p.get("force") || "player";
           var x = Number(p.get("x"));
           var y = Number(p.get("y"));
-          var s = Number(p.get("s"));
+          var s = num("s");
+          if (!(s > 0 && isFinite(s))) {
+            var zq = num("z");
+            s = isFinite(zq) && zq >= -20 && zq <= 10 ? Math.pow(2, zq) : NaN;
+          }
           var tRaw = p.get("t");
           var t = tRaw !== null && tRaw !== "" ? Number(tRaw) : null;
-          if (map && sfc && p.get("x") !== null && isFinite(x) && isFinite(y) && s > 0 && (t === null || (isFinite(t) && Math.abs(t) <= 8.64e15))) {
+          if ((ds || (map && sfc)) && p.get("x") !== null && isFinite(x) && isFinite(y) && s > 0 && (t === null || (isFinite(t) && Math.abs(t) <= 8.64e15))) {
             var esc = function (n) {
               var out = "";
               var b = new TextEncoder().encode(n);
@@ -44,7 +55,7 @@
               }
               return out;
             };
-            var ds = esc(map) + "." + esc(sfc) + "." + esc(force);
+            ds = encodeURIComponent(ds || esc(map) + "." + esc(sfc) + "." + esc(force));
             var z = Math.min(0, Math.max(-10, Math.round(Math.log2(s * (window.devicePixelRatio || 1))))) || 0;
             var path = null;
             if (t !== null || kind === "static") {
