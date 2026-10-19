@@ -307,11 +307,13 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
   after a longer gap in the data the clock catches up over a few envelopes, whose
   message times are clamped meanwhile.
 
-The process sets a soft memory limit of `--mem-budget` plus 32 MiB (Go's `GOMEMLIMIT`,
-which takes precedence when set), so garbage collection works harder before the process
+The process sets a soft memory limit of `--mem-budget` (Go's `GOMEMLIMIT`, which takes
+precedence when set), so garbage collection works harder before the process
 grows past its budget and RSS stays within the budget plus 64 MiB (PLAN.md §5). The
-caches get about 80% of the budget (terrain 3/8, encoded tiles 3/16, coarse images 3/32,
-overlays 1/32; mover open rows are bounded by another eighth); the rest is working memory.
+caches get about half of the budget (terrain 1/8 decoded tiles, 3/32 open windows and
+3/64 indexes, encoded tiles 1/8, coarse images 1/16, overlays 1/32; mover open rows are
+bounded by another eighth); the rest is working memory
+and the collector's headroom.
 After 10 s without requests the server returns freed memory to the operating system.
 
 Interrupt or SIGTERM shuts down cleanly: live streams are ended at once, requests in
