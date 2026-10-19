@@ -51,8 +51,12 @@ func (s *Server) Commit(ctx context.Context, now core.TimeMs) error {
 	}
 	t1 := time.Now()
 	if len(errs) == 0 {
-		if _, err := s.cfg.Tiles.Update(ctx); err != nil {
+		bs, err := s.cfg.Tiles.Update(ctx)
+		if err != nil {
 			errs = append(errs, err)
+		}
+		if bs.Built > 0 || bs.Versions > 0 {
+			s.builds.Add(1)
 		}
 	}
 	t2 := time.Now()

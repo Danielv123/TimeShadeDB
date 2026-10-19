@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"timeshadedb/internal/v3/core"
@@ -104,6 +105,8 @@ type Server struct {
 	spool   spool
 	// ingestWG counts ingest requests in flight (WaitIngest).
 	ingestWG sync.WaitGroup
+	// builds counts commit steps in which the pyramid built tiles (live tile events).
+	builds atomic.Uint64
 	// closing is closed by CloseLive: live streams end.
 	closing   chan struct{}
 	closeOnce sync.Once

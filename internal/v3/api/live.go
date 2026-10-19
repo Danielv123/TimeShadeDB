@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -235,6 +236,10 @@ type liveState struct {
 	// horizons are the last published horizons per datastore and surface id.
 	horizons map[string]core.TimeMs
 	known    map[string]struct{} // datastore and surface ids in the last catalog
+	// seeded: seen holds the tiles of the first scan (which publishes nothing);
+	// builtSeen is the pyramid build count the last scan saw.
+	seeded    bool
+	builtSeen uint64
 }
 
 type tileKey struct {
@@ -283,17 +288,36 @@ func (n *notifier) SamplesApplied(samples []core.MoverSample) {
 		ev    moversEvent
 	}
 	groups := map[core.SurfaceKey]*group{}
+	skip := map[core.SurfaceKey]bool{}
+	horizon := map[core.SurfaceKey]core.TimeMs{}
 	for i := range samples {
-		q := samples[i].Quantized()
-		g := groups[q.Surface]
+		smp := &samples[i]
+		// Rows the store did not keep: invalid ones (core.MoverStore rules) and late
+		// ones, by the horizon the last commit published.
+		if skip[smp.Surface] || smp.Surface.Validate() != nil || smp.Meta.ID == "" || !smp.Meta.Kind.Valid() {
+			continue
+		}
+		g := groups[smp.Surface]
 		if g == nil {
-			id := q.Surface.ID()
+			id := smp.Surface.ID()
 			if !s.hub.wants("", id) {
+				skip[smp.Surface] = true
 				continue
 			}
+			s.live.mu.Lock()
+			h, ok := s.live.horizons[id]
+			s.live.mu.Unlock()
+			if !ok {
+				h = math.MinInt64
+			}
+			horizon[smp.Surface] = h
 			g = &group{metas: map[core.MoverMeta]int{}, ev: moversEvent{Sfc: id, Now: now, Movers: []core.MoverMeta{}, Rows: [][]any{}}}
-			groups[q.Surface] = g
+			groups[smp.Surface] = g
 		}
+		if smp.T < horizon[smp.Surface] {
+			continue
+		}
+		q := smp.Quantized()
 		e, ok := g.metas[q.Meta]
 		if !ok {
 			e = len(g.ev.Movers)
@@ -315,7 +339,9 @@ func (n *notifier) SamplesApplied(samples []core.MoverSample) {
 		g.ev.Rows = append(g.ev.Rows, []any{e, q.T, tick, q.X, q.Y, q.Orientation, int(q.Flags), cars})
 	}
 	for _, g := range groups {
-		s.hub.publish("", g.ev.Sfc, event("movers", g.ev))
+		if len(g.ev.Rows) > 0 {
+			s.hub.publish("", g.ev.Sfc, event("movers", g.ev))
+		}
 	}
 }
 
@@ -387,13 +413,19 @@ func (s *Server) flushDirty(ctx context.Context) {
 		}
 	}
 	now := s.cfg.Clock()
+	wanted := map[core.DatastoreKey]bool{}
 	for k := range dirty {
 		info, ok := infos[k.ds]
 		if !ok {
 			continue
 		}
 		id := info.ID
-		if !s.hub.wants(id, "") {
+		want, seen := wanted[k.ds]
+		if !seen {
+			want = s.hub.wants(id, "")
+			wanted[k.ds] = want
+		}
+		if !want {
 			continue
 		}
 		st, err := s.cfg.Terrain.VersionAt(ctx, k.ds, k.tile, max(now, info.LastT))
@@ -417,51 +449,45 @@ func (s *Server) publishTile(k tileKey, id string, st core.TileState, now core.T
 	s.hub.publish(id, "", event("tile", tileEvent{DS: id, Z: k.tile.Z, X: k.tile.X, Y: k.tile.Y, V: st.Version, Live: st.Live, LS: st.LiveSeq, Now: now}))
 }
 
-// afterCommit publishes horizon and tile events after a commit, and a catalog event
-// when datastores or surfaces appeared.
+// afterCommit publishes horizon events after a commit, and tile events for versions
+// that changed. The tile lists of a datastore are scanned only when its horizon moved or
+// the pyramid built something: z0 versions and coarse versions or live state change only
+// then (open-window z0 changes come from flushDirty). The first scan only records what
+// exists. It publishes a catalog event when datastores or
+// surfaces appeared.
 func (s *Server) afterCommit(ctx context.Context) {
 	s.invalidateDatastores()
-	s.invalidateCatalog()
 	infos, err := s.cfg.Terrain.Datastores(ctx)
 	if err != nil {
 		return
 	}
 	now := s.cfg.Clock()
 	ls := s.live
+	ls.mu.Lock()
+	first := !ls.seeded
+	built := s.builds.Load()
+	rebuilt := built != ls.builtSeen
+	ls.mu.Unlock()
+	changed := false
 	for _, info := range infos {
 		ls.mu.Lock()
 		prev, ok := ls.horizons[info.ID]
 		ls.horizons[info.ID] = info.Horizon
 		ls.mu.Unlock()
+		moved := !ok || prev != info.Horizon
+		if moved {
+			changed = true
+		}
 		if ok && prev != info.Horizon {
 			s.hub.publish(info.ID, "", event("horizon", map[string]any{"ds": info.ID, "horizon": info.Horizon, "now": now}))
 		}
-		for z := int8(0); z >= core.MinZ; z-- {
-			tiles, err := s.cfg.Tiles.ListTiles(ctx, info.Key, z)
-			if err != nil || len(tiles) == 0 {
-				break
-			}
-			for _, ti := range tiles {
-				k := tileKey{info.Key, ti.Tile}
-				st := core.TileState{Version: ti.Version, Live: ti.Live}
-				ls.mu.Lock()
-				prev, ok := ls.seen[k]
-				ls.mu.Unlock()
-				if ok && prev.Version == st.Version && prev.Live == st.Live && !st.Live {
-					continue
-				}
-				if st.Live || (ok && prev.Live) {
-					// The live sequence needs a VersionAt at the latest instant.
-					full, err := s.cfg.Tiles.VersionAt(ctx, info.Key, ti.Tile, max(now, info.LastT))
-					if err != nil {
-						continue
-					}
-					st = full
-				}
-				s.publishTile(k, info.ID, st, now)
-			}
+		if first || moved || rebuilt {
+			s.scanTiles(ctx, info, now, !first)
 		}
 	}
+	ls.mu.Lock()
+	ls.seeded, ls.builtSeen = true, built
+	ls.mu.Unlock()
 	surfaces, err := s.cfg.Movers.Surfaces(ctx)
 	if err == nil {
 		for _, si := range surfaces {
@@ -469,12 +495,53 @@ func (s *Server) afterCommit(ctx context.Context) {
 			prev, ok := ls.horizons[si.ID]
 			ls.horizons[si.ID] = si.Horizon
 			ls.mu.Unlock()
+			if !ok || prev != si.Horizon {
+				changed = true
+			}
 			if ok && prev != si.Horizon {
 				s.hub.publish("", si.ID, event("horizon", map[string]any{"sfc": si.ID, "horizon": si.Horizon, "now": now}))
 			}
 		}
+		s.checkCatalogWith(infos, surfaces)
 	}
-	s.checkCatalog(ctx)
+	if changed {
+		// Horizons are in the catalog; other fields refresh with its TTL.
+		s.invalidateCatalog()
+	}
+}
+
+// scanTiles compares every tile of a datastore at every level with what was published
+// and publishes the changes (or, with publish false, only records the tiles).
+func (s *Server) scanTiles(ctx context.Context, info core.DatastoreInfo, now core.TimeMs, publish bool) {
+	ls := s.live
+	for z := int8(0); z >= core.MinZ; z-- {
+		tiles, err := s.cfg.Tiles.ListTiles(ctx, info.Key, z)
+		if err != nil || len(tiles) == 0 {
+			break
+		}
+		for _, ti := range tiles {
+			k := tileKey{info.Key, ti.Tile}
+			st := core.TileState{Version: ti.Version, Live: ti.Live}
+			ls.mu.Lock()
+			prev, ok := ls.seen[k]
+			if !publish {
+				ls.seen[k] = st
+			}
+			ls.mu.Unlock()
+			if !publish || (ok && prev.Version == st.Version && prev.Live == st.Live && !st.Live) {
+				continue
+			}
+			if st.Live || (ok && prev.Live) {
+				// The live sequence needs a VersionAt at the latest instant.
+				full, err := s.cfg.Tiles.VersionAt(ctx, info.Key, ti.Tile, max(now, info.LastT))
+				if err != nil {
+					continue
+				}
+				st = full
+			}
+			s.publishTile(k, info.ID, st, now)
+		}
+	}
 }
 
 // checkCatalog publishes a catalog event when the set of datastores or surfaces changed.
@@ -487,6 +554,10 @@ func (s *Server) checkCatalog(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	s.checkCatalogWith(infos, surfaces)
+}
+
+func (s *Server) checkCatalogWith(infos []core.DatastoreInfo, surfaces []core.SurfaceInfo) {
 	ids := make(map[string]struct{}, len(infos)+len(surfaces))
 	for _, info := range infos {
 		ids["ds:"+info.ID] = struct{}{}

@@ -200,6 +200,16 @@ func TestLiveEvents(t *testing.T) {
 	if row[0].(float64) != 0 || row[1].(float64) != float64(now) || row[2].(float64) != 60 || row[3].(float64) != 3 || row[5].(float64) != 0.5 || row[7] == nil {
 		t.Fatalf("row %v", row)
 	}
+	// A sample older than the mover horizon is late: the store drops it, and so does the
+	// event.
+	f.post("/api/v3/ingest", envLine(t, 120, now+1000, map[string]any{"type": "move", "s": "nauvis", "m": []any{
+		map[string]any{"j": "1.2.v8", "k": "v", "f": "player", "name": "car", "x": 1, "y": 1, "h": 0.5, "tick": 120 - 60*3600},
+		map[string]any{"j": "1.2.v9", "k": "v", "f": "player", "name": "car", "x": 5, "y": 4, "h": 0.5},
+	}})).wantStatus(t, 200, "ingest late sample")
+	_, mv = s.next(t, "movers")
+	if rows := mv["rows"].([]any); len(rows) != 1 || rows[0].([]any)[3].(float64) != 5 {
+		t.Fatalf("movers event with a late row: %v", mv)
+	}
 	f.srv.Step(ctx)
 	_, te := s.next(t, "tile")
 	if te["ds"] != dsID || te["z"].(float64) != 0 || te["x"].(float64) != 0 || te["live"] != true || te["ls"] == nil || te["v"].(float64) != 2 {
@@ -225,6 +235,22 @@ func TestLiveEvents(t *testing.T) {
 	f.post("/api/v3/ingest", envLine(t, 120, now+2*core.Minute, map[string]any{"type": "chunk", "s": "gleba", "f": "player", "x": 0, "y": 0})).wantStatus(t, 200, "ingest gleba")
 	f.srv.Step(ctx)
 	s.next(t, "catalog")
+}
+
+// TestLiveFirstScanSilent: a client connected before the server's first commit step is
+// not sent an event for every existing tile.
+func TestLiveFirstScanSilent(t *testing.T) {
+	f := newFixture(t, fixtureOpt{})
+	f.srv.live = newLiveState() // as after a restart: nothing published yet
+	s := openSSE(t, f.ts.URL+"/api/v3/live?ds="+dsID)
+	s.next(t, "hello")
+	f.srv.Step(context.Background())
+	f.srv.Step(context.Background())
+	f.srv.hub.publish("", "", event("marker", map[string]any{}))
+	name, _ := s.next(t, "tile", "marker")
+	if name != "marker" {
+		t.Fatal("the first scan published tile events")
+	}
 }
 
 func TestLiveSlowClientDropped(t *testing.T) {
