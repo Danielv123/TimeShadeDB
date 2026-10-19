@@ -45,6 +45,7 @@ func main() {
 	candidate := flag.String("candidate", "v3", "label of the system that must meet the targets")
 	out := flag.String("out", "bench/REPORT.md", "report file ('-' for stdout)")
 	strict := flag.Bool("strict", false, "exit 1 when a target fails or was not run")
+	notes := flag.String("notes", "bench/baselines/NOTES.md", "Markdown appended to the report (how to read the baselines); skipped when missing")
 	flag.Parse()
 
 	b, err := os.ReadFile(*targetsPath)
@@ -60,6 +61,9 @@ func main() {
 		benchlib.Fatal(err)
 	}
 	md, failed := render(tf.Targets, all, *candidate)
+	if b, err := os.ReadFile(*notes); err == nil {
+		md += "\n" + strings.TrimSpace(string(b)) + "\n"
+	}
 	if *out == "-" {
 		fmt.Print(md)
 	} else {
