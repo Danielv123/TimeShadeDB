@@ -186,7 +186,10 @@ jobs running on the machine, mean of the steady state:
 | Clusterio module (`--host clusterio`), cores 4-7, 3 pairs | 0.196 (0.191 to 0.204), whole tick 0.205 | 0.237, whole tick 0.256 |
 | Standalone, `--real-charts`, cores 4-7, 3 pairs | 0.203 (0.198 to 0.206) | |
 
-The median tick costs 0.157 ms. During a resync (four reads a tick, three of them forced,
+The median tick costs 0.157 ms and the 99th percentile 1.6 ms (the file write every 120
+ticks, the mover scan every 30). The slowest tick, 6.6 to 7.2 ms, comes once, when the event
+queue first reaches its cap (tick 1,429 at 20 events a tick, 2,875 at 10); its cause is not
+pinned down (table growth or a garbage collection step). During a resync (four reads a tick, three of them forced,
 each also listing the chunk's machines) the capture costs 0.39 to 0.41 ms/tick, for about
 3.5 minutes per 50,000 chunks. Unpinned on the same busy machine the baseline tick itself
 varied 2.3 times between pairs, and the capture cost 0.19 to 0.47 ms/tick (0.27 to 0.41
