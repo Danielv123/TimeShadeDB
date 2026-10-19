@@ -487,9 +487,30 @@ export function segment(tr: Track, k: number): Segment {
   const [dax, day] = Number.isNaN(a.o) ? [0, 0] : orientationVector(a.o);
   const [dbx, dby] = Number.isNaN(b.o) ? [0, 0] : orientationVector(b.o);
   a.seg ??= new Segment();
-  a.seg.build(a.t, a.x, a.y, a.vx, a.vy, dax, day, b.t, b.x, b.y, b.vx, b.vy, dbx, dby);
+  const train = tr.kind === "t";
+  a.seg.build(a.t, a.x, a.y, a.vx, a.vy, dax, day, b.t, b.x, b.y, b.vx, b.vy, dbx, dby,
+    train, train ? turnRate(tr, k - 1) : NaN, train ? turnRate(tr, k + 1) : NaN);
   a.sv = tr.version;
   return a.seg;
+}
+
+/**
+ * How fast a mover turned between samples k and k+1 (radians per tile, magnitude): the
+ * angle between their velocities over the distance. NaN when they are not linked, either
+ * one stands still, or they are under half a tile apart. Reads velocities only, never
+ * segments (segment() asks for its neighbours' turn rates).
+ */
+function turnRate(tr: Track, k: number): number {
+  if (k < 0 || k + 1 >= tr.s.length || !linked(tr, k)) {
+    return NaN;
+  }
+  const p = velocity(tr, k);
+  const a = velocity(tr, k + 1);
+  const ds = Math.hypot(a.x - p.x, a.y - p.y);
+  if (ds < 0.5 || (p.vx === 0 && p.vy === 0) || (a.vx === 0 && a.vy === 0)) {
+    return NaN;
+  }
+  return Math.abs(Math.atan2(p.vx * a.vy - p.vy * a.vx, p.vx * a.vx + p.vy * a.vy)) / ds;
 }
 
 /** The head of a mover at time t. */
@@ -971,9 +992,69 @@ export function bodyPath(tr: Track, head: Head, t: number, length: number, poly:
     }
     const d = Math.hypot(dx, dy);
     const rest = length - poly.length + step;
-    poly.push(poly.lastX() + (dx / d) * rest, poly.lastY() + (dy / d) * rest);
+    const k = tailCurvature(poly);
+    if (k === 0) {
+      poly.push(poly.lastX() + (dx / d) * rest, poly.lastY() + (dy / d) * rest);
+    } else {
+      // The known path ends on a curve (a journey that starts in one): rails go on along
+      // it, so the body follows the same curvature for up to TAIL_TURN, then straight.
+      const th = Math.atan2(dy, dx);
+      const x0 = poly.lastX();
+      const y0 = poly.lastY();
+      const arc = Math.min(rest, TAIL_TURN / Math.abs(k));
+      const n = Math.max(1, Math.ceil(arc / step));
+      for (let i = 1; i <= n; i++) {
+        const a = (arc * i) / n;
+        const th1 = th + k * a;
+        poly.push(x0 + (Math.sin(th1) - Math.sin(th)) / k, y0 + (Math.cos(th) - Math.cos(th1)) / k);
+      }
+      if (rest > arc) {
+        const th1 = th + k * arc;
+        poly.push(poly.lastX() + Math.cos(th1) * (rest - arc), poly.lastY() + Math.sin(th1) * (rest - arc));
+      }
+    }
   }
   return poly;
+}
+
+/** Path length (tiles) over which tailCurvature measures the turn. */
+const TAIL_SPAN = 6;
+/** Largest turn (radians) a body path continues along the curvature its known path ended on. */
+export const TAIL_TURN = Math.PI / 2;
+
+/**
+ * Signed curvature (1/tiles, in the polyline's direction of travel) of the last TAIL_SPAN
+ * tiles of `poly`: the turn between its two halves over half the span. 0 when the path is
+ * shorter, straight (under about 3 degrees) or turns tighter than any rail (MIN_RADIUS).
+ */
+function tailCurvature(poly: Polyline): number {
+  const n = poly.size;
+  const len = poly.length;
+  if (n < 3 || len < TAIL_SPAN) {
+    return 0;
+  }
+  let a = n - 1;
+  while (a > 0 && len - poly.ls[a] < TAIL_SPAN / 2) {
+    a--;
+  }
+  let b = a;
+  while (b > 0 && len - poly.ls[b] < TAIL_SPAN) {
+    b--;
+  }
+  const x1 = poly.xs[n - 1] - poly.xs[a];
+  const y1 = poly.ys[n - 1] - poly.ys[a];
+  const x0 = poly.xs[a] - poly.xs[b];
+  const y0 = poly.ys[a] - poly.ys[b];
+  const half = poly.ls[a] - poly.ls[b];
+  if (half <= 0 || poly.ls[n - 1] - poly.ls[a] <= 0) {
+    return 0;
+  }
+  const turn = Math.atan2(x0 * y1 - y0 * x1, x0 * x1 + y0 * y1);
+  if (Math.abs(turn) < 0.05) {
+    return 0;
+  }
+  const k = turn / ((half + poly.ls[n - 1] - poly.ls[a]) / 2);
+  return Math.abs(k) > 1 / MIN_RADIUS ? 0 : k;
 }
 
 /** One carriage to draw: centre, angle (radians, towards the leading end), kind letter. */

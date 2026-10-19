@@ -86,6 +86,64 @@ test("line+arc segment reproduces a straight followed by a quarter circle", () =
   assert.ok(Math.hypot(o[0] - 10, o[1]) < 1e-9);
 });
 
+/** Distance from (x, y) to the polyline through pts. */
+function distToPath(x: number, y: number, pts: number[][]): number {
+  let best = Infinity;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [ax, ay] = pts[i];
+    const [bx, by] = pts[i + 1];
+    const l2 = (bx - ax) ** 2 + (by - ay) ** 2;
+    const u = l2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / l2)) : 0;
+    best = Math.min(best, Math.hypot(x - (ax + u * (bx - ax)), y - (ay + u * (by - ay))));
+  }
+  return best;
+}
+
+test("a train's long S gap follows line, arc, rail-direction straight, arc instead of the chord", () => {
+  // Test data, nauvis (-312, 799) -> (-295, 751), 1.6 s at 36 tiles/s: a 1:2 diagonal straight
+  // bends north onto a straight, then into the next curve. Track centre line from the chart.
+  const rail = [[-312, 799], [-300.5, 775], [-298, 769], [-297.5, 760], [-296.5, 755], [-295.3, 751.4]];
+  const t0 = [Math.sin(2 * Math.PI * 0.0738), -Math.cos(2 * Math.PI * 0.0738)];
+  const t1 = [Math.sin(2 * Math.PI * 0.08), -Math.cos(2 * Math.PI * 0.08)];
+  const build = (rail: boolean) => new G.Segment().build(0, -312, 799, t0[0] * 36, t0[1] * 36, 0, 0, 1600, -295.3, 751.4, t1[0] * 36, t1[1] * 36, 0, 0, rail, 0, 1 / 14);
+  const seg = build(true);
+  assert.equal(seg.kind, G.SEG_PATH);
+  const cubic = build(false);
+  assert.equal(cubic.kind, G.SEG_HERMITE, "other movers keep the cubic");
+  const o = [0, 0, 0, 0];
+  let worst = 0;
+  let worstCubic = 0;
+  for (let i = 0; i <= 40; i++) {
+    seg.pointAt((seg.length * i) / 40, o);
+    worst = Math.max(worst, distToPath(o[0], o[1], rail));
+    cubic.pointAt((cubic.length * i) / 40, o);
+    worstCubic = Math.max(worstCubic, distToPath(o[0], o[1], rail));
+  }
+  assert.ok(worst < 1.5, `rail path within ${worst.toFixed(2)} tiles of the track`);
+  assert.ok(worstCubic > 2.5, `the cubic cuts the corner by ${worstCubic.toFixed(2)} tiles`);
+  seg.pointAt(seg.length, o);
+  assert.ok(Math.hypot(o[0] + 295.3, o[1] - 751.4) < 1e-6 && Math.abs(o[2] - t1[0]) < 1e-6, "ends at b along its tangent");
+  // A short S stays a cubic (under 30 tiles of chord the samples are close enough).
+  const short = new G.Segment().build(0, 0, 0, 10, -5, 0, 0, 1000, 20, 0, 10, -5, 0, 0, true);
+  assert.notEqual(short.kind, G.SEG_PATH);
+});
+
+test("a long gap from one straight round a curve onto another keeps both straights", () => {
+  // East along y = 0, a 13-tile quarter curve round to south, then south: samples 40 tiles
+  // before the curve and 30 after it.
+  const seg = new G.Segment().build(0, -40, 0, 20, 0, 0, 0, 5000, 13, 43, 0, 20, 0, 0, true);
+  assert.equal(seg.kind, G.SEG_PATH);
+  assert.ok(Math.abs(seg.length - (40 + 30 + (Math.PI / 2) * 13)) < 1e-6, `length ${seg.length}`);
+  const o = [0, 0, 0, 0];
+  seg.pointAt(39, o);
+  assert.ok(Math.abs(o[1]) < 1e-9, "straight before the curve");
+  seg.pointAt(seg.length - 29, o);
+  assert.ok(Math.abs(o[0] - 13) < 1e-9, "straight after it");
+  // Not a rail direction at one end: line+arc as before.
+  const other = new G.Segment().build(0, -40, 0, 20, 0, 0, 0, 5000, 13, 43, 4, 20, 0, 0, true);
+  assert.notEqual(other.kind, G.SEG_PATH);
+});
+
 test("segment timing is monotone and hits both ends", () => {
   const seg = new G.Segment().build(0, 0, 0, 0, 0, 1, 0, 2000, 10, 0, 20, 0, 0, 0);
   const o = [0, 0];
@@ -347,6 +405,19 @@ test("without history or geometry the body runs straight against the orientation
   const poly = T.bodyPath(tr, h, 2000, 32, new H.Polyline());
   const cars = T.placeCarriages(poly, h, "LCCCC", T.pitches(tr, h.k, []), []);
   assert.ok(Math.abs(cars[4].x - 10) < 1e-9 && Math.abs(cars[4].y - 38) < 1e-6, `tail south of the head: ${cars[4].x},${cars[4].y}`);
+});
+
+test("a body whose known path ends in a curve continues along it", () => {
+  // A journey that starts on a circle of radius 30: 4 samples, 9 tiles of path; the rest of
+  // the 30-tile body lies on the same circle instead of on its tangent.
+  const tr = circleTrack(30, 20, 3, 4);
+  const h = T.newHead();
+  T.headAt(tr, tr.s[3].t, Infinity, h);
+  const poly = T.bodyPath(tr, h, tr.s[3].t, 30, new H.Polyline());
+  assert.ok(poly.length >= 30);
+  const n = poly.size;
+  const r = Math.hypot(poly.xs[n - 1], poly.ys[n - 1]);
+  assert.ok(Math.abs(r - 30) < 1.5, `tail ${r.toFixed(2)} from the centre, on the circle`);
 });
 
 test("an end switch re-anchors the head without moving the carriages", () => {
