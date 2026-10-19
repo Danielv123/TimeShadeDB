@@ -115,3 +115,11 @@ it. Event names are fixed:
 
 `firstFullPaint` is set once, at the first `view.full`; `lastFullPaint` and
 `lastFallbackPaint` at the latest. Times are `performance.now()` milliseconds.
+
+The viewer also exposes `window.__tsdbControl` (type `TsdbControl` in
+`web/src/api/types.ts`): `ready()`, `setView(x, y, s)`, `view()`, `datastore()`,
+`seek(t)`, `play(speed)`, `time()`, `range()` and `surfaceBounds()`. WP11 drives zoom-out,
+scrub and timelapse through it, and checks `view()` and `datastore()` before measuring;
+without it only the first-paint numbers can be measured. The suite opens the viewer with
+the query parameters `ds`, `x`, `y`, `z` and `t` (datastore id, centre in world tiles,
+level, map-clock time). WP7 implements `window.__tsdbControl` and these parameters.
