@@ -3,6 +3,7 @@ package terrain
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"sync"
 	"testing"
@@ -315,4 +316,48 @@ func TestConcurrentReadsDuringIngest(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestPaletteCoversLiveContent checks that colours of open-window updates are in the
+// palette before any commit (live tiles are encoded with it) and survive a reopen.
+func TestPaletteCoversLiveContent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := Open(dir, Options{NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	px := coretest.Fill(0x1234)
+	px[7] = 0xBEEF
+	if _, err := s.Apply(ctx, []core.ChunkUpdate{{DS: coretest.DS, Chunk: core.ChunkCoord{}, T: 5, Pixels: px}}); err != nil {
+		t.Fatal(err)
+	}
+	has := func(s *Store) bool {
+		pal, err := s.Palette(ctx, coretest.DS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[uint16]bool{}
+		for _, c := range pal.Colors {
+			seen[c] = true
+		}
+		return seen[0x1234] && seen[0xBEEF]
+	}
+	if !has(s) {
+		t.Fatal("live colours missing from the palette before commit")
+	}
+	before, _ := s.Palette(ctx, coretest.DS)
+	s.Close()
+	if s, err = Open(dir, Options{NoSync: true}); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	after, _ := s.Palette(ctx, coretest.DS)
+	if fmt.Sprint(before.Colors) != fmt.Sprint(after.Colors) {
+		t.Fatalf("palette changed across reopen: %v -> %v", before.Colors, after.Colors)
+	}
+	im, st, err := s.ReadTile(ctx, coretest.DS, core.TileCoord{}, 5, true)
+	if err != nil || !st.Live || im.Block(136) != *px {
+		t.Fatalf("live content after reopen: %v %+v", err, st)
+	}
 }

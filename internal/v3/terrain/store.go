@@ -484,6 +484,7 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 		if d.wal, err = openWAL(filepath.Join(dir, "wal"), s.opt.NoSync); err != nil {
 			return nil, err
 		}
+		var palErr error
 		err := d.wal.replay(s.dec, func(ups []walUpdate) {
 			for i := range ups {
 				u := &ups[i]
@@ -491,9 +492,16 @@ func (s *Store) loadDS(id string) (*dsState, error) {
 				if !tc.Valid() || u.t < d.applyHorizon {
 					continue
 				}
+				if err := d.pal.ensure(u.px[:]); err != nil {
+					palErr = err
+					continue
+				}
 				s.acceptLocked(d, tc, block, u.t, u.deleted, &u.px)
 			}
 		})
+		if err == nil {
+			err = palErr
+		}
 		if err != nil {
 			return nil, fmt.Errorf("wal: %w", err)
 		}
@@ -643,6 +651,13 @@ func (s *Store) applyDS(d *dsState, ups []*core.ChunkUpdate) (core.ApplyResult, 
 		s.stats.late.Add(uint64(res.Late))
 		return res, nil
 	}
+	for _, u := range keep {
+		if !u.Deleted {
+			if err := d.pal.ensure(u.Pixels[:]); err != nil {
+				return res, err
+			}
+		}
+	}
 	if d.wal != nil {
 		bp := walScratch.Get().(*[]byte)
 		var frame []byte
@@ -765,20 +780,6 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 	}
 	d.mu.Unlock()
 
-	// Palette first: new colours are durable before any block uses them.
-	for _, ct := range work {
-		for _, win := range ct.windows {
-			for _, oc := range win.chunks {
-				if err := d.pal.add(oc.px[:]); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	if err := d.pal.flush(); err != nil {
-		return err
-	}
-
 	// Encode and append per tile, in parallel.
 	errs := make([]error, len(work))
 	sem := make(chan struct{}, s.opt.Workers)
@@ -845,6 +846,11 @@ func (s *Store) commitTile(d *dsState, ct *closingTile) (err error) {
 	if err != nil {
 		return err
 	}
+	// Every colour of the open windows is in the palette (Apply added it). Hold the
+	// palette's read lock while using its LUT; Apply takes the write lock only to add
+	// a colour.
+	d.pal.mu.RLock()
+	defer d.pal.mu.RUnlock()
 	pal := d.pal.lut
 	versions, firstT, lastT := tl.versions, tl.firstT, tl.lastT
 	sinceBase, bytesSinceBase, refLen := tl.sinceBase, tl.bytesSinceBase, tl.refLen
