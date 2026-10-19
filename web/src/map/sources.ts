@@ -102,6 +102,14 @@ abstract class HttpSource {
       throw abortError();
     }
     const res = await this.fetchFn(this.url(path), { ...init, headers: { ...this.requestHeaders(), ...(init?.headers as Record<string, string> | undefined) }, signal });
+    return this.adopt(res, path);
+  }
+
+  /**
+   * Takes a response fetched elsewhere for `path` (the early requests in index.html): keeps the
+   * data clock and turns error statuses into HttpError, as for the source's own requests.
+   */
+  async adopt(res: Response, path: string): Promise<Response> {
     const now = res.headers.get("X-TSDB-Now");
     if (now !== null && now !== "") {
       this.clock.observe(Number(now));
@@ -179,10 +187,15 @@ export class ServerSource extends HttpSource implements UrlSource {
     return this.getBin(`palette/${enc(ds)}/${version}.bin`, signal);
   }
 
-  view(ds: string, z: number, bbox: [number, number, number, number], t: TimeMs | "latest", signal?: AbortSignal): Promise<ViewResponse> {
+  /** The path of a `view` request (relative to the base). */
+  viewPath(ds: string, z: number, bbox: [number, number, number, number], t: TimeMs | "latest"): string {
     const tq = t === "latest" ? "latest" : String(Math.floor(t));
+    return `view/${enc(ds)}/${z}?bbox=${bbox.join(",")}&t=${tq}`;
+  }
+
+  view(ds: string, z: number, bbox: [number, number, number, number], t: TimeMs | "latest", signal?: AbortSignal): Promise<ViewResponse> {
     const init: RequestInit | undefined = t === "latest" ? { cache: "no-cache" } : undefined;
-    return this.getJson(`view/${enc(ds)}/${z}?bbox=${bbox.join(",")}&t=${tq}`, signal, init);
+    return this.getJson(this.viewPath(ds, z, bbox, t), signal, init);
   }
 
   tileUrl(ds: string, tile: TileCoord, version: Version | "live"): string {

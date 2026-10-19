@@ -6,6 +6,7 @@
 // static files (the built viewer) at /.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createSecureServer } from "node:http2";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -38,6 +39,8 @@ export interface MockServerOptions {
   staticDir?: string;
   /** Extra files: path -> body (for fixture passthrough, e.g. movers). */
   files?: Map<string, { body: Uint8Array; type: string }>;
+  /** Serve HTTP/2 over TLS (HTTP/1.1 is still accepted) with this key and certificate (PEM). */
+  tls?: { key: string | Buffer; cert: string | Buffer };
 }
 
 interface Hold {
@@ -71,18 +74,22 @@ export class MockServer {
   }
 
   get url(): string {
-    return `http://127.0.0.1:${this.port}`;
+    return `${this.opts.tls ? "https" : "http"}://127.0.0.1:${this.port}`;
   }
 
   async start(port = 0): Promise<this> {
-    this.server = createServer((req, res) => {
+    const handler = (req: IncomingMessage, res: ServerResponse): void => {
       void this.handle(req, res).catch(err => {
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
         }
         res.end(JSON.stringify({ error: String(err), code: "internal" }));
       });
-    });
+    };
+    // The HTTP/2 compatibility API matches the parts of IncomingMessage/ServerResponse used here.
+    this.server = this.opts.tls
+      ? (createSecureServer({ key: this.opts.tls.key, cert: this.opts.tls.cert, allowHTTP1: true }, handler as never) as unknown as Server)
+      : createServer(handler);
     await new Promise<void>(r => this.server!.listen(port, "127.0.0.1", r));
     this.port = (this.server.address() as AddressInfo).port;
     return this;
@@ -151,7 +158,7 @@ export class MockServer {
       mode = "static";
     }
     if (rel === null) {
-      await this.serveFile(path, res);
+      await this.serveFile(path, req, res);
       return;
     }
     for (const h of this.holds) {
@@ -338,7 +345,7 @@ export class MockServer {
     return err(404, "not_found", `no route ${rel}`);
   }
 
-  private async serveFile(path: string, res: ServerResponse): Promise<void> {
+  private async serveFile(path: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const dir = this.opts.staticDir;
     if (!dir) {
       res.writeHead(404, { "Content-Type": "text/plain" });
@@ -356,9 +363,24 @@ export class MockServer {
       p = join(p, "index.html");
     }
     try {
-      const body = await readFile(p);
-      res.writeHead(200, { "Content-Type": MIME[extname(p)] ?? "application/octet-stream", "Cache-Control": path.includes("/assets/") ? "public, max-age=31536000, immutable" : "no-cache" });
+      let body: Buffer = await readFile(p);
+      const type = MIME[extname(p)] ?? "application/octet-stream";
+      const headers: Record<string, string> = { "Content-Type": type, "Cache-Control": path.includes("/assets/") ? "public, max-age=31536000, immutable" : "no-cache", Vary: "Accept-Encoding" };
+      // Compress text assets as a CDN or the Go server would.
+      if (/^(text\/|application\/json)/.test(type) && /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""))) {
+        const key = `file:${p}`;
+        let c = this.cache.get(key);
+        if (!c) {
+          c = { body, gz: gzipSync(body, { level: 9 }) };
+          this.cache.set(key, c);
+        }
+        body = c.gz!;
+        headers["Content-Encoding"] = "gzip";
+      }
+      headers["Content-Length"] = String(body.byteLength);
+      res.writeHead(200, headers);
       res.end(body);
+      this.log.push({ path, t: performance.now(), status: 200, bytes: body.byteLength });
     } catch {
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end("not found");

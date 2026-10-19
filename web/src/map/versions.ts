@@ -6,7 +6,7 @@
 // - ViewVersions: the live server's `view` route at t=latest, by 16x16-tile cells, kept
 //   current by live `tile` events (or polling). Carries live content (`live`, `ls`).
 
-import type { CatalogDatastore, DataSource, LiveTileEvent, TimelineResponse, TimelineTile, TimeMs, Version } from "../api/types";
+import type { CatalogDatastore, DataSource, LiveTileEvent, TimelineResponse, TimelineTile, TimeMs, Version, ViewResponse } from "../api/types";
 import { utcDay } from "../api/grid.ts";
 import { boundsAtLevel, tileKey, type TileRange } from "./camera.ts";
 import { HttpError } from "./sources.ts";
@@ -325,6 +325,32 @@ export class ViewVersions implements VersionResolver {
     for (let ry = y0; ry <= y1; ry += rows) {
       this.fetch(range.z, [x0, ry, Math.min(x1, x0 + Math.min(w, VIEW_MAX_TILES) - 1), Math.min(y1, ry + rows - 1)]);
     }
+  }
+
+  /**
+   * Seeds answers from a `view` response for `bbox` fetched elsewhere (the speculative first
+   * request in boot.ts). Tiles already answered are left alone.
+   */
+  seed(res: ViewResponse, bbox: [number, number, number, number]): void {
+    if (res.ds !== this.ds.id) {
+      return;
+    }
+    const z = res.z;
+    const listed = new Map(res.tiles.map(t => [tileKey(z, t.x, t.y), t] as const));
+    for (let y = bbox[1]; y <= bbox[3]; y++) {
+      for (let x = bbox[0]; x <= bbox[2]; x++) {
+        const k = tileKey(z, x, y);
+        if (this.known.has(k) || this.touched.has(k)) {
+          continue;
+        }
+        const t = listed.get(k);
+        if (t) {
+          this.states.set(k, { v: t.v, live: t.live || undefined, ls: t.live ? t.ls : undefined });
+        }
+        this.known.set(k, this.refreshGen);
+      }
+    }
+    this.onChange();
   }
 
   /** Applies a live `tile` event. */

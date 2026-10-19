@@ -4,7 +4,7 @@
 // it draws an older version of the same tile, its nearest loaded ancestor (scaled up) or its
 // loaded descendants (scaled down), so the screen never goes black.
 
-import type { Catalog, CatalogDatastore, DataSource, LiveTileEvent, TimeMs } from "../api/types";
+import type { Catalog, CatalogDatastore, DataSource, LiveTileEvent, TimeMs, ViewResponse } from "../api/types";
 import type { Camera, Viewport } from "./layer";
 import { decodePalette, decodeTile, decodeTileDelta } from "../api/wire.ts";
 import { tileSpan } from "../api/grid.ts";
@@ -274,6 +274,13 @@ export class TerrainEngine {
     }
   }
 
+  /** Seeds live-server version answers from a `view` response fetched ahead of time. */
+  seedView(res: ViewResponse, bbox: [number, number, number, number]): void {
+    if (this.view && this.ds && res.ds === this.ds.id) {
+      this.view.seed(res, bbox);
+    }
+  }
+
   /** Re-fetches mutable version answers (catalog changed or the live stream reconnected). */
   refreshVersions(): void {
     this.resolver?.refresh();
@@ -311,8 +318,13 @@ export class TerrainEngine {
     this.epoch++;
   }
 
-  /** Computes one frame: schedules loads and returns what to draw. */
-  frame(cam: Camera, vp: Viewport): FrameResult {
+  /**
+   * Computes one frame: schedules loads and returns what to draw. With `scheduleOnly` it only
+   * plans and starts loads (called as soon as data arrives, before the next animation frame);
+   * draw-related perf events are left to the frame that renders.
+   */
+  frame(cam: Camera, vp: Viewport, opts: { scheduleOnly?: boolean } = {}): FrameResult {
+    const scheduleOnly = !!opts.scheduleOnly;
     const ds = this.ds;
     const resolver = this.resolver;
     const draws: DrawCommand[] = [];
@@ -341,12 +353,21 @@ export class TerrainEngine {
     if (ring) {
       resolver.ensure(ring);
     }
-    if (parent) {
+    // The parent level only matters as a fallback; ask for its versions once the visible
+    // level is resolved and its loads have started, so it does not delay the first tiles.
+    if (parent && this.lastFrame && this.lastFrame.unresolved === 0 && this.scheduler.pending === 0) {
       resolver.ensure(parent);
     }
-    if (this.playing && this.timeline && this.target !== "latest") {
-      // Timelapse: have the next day's timeline ready before midnight.
-      this.timeline.prefetch(z, this.target + 3 * 3600_000);
+    if (this.timeline && this.target !== "latest") {
+      if (this.playing) {
+        // Timelapse: have the next day's timeline ready before midnight.
+        this.timeline.prefetch(z, this.target + 3 * 3600_000);
+      } else if (this.scheduler.inFlight === 0 && this.scheduler.pending === 0 && this.timeline.loaded(z, this.target)) {
+        // Idle while scrubbing: load the neighbouring days so a step across midnight
+        // costs no extra round trip.
+        this.timeline.prefetch(z, this.target - 86400_000);
+        this.timeline.prefetch(z, this.target + 86400_000);
+      }
     }
 
     this.textures.unpinAll();
@@ -420,7 +441,9 @@ export class TerrainEngine {
             if (own) {
               this.textures.pin(want.key);
               ownDraws.push({ tex: own.tex, sx: 0, sy: 0, sw: 512, sh: 512, dx, dy, dw, dh });
-              this.markDrawn(want.key, tk, want.ver);
+              if (!scheduleOnly) {
+                this.markDrawn(want.key, tk, want.ver);
+              }
               covered++;
               full++;
               continue;
@@ -506,6 +529,9 @@ export class TerrainEngine {
     draws.push(...ancestorDraws, ...childDraws, ...ownDraws);
     const result: FrameResult = { z, draws, visible, covered, full, unresolved };
     this.lastFrame = result;
+    if (scheduleOnly) {
+      return result;
+    }
     perfCount("framesDrawn");
     if (covered === visible && this.emittedFallback !== this.epoch) {
       this.emittedFallback = this.epoch;
@@ -599,6 +625,12 @@ export class TerrainEngine {
     if (this.textures.has(want.key) || this.isMissing(want.key, tNow)) {
       return;
     }
+    // Prefetch is for panning and zoom fallbacks, where any loaded version already shows
+    // something; refetching every new version while scrubbing would waste bandwidth (coarse
+    // tiles have no deltas). The tile loads its current version once it becomes visible.
+    if (this.byTile.get(tileKey(z, x, y))?.size && !this.scheduler.has(want.key)) {
+      return;
+    }
     this.requestTile(want, z, x, y, prio, wanted, busy, tNow);
   }
 
@@ -668,13 +700,14 @@ export class TerrainEngine {
     return best;
   }
 
-  private async fetchBody(kind: "tile" | "delta" | "palette", url: (s: UrlSource) => string, direct: () => Promise<ArrayBuffer>, signal: AbortSignal, live = false): Promise<{ buffer: ArrayBuffer; ms: number }> {
+  private async fetchBody(kind: "tile" | "delta" | "palette", url: (s: UrlSource) => string, direct: () => Promise<ArrayBuffer>, signal: AbortSignal, live = false): Promise<{ buffer: ArrayBuffer; ms: number; rgba?: Uint8ClampedArray }> {
     const t0 = this.now();
     if (isUrlSource(this.source)) {
-      const r = await this.loader.fetch(url(this.source), this.source.requestHeaders(), signal, { cache: live ? "no-store" : undefined });
-      return { buffer: r.buffer, ms: r.ms };
+      // Canvas2D draws RGBA: let a worker loader expand tiles off the main thread.
+      const expand = kind === "tile" && this.renderer.kind === "canvas2d" && this.loader.kind === "worker";
+      const r = await this.loader.fetch(url(this.source), this.source.requestHeaders(), signal, { cache: live ? "no-store" : undefined, expand });
+      return { buffer: r.buffer, ms: r.ms, rgba: r.rgba };
     }
-    void kind;
     const buffer = await direct();
     return { buffer, ms: this.now() - t0 };
   }
@@ -750,7 +783,7 @@ export class TerrainEngine {
 
   private async loadFull(dsId: string, want: Want, z: number, x: number, y: number, signal: AbortSignal, gen: number): Promise<void> {
     const version = want.live ? "live" : want.version!;
-    const { buffer, ms } = await this.fetchBody(
+    const { buffer, ms, rgba } = await this.fetchBody(
       "tile",
       s => s.tileUrl(dsId, { z, x, y }, version),
       () => this.source.tile(dsId, { z, x, y }, version, signal),
@@ -774,7 +807,7 @@ export class TerrainEngine {
     if (signal.aborted || gen !== this.gen) {
       return;
     }
-    this.addTexture(want, z, x, y, this.renderer.createTexture({ format: h.format, pixels: tile.pixels, paletteVersion: h.paletteVersion }));
+    this.addTexture(want, z, x, y, this.renderer.createTexture({ format: h.format, pixels: tile.pixels, paletteVersion: h.paletteVersion, rgba }));
   }
 
   private addTexture(want: Want, z: number, x: number, y: number, tex: TileTexture): void {

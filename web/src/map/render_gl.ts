@@ -100,6 +100,11 @@ export class GLRenderer implements TileRenderer {
     return this.palette.length;
   }
 
+  /** The WebGL2 context, for layers that draw after terrain (MapLayer.drawGL). */
+  get context(): WebGL2RenderingContext {
+    return this.gl;
+  }
+
   private handleLost = (e: Event): void => {
     e.preventDefault();
     this.lost = true;
@@ -221,6 +226,7 @@ export class GLRenderer implements TileRenderer {
       return t;
     }
     const gl = this.gl;
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     const tex = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texStorage2D(gl.TEXTURE_2D, 1, wide ? gl.R16UI : gl.R8UI, TILE, TILE);
@@ -241,6 +247,7 @@ export class GLRenderer implements TileRenderer {
       return false;
     }
     const gl = this.gl;
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.bindTexture(gl.TEXTURE_2D, t.tex);
     for (const e of delta.entries) {
       const [x, y] = blockOrigin(e.block);
@@ -274,6 +281,9 @@ export class GLRenderer implements TileRenderer {
     }
     const gl = this.gl;
     gl.viewport(0, 0, w, h);
+    // Layers drawing with GL after terrain may have changed state.
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.useProgram(this.prog);
