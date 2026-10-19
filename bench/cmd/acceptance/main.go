@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"timeshadedb/bench/internal/benchlib"
 )
 
 type config struct {
@@ -57,7 +59,7 @@ func main() {
 	flag.StringVar(&c.work, "work", "", "scratch directory for binaries, databases and logs (default: <os temp>/tsdb-acceptance)")
 	flag.StringVar(&c.results, "results", "", "result directory (default: bench/results for candidate, bench/baselines for baseline)")
 	flag.StringVar(&c.testdata, "testdata", os.Getenv("TSDB_TESTDATA"), "illisis export root (env TSDB_TESTDATA)")
-	flag.StringVar(&c.stream, "stream", os.Getenv("TSDB_STREAM"), "directory of research/scripts/to_stream.py output at --coalesce 60000 (env TSDB_STREAM)")
+	flag.StringVar(&c.stream, "stream", os.Getenv("TSDB_STREAM"), "directory of chunk TSV files at 60 s windows (env TSDB_STREAM; default: made from -testdata by `measure stream` under -work)")
 	flag.StringVar(&c.bin, "bin", os.Getenv("TSDB_BIN"), "v3 timeshadedb binary (default: built from -repo)")
 	flag.StringVar(&c.masterBin, "master-bin", os.Getenv("TSDB_MASTER_BIN"), "TimeShadeDB master binary for -mode baseline")
 	flag.StringVar(&c.importArgs, "import-args", envOr("TSDB_IMPORT_ARGS", "import-minimap --data {data} --db {db}"), "arguments of the import command ({data}, {db})")
@@ -93,6 +95,14 @@ func main() {
 	}
 	for _, d := range []string{"bin", "db", "logs"} {
 		check(os.MkdirAll(filepath.Join(c.work, d), 0o755))
+	}
+	// The tools shorten paths under these roots in the result files they write.
+	os.Setenv("TSDB_WORK", c.work)
+	if c.testdata != "" {
+		os.Setenv("TSDB_TESTDATA", c.testdata)
+	}
+	if c.stream != "" {
+		os.Setenv("TSDB_STREAM", c.stream)
 	}
 	r := &runner{c: c}
 	switch c.mode {
@@ -175,7 +185,12 @@ func (r *runner) runIn(dir, log, bin string, args ...string) error {
 	}
 	cmd.Stdout = io.MultiWriter(lf, os.Stdout)
 	cmd.Stderr = io.MultiWriter(lf, os.Stderr)
-	return cmd.Run()
+	// Tied to this process, so an interrupted run leaves no tool (and, through the
+	// tools' own ties, no server) behind.
+	if err := benchlib.StartTied(cmd); err != nil {
+		return err
+	}
+	return cmd.Wait()
 }
 
 func (r *runner) tool(name string) string {
@@ -212,9 +227,29 @@ func (r *runner) buildJS() {
 	})
 }
 
+// makeStream writes the 60 s chunk stream from the test data unless -stream was given.
+func (r *runner) makeStream() {
+	r.step("stream", func() error {
+		if r.c.stream != "" {
+			return nil
+		}
+		if r.c.testdata == "" {
+			return errors.New("neither -stream (TSDB_STREAM) nor -testdata (TSDB_TESTDATA) is set")
+		}
+		dir := filepath.Join(r.c.work, "stream60")
+		os.RemoveAll(dir)
+		if err := r.run("stream", r.tool("measure"), "stream", "-data", r.c.testdata, "-out", dir, "-coalesce", "60000"); err != nil {
+			return err
+		}
+		r.c.stream = dir
+		os.Setenv("TSDB_STREAM", dir)
+		return nil
+	})
+}
+
 func (r *runner) streamFiles(nauvisOnly bool) (files string, surface string, err error) {
 	if r.c.stream == "" {
-		return "", "", errors.New("-stream (TSDB_STREAM) is not set: run research/scripts/to_stream.py <testdata> <dir> --coalesce 60000 --no-jsonl")
+		return "", "", errors.New("no chunk stream: set -stream (TSDB_STREAM) or -testdata so the stream step can make one")
 	}
 	matches, _ := filepath.Glob(filepath.Join(r.c.stream, "*.chunks.tsv"))
 	if len(matches) == 0 {
@@ -262,6 +297,7 @@ func (r *runner) candidate() {
 	c := r.c
 	r.buildTools()
 	r.buildJS()
+	r.makeStream()
 	bin := c.bin
 	r.step("build-server", func() error {
 		if bin != "" {
@@ -309,7 +345,9 @@ func (r *runner) candidate() {
 		if err != nil {
 			return err
 		}
-		return r.run("ingest", r.tool("ingestbench"), append(srvArgs("v3", "v3", bin, "testdata", r.out("v3", "ingest-testdata")),
+		// Its own scenario: this database is the stream re-ingested over HTTP, not the
+		// imported one that the disk, tile and startup targets grade.
+		return r.run("ingest", r.tool("ingestbench"), append(srvArgs("v3", "v3", bin, "testdata-stream", r.out("v3", "ingest-testdata-stream")),
 			"-work", filepath.Join(c.work, "db"), "-input", files, "-surface", surface)...)
 	})
 	r.step("synth10x", func() error { return r.tenfold("v3", "v3", bin) })
@@ -329,21 +367,37 @@ func (r *runner) candidate() {
 			"--renderer", "v3", "--label", "v3", "--out", r.out("v3", "trains"))
 	})
 	r.step("web", func() error {
-		spec := []string{"serve-v3", "--db", imported, "--listen", "127.0.0.1:0"}
-		srv, url, err := startOwned(bin, spec)
+		// The same view as the illisis run: gridworld nauvis, z0, centred on (0, 0).
+		srv, err := benchlib.StartServer(benchlib.ServerSpec{Binary: bin,
+			Args: []string{"serve-v3", "--db", "{db}", "--listen", "{listen}"}, DB: imported,
+			Log: logFile(filepath.Join(c.work, "logs", "web-server.log"))})
 		if err != nil {
 			return err
 		}
-		defer srv.Process.Kill()
-		return r.runIn(filepath.Join(c.repo, "bench", "web"), "web", "node", "run.mjs", "--viewer", "v3", "--url", url,
+		defer srv.Stop()
+		return r.runIn(filepath.Join(c.repo, "bench", "web"), "web", "node", "run.mjs", "--viewer", "v3", "--url", srv.BaseURL+"/",
+			"--ds", webDatastore, "--x", "0", "--y", "0", "--z", "0",
 			"--runs", strconv.Itoa(c.webRuns), "--label", "v3", "--out", r.out("v3", "web"))
 	})
+}
+
+// webDatastore is the datastore both client benchmarks show (illisis: map
+// gw-bc41437d~2E1, surface nauvis, force player).
+const webDatastore = "gw-bc41437d~2E1.nauvis.player"
+
+func logFile(path string) io.Writer {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return io.Discard
+	}
+	return f
 }
 
 func (r *runner) baseline() {
 	c := r.c
 	r.buildTools()
 	r.buildJS()
+	r.makeStream()
 	mb := c.masterBin
 	const label = "tsdb-master"
 	needMaster := func() error {
@@ -447,29 +501,6 @@ func (r *runner) baseline() {
 		return r.runIn(filepath.Join(c.repo, "bench", "web"), "web", "node", "run.mjs", "--viewer", "illisis", "--data", c.testdata,
 			"--runs", strconv.Itoa(c.webRuns), "--label", "illisis", "--out", r.out("illisis", "web"))
 	})
-}
-
-// startOwned starts a v3 server that prints "listening on <addr>" and returns its URL.
-func startOwned(bin string, args []string) (*exec.Cmd, string, error) {
-	cmd := exec.Command(bin, args...)
-	out, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, "", err
-	}
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return nil, "", err
-	}
-	buf := make([]byte, 256)
-	n, _ := out.Read(buf)
-	line := strings.TrimSpace(strings.SplitN(string(buf[:n]), "\n", 2)[0])
-	addr, ok := strings.CutPrefix(line, "listening on ")
-	if !ok {
-		cmd.Process.Kill()
-		return nil, "", fmt.Errorf("server did not print its listening line (got %q)", line)
-	}
-	go io.Copy(io.Discard, out)
-	return cmd, "http://" + addr + "/", nil
 }
 
 func copyDir(src, dst string) error {

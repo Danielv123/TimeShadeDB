@@ -164,6 +164,44 @@ async function wholeSurfaceView(page) {
   }, [width, height]);
 }
 
+/**
+ * Checks that the v3 viewer shows what was asked for (--ds, --x, --y, --z), so its
+ * numbers compare with the illisis run (gridworld nauvis, z0, centred on 0, 0). A
+ * mismatch is an error; what the viewer cannot report is noted once.
+ */
+async function checkV3View(page, run) {
+  const want = { ds: arg("ds"), x: arg("x"), y: arg("y"), z: arg("z") };
+  if (!want.ds && want.x === undefined && want.z === undefined) return;
+  const got = await page.evaluate(() => {
+    const c = window.__tsdbControl;
+    if (!c) return null;
+    return { view: c.view ? c.view() : null, ds: c.datastore ? c.datastore() : null };
+  });
+  if (!got) {
+    if (run === 0) notes.push("viewer has no window.__tsdbControl: the shown datastore and view were not verified");
+    return;
+  }
+  if (want.ds) {
+    if (got.ds == null) {
+      if (run === 0) notes.push("viewer has no __tsdbControl.datastore(): the shown datastore was not verified");
+    } else if (got.ds !== want.ds) {
+      throw new Error(`viewer shows datastore ${got.ds}, not ${want.ds}`);
+    }
+  }
+  if (got.view) {
+    const v = got.view;
+    if (want.x !== undefined && Math.abs(v.x - Number(want.x)) > 1) throw new Error(`viewer centre x ${v.x}, not ${want.x}`);
+    if (want.y !== undefined && Math.abs(v.y - Number(want.y)) > 1) throw new Error(`viewer centre y ${v.y}, not ${want.y}`);
+    if (want.z !== undefined) {
+      const s = 2 ** -Number(want.z);
+      if (Math.abs(v.s - s) > s * 0.01) throw new Error(`viewer scale ${v.s} world tiles per pixel, not ${s} (z ${want.z})`);
+    }
+    if (run === 0 && (v.width !== width || v.height !== height)) notes.push(`viewer canvas ${v.width}x${v.height}, page ${width}x${height}`);
+  } else if (run === 0) {
+    notes.push("viewer has no __tsdbControl.view(): the shown view was not verified");
+  }
+}
+
 // ---------------------------------------------------------------- cold runs
 const coldPaint = [], coldBytes = [], coldReqs = [], zoomFull = [], zoomFallback = [];
 for (let i = 0; i < runs; i++) {
@@ -176,6 +214,8 @@ for (let i = 0; i < runs; i++) {
       if (sel.map !== arg("map", "gw-bc41437d~2E1") || sel.surface !== arg("surface", "nauvis")) {
         throw new Error(`viewer shows ${sel.map}/${sel.surface}, not the requested surface`);
       }
+    } else {
+      await checkV3View(page, i);
     }
     coldPaint.push(await page.evaluate(() => window.__tsdbPerf.firstFullPaint));
     coldBytes.push(net.bytes);

@@ -39,3 +39,30 @@ func TestRenderStatuses(t *testing.T) {
 		t.Fatalf("failed = %d, want 2 (one FAIL, one NOT RUN)", failed)
 	}
 }
+
+func TestToolPriority(t *testing.T) {
+	disk := Target{ID: "d", Group: "G", Title: "disk", Tool: "measure-v3disk|measure-illisis|ingestbench", Scenario: "testdata", Metric: "disk.b_per_chunk_hour_z0", Op: "<=", Value: 4, Unit: "B"}
+	mk := func(label, tool string, v float64, age time.Duration) *benchlib.Result {
+		r := benchlib.NewResult(tool, label, label)
+		r.Scenario = "testdata"
+		r.Metrics = map[string]float64{"disk.b_per_chunk_hour_z0": v}
+		r.Started = time.Now().Add(-age)
+		return r
+	}
+	all := []*benchlib.Result{
+		mk("v3", "measure-v3disk", 3.1, time.Hour), // the imported database, measured first
+		mk("v3", "ingestbench", 9.9, 0),            // a later re-ingest over HTTP must not win
+		mk("tsdb-master", "ingestbench", 8.9, 0),   // the only source for v2
+	}
+	if v, r, ok := pick(disk, all, "v3"); !ok || v != 3.1 || r.Tool != "measure-v3disk" {
+		t.Fatalf("v3 picked %v from %v", v, r)
+	}
+	if v, _, ok := pick(disk, all, "tsdb-master"); !ok || v != 8.9 {
+		t.Fatalf("master picked %v", v)
+	}
+	any := disk
+	any.Tool = "*"
+	if v, _, _ := pick(any, all, "v3"); v != 9.9 {
+		t.Fatalf("'*' should take the newest, got %v", v)
+	}
+}

@@ -117,15 +117,30 @@ func loadResults(paths []string) ([]*benchlib.Result, error) {
 	return out, nil
 }
 
-// pick returns the newest result value for the target and label.
+// pick returns the result value for the target and label. Tool is one tool name, "*"
+// (any tool), or "a|b|c": the first of those tools that has the metric wins, so a metric
+// two tools record in one scenario is read from the intended one. Scenario may list
+// alternatives the same way (tried in order for each tool). Among results of the same
+// tool and scenario the newest wins.
 func pick(t Target, all []*benchlib.Result, label string) (float64, *benchlib.Result, bool) {
+	for _, tool := range strings.Split(t.Tool, "|") {
+		for _, scen := range strings.Split(t.Scenario, "|") {
+			if v, r, ok := pickOne(t.Metric, tool, scen, all, label); ok {
+				return v, r, true
+			}
+		}
+	}
+	return 0, nil, false
+}
+
+func pickOne(metric, tool, scenario string, all []*benchlib.Result, label string) (float64, *benchlib.Result, bool) {
 	var best *benchlib.Result
 	var v float64
 	for _, r := range all {
-		if r.Label != label || (t.Tool != "*" && r.Tool != t.Tool) || (t.Scenario != "" && r.Scenario != t.Scenario) {
+		if r.Label != label || (tool != "*" && r.Tool != tool) || (scenario != "" && r.Scenario != scenario) {
 			continue
 		}
-		x, ok := r.Metrics[t.Metric]
+		x, ok := r.Metrics[metric]
 		if !ok || math.IsNaN(x) {
 			continue
 		}

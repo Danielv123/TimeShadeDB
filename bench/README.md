@@ -8,10 +8,10 @@ One command runs everything and writes [REPORT.md](REPORT.md):
 
 ```sh
 # v3 acceptance (needs WP2-WP8 landed): imports the test data, then measures it.
-TSDB_TESTDATA=/data/minimap TSDB_STREAM=/data/stream60 bench/run_acceptance.sh
+TSDB_TESTDATA=/data/minimap bench/run_acceptance.sh
 
 # Wave 1 baselines: TimeShadeDB master, the illisis export and the illisis viewer.
-TSDB_MASTER_BIN=/tmp/tsdb-master TSDB_TESTDATA=... TSDB_STREAM=... bench/run_acceptance.sh -mode baseline
+TSDB_MASTER_BIN=/tmp/tsdb-master TSDB_TESTDATA=/data/minimap bench/run_acceptance.sh -mode baseline
 ```
 
 On Windows use `bench\run_acceptance.ps1` with the same arguments. Both wrappers run
@@ -26,7 +26,7 @@ NOT RUN.
 | Input | How to get it |
 |---|---|
 | `TSDB_TESTDATA` | The illisis S3 export (the directory holding `maps.json.gz`). It is untrusted data: the tools only parse it and never run its bundled viewer. |
-| `TSDB_STREAM` | `python -I research/scripts/to_stream.py $TSDB_TESTDATA <dir> --coalesce 60000 --no-jsonl`: chunk TSV files at 60 s windows, the same net changes the v3 format stores. Used for v2 ingest, the disk baseline and the 10x database. |
+| `TSDB_STREAM` | Optional. Chunk TSV files at 60 s windows (`<map>.chunks.tsv`), the same net changes the v3 format stores; used for ingest over HTTP, the v2 disk baseline and the 10x database. When unset, the runner's `stream` step makes them under `-work` with `go run ./bench/cmd/measure stream -data $TSDB_TESTDATA -out <dir> -coalesce 60000` (about 2 s). That command is a Go port of the chunk output of the research script `to_stream.py` and writes byte-identical files on the test data. |
 | `TSDB_MASTER_BIN` | TimeShadeDB master built without its viewer: `git archive master \| tar -x -C src`, create `src/web/dist/index.html`, `go build ./cmd/timeshadedb`. |
 | `ILLISIS_REPO` | The illisis-minimap checkout the baseline viewer and train renderer are built from (default: next to this repository or its worktree directory). |
 | `TSDB_IMPORT_ARGS` | Arguments of the import step (default `import-minimap --data {data} --db {db}`; WP5 owns the real flags). |
@@ -37,31 +37,47 @@ NOT RUN.
 All Go tools share `-target v2|v3`, `-label`, `-scenario`, `-out <result.json>`, and either
 `-base <url>` (an already running server; no memory numbers) or `-server-bin <binary>`
 with `-db`/`-work`. A started server always listens on `127.0.0.1` on a random port
-(never 8880, 4443 or 8080) and is killed when the tool ends. v3 servers are started as
+(never 8880, 4443 or 8080) and is killed when the tool ends, also when it ends on an
+error (`benchlib.Fatal` stops every server first) or is interrupted. Each child is also
+tied to the process that started it (a kill-on-close Job Object on Windows, `Pdeathsig`
+on Linux), so a crashed or killed tool, or acceptance runner, leaves nothing running.
+v3 servers are started as
 `serve-v3 --db {db} --listen {listen}` and must print `listening on <addr>` first;
 v2 as `serve --db {db} --addr {addr}`.
 
 | Tool | Measures |
 |---|---|
-| `cmd/ingestbench` | Chunk updates/s (TSV rows for v2, PROTOCOL.md envelopes for v3) and mover samples/s, the rate per tenth of the stream (`chunk_flatness` = last tenth / second tenth), server RSS while ingesting, database size and B/chunk-hour, startup on the result. `-input` replays to_stream TSV files, otherwise the synthetic workload (`-synth N`, `-movers N`). |
-| `cmd/tilebench` | Server tile latency: z0 latest cold (after a restart) and warm, z0 at random historical times (one new time per round, so caches cannot help), coarse levels `-levels`. v3 tiles are listed with the `view` route and fetched by version. Also startup. |
-| `cmd/attack` | Random hostile tile requests (random levels and coordinates, unknown datastores, missing versions): RSS growth per million and latency. Stops at `-max-rss-mib` or `-max-duration` and extrapolates (noted in the result). |
+| `cmd/ingestbench` | Chunk updates/s (TSV rows for v2, PROTOCOL.md envelopes for v3) and mover samples/s, the rate per tenth of the stream (`chunk_flatness` = last tenth / second tenth), server RSS while ingesting, database size and B/chunk-hour, startup on the result. `-input` replays chunk TSV files, otherwise the synthetic workload (`-synth N`, `-movers N`). A v3 server answers 200 even when it skips lines or rejects rows (API.md 5), so every answer's `IngestResponse` is checked: a body whose rows were not all stored stops the run (`-allow-rejected` records them instead, and rates then count stored rows). Envelopes are kept under 1 MiB per line and bodies under 16 MiB (the server caps are 4 MiB and 32 MiB). 503 answers are retried for at most `-max-retry-wait` (2 min) per request. |
+| `cmd/tilebench` | Server tile latency: z0 latest cold (after a restart) and warm, z0 at random historical times (a new time per round; each tile URL, that is each (tile, version), is fetched once so caches cannot help), coarse levels `-levels` (the cold pass is repeated after restarts until it has `-min-cold` samples, 20 by default, because few tiles cover a coarse level). v3 tiles are listed with the `view` route and fetched by version. Also startup. |
+| `cmd/attack` | Random hostile tile requests (random levels and coordinates, unknown datastores, missing versions): memory growth per million and latency. Memory is the median of 5 readings before and after, as private bytes (the target metric), RSS, and the Go heap from `/metrics` when the server exports it. Stops at `-max-rss-mib` or `-max-duration`; the growth is extrapolated per million only from at least 100,000 requests, or when it is already far past the budget (both noted in the result). |
 | `cmd/soak` | Replays a workload at `-speed` (100x) for `-duration` while sampling RSS: maximum, growth from the end of the first sixth to the end ("hour 1 to hour 6"), slope. Reads a few tiles a second like a viewer. |
-| `cmd/measure` | `run`: wall time and peak RSS of a command (the import). `v3disk`: v3 database size by category, B/chunk-hour (z0, and terrain with the pyramid) and mover B/sample. `illisis`: the same numbers for the illisis export. |
+| `cmd/measure` | `run`: wall time and peak RSS of a command (the import). `v3disk`: v3 database size by category, B/chunk-hour (z0, and terrain with the pyramid) and mover B/sample, with the stored samples counted by decoding the closed mover windows. `illisis`: the same numbers for the illisis export. `stream`: the chunk TSV stream from the illisis export. |
 | `cmd/report` | Builds REPORT.md from `targets.json` and every result file under `bench/baselines` and `bench/results`. |
 | `cmd/acceptance` | Runs all of the above in order (the wrappers call it). |
 | `trains/` | Train evaluator (TypeScript, bundled with esbuild): leave-one-out error, carriage distance to rail pixels at 10 Hz over all train time, frame-to-frame jumps. Renderers: `illisis` (the illisis viewer's own `Tracks` class, bundled from its repo), `linear` and `hermite` (head-only references), `v3` (WP8). |
 | `web/` | Client benchmark (Playwright, headless Chromium, 1920x1080, 40 ms RTT, 50 Mbit/s): cold and warm first full paint, zoom out to the whole surface, -5 min scrub steps, 10 s timelapse at 1 h/s, memory. Viewers: `illisis` (built from its repo source with a small bench entry) and `v3`. |
 
 Results are JSON files (`bench/internal/benchlib/result.go`): tool, label, target,
-scenario, machine (CPU, OS), parameters, metrics, notes. `targets.json` maps each target
-to a metric, a tool and a scenario.
+scenario, machine (CPU, OS), parameters, metrics, notes. Local paths in parameters and
+notes are written relative to `$TSDB_TESTDATA`, `$TSDB_STREAM`, `$TSDB_WORK`, `$TMP` or
+`~`, or as their last element, because the baselines are committed.
+
+`targets.json` maps each target to a metric, a tool and a scenario. `tool` may list
+alternatives, such as `"measure-v3disk|measure-illisis|ingestbench"`: the first listed
+tool that has the metric for a label wins (the newest result within one tool). That is
+how the baselines read the disk numbers from their own tools while v3 is graded on the
+imported database. `scenario` may list alternatives the same way. The v3 run that
+re-ingests the stream over HTTP uses its own scenario, `testdata-stream`, so its database
+never stands in for the imported one.
 
 ## Workloads
 
 - **testdata**: the illisis export. Disk and tile numbers use nauvis on the gridworld map
   (7,483 charted chunks over 169.1 h is the chunk-hour denominator). **testdata-all** is
-  every map and surface.
+  every map and surface. For v2 these numbers come from ingesting the 60 s stream; for v3
+  they come from the imported database.
+- **testdata-stream** (v3): the 60 s nauvis stream ingested over HTTP into a fresh
+  database (ingest memory).
 - **synth**: `benchlib.Synth`, modelled on the test data: 8,000 charted chunks, 97% of the
   updates in 0.4% of the chunks (Zipf inside that hot set; small groups of pixels toggling
   to enemy red and back), full chunk states as a capture sends them, and 25 trains on
@@ -79,6 +95,9 @@ to a metric, a tool and a scenario.
 - **WP5** the import command (see `TSDB_IMPORT_ARGS`).
 - **WP7** `window.__tsdbPerf` (docs/v3/README.md) and `window.__tsdbControl`
   (`TsdbControl` in `web/src/api/types.ts`); the query parameters `ds`, `x`, `y`, `z`, `t`.
+  The client benchmark opens the v3 viewer at `ds=gw-bc41437d~2E1.nauvis.player`, x 0,
+  y 0, z 0, the same view as the illisis run, and checks `view()` and `datastore()` before
+  measuring (an error when they differ, a note when the viewer cannot report them).
 - **WP8** `web/src/movers/bench.ts` exporting `createTrainRenderer(): TrainRenderer`
   (`bench/trains/src/types.ts`): a session gets samples in time order (`feed`) and returns
   the drawn head and carriage centres at a time (`pose`).

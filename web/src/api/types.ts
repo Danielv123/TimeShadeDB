@@ -417,6 +417,8 @@ export interface TsdbControl {
   /** Centre in world tiles and scale in world tiles per CSS pixel (1 = z0, 16 = z-4). */
   setView(x: number, y: number, s: number): void;
   view(): { x: number; y: number; s: number; width: number; height: number };
+  /** Id of the selected datastore (core datastore id, e.g. "gw-bc41437d~2E1.nauvis.player"). */
+  datastore(): string;
   /** Show map-clock time t, or live with undefined. Records a time.change event. */
   seek(t?: TimeMs): void;
   /** Timelapse speed in data ms per browser ms (3600 = 1 h/s); 0 pauses. */

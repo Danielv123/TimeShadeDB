@@ -1,7 +1,7 @@
 # Runs the WP11 acceptance suite (or, with -mode baseline, the Wave 1 baselines) and
 # writes bench/REPORT.md. All options are flags of bench/cmd/acceptance; see
 # bench/README.md. Example:
-#   $env:TSDB_TESTDATA = "G:\data\minimap"; $env:TSDB_STREAM = "G:\data\stream60"
+#   $env:TSDB_TESTDATA = "G:\data\minimap"
 #   .\bench\run_acceptance.ps1
 #   $env:TSDB_MASTER_BIN = "C:\tmp\tsdb-master.exe"; .\bench\run_acceptance.ps1 -mode baseline
 $ErrorActionPreference = "Stop"
