@@ -32,6 +32,11 @@ const option = (name, fallback) => {
 const flag = (name) => args.includes(name);
 const modeArg = flag("--bench") ? "bench" : option("--mode", "all");
 const keep = flag("--keep");
+if (option("--real-charts", null) && option("--host", "mod") === "clusterio") {
+	// the real charts are only wired into the standalone mod's test interface: the harness would bench generated ones
+	console.log("ERROR: --real-charts only works with the standalone mod, not with --host clusterio");
+	process.exit(2);
+}
 const factorio = option("--factorio", process.env.FACTORIO_EXE
 	?? "C:/Program Files (x86)/Steam/steamapps/common/Factorio/bin/x64/factorio.exe");
 
@@ -526,7 +531,13 @@ function realCharts(dir, max = 509, scan = 20000) {
 			if (entry.isDirectory() && depth < 6) {
 				walk(p, depth + 1);
 			} else if (entry.isFile() && entry.name.endsWith(".c.gz") && /[\\/]0[\\/][-\d]+_[-\d]+$/.test(d)) {
-				const b = zlib.gunzipSync(fs.readFileSync(p));
+				// untrusted data: cap the inflated size (a level-0 change file is far smaller) and skip what exceeds it
+				let b;
+				try {
+					b = zlib.gunzipSync(fs.readFileSync(p), { maxOutputLength: 64 * 1024 * 1024 });
+				} catch {
+					continue;
+				}
 				if (b.subarray(0, 4).toString("latin1") !== "MMC1") {
 					continue;
 				}

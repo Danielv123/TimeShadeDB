@@ -128,7 +128,8 @@ Options: `--keep` leaves the temporary directory; `--write-fixture` (test mode) 
 `--runs N` (interleaved pairs, 3), `--host clusterio` (bench the Clusterio module instead of
 the mod), `--compare <capture dir>` (run another version of `capture/`, for example an older
 checkout's, interleaved on the same save), `--real-charts <illisis export>` (use 509 charts
-cut from a real map instead of generated ones), `--profile` (per-step LuaProfiler totals),
+cut from a real map instead of generated ones; standalone mod only, refused with
+`--host clusterio`), `--profile` (per-step LuaProfiler totals),
 `--micro` (per-operation timings), and `--trains`, `--charted`, `--chart-reads`.
 
 `run_game.mjs` needs a Factorio 2.x install (`--factorio <exe>` or `FACTORIO_EXE`; default:
@@ -189,11 +190,21 @@ jobs running on the machine, mean of the steady state:
 The median tick costs 0.157 ms and the 99th percentile 1.6 ms (the file write every 120
 ticks, the mover scan every 30). The slowest tick, 6.6 to 7.2 ms, comes once, when the event
 queue first reaches its cap (tick 1,429 at 20 events a tick, 2,875 at 10); its cause is not
-pinned down (table growth or a garbage collection step). During a resync (four reads a tick, three of them forced,
-each also listing the chunk's machines) the capture costs 0.39 to 0.41 ms/tick, for about
-3.5 minutes per 50,000 chunks. Unpinned on the same busy machine the baseline tick itself
-varied 2.3 times between pairs, and the capture cost 0.19 to 0.47 ms/tick (0.27 to 0.41
-before); the budget is not verified on a quiet machine or on Linux.
+pinned down (table growth or a garbage collection step). During a resync (four reads a
+tick, three of them forced, each also listing the chunk's machines) the capture costs 0.39
+to 0.41 ms/tick, for about 3.5 minutes per 50,000 chunks.
+
+So the 0.3 ms/tick budget is met on quiet pinned runs, but the margin depends on the load
+on the machine: a later pinned standalone run on the same machine under load (cores 4-7, 5
+pairs) printed FAIL at 0.325 ms/tick, whole tick 0.385, while a pinned Clusterio run at the
+same time passed at 0.282 (two quiet pairs at about 0.21). Another pinned standalone run
+(cores 4-7, 5 pairs, `--compare`, the baseline's whole tick moving from 0.59 to 0.75 ms)
+printed FAIL at 0.308 ms/tick (pairs 0.271 to 0.330), whole tick 0.333, against 0.364 and
+0.406 for the earlier version, with the same 7,209,102 bytes written. Unpinned on the same
+busy machine the baseline tick itself varied 2.3 times between pairs, and the capture cost
+0.19 to 0.47 ms/tick (0.27 to 0.41 before). The improvement over the earlier version
+reproduces in every run; the absolute budget is not confirmed on a quiet machine or on
+Linux.
 
 Where a tick goes (`--profile`, which adds about 0.5 µs a wrapped call):
 
@@ -217,8 +228,8 @@ whose indexes drifted into its hash part), which halves the capture's Lua heap i
 (19.8 to 9.4 MiB); chunk messages and move messages are encoded
 without escaping the base64 or building a string per sample; the chord test avoids square
 roots. The output is the same: the bench writes the same 7,209,102 bytes, and the game
-test's envelopes match field for field (apart from entity unit numbers, all 7 lower in the
-new run). Much of the earlier figure was the machine: the
+test's envelopes match field for field (apart from entity unit numbers, which differ by a
+run-dependent offset). Much of the earlier figure was the machine: the
 earlier version measures 0.21 to 0.29 ms/tick pinned in the runs above.
 
 ## Licence
