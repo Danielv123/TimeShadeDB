@@ -62,8 +62,10 @@ const (
 	FlagEndSwitch MoverFlags = 1 << 3
 	// FlagNoTick: Tick is unknown (imported data). Velocity must come from T.
 	FlagNoTick MoverFlags = 1 << 4
-	// FlagNoHeading: Orientation is unknown (imported vehicle rows); viewers derive it
-	// from the motion.
+	// FlagNoHeading: Orientation was not captured (imported player and vehicle rows);
+	// viewers derive it from the motion. Imported vehicle rows still carry an estimate
+	// from the velocity in Orientation, which is wrong for a reversing car or a strafing
+	// spidertron.
 	FlagNoHeading MoverFlags = 1 << 5
 )
 

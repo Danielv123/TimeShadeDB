@@ -2,6 +2,7 @@ package minimap_test
 
 import (
 	"context"
+	"errors"
 	"math"
 	"os"
 	"testing"
@@ -370,5 +371,48 @@ func TestVerifyMoversDetectsDifferences(t *testing.T) {
 	}
 	if len(mv) != 1 || mv[0].Match || !mv[0].CountsMatch || mv[0].Missing != 1 || mv[0].Extra != 2 || len(mv[0].Examples) != 1 {
 		t.Fatalf("verify should find the moved sample: %+v", mv)
+	}
+}
+
+var errBoom = errors.New("boom")
+
+type failingTerrain struct {
+	*memstore.Terrain
+	calls int
+}
+
+func (s *failingTerrain) Apply(ctx context.Context, ups []core.ChunkUpdate) (core.ApplyResult, error) {
+	if s.calls++; s.calls == 2 {
+		return core.ApplyResult{}, errBoom
+	}
+	return s.Terrain.Apply(ctx, ups)
+}
+
+type failingMovers struct{ *memstore.Movers }
+
+func (failingMovers) Append(context.Context, []core.MoverSample) (core.ApplyResult, error) {
+	return core.ApplyResult{}, errBoom
+}
+
+// TestImportStopsOnStoreError checks that a store error ends the import (after its
+// goroutines stopped) and is returned.
+func TestImportStopsOnStoreError(t *testing.T) {
+	exp := minimaptest.Write(t, t.TempDir())
+	d, err := minimap.Open(exp.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, opt := range map[string]minimap.Options{
+		"terrain": {Terrain: &failingTerrain{Terrain: memstore.NewTerrain()}, Workers: 1},
+		"movers":  {Movers: failingMovers{memstore.NewMovers()}, Workers: 1},
+	} {
+		if _, err := minimap.Import(context.Background(), d, opt); !errors.Is(err, errBoom) {
+			t.Errorf("%s: err = %v, want the store's error", name, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := minimap.Import(ctx, d, minimap.Options{Terrain: memstore.NewTerrain(), Movers: memstore.NewMovers()}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled import: err = %v", err)
 	}
 }

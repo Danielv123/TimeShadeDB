@@ -131,6 +131,11 @@ func TestTestdata(t *testing.T) {
 		if mr.InvalidRows != 0 || len(mr.Errors) != 0 {
 			t.Errorf("%s: invalid %d errors %v", mr.Surface, mr.InvalidRows, mr.Errors)
 		}
+		// The streaming bounds are never reached on the test data, so the result is the
+		// same as fixing every journey as a whole.
+		if mr.OpenRunCuts != 0 || mr.KeyframeSeedsClamped != 0 {
+			t.Errorf("%s: %d open-run cuts, %d clamped seeds", mr.Surface, mr.OpenRunCuts, mr.KeyframeSeedsClamped)
+		}
 		trainJumps += mr.TrainJumpsAfter
 		t.Logf("%s: boundary %d retimed %v (+%d gones), dups dropped %d/%d, seeded %d, handoffs %d, end switches %d, train jumps %d -> %d",
 			mr.Surface, mr.BoundaryStamped, mr.Retimed, mr.RetimedGones, mr.DupSamplesDropped, mr.DupGonesDropped,

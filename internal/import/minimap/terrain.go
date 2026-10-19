@@ -106,7 +106,9 @@ type areaStats struct {
 
 // runArea replays one z0 area's change files and sends, in time order, one areaWindow
 // per terrain window holding the state of every chunk touched in that window after its
-// last record. sem bounds concurrent decoding; it is never held while sending.
+// last record. Each window is sent as soon as it is complete, so an area holds at most
+// one window besides the change file it is decoding. sem bounds concurrent decoding; it
+// is released while sending, since the merge may wait for another area's window first.
 func runArea(ctx context.Context, ds core.DatastoreKey, area SourceArea, w core.TimeMs, sem chan struct{}, out chan<- areaWindow, rep *TerrainReport, st *areaStats) {
 	defer close(out)
 	idx, err := readAreaIndex(area.Dir)
@@ -123,9 +125,9 @@ func runArea(ctx context.Context, ds core.DatastoreKey, area SourceArea, w core.
 		prevT   core.TimeMs
 		started bool
 	)
-	flush := func(pending []areaWindow) []areaWindow {
+	flush := func() (areaWindow, bool) {
 		if len(touched) == 0 {
-			return pending
+			return areaWindow{}, false
 		}
 		sort.Slice(touched, func(i, j int) bool { return touched[i] < touched[j] })
 		ups := make([]core.ChunkUpdate, 0, len(touched))
@@ -150,7 +152,27 @@ func runArea(ctx context.Context, ds core.DatastoreKey, area SourceArea, w core.
 		}
 		st.updates += len(ups)
 		touched = touched[:0]
-		return append(pending, areaWindow{start: cur, updates: ups})
+		return areaWindow{start: cur, updates: ups}, true
+	}
+	held := false
+	// send hands a window to the merge without holding sem, and takes sem back.
+	send := func(aw areaWindow) error {
+		if held {
+			<-sem
+			held = false
+		}
+		select {
+		case out <- aw:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case sem <- struct{}{}:
+			held = true
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	for _, c := range idx.Changes {
 		if ctx.Err() != nil {
@@ -158,10 +180,10 @@ func runArea(ctx context.Context, ds core.DatastoreKey, area SourceArea, w core.
 		}
 		select {
 		case sem <- struct{}{}:
+			held = true
 		case <-ctx.Done():
 			return
 		}
-		var pending []areaWindow
 		b, err := readGz(changePath(area.Dir, c[0]), maxChangeBytes)
 		if err == nil {
 			st.files++
@@ -176,7 +198,11 @@ func runArea(ctx context.Context, ds core.DatastoreKey, area SourceArea, w core.
 					cur, started = ws, true
 					st.first = tm
 				} else if ws != cur {
-					pending = flush(pending)
+					if aw, ok := flush(); ok {
+						if err := send(aw); err != nil {
+							return err
+						}
+					}
 					cur = ws
 				}
 				applyRecord(&state[block], n, data)
@@ -196,22 +222,21 @@ func runArea(ctx context.Context, ds core.DatastoreKey, area SourceArea, w core.
 				return nil
 			})
 		}
-		<-sem
+		if held {
+			<-sem
+			held = false
+		}
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
 			rep.addErr(fmt.Errorf("%v %v: %w", ds, area.Tile, err))
 		}
-		for _, aw := range pending {
-			select {
-			case out <- aw:
-			case <-ctx.Done():
-				return
-			}
-		}
 	}
 	st.last = prevT
-	if pending := flush(nil); len(pending) > 0 {
+	if aw, ok := flush(); ok {
 		select {
-		case out <- pending[0]:
+		case out <- aw:
 		case <-ctx.Done():
 		}
 	}
@@ -257,12 +282,19 @@ func importTerrain(ctx context.Context, d *Dataset, opt *Options, store core.Ter
 	defer cancel()
 	sem := make(chan struct{}, opt.Workers)
 	var wg sync.WaitGroup
+	// fail stops the area goroutines and waits for them, so none of them writes a
+	// report after importTerrain returns.
+	fail := func(err error) ([]*TerrainReport, core.ApplyResult, error) {
+		cancel()
+		wg.Wait()
+		return reports, res, err
+	}
 	for _, src := range d.Datastores {
 		if len(src.Areas) == 0 || !opt.wantDS(src.Key) {
 			continue
 		}
 		if err := store.EnsureDatastore(ctx, src.Key, w); err != nil {
-			return nil, res, err
+			return fail(err)
 		}
 		rep := &TerrainReport{DS: src.Key.ID(), Areas: len(src.Areas), windows: map[core.TimeMs]struct{}{}}
 		reports = append(reports, rep)
@@ -290,7 +322,7 @@ func importTerrain(ctx context.Context, d *Dataset, opt *Options, store core.Ter
 	)
 	for h.Len() > 0 {
 		if err := ctx.Err(); err != nil {
-			return reports, res, err
+			return fail(err)
 		}
 		start := (*h)[0].win.start
 		batch = batch[:0]
@@ -305,7 +337,7 @@ func importTerrain(ctx context.Context, d *Dataset, opt *Options, store core.Ter
 		r, err := store.Apply(ctx, batch)
 		res.Add(r)
 		if err != nil {
-			return reports, res, err
+			return fail(err)
 		}
 		end := start + w
 		lastEnd = end
@@ -314,12 +346,15 @@ func importTerrain(ctx context.Context, d *Dataset, opt *Options, store core.Ter
 		}
 		if end-lastCommit >= opt.CommitEvery {
 			if err := store.Commit(ctx, end); err != nil {
-				return reports, res, err
+				return fail(err)
 			}
 			lastCommit = end
 		}
 	}
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return reports, res, err
+	}
 	if haveCommit {
 		if err := store.Commit(ctx, lastEnd); err != nil {
 			return reports, res, err
