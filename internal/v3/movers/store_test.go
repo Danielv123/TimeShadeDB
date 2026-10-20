@@ -35,6 +35,14 @@ func TestMoverContract(t *testing.T) {
 	})
 }
 
+// TestMoverContractLightEncoder: the same contract with the lighter window encoder.
+func TestMoverContractLightEncoder(t *testing.T) {
+	coretest.MoverStore(t, func(t *testing.T) core.MoverStore {
+		m, _ := openTemp(t, Options{SyncInterval: -1, LightEncoder: true})
+		return m
+	})
+}
+
 func TestMoverContractWithFsync(t *testing.T) {
 	coretest.MoverStore(t, func(t *testing.T) core.MoverStore {
 		m, _ := openTemp(t, Options{})

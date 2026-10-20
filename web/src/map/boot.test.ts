@@ -153,6 +153,13 @@ test("boot adopts the early server requests: one catalog and one view request", 
   assert.equal(server.requests(/\/catalog$/).length, 1);
   assert.equal(server.requests(/\/view\//).length, 1);
   assert.ok(Math.abs(r.source.now() - data.now) < 1000, "data clock from the early catalog response");
+  // The early script prefetches the visible tiles (all 15 here).
+  for (let i = 0; i < 200 && server.requests(/\/tile\//).length < 15; i++) {
+    await new Promise(res => setTimeout(res, 10));
+  }
+  const tiles = server.requests(/\/tile\//);
+  assert.equal(tiles.length, 15, "visible tiles prefetched");
+  assert.ok(tiles.some(l => /\/tile\/[^/]+\/0\/0\/0\/\d+\.bin$/.test(l.path)), "the centre tile is among them");
 });
 
 test("boot adopts early static requests: catalog.json and today's timeline", async () => {

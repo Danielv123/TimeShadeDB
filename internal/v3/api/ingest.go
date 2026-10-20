@@ -61,16 +61,49 @@ func (s *spool) release(n int64) {
 
 var errSpoolFull = &apiError{http.StatusServiceUnavailable, "overloaded", "too many ingest bodies in flight"}
 
+// bodyBufs keeps one body buffer for the next request (bodies are read whole before
+// they are applied; a forwarder posts one after another). At most maxKeptBody bytes.
+var bodyBufs = make(chan []byte, 1)
+
+const maxKeptBody = 8 << 20
+
+func putBodyBuf(b []byte) {
+	if cap(b) > maxKeptBody {
+		return
+	}
+	select {
+	case bodyBufs <- b[:0]:
+	default:
+	}
+}
+
 // readBody reads a raw (still compressed) request body into memory, reserving its
 // buffer in the spool as it grows. It returns the bytes reserved, to release.
 func (s *Server) readBody(r io.Reader, contentLength int64) ([]byte, int64, error) {
 	var buf []byte
 	var held int64
+	if contentLength > 0 && contentLength < s.cfg.MaxBody {
+		select {
+		case b := <-bodyBufs:
+			// Only for a body of about its size: the whole buffer is reserved.
+			if c := int64(cap(b)); c > contentLength && c <= 2*contentLength+1<<20 && s.spool.acquire(c) {
+				buf, held = b, int64(cap(b))
+			} else {
+				putBodyBuf(b)
+			}
+		default:
+		}
+	}
 	for {
 		if len(buf) == cap(buf) {
 			want := max(2*int64(cap(buf)), 64<<10)
 			if cap(buf) == 0 && contentLength > 0 {
 				want = contentLength + 1 // +1: the EOF read needs no growth
+				if contentLength >= 1<<20 {
+					// Whole MiB, so the kept buffer fits the next body of about the
+					// same size.
+					want = (want + 1<<20 - 1) &^ (1<<20 - 1)
+				}
 			}
 			want = min(want, s.cfg.MaxBody+1)
 			if want <= int64(cap(buf)) {
@@ -134,6 +167,16 @@ func (s *Server) serveIngest(w http.ResponseWriter, r *http.Request) int {
 		return s.writeError(w, err)
 	}
 	_ = rc.SetReadDeadline(time.Time{})
+	if enc == "" || enc == "identity" {
+		// Applied in place: the ingester parses the lines inside data.
+		resp, err := s.cfg.Ingest.IngestBytes(r.Context(), data)
+		putBodyBuf(data)
+		if err != nil {
+			return s.writeError(w, err)
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		return s.writeJSON(w, r, cacheNone, resp)
+	}
 	var body io.Reader = bytes.NewReader(data)
 	switch enc {
 	case "gzip":

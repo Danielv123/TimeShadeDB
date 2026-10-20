@@ -219,6 +219,16 @@ func (d *Dataset) readCatalog() error {
 	return nil
 }
 
+// edges returns the Universal Edges segments of a surface from the catalog.
+func (d *Dataset) edges(k core.SurfaceKey) []core.Quad {
+	for i := range d.Maps {
+		if d.Maps[i].Key == k.Map {
+			return d.Maps[i].Edges[k.Surface]
+		}
+	}
+	return nil
+}
+
 // numLess orders numeric strings numerically, others after them lexically.
 func numLess(a, b string) bool {
 	x, errA := strconv.ParseInt(a, 10, 64)

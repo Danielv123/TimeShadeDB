@@ -151,9 +151,33 @@ func renameRetry(from, to string) error {
 	return err
 }
 
+var (
+	lightOnce sync.Once
+	lightEnc  *zstd.Encoder
+	lightErr  error
+)
+
+// lightCodec returns the shared encoder of Options.LightEncoder: SpeedBetterCompression,
+// whose tables take about 6 MiB where the best level's take about 34 MiB for the life of
+// the process. Files come out about 3% larger (imported test data).
+func lightCodec() (*zstd.Encoder, error) {
+	lightOnce.Do(func() {
+		lightEnc, lightErr = zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+			zstd.WithEncoderConcurrency(1),
+			zstd.WithLowerEncoderMem(true),
+			zstd.WithWindowSize(1<<22),
+		)
+	})
+	return lightEnc, lightErr
+}
+
 // encodeWindowFile encodes w as a .mvw file: one zstd frame holding the MVW3 body.
-func encodeWindowFile(body []byte) ([]byte, error) {
+func encodeWindowFile(body []byte, light bool) ([]byte, error) {
 	e, _, err := codec()
+	if light {
+		e, err = lightCodec()
+	}
 	if err != nil {
 		return nil, err
 	}

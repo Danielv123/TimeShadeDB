@@ -266,6 +266,61 @@ func TestEndSwitchNotAfterGap(t *testing.T) {
 	}
 }
 
+// TestEdgeCrossingWithoutGone: a train runs past an edge line into the buffer, stops,
+// and the next sample lies behind it, heading back towards it (the other instance placed
+// it at the line). The import adds a gone before it, which makes a handoff. The same
+// step away from any edge, and an end switch near one, are left alone.
+func TestEdgeCrossingWithoutGone(t *testing.T) {
+	edges := []core.Quad{{-256, -256, -256, 256}}
+	cross := trainRows(
+		[6]float64{1000, -260, 55, 12, 0, 0},
+		[6]float64{3000, -224, 55, 0, 0, 0}, // stopped 32 tiles past the line
+		[6]float64{71000, -254.875, 55, 8, 0, 0},
+		[6]float64{71600, -250, 55, 8, 0, 0},
+	)
+	run := func(rows []srcRow, edges []core.Quad) ([]outSample, *MoverReport) {
+		rep := newRep()
+		s := newMoverSurface(core.SurfaceKey{}, 300000, rep)
+		s.edges = edges
+		for _, r := range rows {
+			r.meta = &trainMeta[0]
+			s.addRow(r)
+		}
+		s.advance(math.MaxInt64, true)
+		return drain(s), rep
+	}
+	got, rep := run(cross, edges)
+	if rep.CrossingsInferred != 1 || rep.Handoffs != 1 || len(got) != 5 || rep.Imported.Gones["t"] != 1 {
+		t.Fatalf("crossings %d handoffs %d gones %v, rows %+v", rep.CrossingsInferred, rep.Handoffs, rep.Imported.Gones, got)
+	}
+	if g := got[2]; g.flags&core.FlagGone == 0 || g.t != 70999 {
+		t.Fatalf("added gone %+v, want a gone at 70999", g)
+	}
+	// Far from any edge: kept as it is.
+	if got, rep := run(cross, []core.Quad{{256, -256, 256, 256}}); rep.CrossingsInferred != 0 || len(got) != 4 {
+		t.Fatalf("crossing inferred away from the edges: %+v", rep)
+	}
+	// Placed at rest: the row after it gives the direction.
+	rest := trainRows(
+		[6]float64{1000, -309, 790, 0, 12, 0},
+		[6]float64{1600, -309, 799, 0, 12, 0},
+		[6]float64{2700, -309, 764, 0, 0, 0},
+		[6]float64{5200, -309, 773.5, 0, 5, 0},
+	)
+	if _, rep := run(rest, []core.Quad{{-768, 768, -256, 768}}); rep.CrossingsInferred != 1 || rep.EndSwitches != 0 {
+		t.Fatalf("crossing at rest: crossings %d end switches %d", rep.CrossingsInferred, rep.EndSwitches)
+	}
+	// An end switch moves away from the old head: not a crossing.
+	sw := trainRows(
+		[6]float64{1000, -240, 55, 5, 0, 0},
+		[6]float64{3000, -230, 55, 0, 0, 0},
+		[6]float64{5000, -258, 55, -1, 0, 0},
+	)
+	if _, rep := run(sw, edges); rep.CrossingsInferred != 0 || rep.EndSwitches != 1 {
+		t.Fatalf("end switch: crossings %d end switches %d", rep.CrossingsInferred, rep.EndSwitches)
+	}
+}
+
 func TestDupPairsResetAtGone(t *testing.T) {
 	g := float64(rowGone)
 	rows := trainRows(

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"time"
 
 	"timeshadedb/internal/v3/core"
@@ -10,7 +11,9 @@ import (
 
 // Run drives the commit loop until ctx ends: every CommitEvery it commits terrain up to
 // the clock minus TerrainGrace, updates the pyramid, commits movers up to the clock
-// minus MoverGrace, then publishes live events for what changed. It returns ctx's error.
+// minus MoverGrace, then publishes live events for what changed. It also steps at once
+// when ingest has filled a quarter of the mover store's open rows (a fast replay), so
+// those rows are committed before the store refuses batches. It returns ctx's error.
 // The first step runs one period after the start, so a freshly started server serves its
 // first requests without competing with the catch-up commit and pyramid build.
 func (s *Server) Run(ctx context.Context) error {
@@ -21,6 +24,9 @@ func (s *Server) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			s.Step(ctx)
+			s.releaseIfIdle()
+		case <-s.kick:
 			s.Step(ctx)
 		}
 	}
@@ -68,4 +74,33 @@ func (s *Server) Commit(ctx context.Context, now core.TimeMs) error {
 	}
 	s.metrics.commits.Add(1)
 	return errors.Join(errs...)
+}
+
+// pressured is implemented by stores that bound their open rows (movers.Store).
+type pressured interface{ Pressure() float64 }
+
+// checkPressure kicks the commit loop when the mover store's open rows are a quarter
+// full.
+func (s *Server) checkPressure() {
+	if p, ok := s.cfg.Movers.(pressured); ok && p.Pressure() >= 0.25 {
+		select {
+		case s.kick <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// releaseIfIdle returns freed memory to the operating system once after IdleRelease
+// without requests (Config.IdleRelease).
+func (s *Server) releaseIfIdle() {
+	if s.cfg.IdleRelease < 0 || s.released.Load() {
+		return
+	}
+	last := s.lastReq.Load()
+	if last == 0 || time.Since(time.Unix(0, last)) < s.cfg.IdleRelease {
+		return
+	}
+	s.released.Store(true)
+	debug.FreeOSMemory()
+	s.metrics.idleReleases.Add(1)
 }

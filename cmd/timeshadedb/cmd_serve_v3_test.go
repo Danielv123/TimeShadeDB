@@ -464,3 +464,35 @@ func TestServeV3ShutdownWithLiveClient(t *testing.T) {
 		t.Fatalf("shutdown took %v with a live client", d)
 	}
 }
+
+// TestServeV3DataClockMoversFirst: on the data clock a fresh database's first body may
+// be mover samples recorded long ago, spanning more than the commit grace; none of them
+// is late or "ahead" of the clock.
+func TestServeV3DataClockMoversFirst(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "db")
+	base, stop := startServeV3(t, "--db", db, "--clock", "data", "--commit-every", "20ms")
+	defer stop()
+	start := time.Now().Add(-30 * 24 * time.Hour).UnixMilli()
+	var body strings.Builder
+	const n = 600 // 10 minutes of data at one sample per second
+	for i := range n {
+		env := map[string]any{"v": 1, "tick": i * 60, "src": "s", "map": "m", "recv_ms": start + int64(i)*1000, "msgs": []any{
+			map[string]any{"type": "move", "s": "nauvis", "m": []any{map[string]any{"j": "1", "k": "t", "f": "player", "x": i, "y": 0, "h": 0.25}}},
+		}}
+		b, _ := json.Marshal(env)
+		body.Write(b)
+		body.WriteByte('\n')
+	}
+	resp, err := http.Post(base+"/api/v3/ingest", "application/x-ndjson", strings.NewReader(body.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var ir core.IngestResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ir); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("status %d err %v", resp.StatusCode, err)
+	}
+	if ir.Samples.Accepted != n {
+		t.Fatalf("samples %+v (errors %v)", ir.Samples, ir.Errors)
+	}
+}

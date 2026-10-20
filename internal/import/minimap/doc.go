@@ -57,6 +57,14 @@
 //     same journey with the same stamp that was not re-timed.
 //   - Handoffs: a gone followed by a sample of the same journey within
 //     core.HandoffWindow is counted here; the store sets core.FlagHandoff itself.
+//   - Edge crossings without a gone: a train entering a Universal Edge runs into a
+//     buffer past the edge line and stops; the other instance places it near the line,
+//     behind that point, and it drives on. Where the source has no gone between the two
+//     samples (the sample after lies at least 8 tiles behind the one before and heads
+//     back towards it, both within 64 tiles of the same edge segment), a gone is added
+//     1 ms before the later sample, so it becomes a handoff instead of a jump back
+//     (MoverReport.CrossingsInferred; VerifyMovers counts them as extra rows). Trains
+//     only, since a vehicle can turn around between two samples.
 //   - Headings: vehicle rows carry no heading in windows; an estimate is derived from
 //     the velocity (the previous one is kept while the vehicle stands still) and the row
 //     keeps core.FlagNoHeading, so viewers can tell it from a captured heading. Player

@@ -461,7 +461,7 @@ func (v *V3) EncodeChunks(rows []ChunkRow) ([]Body, error) {
 		tick := v.tickOf(r.T)
 		m := core.ChunkMsg{Type: "chunk", S: r.Surface, F: r.Force, X: r.CX, Y: r.CY, Tick: &tick}
 		if !r.Deleted && r.Pixels != nil {
-			d := core.EncodeChart(r.Pixels)
+			d := encodeChart(r.Pixels)
 			m.D = &d
 		}
 		b, err := json.Marshal(m)

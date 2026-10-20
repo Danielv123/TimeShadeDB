@@ -243,3 +243,16 @@ func TestServerDiesWithItsParent(t *testing.T) {
 		t.Fatalf("server %d outlived a tool that exited without stopping it", pid)
 	}
 }
+
+func TestEncodeChartMatchesCore(t *testing.T) {
+	s := NewSynth(DefaultSynth())
+	for _, r := range s.NextChunks(50) {
+		got, err := core.DecodeChart(encodeChart(r.Pixels))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *got != *r.Pixels {
+			t.Fatal("chart does not round-trip")
+		}
+	}
+}

@@ -30,7 +30,11 @@ type V3Disk struct {
 	WAL         int64
 	Movers      int64
 	Overlays    int64
-	Other       int64
+	// Icons is icons/: catalog icons copied from the capture source (API.md icons
+	// route). They are not map history, and the illisis figure (Store) leaves its
+	// icons out too.
+	Icons int64
+	Other int64
 	// ByDatastore maps a datastore id to its z0 tile bytes.
 	ByDatastoreZ0 map[string]int64
 	// ByDatastoreTerrain maps a datastore id to all of its terrain bytes except wal.
@@ -80,6 +84,8 @@ func MeasureV3Disk(db string) (V3Disk, error) {
 			}
 		case len(parts) >= 2 && parts[0] == "overlays":
 			d.Overlays += n
+		case len(parts) >= 2 && parts[0] == "icons":
+			d.Icons += n
 		default:
 			d.Other += n
 		}

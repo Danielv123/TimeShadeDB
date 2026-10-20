@@ -75,6 +75,46 @@
               }
             }
             if (path) early.seed = { path: path, res: get(path) };
+            if (path && path.indexOf("view/") === 0) {
+              // Prefetch the palette and the visible tiles as soon as the catalog and the
+              // version answer arrive, the palette first and then the tiles nearest the
+              // centre, instead of waiting for the bundle: their URLs are immutable, so the
+              // viewer's own requests for them are answered by the HTTP cache (or wait for
+              // these). It saves the bundle's download and start-up before the first tile.
+              var lo = [bbox[0] + 1, bbox[1] + 1], hi = [bbox[2] - 1, bbox[3] - 1];
+              var cx = (x + 256) / span, cy = (y + 256) / span;
+              var json = function (p) {
+                return p.then(function (r) { return r.ok ? r.clone().json() : null; }).catch(function () { return null; });
+              };
+              var dsId = decodeURIComponent(ds);
+              Promise.all([json(early.catalog), json(early.seed.res)]).then(function (cv) {
+                var c = cv[0], v = cv[1];
+                if (!v) return;
+                ((c && c.maps) || []).forEach(function (m) {
+                  (m.surfaces || []).forEach(function (sf) {
+                    (sf.datastores || []).forEach(function (d) {
+                      if (d.id === dsId && typeof d.palette_version === "number") {
+                        fetch(base + "palette/" + ds + "/" + d.palette_version + ".bin", { headers: headers })
+                          .then(function (res) { return res.arrayBuffer(); })
+                          .catch(function () {});
+                      }
+                    });
+                  });
+                });
+                var list = (v && v.tiles) || [];
+                list = list.filter(function (t) {
+                  return !t.live && typeof t.v === "number" && t.x >= lo[0] && t.x <= hi[0] && t.y >= lo[1] && t.y <= hi[1];
+                });
+                list.sort(function (a, b) {
+                  return Math.hypot(a.x + 0.5 - cx, a.y + 0.5 - cy) - Math.hypot(b.x + 0.5 - cx, b.y + 0.5 - cy);
+                });
+                list.forEach(function (t) {
+                  fetch(base + "tile/" + ds + "/" + z + "/" + t.x + "/" + t.y + "/" + t.v + ".bin", { headers: headers })
+                    .then(function (res) { return res.arrayBuffer(); })
+                    .catch(function () {});
+                });
+              }).catch(function () {});
+            }
           }
           window.__tsdbEarly = early;
         } catch (e) {

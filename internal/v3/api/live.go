@@ -279,6 +279,7 @@ func (n *notifier) ChunksApplied(updates []core.ChunkUpdate) {
 
 func (n *notifier) SamplesApplied(samples []core.MoverSample) {
 	s := (*Server)(n)
+	s.checkPressure()
 	if s.hub.count() == 0 {
 		return
 	}

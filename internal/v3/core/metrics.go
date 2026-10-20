@@ -12,6 +12,7 @@ const (
 	MetricMoverSamples         = "tsdb_mover_samples_total"          // counter {result}
 	MetricOverlayEvents        = "tsdb_overlay_events_total"         // counter {result}
 	MetricCommits              = "tsdb_commits_total"                // counter
+	MetricIdleReleases         = "tsdb_idle_releases_total"          // counter: freed memory returned to the OS after idle
 	MetricBlocksWritten        = "tsdb_terrain_blocks_written_total" // counter {kind=delta|keyframe}
 	MetricTerrainBytes         = "tsdb_terrain_bytes_written_total"  // counter
 	MetricOpenWindowBytes      = "tsdb_open_window_bytes"            // gauge

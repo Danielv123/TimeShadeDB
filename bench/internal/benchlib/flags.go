@@ -75,6 +75,25 @@ func (f *ServerFlags) EnsureDB(prefix string) error {
 	return nil
 }
 
+// defaultArgs is DefaultServerArgs for the target, with the ingest token for v3.
+func (f *ServerFlags) defaultArgs() string {
+	args := DefaultServerArgs[f.Target]
+	if f.Target == "v3" && f.Token != "" {
+		args += " --ingest-token " + f.Token
+	}
+	return args
+}
+
+// AddServerArgs appends extra to the server arguments (the target's defaults when
+// --server-args was not given). Tools use it for flags only they need, such as
+// --clock data for a v3 server that replays recorded data.
+func (f *ServerFlags) AddServerArgs(extra string) {
+	if f.Args == "" {
+		f.Args = f.defaultArgs()
+	}
+	f.Args += " " + extra
+}
+
 // Spec builds the ServerSpec. The binary must be set.
 func (f *ServerFlags) Spec() (ServerSpec, error) {
 	if f.Bin == "" {
@@ -82,10 +101,7 @@ func (f *ServerFlags) Spec() (ServerSpec, error) {
 	}
 	args := f.Args
 	if args == "" {
-		args = DefaultServerArgs[f.Target]
-		if f.Target == "v3" && f.Token != "" {
-			args += " --ingest-token " + f.Token
-		}
+		args = f.defaultArgs()
 	}
 	if args == "" {
 		return ServerSpec{}, fmt.Errorf("no default server args for target %q", f.Target)

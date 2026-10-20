@@ -88,6 +88,11 @@ type Config struct {
 	MoverGrace   core.TimeMs
 	// SlowLog, if positive, logs requests that take longer (Logf).
 	SlowLog time.Duration
+	// IdleRelease: after this long without requests the commit loop returns freed memory
+	// to the operating system once (debug.FreeOSMemory), instead of leaving it to the
+	// runtime's gradual scavenger, so a burst of ingest or reads does not leave the
+	// process large while idle (default 10 s; < 0 disables).
+	IdleRelease time.Duration
 	// MemBudget is reported as tsdb_mem_budget_bytes.
 	MemBudget int64
 	// Logf receives errors of the commit loop (default: discard).
@@ -110,6 +115,12 @@ type Server struct {
 	// closing is closed by CloseLive: live streams end.
 	closing   chan struct{}
 	closeOnce sync.Once
+	// kick asks the commit loop for a step now (ingest filled the mover open windows).
+	kick chan struct{}
+	// lastReq is the start of the latest request (unix ns); released is set once idle
+	// memory was returned after it.
+	lastReq  atomic.Int64
+	released atomic.Bool
 
 	catMu    sync.Mutex
 	catBody  []byte
@@ -151,6 +162,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.CommitEvery <= 0 {
 		cfg.CommitEvery = time.Second
 	}
+	if cfg.IdleRelease == 0 {
+		cfg.IdleRelease = 10 * time.Second
+	}
 	if cfg.TerrainGrace <= 0 {
 		cfg.TerrainGrace = 10 * core.Second
 	}
@@ -163,7 +177,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	s := &Server{cfg: cfg, metrics: newMetrics(), closing: make(chan struct{})}
+	s := &Server{cfg: cfg, metrics: newMetrics(), closing: make(chan struct{}), kick: make(chan struct{}, 1)}
 	s.spool.max = cfg.IngestSpool
 	s.files, _ = cfg.Movers.(MoverFiles)
 	s.hub = newHub(cfg.LiveClients, cfg.LiveBuffer)
@@ -367,6 +381,10 @@ func tokenOK(r *http.Request, want string, allowQuery bool) bool {
 // ServeHTTP routes a request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	s.lastReq.Store(start.UnixNano())
+	if s.released.Load() {
+		s.released.Store(false)
+	}
 	path := r.URL.Path
 	route := routeOther
 	status := 0

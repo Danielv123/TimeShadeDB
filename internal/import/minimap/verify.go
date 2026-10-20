@@ -371,7 +371,8 @@ type MoverVerify struct {
 	MatchedRetimed int `json:"matched_retimed"`
 	// Missing source rows (not duplicates) have no stored row.
 	Missing int `json:"missing"`
-	// Extra stored rows match no source row; they must be the keyframe seeds.
+	// Extra stored rows match no source row; they must be the keyframe seeds and the
+	// gones added for edge crossings (MoverReport.CrossingsInferred).
 	Extra int `json:"extra"`
 	// FlagErrors are matched stored rows without FlagNoTick, player or vehicle samples
 	// without FlagNoHeading, and train samples whose orientation is not the source
@@ -379,7 +380,7 @@ type MoverVerify struct {
 	FlagErrors int      `json:"flag_errors"`
 	Examples   []string `json:"examples,omitempty"`
 	// Match is true when the counts match and the source comparison agrees with the
-	// import report: no missing rows, Extra equal to the seeds, SourceDups equal to the
+	// import report: no missing rows, Extra equal to the seeds and inferred crossings, SourceDups equal to the
 	// dropped duplicates, MatchedRetimed equal to the re-timed samples and gones, and
 	// no flag errors.
 	Match bool `json:"match"`
@@ -457,7 +458,7 @@ func VerifyMovers(ctx context.Context, d *Dataset, rep *Report, store core.Mover
 		}
 		v.Extra = sum(v.Stored.Samples) + sum(v.Stored.Gones) - v.Matched
 		retimed := sum(mr.Retimed) + mr.RetimedGones
-		v.Match = v.CountsMatch && v.Missing == 0 && v.FlagErrors == 0 && v.Extra == mr.KeyframeSeeded &&
+		v.Match = v.CountsMatch && v.Missing == 0 && v.FlagErrors == 0 && v.Extra == mr.KeyframeSeeded+mr.CrossingsInferred &&
 			v.SourceDups == mr.DupSamplesDropped+mr.DupGonesDropped && v.MatchedRetimed == retimed
 		out = append(out, v)
 	}

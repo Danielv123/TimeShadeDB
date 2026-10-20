@@ -60,9 +60,18 @@ func TestCountV3MoverRows(t *testing.T) {
 	if c.Windows != 2 || c.Samples != 3 || c.Gones != 1 {
 		t.Fatalf("counted %+v, want 2 windows, 3 samples, 1 gone", c)
 	}
+	if err := os.MkdirAll(filepath.Join(db, "icons"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(db, "icons", "a.png"), make([]byte, 100), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	d, err := MeasureV3Disk(db)
 	if err != nil || d.Movers == 0 {
 		t.Fatalf("mover bytes %d %v", d.Movers, err)
+	}
+	if d.Icons != 100 || d.Other != 0 {
+		t.Fatalf("icons %d other %d, want 100 and 0", d.Icons, d.Other)
 	}
 	if c, err := CountV3MoverRows(t.TempDir()); err != nil || c.Windows != 0 {
 		t.Fatalf("empty db: %+v %v", c, err)

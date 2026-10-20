@@ -52,10 +52,13 @@ export interface Pose {
 }
 
 export interface TrainSession {
-  /** Called in time order. Before pose(t), every sample known at t has been fed. */
+  /**
+   * Called in time order. Before pose(t, horizon), every sample up to `horizon` has been
+   * fed: nothing else exists before it.
+   */
   feed(s: TrainSample): void;
   /** The drawn train at t (non-decreasing), or undefined when the train is not shown. */
-  pose(t: number): Pose | undefined;
+  pose(t: number, horizon?: number): Pose | undefined;
 }
 
 export interface TrainRenderer {

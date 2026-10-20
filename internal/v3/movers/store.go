@@ -35,6 +35,10 @@ type Options struct {
 	// NoWAL disables the write-ahead log: open-window samples are lost on a crash.
 	// For bulk imports that commit at the end.
 	NoWAL bool
+	// LightEncoder compresses window and keyframe files at zstd's better level instead of
+	// its best: about 28 MiB less memory held, files about 3% larger. For a long-running
+	// server under a memory budget; imports keep the best level.
+	LightEncoder bool
 	// MaxOpenRows bounds the samples held in open windows across all surfaces
 	// (default 1,048,576, about 75 MB). Append returns ErrOverloaded beyond it.
 	MaxOpenRows int
@@ -304,6 +308,14 @@ func (m *Store) ref() (core.TimeMs, bool) {
 	return t, ok
 }
 
+// Pressure returns the share of Options.MaxOpenRows the open windows hold (Append
+// refuses batches beyond 1). A server commits early when it grows.
+func (m *Store) Pressure() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return float64(m.openRows) / float64(m.opts.MaxOpenRows)
+}
+
 // Append implements core.MoverStore. The batch is checked and logged to the WAL before
 // anything changes in memory: when the WAL write fails nothing is applied and the
 // result is zero.
@@ -553,7 +565,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		file, err := encodeWindowFile(body)
+		file, err := encodeWindowFile(body, m.opts.LightEncoder)
 		if err != nil {
 			return 0, err
 		}
@@ -735,7 +747,7 @@ func (m *Store) writeKeyframe(s *surface, h core.TimeMs, live map[string]*row, s
 	if err != nil {
 		return err
 	}
-	file, err := encodeWindowFile(body)
+	file, err := encodeWindowFile(body, m.opts.LightEncoder)
 	if err != nil {
 		return err
 	}

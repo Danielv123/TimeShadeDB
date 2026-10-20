@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"timeshadedb"
 	"timeshadedb/internal/v3/api"
 	"timeshadedb/internal/v3/core"
@@ -147,9 +149,15 @@ func (v *v3Server) Close() error {
 }
 
 // openV3Server opens every store under o.db and builds the API server. The memory
-// budget is split (PLAN.md §4.3): half to the terrain store (terrain.SplitBudget), a
-// quarter to the encoded-response cache, an eighth to decoded coarse images, and the
-// rest to mover open rows and overlay caches.
+// budget is split (PLAN.md §4.3): to the terrain store 3/32 for decoded tiles, 1/8 for
+// open windows (Apply refuses batches beyond it, counting every update of a batch as a
+// new open chunk: 1/16 was too little for the synthetic soak at 100x and 3/32 for the
+// test data's 60 s stream) and 3/64 for idle indexes; 1/8 to the encoded-response cache, 1/16 to decoded coarse images, 1/32 to overlay caches
+// and an eighth bounds the mover open rows (held only while a burst outruns the commit
+// loop). The rest of the budget is the working memory of ingest and reads, the encoders
+// and the collector's headroom: with full caches the live heap measured about 190 MiB
+// at 3/8 + 3/16 + 3/32, and the process must stay within the budget + 64 MiB
+// (runServeV3).
 func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...any)) (*v3Server, error) {
 	t0 := time.Now()
 	if err := os.MkdirAll(o.db, 0o755); err != nil {
@@ -158,13 +166,17 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v := &v3Server{}
 	fail := func(err error) (*v3Server, error) { return nil, errors.Join(err, v.Close()) }
 	clock := ingest.WallClock
+	// refClock is the movers' MaxAhead/MaxBehind reference: on the data clock the newest
+	// data read, which runs ahead of the commit clock until those rows are applied.
+	refClock := clock
 	var dataClock *ingest.DataClock
 	if o.clock == "data" {
 		dataClock = &ingest.DataClock{}
 		clock = dataClock.Now
+		refClock = dataClock.Seen
 	}
 
-	topt := terrain.SplitBudget(o.memBudget / 2)
+	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64}
 	topt.Window = core.TimeMs(o.window.Milliseconds())
 	// Each commit worker holds decoded tiles and an encoder; bound them for memory.
 	topt.Workers = min(runtime.GOMAXPROCS(0), 8)
@@ -178,14 +190,18 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 
 	// Coarse series load lazily (and are preloaded in the background), so the server
 	// listens at once whatever the size of the history.
-	pyr, err := pyramid.New(ctx, ter, ter.SeriesStore(), pyramid.Options{CacheBytes: o.memBudget / 8, Lazy: true})
+	// SpeedBetterCompression rather than the default best: the best encoder holds about
+	// 34 MiB of tables for the life of the server, and the coarse tiles a live server
+	// builds come out only about 4% larger (imports keep the best level).
+	pyr, err := pyramid.New(ctx, ter, ter.SeriesStore(), pyramid.Options{CacheBytes: o.memBudget / 16, Lazy: true,
+		ZstdLevel: zstd.SpeedBetterCompression})
 	if err != nil {
 		return fail(fmt.Errorf("pyramid: %w", err))
 	}
 	v.pyr = pyr
 	v.closers = append(v.closers, pyr.Close)
 
-	rend, err := tileenc.NewRenderer(pyr, ter, tileenc.Options{CacheBytes: o.memBudget / 4})
+	rend, err := tileenc.NewRenderer(pyr, ter, tileenc.Options{CacheBytes: o.memBudget / 8})
 	if err != nil {
 		return fail(err)
 	}
@@ -194,7 +210,8 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 
 	// About 72 bytes per open mover row (WP4); an eighth of the budget.
 	maxRows := int(o.memBudget / 8 / 72)
-	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: clock, Logf: logf})
+	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: refClock, Logf: logf,
+		LightEncoder: true})
 	if err != nil {
 		return fail(fmt.Errorf("movers: %w", err))
 	}
@@ -296,10 +313,14 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 		}()
 	}
 
-	// The budget covers caches and buffers; let the GC work harder before the process
-	// grows far past it (PLAN.md §5: RSS <= mem-budget + 64 MiB). GOMEMLIMIT overrides.
+	// The budget is the process's Go memory: caches (about half of it, openV3Server),
+	// buffers and the collector's headroom. The soft limit holds the runtime's mapped
+	// memory near it under load; on Windows the committed private bytes measured about
+	// 30 MiB above that (runtime metadata, the executable's writable pages) and the
+	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB.
+	// GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(o.memBudget + o.memBudget/2 + 64<<20)
+		debug.SetMemoryLimit(o.memBudget)
 	}
 	v, err := openV3Server(ctx, o, logf)
 	if err != nil {

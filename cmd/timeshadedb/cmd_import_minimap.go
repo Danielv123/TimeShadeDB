@@ -332,8 +332,8 @@ func printImportReport(w io.Writer, r *minimap.Report, heap uint64) {
 			m.Surface, m.WindowFiles, m.KeyframeFiles, fmtCounts(m.Source.Journeys), fmtCounts(m.Source.Samples), fmtCounts(m.Source.Gones), m.SourceDupPairs)
 		fmt.Fprintf(w, "  fixes: boundary %d, retimed %s (+%d gones), dup samples dropped %d, dup gones dropped %d, keyframe rows %d matched %d seeded %d conflicts %d, invalid %d\n",
 			m.BoundaryStamped, fmtCounts(m.Retimed), m.RetimedGones, m.DupSamplesDropped, m.DupGonesDropped, m.KeyframeRows, m.KeyframeMatched, m.KeyframeSeeded, m.KeyframeConflicts, m.InvalidRows)
-		fmt.Fprintf(w, "  headings derived %d, no heading %d, stops %d, end switches %d, handoffs %d, train jumps %d -> %d\n",
-			m.HeadingsDerived, m.NoHeading, m.Stops, m.EndSwitches, m.Handoffs, m.TrainJumpsBefore, m.TrainJumpsAfter)
+		fmt.Fprintf(w, "  headings derived %d, no heading %d, stops %d, end switches %d, handoffs %d (%d edge crossings without a gone), train jumps %d -> %d\n",
+			m.HeadingsDerived, m.NoHeading, m.Stops, m.EndSwitches, m.Handoffs, m.CrossingsInferred, m.TrainJumpsBefore, m.TrainJumpsAfter)
 		fmt.Fprintf(w, "  imported journeys %s samples %s gones %s\n", fmtCounts(m.Imported.Journeys), fmtCounts(m.Imported.Samples), fmtCounts(m.Imported.Gones))
 		for _, e := range m.Errors {
 			fmt.Fprintf(w, "  error: %s\n", e)

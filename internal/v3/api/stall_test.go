@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"timeshadedb/internal/v3/core"
 )
 
 // openPartialPost sends the headers of an ingest POST and part of its body, and leaves
@@ -95,4 +98,59 @@ func TestLiveMethodsAndClose(t *testing.T) {
 		}
 	}
 	f.get("/api/v3/live?ds="+dsID).wantError(t, 503, "overloaded", "live after CloseLive")
+}
+
+// TestIngestKicksCommitUnderPressure: once ingest has filled a quarter of the mover
+// open rows, the commit loop steps at once instead of waiting for its period, so a
+// fast replay is committed before the store refuses batches.
+func TestIngestKicksCommitUnderPressure(t *testing.T) {
+	f := newFixture(t, fixtureOpt{maxRows: 4000, cfg: func(c *Config) { c.CommitEvery = time.Hour }})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.srv.Run(ctx)
+	sfc := core.SurfaceKey{Map: testDS.Map, Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "9.9.9", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 1, Kinds: "L"}
+	start := f.clock() - 30*core.Minute
+	var samples []core.MoverSample
+	for i := range 1500 {
+		samples = append(samples, core.MoverSample{Surface: sfc, Meta: meta, T: start + core.TimeMs(i)*core.Second, X: float64(i), Orientation: 0.25})
+	}
+	if _, err := f.mov.Append(context.Background(), samples); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.Notifier().SamplesApplied(samples)
+	deadline := time.Now().Add(5 * time.Second)
+	for f.mov.Pressure() >= 0.25 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no commit: pressure %.2f", f.mov.Pressure())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestIdleRelease: after IdleRelease without requests the loop returns memory to the OS
+// once, and again only after another request.
+func TestIdleRelease(t *testing.T) {
+	f := newFixture(t, fixtureOpt{cfg: func(c *Config) { c.IdleRelease = 20 * time.Millisecond }})
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 0 {
+		t.Fatalf("released before any request: %d", n)
+	}
+	f.get("/healthz")
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 0 {
+		t.Fatalf("released right after a request: %d", n)
+	}
+	time.Sleep(40 * time.Millisecond)
+	f.srv.releaseIfIdle()
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 1 {
+		t.Fatalf("releases after idle: %d, want 1", n)
+	}
+	f.get("/healthz")
+	time.Sleep(40 * time.Millisecond)
+	f.srv.releaseIfIdle()
+	if n := f.srv.metrics.idleReleases.Load(); n != 2 {
+		t.Fatalf("releases after a second idle period: %d, want 2", n)
+	}
 }

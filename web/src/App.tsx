@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import logoDarkUrl from "../images/logo_dark_transparent.png";
-import logoLightUrl from "../images/logo_light_transparent.png";
+import logoDarkUrl from "../images/logo_dark_small.png";
+import logoLightUrl from "../images/logo_light_small.png";
 import type { Catalog, TimeMs } from "./api/types";
 import { layers as layerFactories } from "./layers/index";
 import type { LayerHit } from "./map/layer";
@@ -272,7 +272,7 @@ export function App({ boot }: { boot: Promise<Boot> }) {
   return (
     <main className="app">
       <header className="topbar">
-        {/* The logo PNGs are 250-300 KB each: load one, after the first full paint, so it never competes with tiles. */}
+        {/* The logo (3x its drawn size, about 24 KB): loaded after the first full paint, so it never competes with tiles. */}
         <picture className="brand">
           {showLogo ? <source srcSet={logoDarkUrl} media="(prefers-color-scheme: dark)" /> : null}
           {showLogo ? <img className="brandLogo" src={logoLightUrl} alt="TimeShadeDB" width={92} height={28} decoding="async" /> : <span className="brandText">TimeShadeDB</span>}

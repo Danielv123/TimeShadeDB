@@ -97,6 +97,8 @@ type metrics struct {
 	requests [numRoutes][numCodes]atomic.Uint64
 	hist     [numRoutes]routeHist
 	commits  atomic.Uint64
+	// idleReleases counts Config.IdleRelease returns of memory to the OS.
+	idleReleases atomic.Uint64
 }
 
 func newMetrics() *metrics { return &metrics{} }
@@ -158,6 +160,8 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 	}
 	typ(core.MetricCommits, "counter")
 	val(core.MetricCommits, "", m.commits.Load())
+	typ(core.MetricIdleReleases, "counter")
+	val(core.MetricIdleReleases, "", m.idleReleases.Load())
 	if ts, ok := s.cfg.Terrain.(*terrain.Store); ok {
 		st := ts.Stats()
 		typ(core.MetricBlocksWritten, "counter")

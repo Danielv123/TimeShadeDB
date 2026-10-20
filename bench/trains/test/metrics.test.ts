@@ -98,3 +98,42 @@ test("illisis names", () => {
   assert.equal(illisisName("nauvis"), "nauvis");
   assert.equal(illisisName("Nauvis.1"), "~4Eauvis~2E1");
 });
+
+test("rail mask takes every track colour (rail, elevated rail, rail ramp)", () => {
+  const px = new Uint16Array(512 * 512);
+  px[0] = 0x8c71; // rail
+  px[1] = 0xbdd7; // elevated rail
+  px[2] = 0xa534; // rail ramp
+  px[3] = 0x51a3; // something else
+  const m = new RailMask();
+  m.addArea(0, 0, px);
+  assert.equal(m.railTiles, 3);
+  assert.ok(m.isRail(-256, -256) && m.isRail(-255, -256) && m.isRail(-254, -256));
+  assert.ok(!m.isRail(-253, -256));
+});
+
+test("an end switch drawn in place is not a jump; a moved body is", () => {
+  const mask = new RailMask();
+  const j: Journey = { id: "j", force: "player", name: "t", samples: [sample(0, 0, 0, 0, 0), sample(2000, 0, 0, 0, 0)], handoffs: [] };
+  // A parked two-carriage train whose leading end switches at t = 1000 (cars reversed),
+  // and one whose body moves 30 tiles at t = 1000.
+  const fake = (move: boolean) => ({
+    name: "fake",
+    session: () => ({
+      feed() {},
+      pose(t: number) {
+        const cars = [{ x: 0, y: 0 }, { x: 7, y: 0 }];
+        if (t >= 1000) {
+          return move ? { x: 30, y: 0, cars: cars.map((c) => ({ x: c.x + 30, y: 0 })) } : { x: 7, y: 0, cars: [cars[1], cars[0]] };
+        }
+        return { x: 0, y: 0, cars };
+      },
+    }),
+  });
+  const a = newRenderStats();
+  renderJourney(fake(false), j, mask, defaultOptions, a);
+  assert.equal(a.jumps, 0);
+  const b = newRenderStats();
+  renderJourney(fake(true), j, mask, defaultOptions, b);
+  assert.equal(b.jumps, 1);
+});

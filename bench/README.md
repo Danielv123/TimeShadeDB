@@ -17,7 +17,11 @@ TSDB_MASTER_BIN=/tmp/tsdb-master TSDB_TESTDATA=/data/minimap bench/run_acceptanc
 On Windows use `bench\run_acceptance.ps1` with the same arguments. Both wrappers run
 `go run ./bench/cmd/acceptance`; its flags are listed by `-h`. Useful ones:
 `-work <dir>` (scratch: binaries, databases, logs), `-only a,b` / `-skip a,b` (steps),
-`-soak 6h`, `-attack-n`, `-web-runs`, `-strict` (exit 1 unless every target passes).
+`-soak 6h`, `-attack-n`, `-web-runs`, `-capture-runs`, `-capture-affinity FF00` (pin the
+capture UPS benchmark to cores 4-7 on Windows), `-strict` (exit 1 unless every target
+passes). Candidate steps: `build-tools`, `build-js`, `stream`, `build-server`, `import`,
+`disk`, `tiles`, `ingest-synth`, `ingest-testdata`, `synth10x`, `attack`, `soak`, `trains`,
+`web`, `capture`, `report`.
 A failing step is logged under `<work>/logs/` and the report shows its targets as
 NOT RUN.
 
@@ -31,6 +35,7 @@ NOT RUN.
 | `ILLISIS_REPO` | The illisis-minimap checkout the baseline viewer and train renderer are built from (default: next to this repository or its worktree directory). |
 | `TSDB_IMPORT_ARGS` | Arguments of the import step (default `import-minimap --data {data} --db {db}`; WP5 owns the real flags). |
 | `TSDB_BENCH_CHROME` | Chromium for the client benchmark (default: the newest `ms-playwright/chromium-*`, else the installed Chrome). |
+| `FACTORIO_EXE` | Factorio 2.x for the capture UPS benchmark (default: the Steam path; see `capture/README.md`). |
 
 ## Tools
 
@@ -43,19 +48,25 @@ tied to the process that started it (a kill-on-close Job Object on Windows, `Pde
 on Linux), so a crashed or killed tool, or acceptance runner, leaves nothing running.
 v3 servers are started as
 `serve-v3 --db {db} --listen {listen}` and must print `listening on <addr>` first;
-v2 as `serve --db {db} --addr {addr}`.
+v2 as `serve --db {db} --addr {addr}`. The tools that replay recorded or synthetic data
+into v3 (`ingestbench`, `soak`) add `--clock data` (`-data-clock=false` turns it off): on
+the wall clock serve-v3 counts every replayed row as late, and on the data clock it never
+moves past the wall clock plus 10 s, so replays must lie in the past. `soak` therefore
+places its data to end at the present, and the 10x database is built from replays
+shifted into the past, oldest first. `attack` adds `--pprof` on a free loopback port
+(`-gc`, default on) to force a garbage collection before each memory reading.
 
 | Tool | Measures |
 |---|---|
 | `cmd/ingestbench` | Chunk updates/s (TSV rows for v2, PROTOCOL.md envelopes for v3) and mover samples/s, the rate per tenth of the stream (`chunk_flatness` = last tenth / second tenth), server RSS while ingesting, database size and B/chunk-hour, startup on the result. `-input` replays chunk TSV files, otherwise the synthetic workload (`-synth N`, `-movers N`). A v3 server answers 200 even when it skips lines or rejects rows (API.md 5), so every answer's `IngestResponse` is checked: a body whose rows were not all stored stops the run (`-allow-rejected` records them instead, and rates then count stored rows). Envelopes are kept under 1 MiB per line and bodies under 16 MiB (the server caps are 4 MiB and 32 MiB). 503 answers are retried for at most `-max-retry-wait` (2 min) per request. |
 | `cmd/tilebench` | Server tile latency: z0 latest cold (after a restart) and warm, z0 at random historical times (a new time per round; each tile URL, that is each (tile, version), is fetched once so caches cannot help), coarse levels `-levels` (the cold pass is repeated after restarts until it has `-min-cold` samples, 20 by default, because few tiles cover a coarse level). v3 tiles are listed with the `view` route and fetched by version. Also startup. |
-| `cmd/attack` | Random hostile tile requests (random levels and coordinates, unknown datastores, missing versions): memory growth per million and latency. Memory is the median of 5 readings before and after, as private bytes (the target metric), RSS, and the Go heap from `/metrics` when the server exports it. Stops at `-max-rss-mib` or `-max-duration`; the growth is extrapolated per million only from at least 100,000 requests, or when it is already far past the budget (both noted in the result). |
+| `cmd/attack` | Random hostile tile requests (random levels and coordinates, unknown datastores, missing versions): memory growth per million and latency. Memory is the median of 5 readings before and after, as private bytes, RSS, and the Go heap from `/metrics` when the server exports it. For v3 each reading follows a forced garbage collection (pprof `heap?gc=1`) and `-gc-settle` (30 s), and the live heap after it (`attack.live_heap_growth_mib_per_1m`, the primary memory target) is what the requests retained; without the forced collection the readings mostly show how far the collector let garbage grow. Stops at `-max-rss-mib` or `-max-duration`; the growth is extrapolated per million only from at least 100,000 requests, or when it is already far past the budget (both noted in the result). Before the baseline reading, `-warm-hostile` (200,000) hostile requests at the measured concurrency grow the connection goroutine stacks and runtime caches once (a one-time step of about 8 MiB of private bytes on Windows that further millions of requests do not repeat). |
 | `cmd/soak` | Replays a workload at `-speed` (100x) for `-duration` while sampling RSS: maximum, growth from the end of the first sixth to the end ("hour 1 to hour 6"), slope. Reads a few tiles a second like a viewer. |
-| `cmd/measure` | `run`: wall time and peak RSS of a command (the import). `v3disk`: v3 database size by category, B/chunk-hour (z0, and terrain with the pyramid) and mover B/sample, with the stored samples counted by decoding the closed mover windows. `illisis`: the same numbers for the illisis export. `stream`: the chunk TSV stream from the illisis export. |
+| `cmd/measure` | `run`: wall time and peak RSS of a command (the import). `v3disk`: v3 database size by category, B/chunk-hour (z0, and terrain with the pyramid) and mover B/sample, with the stored samples counted by decoding the closed mover windows; `disk.store_mib` leaves out `icons/` (catalog icons, not map history), as the illisis figure leaves out its icons. `illisis`: the same numbers for the illisis export. `stream`: the chunk TSV stream from the illisis export. `capture`: runs `capture/test/run_game.mjs --mode bench` (headless Factorio, WP9) and records the capture's steady-state cost per tick (Lua and whole tick, mean over the interleaved pairs). `movers`: the train journeys stored in a v3 database as JSON, for the train evaluator's `--journeys-json`. |
 | `cmd/report` | Builds REPORT.md from `targets.json` and every result file under `bench/baselines` and `bench/results`. |
 | `cmd/acceptance` | Runs all of the above in order (the wrappers call it). |
-| `trains/` | Train evaluator (TypeScript, bundled with esbuild): leave-one-out error, carriage distance to rail pixels at 10 Hz over all train time, frame-to-frame jumps. Renderers: `illisis` (the illisis viewer's own `Tracks` class, bundled from its repo), `linear` and `hermite` (head-only references), `v3` (WP8). |
-| `web/` | Client benchmark (Playwright, headless Chromium, 1920x1080, 40 ms RTT, 50 Mbit/s): cold and warm first full paint, zoom out to the whole surface, -5 min scrub steps, 10 s timelapse at 1 h/s, memory. Viewers: `illisis` (built from its repo source with a small bench entry) and `v3`. |
+| `trains/` | Train evaluator (TypeScript, bundled with esbuild): leave-one-out error, carriage distance to rail pixels at 10 Hz over all train time, frame-to-frame jumps. Renderers: `illisis` (the illisis viewer's own `Tracks` class, bundled from its repo), `linear` and `hermite` (head-only references), `v3` (WP8). Input: the illisis movement windows (`--data`), or with `--journeys-json` the rows of a v3 database exported by `measure movers`; the candidate is graded on the imported database's rows (scenario `testdata`) and also run on the illisis windows (scenario `testdata-illisis-input`). Rail mask (`--mask`): `history` (default) takes every track colour (rail, elevated rail, rail ramp) in every snapshot and change record of the z0 chart history, `final` the final chart only. Renderers get the data horizon the evaluator has fed (pose time plus `--lookahead-ms`). A jump also compares the drawn body with the previous body reversed (an end switch drawn in place is not a jump). Diagnostics: `--jumps-out`, `--offrail-out` (JSON lines), `--probe <journey> --probe-from --probe-to` (frames printed), `--shard k/n`. |
+| `web/` | Client benchmark (Playwright, headless Chromium, 1920x1080, 40 ms RTT, 50 Mbit/s): cold and warm first full paint, zoom out to the whole surface, -5 min scrub steps, 10 s timelapse at 1 h/s, memory. For v3 the scrub also checks "bytes <= the changed tiles": tile URLs carry the tile version, so a step that downloads a tile URL the page has already downloaded fetched an unchanged tile again (`web.scrub_unchanged_tile_bytes`, target 0). The timelapse also records the page's own `requestAnimationFrame` rate (`web.raf_hz`) and the share of those frames the viewer drew (`web.timelapse_frame_share`). Viewers: `illisis` (built from its repo source with a small bench entry) and `v3`. |
 
 Results are JSON files (`bench/internal/benchlib/result.go`): tool, label, target,
 scenario, machine (CPU, OS), parameters, metrics, notes. Local paths in parameters and
@@ -82,8 +93,10 @@ never stands in for the imported one.
   updates in 0.4% of the chunks (Zipf inside that hot set; small groups of pixels toggling
   to enemy red and back), full chunk states as a capture sends them, and 25 trains on
   closed loops sampled every 300 ms.
-- **synth10x**: ten time-shifted replays of the testdata stream in one database (startup on
-  a 10x history).
+- **synth10x**: for v3, ten copies of the imported database under suffixed map keys
+  (`measure replicate`: ten times its datastores, tiles, movers, overlays and bytes,
+  184 MiB), started three times (`measure startup`). For v2 (baseline), ten time-shifted
+  replays of the testdata stream in one database.
 - **soak**: the synthetic workload at 100x (v3: with trains).
 - **attack**: random tile URLs against the testdata database.
 
@@ -101,8 +114,10 @@ never stands in for the imported one.
 - **WP8** `web/src/movers/bench.ts` exporting `createTrainRenderer(): TrainRenderer`
   (`bench/trains/src/types.ts`): a session gets samples in time order (`feed`) and returns
   the drawn head and carriage centres at a time (`pose`).
-- **WP9** a result file with `capture.ms_per_tick` (tool `capture`, scenario `ups`) from
-  the headless benchmark save, placed under `bench/results/v3/`.
+- **WP9** `capture/test/run_game.mjs --mode bench` printing its summary lines (`bench pair
+  N: capture Lua cost ...`, `bench: capture costs ... (..., mean), ... of the whole tick`);
+  the `capture` step parses them into `capture.ms_per_tick` and
+  `capture.whole_ms_per_tick` (tool `capture`, scenario `ups`).
 
 ## Caveats
 
@@ -115,8 +130,10 @@ never stands in for the imported one.
 - The client benchmark serves files over HTTP/1.1 from a local server with CDP network
   emulation. Production illisis is served over h2 by a CDN, so the illisis numbers here
   are for 6 connections per host, not for multiplexed requests.
-- Headless Chromium does not cap `requestAnimationFrame` at the display rate, so the
-  timelapse fps can exceed 60.
-- The train evaluator reads movers from the illisis export. Once WP4 and WP6 serve v3
-  movers, it should read the imported (re-timed) data instead; until then the v3 renderer
-  is measured on the illisis samples.
+- Headless Chromium paces `requestAnimationFrame` differently per page: the illisis page
+  (no WebGL) ran it at about 130 Hz, the v3 page (a WebGL canvas, presented through
+  ANGLE/D3D11) at about 55.4 Hz on the owner's machine, which bounds the v3 timelapse fps
+  (`web.raf_hz`).
+- The train evaluator grades v3 on the imported database's rows, while the baselines
+  ran on the illisis windows, which still hold the illisis store's clamp re-timing. The
+  rail mask is the same for all (`--mask history`).

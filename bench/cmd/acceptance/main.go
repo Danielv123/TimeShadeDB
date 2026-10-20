@@ -5,7 +5,8 @@
 //
 //	-mode candidate  (default) the v3 acceptance run: import the test data with
 //	                 `timeshadedb import-minimap`, then disk, tile, ingest, startup,
-//	                 attack, soak, train and client benchmarks against v3.
+//	                 attack, soak, train and client benchmarks against v3, and the
+//	                 capture's UPS benchmark (headless Factorio, `measure capture`).
 //	-mode baseline   the Wave 1 baselines: TimeShadeDB master (-master-bin) over the
 //	                 same inputs, and the illisis viewer and export.
 //
@@ -49,6 +50,8 @@ type config struct {
 	strict     bool
 	synthN     int
 	moversN    int
+	capRuns    int
+	capAff     string
 }
 
 func main() {
@@ -68,6 +71,8 @@ func main() {
 	flag.IntVar(&c.webRuns, "web-runs", 10, "cold and warm runs of the client benchmark")
 	flag.IntVar(&c.synthN, "synth", 0, "synthetic chunk updates (default 1000000 candidate, 200000 baseline)")
 	flag.IntVar(&c.moversN, "movers", 5000000, "synthetic mover samples (candidate)")
+	flag.IntVar(&c.capRuns, "capture-runs", 3, "interleaved pairs of the capture UPS benchmark")
+	flag.StringVar(&c.capAff, "capture-affinity", "", "Windows: hex CPU mask for the capture UPS benchmark (e.g. FF00; a pinned run is steadier on a busy machine)")
 	flag.StringVar(&skip, "skip", "", "comma-separated steps to skip")
 	flag.StringVar(&only, "only", "", "comma-separated steps to run (default all)")
 	flag.StringVar(&c.report, "report", "bench/REPORT.md", "report file")
@@ -271,7 +276,9 @@ func srvArgs(target, label, bin, scenario, out string) []string {
 }
 
 // tenfold builds a database holding ten time-shifted replays of the test data stream and
-// measures startup on it (the "10x" startup target).
+// measures startup on it (the "10x" startup target). The replays are shifted into the
+// past, oldest first: a v3 server replaying data (--clock data) never moves its clock
+// past the wall clock and counts rows behind it as late.
 func (r *runner) tenfold(target, label, bin string) error {
 	files, surface, err := r.streamFiles(true)
 	if err != nil {
@@ -285,7 +292,7 @@ func (r *runner) tenfold(target, label, bin string) error {
 			scenario, out, restarts, settle = "synth10x", r.out(label, "startup-synth10x"), "3", "2s"
 		}
 		args := append(srvArgs(target, label, bin, scenario, out), "-db", db, "-input", files, "-surface", surface,
-			"-time-shift-ms", strconv.FormatInt(int64(k)*span, 10), "-restarts", restarts, "-settle", settle)
+			"-time-shift-ms", strconv.FormatInt(int64(k-9)*span, 10), "-restarts", restarts, "-settle", settle)
 		if err := r.run("synth10x", r.tool("ingestbench"), args...); err != nil {
 			return err
 		}
@@ -350,21 +357,45 @@ func (r *runner) candidate() {
 		return r.run("ingest", r.tool("ingestbench"), append(srvArgs("v3", "v3", bin, "testdata-stream", r.out("v3", "ingest-testdata-stream")),
 			"-work", filepath.Join(c.work, "db"), "-input", files, "-surface", surface)...)
 	})
-	r.step("synth10x", func() error { return r.tenfold("v3", "v3", bin) })
+	r.step("synth10x", func() error {
+		// Ten copies of the imported database under suffixed map keys: ten times its
+		// datastores, tiles, history and bytes (startup is O(tiles) by design, so a longer
+		// history of the same tiles would not test it), then the median of three starts.
+		db := r.freshDB("v3-10x")
+		if err := r.run("synth10x", r.tool("measure"), "replicate", "-db", imported, "-out", db, "-n", "10"); err != nil {
+			return err
+		}
+		return r.run("synth10x", r.tool("measure"), "startup", "-server-bin", bin, "-db", db, "-restarts", "3",
+			"-label", "v3", "-target", "v3", "-scenario", "synth10x", "-out", r.out("v3", "startup-synth10x"))
+	})
 	r.step("attack", func() error {
 		return r.run("attack", r.tool("attack"), append(srvArgs("v3", "v3", bin, "attack", r.out("v3", "attack")),
 			"-db", imported, "-n", strconv.Itoa(c.attackN))...)
 	})
 	r.step("soak", func() error {
 		return r.run("soak", r.tool("soak"), append(srvArgs("v3", "v3", bin, "soak", r.out("v3", "soak")),
-			"-work", filepath.Join(c.work, "db"), "-duration", c.soak.String())...)
+			"-work", filepath.Join(c.work, "db"), "-duration", c.soak.String(),
+			"-server-log", filepath.Join(c.work, "logs", "soak-server.log"))...)
 	})
 	r.step("trains", func() error {
 		if c.testdata == "" {
 			return errors.New("-testdata (TSDB_TESTDATA) is not set")
 		}
-		return r.runIn(filepath.Join(c.repo, "bench", "trains"), "trains", "node", "dist/eval.mjs", "--data", c.testdata,
-			"--renderer", "v3", "--label", "v3", "--out", r.out("v3", "trains"))
+		// Graded on the imported rows (re-timed, deduped, handoffs flagged by WP5), read
+		// back from the database; the rail mask comes from the test data's final chart.
+		journeys := filepath.Join(c.work, "trains-v3-journeys.json")
+		if err := r.run("trains", r.tool("measure"), "movers", "-db", imported, "-surface", "gw-bc41437d~2E1.nauvis", "-out", journeys); err != nil {
+			return err
+		}
+		dir := filepath.Join(c.repo, "bench", "trains")
+		if err := r.runIn(dir, "trains", "node", "dist/eval.mjs", "--data", c.testdata, "--journeys-json", journeys,
+			"--renderer", "v3", "--label", "v3", "--out", r.out("v3", "trains")); err != nil {
+			return err
+		}
+		// The same renderer on the illisis windows as exported (what the baselines got),
+		// in its own scenario so it does not stand in for the graded run.
+		return r.runIn(dir, "trains", "node", "dist/eval.mjs", "--data", c.testdata,
+			"--renderer", "v3", "--label", "v3", "--scenario", "testdata-illisis-input", "--out", r.out("v3", "trains-illisis-input"))
 	})
 	r.step("web", func() error {
 		// The same view as the illisis run: gridworld nauvis, z0, centred on (0, 0).
@@ -378,6 +409,16 @@ func (r *runner) candidate() {
 		return r.runIn(filepath.Join(c.repo, "bench", "web"), "web", "node", "run.mjs", "--viewer", "v3", "--url", srv.BaseURL+"/",
 			"--ds", webDatastore, "--x", "0", "--y", "0", "--z", "0",
 			"--runs", strconv.Itoa(c.webRuns), "--label", "v3", "--out", r.out("v3", "web"))
+	})
+	r.step("capture", func() error {
+		// Headless Factorio (FACTORIO_EXE or the Steam path): the capture's cost per tick
+		// on the WP9 benchmark save, with and without the capture, interleaved.
+		args := []string{"capture", "-repo", c.repo, "-label", "v3", "-scenario", "ups", "-out", r.out("v3", "capture-ups"),
+			"-runs", strconv.Itoa(c.capRuns)}
+		if c.capAff != "" {
+			args = append(args, "-affinity", c.capAff)
+		}
+		return r.run("capture", r.tool("measure"), args...)
 	})
 }
 

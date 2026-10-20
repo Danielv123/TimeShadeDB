@@ -45,7 +45,25 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    chord is rejected as a loop. (Tangents of v x dt put timing into the shape: a braking
    train's curve overshot its end and came back, and walking it by curve parameter drew the
    head at up to 4x its speed. That caused 56 of the 61 jumps the first version had in
-   history mode.)
+   history mode.) Trains get rail-shaped paths over gaps of 30 tiles or more (a sample
+   gap at speed, often at an instance crossing), where a cubic cuts corners by several
+   tiles. An end heading counts as a straight when it lies within 2 degrees of one of the
+   16 rail directions; the captured orientation is used for it when it lies within 1
+   degree of one (and 15 degrees of the derived tangent, which bends towards a neighbour
+   across a corner). Both ends straight and turning by 10 degrees or more: a line, an arc
+   of radius 13 and a line, which keeps both straights straight. End tangents that make
+   an S (both at least 4 degrees to the same side of the chord), where no line+arc fits:
+   a line, arc, straight in a rail direction, arc (or arc, line, arc, line when the mover
+   turned harder before the gap than after it), radius 13, falling back to 9, 20 and 30
+   tiles, at most 1.2 times the chord. Otherwise, when line+arc would need a curve tighter
+   than 3 tiles (or has no solution) and one end is straight: a line from that end and an
+   arc of radius 13 to the other end point, accepting a heading kink of up to 15 degrees
+   there (the captured heading leads a curve). On the test data, with the importer's
+   edge-crossing gones, this took the carriage-frames more than 2 tiles off the rails
+   outside handoffs from 3,507 to 1,830 (one S at the y = 768 crossing on nauvis held
+   1,869 of them), moving carriage-frames over 1 tile from 0.040% to 0.018%, and
+   leave-one-out p90 from 0.574 to about 0.56. Allowed on chords of 15 tiles or more, the
+   S shape made leave-one-out p90 worse (0.574 -> 0.579).
 4. **Extrapolation.** Past the newest sample the head runs on along its velocity. Inside
    the data horizon (every sample older than `now - p99 lag` has arrived) silence means the
    mover is still on its predicted line, up to the capture heartbeat (11 s), so it runs
@@ -59,19 +77,28 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    heartbeat's run away from it until data resumes, minutes later. A train whose last two
    chord speeds show braking decelerates and stops (at most 40 tiles/s²) instead of running
    on at full speed, so a lost stop sample costs a few tiles, not heartbeat x speed. Never
-   towards a gone; across a known gap it holds.
+   towards a gone. Across a known gap (over 60 s) the mover holds when it is at the same
+   place afterwards (a parked train: the imported data has no parked heartbeats); when it
+   is somewhere else afterwards (an instance down, a save reloaded, without a gone), it is
+   hidden from a heartbeat after the last sample until the next one, since where it was
+   meanwhile is unknown, instead of standing still for minutes and then jumping.
 5. **Body.** The path is sampled every 0.5 tile back from the head along the same segment
    geometry. Carriage *i*'s bogies sit 2 tiles either side of its arc position; its centre
    is their midpoint and its angle points from the rear bogie to the front one. Pitches come
    from captured carriage geometry when present, else 7 tiles. Where the history ends the
-   path continues along the newest captured carriage geometry, else straight.
+   path continues along the newest captured carriage geometry, else along the curvature of
+   its last 6 tiles (a journey that starts in a curve; at most a quarter turn, only between
+   about 3 degrees over the span and a 10-tile radius), else straight.
 6. **Handoffs.** A gone followed by the same journey within 10 s is bridged with a straight
    blend in time, and the history is kept. In live mode an unresolved gone holds the mover
    until the handoff window has passed the data horizon.
 7. **End switches.** Flagged (`es`), or inferred on imported data: the head jumped about
    the train's length and the orientation flipped, the step was faster than any train, or
    the new head lies behind the old one. The body behind the new head is the old body
-   reversed, so carriages do not move.
+   reversed, so carriages do not move. (A train that reappears behind its last position
+   at a Universal Edge and drives on towards it is an instance crossing, not an end
+   switch; the importer adds the gone the export lacks there, so it is drawn as a
+   handoff: see `internal/import/minimap/doc.go`.)
 8. **Never snap.** When new data changes where a drawn mover or any carriage would have
    been, the difference is blended out over 400 ms, or longer for a large difference so the
    blend adds at most 15 tiles/s to the mover's own motion (at most 2 s; corrections over 30

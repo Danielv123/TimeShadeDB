@@ -27,6 +27,33 @@ export interface EvalOptions {
   offTiles: number;
   /** Margin around handoffs excluded from the outside-handoff counts (ms). */
   handoffMarginMs: number;
+  /** Called for every jump outside a handoff window (diagnostics, --jumps-out). */
+  onJump?: (j: Journey, info: JumpInfo) => void;
+  /** Called for every frame with a carriage more than 2 tiles off outside a handoff (--offrail-out). */
+  onOffRail?: (j: Journey, info: OffRailInfo) => void;
+}
+
+/** A frame with a carriage centre more than 2 tiles from a rail. */
+export interface OffRailInfo {
+  t: number;
+  /** Index of the carriage (0 = head) and its centre and distance. */
+  car: number;
+  x: number;
+  y: number;
+  dist: number;
+  /** Index of the last sample at or before t. */
+  at: number;
+}
+
+/** A frame-to-frame jump of the head larger than v*dt + 2 tiles. */
+export interface JumpInfo {
+  t: number;
+  from: { x: number; y: number; t: number };
+  to: { x: number; y: number };
+  disp: number;
+  v: number;
+  /** Index of the last sample at or before t. */
+  at: number;
 }
 
 export const defaultOptions: EvalOptions = {
@@ -244,6 +271,7 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
   const sess = r.session(j);
   let fed = 0;
   let prev: { x: number; y: number; t: number } | undefined;
+  let prevCars: { x: number; y: number }[] = [];
   let prevKey = "";
   let prevDists: number[] = [];
   let prevHead = 0;
@@ -257,7 +285,9 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
     while (at + 1 < s.length && s[at + 1].t <= t) {
       at++;
     }
-    const p = sess.pose(t);
+    // History playback has loaded every sample up to t + lookahead (the viewer's history
+    // feed likewise reports the end of its loaded range as the data horizon).
+    const p = sess.pose(t, t + o.lookaheadMs);
     if (!p) {
       prev = undefined;
       continue;
@@ -283,7 +313,9 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
       st.headOver2OutsideHandoff++;
     }
     const movingFrame = prev !== undefined && Math.hypot(p.x - prev.x, p.y - prev.y) > 0.05;
+    let ci = -1;
     for (const d of dists) {
+      ci++;
       if (movingFrame) {
         st.movingCarFrames++;
         st.movingDist.add(d);
@@ -300,6 +332,10 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
         st.carOver2++;
         if (!handoff) {
           st.carOver2OutsideHandoff++;
+          if (o.onOffRail) {
+            const c = p.cars[ci] ?? p;
+            o.onOffRail(j, { t, car: ci, x: c.x, y: c.y, dist: d, at });
+          }
         }
       }
     }
@@ -308,7 +344,17 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
     prevHead = head;
     if (prev) {
       const dt = (t - prev.t) / 1000;
-      const disp = Math.hypot(p.x - prev.x, p.y - prev.y);
+      // The head's displacement, unless the drawn body is the previous one reversed (an end
+      // switch: the leading end changed but no carriage moved, so nothing jumped).
+      let disp = Math.hypot(p.x - prev.x, p.y - prev.y);
+      const n = p.cars.length;
+      if (n >= 2 && prevCars.length === n) {
+        let rev = 0;
+        for (let i = 0; i < n; i++) {
+          rev = Math.max(rev, Math.hypot(p.cars[i].x - prevCars[n - 1 - i].x, p.cars[i].y - prevCars[n - 1 - i].y));
+        }
+        disp = Math.min(disp, rev);
+      }
       const lo = Math.max(0, at - 1);
       const hi = Math.min(s.length - 1, at + 1);
       let v = 0;
@@ -322,10 +368,12 @@ export function renderJourney(r: TrainRenderer, j: Journey, mask: RailMask, o: E
         st.jumps++;
         if (!handoff) {
           st.jumpsOutsideHandoff++;
+          o.onJump?.(j, { t, from: prev, to: { x: p.x, y: p.y }, disp, v, at });
         }
       }
     }
     prev = { x: p.x, y: p.y, t };
+    prevCars = p.cars;
   }
 }
 

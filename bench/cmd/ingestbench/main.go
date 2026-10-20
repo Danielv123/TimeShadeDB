@@ -42,7 +42,11 @@ func main() {
 	settle := flag.Duration("settle", 2*time.Second, "wait after ingest before measuring disk and memory (lets windows flush)")
 	allowRejected := flag.Bool("allow-rejected", false, "record rows the server did not store (late, invalid, bad lines) instead of failing; rates then count stored rows only")
 	retryWait := flag.Duration("max-retry-wait", benchlib.MaxRetryWait, "longest total wait on 503 answers for one request")
+	dataClock := flag.Bool("data-clock", true, "v3: start the server with --clock data (the map clock follows the replayed data; on the wall clock every replayed row is late)")
 	flag.Parse()
+	if *dataClock && sf.Target == "v3" && sf.Base == "" {
+		sf.AddServerArgs("--clock data")
+	}
 	popt := benchlib.PipelineOptions{AllowRejected: *allowRejected, MaxRetryWait: *retryWait}
 
 	res := sf.NewResult("ingestbench")
@@ -162,6 +166,9 @@ func main() {
 			cfg := benchlib.DefaultSynth()
 			cfg.Chunks, cfg.Trains = 1, *trains
 			synth = benchlib.NewSynth(cfg)
+		} else {
+			// The chunks moved a data clock to their last time; continue from there.
+			synth.AlignMovers()
 		}
 		msent := 0
 		mgen := func() ([]benchlib.MoverRow, bool) {
@@ -247,7 +254,7 @@ func main() {
 					// the numerator is all of them too.
 					res.Set("disk.b_per_chunk_hour_z0", float64(d.TerrainZ0)/ch)
 					res.Set("disk.b_per_chunk_hour_terrain", float64(d.TerrainZ0+d.Pyramid+d.TerrainMeta)/ch)
-					res.Set("disk.store_mib", float64(d.Total-d.WAL)/(1<<20))
+					res.Set("disk.store_mib", float64(d.Total-d.WAL-d.Icons)/(1<<20))
 					res.Set("disk.wal_bytes", float64(d.WAL))
 				}
 			}

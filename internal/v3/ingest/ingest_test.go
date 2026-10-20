@@ -332,17 +332,21 @@ func TestDataClock(t *testing.T) {
 // at most MaxDataJump, and never past the wall clock plus MaxAhead.
 func TestDataClockBounded(t *testing.T) {
 	dc := &DataClock{}
-	if dc.Advance(1000, 5000, 10, 100) || dc.Now() != 1000 {
-		t.Fatalf("first advance: %d", dc.Now())
+	if dc.Advance(1000, 5000, 10, 100) || dc.Seen() != 1000 || dc.Now() != 0 {
+		t.Fatalf("first advance: seen %d now %d", dc.Seen(), dc.Now())
 	}
-	if !dc.Advance(9000, 1_000_000, 10, 100) || dc.Now() != 1100 {
-		t.Fatalf("jump not bounded: %d", dc.Now())
+	if !dc.Advance(9000, 1_000_000, 10, 100) || dc.Seen() != 1100 {
+		t.Fatalf("jump not bounded: %d", dc.Seen())
 	}
-	if !dc.Advance(1_000_000, 1150, 10, 1000) || dc.Now() != 1160 {
-		t.Fatalf("wall clock bound: %d", dc.Now())
+	if !dc.Advance(1_000_000, 1150, 10, 1000) || dc.Seen() != 1160 {
+		t.Fatalf("wall clock bound: %d", dc.Seen())
 	}
-	if dc.Advance(500, 1150, 10, 1000) || dc.Now() != 1160 {
-		t.Fatalf("went backwards: %d", dc.Now())
+	if dc.Advance(500, 1150, 10, 1000) || dc.Seen() != 1160 {
+		t.Fatalf("went backwards: %d", dc.Seen())
+	}
+	dc.Publish(dc.Seen())
+	if dc.Now() != 1160 {
+		t.Fatalf("published %d", dc.Now())
 	}
 
 	dc = &DataClock{}
@@ -357,5 +361,89 @@ func TestDataClockBounded(t *testing.T) {
 	}
 	if dc.Now() != old+core.Hour || in.Stats().Clamped != 1 {
 		t.Fatalf("clock %d (old+%d), clamped %d", dc.Now(), dc.Now()-old, in.Stats().Clamped)
+	}
+}
+
+// clockMovers records the published data clock at each Append.
+type clockMovers struct {
+	*memstore.Movers
+	dc  *DataClock
+	bad []string
+}
+
+func (m *clockMovers) Append(ctx context.Context, s []core.MoverSample) (core.ApplyResult, error) {
+	now := m.dc.Now()
+	for _, x := range s {
+		if x.T < now {
+			m.bad = append(m.bad, fmt.Sprintf("sample at %d applied after the clock reached %d", x.T, now))
+			break
+		}
+	}
+	return m.Movers.Append(ctx, s)
+}
+
+// TestDataClockWaitsForApply: the data clock the commit loop reads (Now) must not pass
+// rows that were read but not yet applied, or a commit could close their window first.
+func TestDataClockWaitsForApply(t *testing.T) {
+	dc := &DataClock{}
+	maps, _ := OpenMaps(t.TempDir())
+	mov := &clockMovers{Movers: memstore.NewMovers(), dc: dc}
+	in := New(Stores{Terrain: memstore.NewTerrain(), Movers: mov, Overlays: memstore.NewOverlays(), Maps: maps},
+		Options{Clock: dc.Now, DataClock: dc, FlushSamples: 4})
+	old := base - core.Day
+	var body strings.Builder
+	for i := range 200 {
+		body.WriteString(line(t, env{V: 1, Tick: int64(i * 60), Src: "s", Map: "m", RecvMs: int64(old) + int64(i)*1000, Msgs: []any{
+			map[string]any{"type": "move", "s": "nauvis", "m": []any{map[string]any{"j": "1", "k": "t", "x": float64(i), "y": 0, "h": 0.25}}},
+		}}))
+	}
+	resp, err := in.Ingest(context.Background(), strings.NewReader(body.String()))
+	if err != nil || resp.Samples.Accepted != 200 {
+		t.Fatalf("resp %+v err %v", resp, err)
+	}
+	if len(mov.bad) > 0 {
+		t.Fatalf("%d batches applied behind the clock, first: %s", len(mov.bad), mov.bad[0])
+	}
+	if dc.Now() != old+199*core.Second {
+		t.Fatalf("clock %d after the body, want %d", dc.Now(), old+199*core.Second)
+	}
+}
+
+// TestIngestBytesMatchesReader: a body applied in place (IngestBytes) gives the same
+// result as the same body read from a reader.
+func TestIngestBytesMatchesReader(t *testing.T) {
+	d := core.EncodeChart(chart(0x1234))
+	h := 0.5
+	body := "not json\r\n" +
+		line(t, env{V: 1, Tick: 600, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 1, "y": 2, "d": d},
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 3, "y": 2},
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 4, "y": 2, "d": "!!"},
+			map[string]any{"type": "move", "s": "nauvis", "m": []any{
+				map[string]any{"j": "5.1.7", "k": "t", "f": "player", "x": 1.5, "y": 2.5, "h": h},
+			}},
+		}}) +
+		`{"v":1,"tick":1,"src":"s","map":"m","recv_ms":1,"msgs":[]` + strings.Repeat(" ", 400) + "}\n" +
+		"\n\n" +
+		strings.TrimSuffix(line(t, env{V: 1, Tick: 660, Src: "s", Map: "m", RecvMs: int64(base + 1000), Msgs: []any{
+			map[string]any{"type": "chunk", "s": "nauvis", "f": "player", "x": 1, "y": 2, "d": d},
+		}}), "\n") + "\r"
+	a := newFixture(t, Options{MaxLine: 300 + len(d)*3})
+	b := newFixture(t, Options{MaxLine: 300 + len(d)*3})
+	ra := a.ingest(t, body)
+	rb, err := b.in.IngestBytes(context.Background(), []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ja, _ := json.Marshal(ra)
+	jb, _ := json.Marshal(rb)
+	if string(ja) != string(jb) {
+		t.Fatalf("reader %s\nbytes  %s", ja, jb)
+	}
+	if ra.Chunks.Accepted != 3 || ra.Samples.Accepted != 1 || ra.BadLines != 2 {
+		t.Fatalf("resp %s", ja)
+	}
+	if *a.notes != *b.notes || a.in.Stats() != b.in.Stats() {
+		t.Fatalf("notes %+v / %+v, stats %+v / %+v", *a.notes, *b.notes, a.in.Stats(), b.in.Stats())
 	}
 }
