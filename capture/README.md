@@ -114,9 +114,10 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   a short piece that came and went under the end between reads that did not look. Reads are at most 5 tiles of
   travel apart (the wait rounded down), less than the shortest curved piece. Where a new path begins (`ru`: first sight, a
   changed train, end switch, surface change, a missed piece, a resync) the sample lists the pieces under the
-  whole train instead (`LuaTrain.get_rails`). A stop sample lists the pieces under the whole
-  train as well as those entered since the last sample, without beginning a new path, because a
-  keyframe or the live payload holds only a parked train's stop sample. The reads kept for the check are at most 16; a
+  whole train instead (`LuaTrain.get_rails`). Stop and start samples list the pieces under the
+  whole train as well as those entered since the last sample, without beginning a new path, because a
+  keyframe or the live payload holds only a parked train's stop sample (and the live payload's trail
+  often begins at a start). The reads kept for the check are at most 16; a
   full buffer keeps every other one. `car` (every carriage's position and orientation, which
   gives the viewer the carriages' pitches) comes with first sight, a changed train, a surface
   change and resyncs; the rail path places the carriages at stops, starts and end switches. A parked train is

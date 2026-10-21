@@ -448,7 +448,7 @@ local function under(tr)
 	return out
 end
 
-t.test("trains: a stop sample lists the pieces under the whole train, those sent before included", function()
+t.test("trains: stop and start samples list the pieces under the whole train, those sent before included", function()
 	local capture, world, log = boot()
 	local s = world.surfaces.nauvis
 	local path = fake.path_lc(0, 12)
@@ -472,20 +472,37 @@ t.test("trains: a stop sample lists the pieces under the whole train, those sent
 		before = before + #(got[i].rp or {})
 	end
 	t.expect_true(before > 0, "some of them were sent before the stop too")
-	-- it moves on: the path continues from where it stood, without a new rail path or a gap
-	run(capture, 401, 700, function()
-		tr.speed = 0.3
-		fake.place(tr, tr.pos + 0.3)
+	-- it moves on: the start sample lists the pieces under the train again (the live payload's trail may begin with
+	-- it), then the path continues from where it stood, without a new rail path or a gap
+	local under_at = {}
+	run(capture, 401, 700, function(tick)
+		tr.speed = tick >= 410 and 0.3 or 0
+		fake.place(tr, tr.pos + tr.speed)
+		under_at[tick] = under(tr)
 	end)
 	local after = entries(log, storage.timeshade.by_train[tr.id])
-	local pieces = {}
-	for i = #got + 1, #after do
-		t.expect_true(not after[i].ru, "no new rail path after the stop")
+	local start = after[#got + 1]
+	t.expect_true(start and not start.stop and start.v > 0 and not start.ru, "a start sample")
+	t.expect_same(start.rp, under_at[start.__tick], "the start sample lists every piece under the train")
+	local seen, all = {}, {}
+	for _, q in ipairs(start.rp) do
+		seen[table.concat(q, ",")] = true
+		all[#all + 1] = q
+	end
+	for i = #got + 2, #after do
+		t.expect_true(not after[i].ru, "no new rail path after the start")
 		for _, q in ipairs(after[i].rp or {}) do
-			pieces[#pieces + 1] = q[4]
+			t.expect_true(not seen[table.concat(q, ",")], "a piece listed by the start is not sent again")
+			all[#all + 1] = q
 		end
 	end
-	t.expect_same(pieces, { 1 }, "the turn's last piece")
+	local turn = {}
+	for _, r in ipairs(path.rails) do
+		if r.type ~= "straight-rail" then
+			turn[#turn + 1] = { r.position.x, r.position.y, r.direction, r.type == "curved-rail-a" and 1 or 2 }
+		end
+	end
+	t.expect_same(all, turn, "the whole turn, once")
 end)
 
 t.test("trains: a changed train begins a new rail path with car from its new leading carriage", function()

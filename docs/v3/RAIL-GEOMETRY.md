@@ -302,15 +302,16 @@ next sample, and only the timing needs samples.
   A changed train (`on_train_created` after a join or a split) begins a new path at its next
   read: its leading joint may have jumped back (carriages taken from the leading end) or
   ahead (carriages coupled there), and its last read before the change is sent first.
-- A stop sample lists, besides the pieces entered since the previous sample, the pieces
+- A stop sample, and the sample where a stopped train starts, list, besides the pieces entered since the previous sample, the pieces
   under the train that came before them (in front, rear first) and any under the train's
   end after them (a piece no read looked at), but begins no new path: a viewer that has the
   samples before it already holds those pieces and skips them as resends (8.2). A parked
   train is not sampled again until it moves, so a keyframe or the live payload holds only its
-  stop sample, and that sample alone must place every carriage. (With only the pieces
-  entered since the previous sample, 11.7% of the parked trains on the benchmark map were
-  drawn more than 2 tiles off from a keyframe, up to 69 tiles: the body was laid along the
-  straight lead-in through the curves it stood on.) The path recorded for the next pieces
+  stop sample, and that sample alone must place every carriage; the live payload keeps the
+  last 60 s of rows, which often begin at a start. (With only the pieces entered since the
+  previous sample, 11.7% of the parked trains on the benchmark map were drawn more than 2
+  tiles off from a keyframe, up to 69 tiles: the body was laid along the straight lead-in
+  through the curves it stood on.) The path recorded for the next pieces
   then goes on from the rail under the leading joint, as after a new path.
 
 ### 8.2 The chain
@@ -387,8 +388,8 @@ when that wait ends), on the 600-tick heartbeat, on first sight, stop, start, en
 surface change and a missed piece that the walk back did not find, and when 32 pieces wait.
 The reads kept for the check are at most 16; a full buffer keeps every other one. `car` goes
 with first sight, a changed train, a surface change and resyncs only: the path places every
-carriage, and `car` only tells the viewer the carriages' pitches. A stop sample lists the
-pieces under the whole train (8.1).
+carriage, and `car` only tells the viewer the carriages' pitches. Stop and start samples list
+the pieces under the whole train (8.1).
 
 ### 8.5 Test vectors
 

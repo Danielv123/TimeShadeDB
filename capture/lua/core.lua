@@ -668,7 +668,7 @@ local function same_piece(a, b)
 	return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
 end
 
---- The pieces a stop sample lists (PROTOCOL.md 3.1 `rp`): `sent`, the pieces entered since the last sample (travel
+--- The pieces a stop or start sample lists (PROTOCOL.md 3.1 `rp`): `sent`, the pieces entered since the last sample (travel
 --- order, or nil), with the pieces under the train (`under`, rear first, or nil) that came before them added in front and
 --- any after them (a piece under the train's end that no read looked at) behind, so a parked train's last sample alone
 --- describes its whole body (a keyframe or the live payload holds only that row). Entered pieces that left the train's

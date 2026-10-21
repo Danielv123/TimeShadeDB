@@ -9,8 +9,8 @@
 -- sample (`rp`). So only the timing needs samples (core.train_read): a sample carries the game tick of its read, the
 -- speed (`v`) and the leading carriage's own orientation (`h`), every carriage's position and orientation (`car`) on
 -- first sight, a changed train, a surface change and resync, `es` when the leading end switched, and `ru` with the pieces
--- under the whole train where a new rail path begins. A stop sample also lists the pieces under the whole train, so a
--- parked train's last sample alone places it. Vehicles and players are sent by dead reckoning (core.poll); vehicles carry
+-- under the whole train where a new rail path begins. Stop and start samples also list the pieces under the whole
+-- train, so a parked train's last sample alone places it, and so does a live payload whose trail begins at a start. Vehicles and players are sent by dead reckoning (core.poll); vehicles carry
 -- their orientation.
 --
 -- Journeys, registrations, the wheel and each mover's last sample live in storage and change only in events and
@@ -439,10 +439,10 @@ local function poll(st, j, t, how)
 					end
 					s.rp, m.rp = sent, rest
 				end
-				if emit.why == "stop" then
+				if emit.why == "stop" or emit.why == "start" then
 					-- and the pieces under the whole train (this is always the current read): a keyframe or the live payload
-					-- holds only a parked train's stop sample. The path goes on from the rail under the leading joint now, as
-					-- after a run start.
+					-- holds only a parked train's stop sample, and the live payload's trail often begins with a start. The
+					-- path goes on from the rail under the leading joint now, as after a run start.
 					local max = core.rp_start(car and m.n or nil)
 					s.rp = core.stop_pieces(s.rp, rails_under(r, rv.fwd, max), max)
 					started = true
