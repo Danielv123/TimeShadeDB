@@ -40,9 +40,10 @@ function outbox.send(msg)
 end
 
 --- Add a sample, or { j, gone = true }, to this tick's move message for the surface named s: at most core.MOVE_MAX
---- samples a message, and a sample with `car` always in a message of its own, so every message fits a line.
+--- samples a message, and a sample with `car` or more than 16 rail pieces always in a message of its own, so every
+--- message fits a line.
 function outbox.move(s, sample)
-	if sample.car then
+	if sample.car or (sample.rp and #sample.rp > 16) then
 		queue[#queue + 1] = { type = "move", s = s, m = { sample } }
 		return
 	end

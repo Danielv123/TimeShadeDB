@@ -4,10 +4,13 @@
 -- Movers (docs/v3/PROTOCOL.md sections 3.1 and 6): a scan of what moves, a walk polling core.WALK movers a tick, a wheel
 -- of due train reads, journeys minted by the scan and followed through joins, splits and Universal Edges crossings.
 --
--- Trains are read every core.STEP tiles and sent by the chord, heading and heartbeat rules (core.train_read), always with
--- the game tick of the read, with every carriage's position and orientation (`car`) on first sight, stop, start, end
--- switch and resync, and `es` when the leading end switched. Vehicles and players are sent by dead reckoning
--- (core.poll); vehicles carry their orientation.
+-- Trains are read every core.STEP tiles. Each read notes the rail under the leading joint: the curved pieces and ramps
+-- it enters, joined by straight rails, are the train's exact path (docs/v3/RAIL-GEOMETRY.md 8), sent with the next
+-- sample (`rp`). So only the timing needs samples (core.train_read): a sample carries the game tick of its read, the
+-- speed (`v`) and the leading carriage's own orientation (`h`), every carriage's position and orientation (`car`) on
+-- first sight, stop, start, end switch and resync, `es` when the leading end switched, and `ru` with the pieces under the
+-- whole train where a new rail path begins. Vehicles and players are sent by dead reckoning (core.poll); vehicles carry
+-- their orientation.
 --
 -- Journeys, registrations, the wheel and each mover's last sample live in storage and change only in events and
 -- on_tick steps that run identically on every peer. The resync only reads: it may run on one peer alone (the standalone
@@ -74,8 +77,6 @@ local function shape(m, tr)
 	m.ob = core.flip_kinds(m.o) -- the kinds read from the back end, for samples while it leads
 	local f, b = cars[1], cars[#cars]
 	m.ef, m.eb = f, b
-	-- the carriage behind each end, for the heading (nil for a single carriage)
-	m.sf, m.sb = cars[2], #cars > 1 and cars[#cars - 1] or nil
 	m.nf, m.nb, m.hf, m.hb = f.name, b.name, f.is_headed_to_trains_front, b.is_headed_to_trains_front
 	m.force, m.n = f.force.name, #cars
 end
@@ -115,23 +116,137 @@ function movers.gone(st, j)
 	core.forget(st, j)
 end
 
---- What a train looks like now: its leading carriage (front_stock while running forwards), position, surface and
---- heading: from the carriage behind it towards it (PROTOCOL.md 3.1, as in illisis); a single carriage's own
---- orientation in the direction of travel. m must be shaped.
+--- What a train looks like now: its leading carriage (front_stock while running forwards), position, surface, heading:
+--- the leading carriage's own orientation turned to the direction of travel (the rail tangent at its centre,
+--- PROTOCOL.md 3.1), and that orientation unrounded (turns). m must be shaped.
 local function train_view(m, r, fwd)
 	local e = fwd and m.ef or m.eb
 	local pos = e.position
-	local second = fwd and m.sf or m.sb
-	local h
-	if second then
-		local sp = second.position
-		h = core.heading(pos.x, pos.y, sp.x, sp.y)
-	else
-		local headed = fwd and m.hf or m.hb
-		h = core.heading(pos.x, pos.y, nil, nil, e.orientation, headed ~= fwd)
+	local headed = fwd and m.hf or m.hb
+	local o = e.orientation
+	if headed ~= fwd then
+		o = o + 0.5
 	end
-	return e, pos, e.surface_index, h
+	return e, pos, e.surface_index, core.heading(pos.x, pos.y, nil, nil, o, false), o
 end
+
+-- Rail pieces by unit number: { kind, direction, x, y } for curved pieces and ramps (core.RAIL_KINDS), false for straight
+-- rails. Rails never change, so this only saves API reads and decides nothing; file-local, emptied past RAIL_CACHE.
+local RAIL_CACHE = 65536
+local rail_cache, rail_cached = {}, 0
+
+--- The piece info of rail entity `rail` with unit number un.
+local function rail_info(rail, un)
+	local info = rail_cache[un]
+	if info == nil then
+		local kind = core.RAIL_KINDS[rail.type]
+		if kind then
+			local p = rail.position
+			info = { kind, rail.direction, math.floor(p.x + 0.5), math.floor(p.y + 0.5) }
+		else
+			info = false
+		end
+		if rail_cached >= RAIL_CACHE then
+			rail_cache, rail_cached = {}, 0
+		end
+		rail_cache[un] = info
+		rail_cached = rail_cached + 1
+	end
+	return info
+end
+
+--- The curved pieces and ramps under train tr as `rp` entries { x, y, direction, kind }, from the rear to the leading
+--- end, at most `max` (those nearest the leading end); nil when there are none.
+local function rails_under(tr, fwd, max)
+	local list = tr.get_rails() -- from the train's front end to its back end
+	local out = {}
+	local n = #list
+	for i = 1, n do
+		local rail = list[fwd and i or n + 1 - i] -- leading end first
+		local info = rail_info(rail, rail.unit_number)
+		if info then
+			out[#out + 1] = { info[3], info[4], info[2], info[1] }
+			if #out >= max then
+				break
+			end
+		end
+	end
+	-- rear first
+	local m = #out
+	if m == 0 then
+		return nil
+	end
+	for i = 1, math.floor(m / 2) do
+		out[i], out[m + 1 - i] = out[m + 1 - i], out[i]
+	end
+	return out
+end
+
+--- Where a train enters and leaves piece info ({ kind, direction, x, y }) when it runs towards its front end (ahead_front)
+--- or its back end: entry x, y, outward direction, then exit x, y, outward direction.
+local function piece_way(info, ahead_front)
+	local en = core.piece_ends(info[1], info[2])
+	local px, py = info[3], info[4]
+	if ahead_front then
+		return px + en[4], py + en[5], en[6], px + en[1], py + en[2], en[3]
+	end
+	return px + en[1], py + en[2], en[3], px + en[4], py + en[5], en[6]
+end
+
+--- The curved pieces and ramps between rail unit `stop` (or `stop2`) and the rail under the leading joint, found by
+--- walking back from it over the rails under the train: rear first as { info, ahead_front, unit number }, or nil when
+--- the walk does not reach either rail within `max` rails. The train itself went over those connections last, so the
+--- natural rail behind each is the one it came from.
+local function fill(le, stop, stop2, max)
+	local walk = le.make_copy()
+	walk.flip_direction()
+	local found = {}
+	for _ = 1, max do
+		if not walk.move_natural() then
+			return nil
+		end
+		local rail = walk.rail
+		local un = rail.unit_number
+		if un == stop or un == stop2 then
+			local out = {}
+			for i = #found, 1, -1 do
+				out[#out + 1] = found[i]
+			end
+			return out
+		end
+		local info = rail_info(rail, un)
+		if info then
+			-- walking backwards the end ahead is the train's entry; the train runs towards the other
+			found[#found + 1] = { info, walk.direction ~= defines.rail_direction.front, un }
+		end
+	end
+	return nil
+end
+
+--- Appends piece info, run towards its front end when ahead_front, to m's recorded path when it continues it (unit
+--- number un). Returns whether it did.
+local function record(m, info, ahead_front, un)
+	local ix, iy, id, xx, xy, xd = piece_way(info, ahead_front)
+	local ex = m.ex
+	if not core.connects(ex[1], ex[2], ex[3], ix, iy, id) then
+		return false
+	end
+	local rp = m.rp
+	rp[#rp + 1] = { info[3], info[4], info[2], info[1] }
+	m.rpn = m.rpn + 1
+	m.ex, m.xu = { xx, xy, xd }, un
+	return true
+end
+
+--- The rail end the leading joint runs towards, as { x, y, outward direction }: where the rail path goes on from.
+local function exit_of(le)
+	local loc = le.location
+	return { math.floor(loc.position.x + 0.5), math.floor(loc.position.y + 0.5), loc.direction }
+end
+
+-- core.LIVE_GAP at the game's speed (2 s of real time), set by each step: a game at speed 0.2 needs a sample every 24
+-- ticks for the same. Game state, so the same on every peer.
+local live_gap = core.LIVE_GAP
 
 --- The fields every sample of mover m carries. Trains take the leading carriage's name and the force from the shape;
 --- vehicles and players read them from src.
@@ -176,12 +291,46 @@ local function poll(st, j, t, how)
 		else
 			fwd = m.fwd ~= false
 		end
-		if not (m.o and m.ef and m.ef.valid and m.eb and m.eb.valid and (m.sf == nil or m.sf.valid)) then
+		if not (m.o and m.ef and m.ef.valid and m.eb and m.eb.valid) then
 			shape(m, r)
 		end
+		if not m.rp then
+			m.rp, m.rpn = {}, 0
+		end
+		local e, pos, si, h, o = train_view(m, r, fwd)
+		local switched = m.fwd ~= nil and fwd ~= m.fwd
+		-- the leading joint: the carriage centre plus half the joint distance along its axis (RAIL-GEOMETRY.md 3)
+		local a = o * 2 * math.pi
+		local jx, jy = pos.x + 2 * math.sin(a), pos.y - 2 * math.cos(a)
+		local v = math.abs(speed)
+		if m.jx and not switched then
+			-- the odometer: chords between reads, lengthened to the arc by the turn between them
+			local dx, dy = jx - m.jx, jy - m.jy
+			local turn = (o - m.jo) % 1
+			if turn > 0.5 then
+				turn = 1 - turn
+			end
+			turn = turn * 2 * math.pi
+			m.odo = (m.odo or 0) + math.sqrt(dx * dx + dy * dy) * (1 + turn * turn / 24)
+		end
+		local accel
+		if speed ~= 0 then
+			if m.lt and t > m.lt and t - m.lt <= 2 * core.SLOW then
+				accel = (v - m.lv) / (t - m.lt)
+			elseif m.e and not m.moving and (m.odo or 0) - m.e.u > 0.05 then
+				-- the first read after a start: uniform acceleration from rest over the distance since the stop
+				accel = v * v / (2 * (m.odo - m.e.u))
+			end
+		end
+		local turned = o ~= m.jo
+		m.jx, m.jy, m.jo, m.lv, m.lt = jx, jy, o, v, t
 		-- a moving train is read again when it has gone core.STEP tiles; at rest it leaves the wheel
 		if speed ~= 0 then
-			local due = t + core.next_read(speed)
+			local due = t + core.next_read(speed, accel)
+			if m.e and m.moving and due > m.e.t + live_gap then
+				-- read when the live gap ends, so no moving train goes longer without a sample
+				due = math.max(t + 1, m.e.t + live_gap)
+			end
 			st.fast[j] = due
 			local slot = due % core.WHEEL
 			local list = st.wheel[slot] or {}
@@ -190,30 +339,113 @@ local function poll(st, j, t, how)
 		elseif st.fast[j] then
 			st.fast[j] = nil
 		end
-		local e, pos, si, h = train_view(m, r, fwd)
-		local read = { x = pos.x, y = pos.y, t = t, h = h, si = si, moving = speed ~= 0 and how ~= "stop", fwd = fwd }
+		-- the rail under the leading joint: a curved piece or ramp it entered must continue the path recorded so far. It is
+		-- read while the leading carriage turns or the last rail read was a curved piece or ramp: on a straight the
+		-- carriage's orientation stays exactly the same until its front joint is on a curve, and a read comes at most 5
+		-- tiles later, still on that piece (5.078 at least). A ramp shows no turn, so on a straight the rail is also read
+		-- every core.RAMP_READS reads: at most 15 tiles apart, and a ramp is 16 long. (A path without its ramps is right in
+		-- plan, but its rail distance is short by about 0.8 tile a ramp, and the carriages behind one are drawn that far off.)
+		local le, un
+		local gap = false
+		local look = turned or m.curved ~= false
+		if look then
+			m.sk = 0
+		else
+			local sk = (m.sk or 0) + 1
+			look = sk >= core.RAMP_READS
+			m.sk = look and 0 or sk
+		end
+		if m.ex and not switched and look then
+			le = fwd and r.front_end or r.back_end
+			local rail = le.rail
+			un = rail.unit_number
+			if un ~= m.ru then
+				local info = rail_info(rail, un)
+				m.curved = info and true or false
+				-- the train runs towards le.direction's end
+				local ahead_front = le.direction == defines.rail_direction.front
+				if info and not record(m, info, ahead_front, un) then
+					-- a piece went by unseen: find it behind, else the path breaks here
+					local missed = fill(le, m.xu, nil, core.FILL_MAX)
+					gap = true
+					if missed then
+						local ok = true
+						for _, q in ipairs(missed) do
+							ok = ok and record(m, q[1], q[2], q[3])
+						end
+						gap = not (ok and record(m, info, ahead_front, un))
+					end
+				elseif not info and turned and m.ru then
+					-- The carriage turns, yet the rail under the train's end is straight: a curved piece may have passed
+					-- under the end between two reads that did not look at the rail (the end leads the carriage, so a
+					-- short piece can come and go before the carriage turns). Walk back to the last rail looked at, or
+					-- the last piece recorded, and record what continues the path (a piece already recorded does not).
+					local missed = fill(le, m.ru, m.xu, core.SEEN_MAX)
+					if missed then
+						for _, q in ipairs(missed) do
+							record(m, q[1], q[2], q[3])
+						end
+					end
+				end
+			end
+			m.ru = un
+		end
+		local read = { x = pos.x, y = pos.y, t = t, h = h, si = si, moving = speed ~= 0 and how ~= "stop", fwd = fwd,
+			v = v, u = m.odo or 0, np = m.rpn, gap = gap,
+			full = #m.rp >= core.RP_MAX or (m.e ~= nil and m.moving and t - m.e.t >= live_gap) }
 		local emits = core.train_read(m, read)
 		if #emits == 0 then
 			return 0
 		end
 		surface_name(m, si)
+		local started = false
 		for _, emit in ipairs(emits) do
-			local v = emit.read
-			local s = sample(j, m, e, v.x, v.y, v.h, v.fwd)
-			if v.t ~= t then
-				s.tick = v.t
+			local rv = emit.read
+			local s = sample(j, m, e, rv.x, rv.y, rv.h, rv.fwd)
+			s.v = core.round(rv.v, 4)
+			if rv.t ~= t then
+				s.tick = rv.t
 			end
-			if not v.moving then
+			if not rv.moving then
 				s.stop = true
 			end
 			if emit.why == "es" then
 				s.es = true
 			end
-			if emit.why ~= "chord" and (core.with_car(emit.why) or m.reshape) then
-				s.car = car_list(r, v.fwd)
+			local car = emit.why ~= "vertex" and (core.with_car(emit.why) or m.reshape)
+			if core.run_start(emit.why) then
+				-- a new rail path: the pieces under the train (this is always the current read)
+				s.ru, s.rp = true, rails_under(r, rv.fwd, core.rp_start(car and m.n or nil))
+				started = true
+			else
+				-- the pieces entered up to this read
+				local rp = m.rp
+				local n = rv.np - (m.rpn - #rp)
+				if n > 0 then
+					local sent, rest = {}, {}
+					for i = 1, #rp do
+						if i <= n then
+							sent[#sent + 1] = rp[i]
+						else
+							rest[#rest + 1] = rp[i]
+						end
+					end
+					s.rp, m.rp = sent, rest
+				end
+			end
+			if car then
+				s.car = car_list(r, rv.fwd)
 				m.reshape = nil
 			end
 			outbox.move(m.s, s)
+		end
+		if started then
+			-- the path goes on from the rail under the leading joint now
+			if not le then
+				le = fwd and r.front_end or r.back_end
+				un = le.rail.unit_number
+			end
+			m.rp, m.ex, m.xu, m.ru, m.curved = {}, exit_of(le), un, un, nil
 		end
 		return #emits
 	end
@@ -290,6 +522,7 @@ end
 --- The per-tick step: the trains a busier tick left over, then this tick's wheel slot (at most core.FAST reads), then
 --- up to core.WALK movers of the walk; with the walk done and core.SCAN ticks passed, a scan instead.
 function movers.step(st, t)
+	live_gap = math.max(core.SLOW, math.floor(core.LIVE_GAP * math.max(0.5, math.min(1, game.speed)) + 0.5))
 	local slot = t % core.WHEEL
 	local reads = 0
 	while reads < core.FAST do
@@ -367,6 +600,10 @@ function movers.resync(st, t)
 				s = sample(j, tmp, e, pos.x, pos.y, h, fwd)
 				s.car = car_list(r, fwd)
 				s.stop = r.speed == 0 or nil
+				s.v = core.round(math.abs(r.speed), 4)
+				-- a resync sample begins a rail path from the pieces under the train; the next sample's pieces, entered since
+				-- the last sample before it, continue that path where they are not already under the train
+				s.ru, s.rp = true, rails_under(r, fwd, core.rp_start(#r.carriages))
 				s.surface = game.get_surface(si).name
 			elseif m.kind == "v" then
 				local tmp = { kind = "v", o = r.type == "spider-vehicle" and "S" or "C", cf = r.color and hex(r) }

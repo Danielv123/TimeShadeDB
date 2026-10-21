@@ -85,7 +85,7 @@ return function(capture)
 			wrap(capture.terrain, "step", "terrain.step (chart reads)")
 			wrap(capture.core, "cooled", "  core.cooled")
 			wrap(capture.terrain, "seam", "  terrain.seam (the synthetic chart)")
-			wrap(capture.core, "off_chord", "    core.off_chord (inside core.train_read)")
+			wrap(capture.core, "off_timing", "    core.off_timing (inside core.train_read)")
 			wrap(capture.overlays, "step", "overlays.step")
 			wrap(capture.movers, "step", "movers.step")
 			wrap(capture.core, "train_read", "  core.train_read")
@@ -192,6 +192,27 @@ return function(capture)
 				time("train API reads (speed, position, orientation, surface_index)", function()
 					for _ = 1, n do
 						local _, _, _, _ = r.speed, m.ef.position, m.ef.orientation, m.ef.surface_index
+					end
+				end)
+				time("rail under the leading end (front_end, rail, unit_number)", function()
+					for _ = 1, n do
+						local _ = r.front_end.rail.unit_number
+					end
+				end)
+				time("leading carriage orientation", function()
+					for _ = 1, n do
+						local _ = m.ef.orientation
+					end
+				end)
+				local e = { u = 0, t = 0, v = 1 }
+				local buf = {}
+				for i = 1, 16 do
+					buf[i] = { u = 4 * i, t = 4 * i, v = 1 }
+				end
+				local c = { u = 68, t = 68, v = 1 }
+				time("core.off_timing of 16 buffered reads", function()
+					for _ = 1, n do
+						local _ = capture.core.off_timing(e, buf, c)
 					end
 				end)
 				time("r.carriages (4 carriages)", function()

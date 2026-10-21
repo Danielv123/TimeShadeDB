@@ -64,7 +64,8 @@ const ruleNames = option("--rules", "current,railshape,railshape-h,railpath,rail
 // "accel": core.STEP tiles at the current speed and the acceleration since the previous read
 const READS = option("--reads", "capture");
 
-// capture/lua/core.lua constants
+// capture/lua/core.lua constants of the 2026-10 capture: reads every 4 tiles rounded up. (The rail path capture reads
+// every 5 rounded down, 1.4% more reads on the benchmark map; the rules here keep the old schedule.)
 const STEP = 4;
 // core.SLOW: the longest wait between reads of a moving train (--slow overrides it to try shorter ones)
 const SLOW = Number(option("--slow", 120));

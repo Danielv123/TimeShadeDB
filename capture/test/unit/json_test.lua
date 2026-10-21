@@ -31,6 +31,8 @@ t.test("json: the move fast path gives what the generic encoder gives", function
 		base,
 		{ j = "1.2.3", k = "t", f = "player", name = "cargo-wagon", x = 1, y = 2, h = 0.75, n = 3, o = "ccl", c = "eb1200",
 			tick = 5000000, stop = true, es = true },
+		{ j = "1.2.5", k = "t", f = "player", name = "locomotive", x = 1, y = 2, h = 0.5, n = 3, o = "LCC", c = "eb1200",
+			v = 0.4375, ru = true, rp = { { -1067, -764, 0, 1 }, { 12, 300, 15, 4 } } },
 		{ j = "p:alice", k = "p", f = "player", name = "alice", x = 3.5, y = 4 },
 		{ j = "1.2.3", gone = true },
 		{ j = "1.2.4", k = "t", f = "player", name = "locomotive", x = 1, y = 2, h = 0.5, n = 1, o = "L", c = "ffffff",

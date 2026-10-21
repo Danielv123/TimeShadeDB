@@ -247,17 +247,19 @@ next sample, and only the timing needs samples.
   is `LuaTrain.front_end` (`back_end` while the train leads with its back), the rail of the
   front stock's open joint (`src/Train/TrainRollingStocks.cpp:150-161`,
   `src/Script/LuaTrain.cpp:683-706`), and `LuaRailEnd.direction` is the end of that rail the
-  train runs towards. Reads are at most 4 tiles of travel apart (the wait rounded down; sooner
-  while accelerating: the next read is where `v w + a w^2 / 2 = 4` with the acceleration
-  since the last read; at most 30 ticks), less than the shortest curved piece (5.08), so no
+  train runs towards. Reads are at most 5 tiles of travel apart (the wait rounded down; sooner
+  while accelerating: the next read is where `v w + a w^2 / 2 = 5` with the acceleration
+  since the last read; at most 30 ticks), less than the shortest curved piece (5.078), so no
   curved piece passes between two reads. (Rounded up, a train at 1.33 tiles a tick was read
-  every 4 ticks, 5.3 tiles, and passed a curved-rail-a unseen on the Aron map.)
+  every 4 ticks, 5.3 tiles, and passed a curved-rail-a unseen on the Aron map. 5 tiles rounded
+  down reads about as often as the 2026-10 capture's 4 rounded up, 1.4% more on the benchmark
+  map; 4 rounded down read 39% more and cost 20% more Lua time.)
 - Only curved pieces and ramps are recorded (`rp` kinds 1 to 4). Between two of them the
   rails are straight. The rail is read while the leading carriage turns (its orientation
   differs from the last read's: on a straight it stays exactly the same until its front
-  joint is on a curve, and the next read comes at most 4 tiles later, still on that piece),
+  joint is on a curve, and the next read comes at most 5 tiles later, still on that piece),
   while the last rail read was a curved piece or ramp, and otherwise every third read. A
-  ramp shows no turn, and three reads are at most 12 tiles apart, less than its 16. (A
+  ramp shows no turn, and three reads are at most 15 tiles apart, less than its 16. (A
   chain without its ramps is right in plan, but its rail distance is 0.76 tile short per
   ramp, 4.8%, and every carriage behind a ramp is drawn that far off: carriage p99 0.74
   tile on the benchmark map when only turns were read, 0.14 with every third read.) A
@@ -286,7 +288,13 @@ next sample, and only the timing needs samples.
   rails: the natural rail behind each connection is the one a train last took,
   `src/Script/LuaRailEnd.cpp:176-187`, which is this train) to the last recorded rail and
   records the curved pieces it passed. Only when that fails does it send the read before
-  and the current one, which begins a new path (`ru`).
+  and the current one, which begins a new path (`ru`). The rail under the train's end leads
+  the leading carriage, so a short piece can pass under the end between two reads that did
+  not look at the rail, before the carriage turns; when a turning carriage's read finds a
+  straight rail, the read walks back the same way (at most 12 rails) to the last rail it
+  looked at and records what continues the path. (Without that walk, a curved-rail-a of an
+  S-bend on the Aron map was only found at the next curve 100 tiles on, and a live viewer
+  drew the train off its path for 22 frames.)
 - Where a new path begins (first sight, end switch, surface change, a missed piece, a
   resync) the sample lists the curved pieces and ramps under the whole train instead,
   rear first: `LuaTrain.get_rails()` lists the rails under the train from its front end to

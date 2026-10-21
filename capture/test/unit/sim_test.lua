@@ -252,9 +252,10 @@ local function seg_dist(p, a, b)
 	return math.sqrt(ex * ex + ey * ey)
 end
 
-t.test("trains: samples carry the read tick; the polyline stays on the track; stop, start and end switch carry car",
-	function()
+t.test("trains: samples at their read ticks with speed; the curve's pieces in rp; the timing model holds between samples;"
+	.. " stop, start and end switch", function()
 		local capture, world, log = boot()
+		local core = capture.core
 		local s = world.surfaces.nauvis
 		local path = fake.path_lc(300, 12)
 		local tr = fake.train(s, "LCC", path, 20)
@@ -262,45 +263,72 @@ t.test("trains: samples carry the read tick; the polyline stays on the track; st
 		local speed = 0
 		run(capture, 1, 1400, function(tick)
 			if tick == 10 then
-				speed = 0.5
-			elseif tick == 1100 then
-				speed = 0
+				speed = 0.05
+			elseif tick > 10 and tick < 100 then
+				speed = math.min(0.5, speed + 0.006) -- accelerates, then cruises
+			elseif tick >= 1060 and tick < 1100 then
+				speed = math.max(0, speed - 0.0125) -- brakes to rest
 			end
 			tr.speed = speed
 			fake.place(tr, tr.pos + speed)
 			local p = tr.front_stock.position
-			truth[tick] = { x = p.x, y = p.y }
+			truth[tick] = { x = p.x, y = p.y, u = tr.pos, v = speed }
 		end)
 		local j = storage.timeshade.by_train[tr.id]
 		t.expect_true(j ~= nil and j:match("^7%.%d+%." .. tr.id .. "$"), "a journey minted by the scan: " .. tostring(j))
 		local got = entries(log, j)
-		t.expect_true(#got >= 5, #got .. " samples")
 		local first = got[1]
 		t.expect_same({ first.k, first.f, first.name, first.n, first.o, first.c }, { "t", "player", "locomotive", 3,
 			"LCC", "ff0000" })
 		t.expect_eq(#first.car, 3, "first sight carries every carriage")
-		t.expect_eq(first.car[1][1], first.x, "car starts at the leading carriage")
+		t.expect_near(first.car[1][1], first.x, 0.006, "car starts at the leading carriage")
+		t.expect_true(first.ru, "first sight begins a rail path")
 		local last = got[#got]
-		t.expect_true(last.stop and last.car and #last.car == 3, "the stop carries car")
-		-- every sample's position is the train's position at its tick
+		t.expect_true(last.stop and not last.car and last.v == 0, "the stop: speed 0, no car (the rail path places it)")
+		-- every sample's position is the train's position at its tick, with its speed and own orientation
 		for _, e in ipairs(got) do
 			local p = truth[e.__tick]
 			t.expect_true(p and math.abs(p.x - e.x) < 1e-9 and math.abs(p.y - e.y) < 1e-9,
 				"sample at its read tick " .. e.__tick)
+			t.expect_near(e.v, p.v, 1e-4, "speed")
 			t.expect_true(e.h ~= nil, "a heading")
 		end
-		-- the polyline of samples is within a quarter tile of every tick's true position, plus the read step's sagitta
-		local worst = 0
-		for tick = got[1].__tick, last.__tick do
-			local p = truth[tick]
-			local best = math.huge
-			for i = 1, #got - 1 do
-				best = math.min(best, seg_dist(p, got[i], got[i + 1]))
+		-- the pieces of the quarter turn, each once and in order, from the samples' rp
+		local pieces = {}
+		for _, e in ipairs(got) do
+			for _, q in ipairs(e.rp or {}) do
+				pieces[#pieces + 1] = q
 			end
-			worst = math.max(worst, best)
 		end
-		t.expect_true(worst <= 0.45, "worst distance to the polyline " .. worst)
-		print(string.format("    trains: %d samples over %d ticks, worst %.3f tiles off the track", #got,
+		local want = {}
+		for _, r in ipairs(path.rails) do
+			if r.type ~= "straight-rail" then
+				want[#want + 1] = { r.position.x, r.position.y, r.direction, r.type == "curved-rail-a" and 1 or 2 }
+			end
+		end
+		t.expect_same(pieces, want, "the turn's pieces")
+		-- the timing model through the samples' rail distances (the truth's) and speeds puts the leading joint within
+		-- TIME_EPS (plus the read step's error between reads) of the truth at every tick
+		local worst = 0
+		for i = 1, #got - 1 do
+			local a, b = got[i], got[i + 1]
+			local ua, ub = truth[a.__tick].u, truth[b.__tick].u
+			for tick = a.__tick, b.__tick do
+				local u = ua + core.timing_u(ub - ua, b.__tick - a.__tick, a.v, b.v, tick - a.__tick)
+				worst = math.max(worst, math.abs(u - truth[tick].u))
+			end
+		end
+		t.expect_true(worst <= 0.3, "worst timing error " .. worst)
+		-- samples only for the timing: first, start, stop, the change from accelerating to cruising and braking, and the
+		-- live gap (core.LIVE_GAP); the curve costs none of its own
+		local span = last.__tick - got[1].__tick
+		t.expect_true(#got <= math.ceil(span / core.LIVE_GAP) + 5, #got .. " samples")
+		for i = 2, #got do
+			if not got[i - 1].stop then
+				t.expect_true(got[i].__tick - got[i - 1].__tick <= core.LIVE_GAP + core.SLOW, "the live gap")
+			end
+		end
+		print(string.format("    trains: %d samples over %d ticks, worst %.3f tiles along the track", #got,
 			last.__tick - got[1].__tick, worst))
 		-- reverse: the leading end switches to the back
 		run(capture, 1401, 1700, function(tick)
@@ -315,12 +343,96 @@ t.test("trains: samples carry the read tick; the polyline stays on the track; st
 			end
 		end
 		t.expect_true(es ~= nil, "an end switch")
-		t.expect_true(es.car and #es.car == 3, "with car")
-		t.expect_true(math.abs(es.x - es.car[1][1]) < 0.01 and math.abs(es.y - es.car[1][2]) < 0.01,
-			"car starts at the new leading carriage")
+		t.expect_true(es.ru and not es.car, "a new rail path, without car")
 		t.expect_eq(es.o, "ccl", "kinds from the new leading end")
 		t.expect_true(after[#after].stop, "stopped again")
 	end)
+
+t.test("trains: a run start in a curve lists the pieces under the train; a piece passed unseen is found behind",
+	function()
+	local capture, world, log = boot()
+	local s = world.surfaces.nauvis
+	local path = fake.path_lc(0, 12)
+	-- the leading joint in the second piece of the turn: the train spans both curved pieces before it
+	local tr = fake.train(s, "LCC", path, path.straight_end + 8)
+	run(capture, 1, 40, function()
+		tr.speed = 0.05
+		fake.place(tr, tr.pos + 0.05)
+	end)
+	local j = storage.timeshade.by_train[tr.id]
+	local got = entries(log, j)
+	t.expect_true(got[1].ru and got[1].rp and #got[1].rp == 2, "the two curved pieces under the train")
+	t.expect_eq(got[1].rp[1][4], 1, "rear first: curved-rail-a")
+	-- jump the train over the next curved piece: the piece it lands on does not continue the path, so the read walks
+	-- back over the rails under the train and finds the one it missed
+	run(capture, 41, 400, function(tick)
+		tr.speed = 0.05
+		fake.place(tr, tr.pos + (tick == 50 and 9 or 0.05))
+	end)
+	local pieces, restarts = {}, 0
+	for _, e in ipairs(entries(log, j)) do
+		if e.ru and e ~= got[1] then
+			restarts = restarts + 1
+		end
+		for _, q in ipairs(e ~= got[1] and e.rp or {}) do
+			pieces[#pieces + 1] = q[4]
+		end
+	end
+	t.expect_eq(restarts, 0, "no new rail path")
+	t.expect_same(pieces, { 2, 1 }, "the missed curved-rail-b, then the curved-rail-a it landed on")
+end)
+
+t.test("trains: a piece that came and went between two reads is found behind when the carriage turns on a straight",
+	function()
+		local capture, world, log = boot()
+		local s = world.surfaces.nauvis
+		local path = fake.path_lc(0, 12)
+		-- the leading joint on the second curved-rail-b of the quarter turn
+		local tr = fake.train(s, "LCC", path, path.straight_end + 12)
+		run(capture, 1, 40, function()
+			tr.speed = 0.05
+			fake.place(tr, tr.pos + 0.05)
+		end)
+		-- jump past the last curved-rail-a onto the straight: the rail under the end is straight, the carriage still turns
+		run(capture, 41, 400, function(tick)
+			tr.speed = 0.05
+			fake.place(tr, tr.pos + (tick == 50 and 8 or 0.05))
+		end)
+		local j = storage.timeshade.by_train[tr.id]
+		local got = entries(log, j)
+		local pieces, restarts = {}, 0
+		for i, e in ipairs(got) do
+			if i > 1 then
+				restarts = restarts + (e.ru and 1 or 0)
+				for _, q in ipairs(e.rp or {}) do
+					pieces[#pieces + 1] = q[4]
+				end
+			end
+		end
+		t.expect_eq(restarts, 0, "no new rail path")
+		t.expect_same(pieces, { 1 }, "the curved-rail-a passed between two reads")
+	end)
+
+t.test("trains: a ramp entered from a straight is recorded, though the train does not turn on it", function()
+	for _, speed in ipairs({ 0.3, 1.38 }) do
+		local capture, world, log = boot()
+		local s = world.surfaces.nauvis
+		local path = fake.path_lc(300, 12, 100)
+		local tr = fake.train(s, "LCC", path, 0)
+		run(capture, 1, 1200, function()
+			tr.speed = speed
+			fake.place(tr, tr.pos + speed)
+		end)
+		local pieces = {}
+		for _, e in ipairs(entries(log, storage.timeshade.by_train[tr.id])) do
+			t.expect_true(not e.ru or e == entries(log, storage.timeshade.by_train[tr.id])[1], "no new rail path")
+			for _, q in ipairs(e.rp or {}) do
+				pieces[#pieces + 1] = q[4]
+			end
+		end
+		t.expect_same(pieces, { 4, 1, 2, 2, 1 }, "the ramp, then the turn's pieces, at speed " .. speed)
+	end
+end)
 
 t.test("trains: a train destroyed sends gone; a long train's car is capped and every line stays under the limit",
 	function()
@@ -649,7 +761,7 @@ t.test("config: tunables a later config omits return to their defaults; Universa
 	capture2.ue = nil
 end)
 
-t.test("trains: h points from the carriage behind the leading one towards it", function()
+t.test("trains: h is the leading carriage's own orientation in the direction of travel", function()
 	local capture, world, log = boot()
 	local s = world.surfaces.nauvis
 	local tr = fake.train(s, "LCC", fake.path_lc(60, 12), 20)
@@ -660,9 +772,7 @@ t.test("trains: h points from the carriage behind the leading one towards it", f
 	local checked = 0
 	for _, e in ipairs(entries(log, storage.timeshade.by_train[tr.id])) do
 		if e.car then
-			local a, b = e.car[1], e.car[2]
-			local want = capture.core.heading(a[1], a[2], b[1], b[2])
-			t.expect_true(capture.core.turn(e.h, want) < 0.002, string.format("h %.3f, chord %.3f", e.h, want))
+			t.expect_true(capture.core.turn(e.h, e.car[1][3]) < 0.002, string.format("h %.3f, own %.3f", e.h, e.car[1][3]))
 			checked = checked + 1
 		end
 	end

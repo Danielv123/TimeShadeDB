@@ -246,7 +246,7 @@ t.test("adoption returns the displaced journey and resets the mover's sampling s
 	local st, register = state(), registrar()
 	local ref = { id = 40 }
 	core.claim(st, "x", "t", 40, ref, 1, register)
-	core.train_read(st.movers.x, { x = 0, y = 0, t = 0, h = 0.25, si = 1, moving = true, fwd = true })
+	core.train_read(st.movers.x, { x = 0, y = 0, t = 0, h = 0.25, si = 1, moving = true, fwd = true, v = 0, u = 0 })
 	t.expect_eq(core.adopt(st, "y", "t", 40, ref, 3, register), "x", "x is displaced")
 	core.forget(st, "x")
 	t.expect_eq(st.by_train[40], "y")
@@ -305,9 +305,9 @@ t.test("the cut: a part filling a line to 3,499 bytes is kept; one byte more is 
 	t.expect_eq(parts_of(lines, 4294967295), "a,b")
 end)
 
-t.test("migrations: a new table becomes schema 1; it is never wiped; a newer schema is refused", function()
+t.test("migrations: a new table gets every schema; it is never wiped; a newer schema is refused", function()
 	local s = core.migrate({})
-	t.expect_eq(s.schema, 1)
+	t.expect_eq(s.schema, #core.MIGRATIONS)
 	t.expect_true(s.configured == false and s.seeded == false and s.wi == 1 and s.next_scan == 0 and s.file_seq == 0)
 	for _, k in ipairs({ "forces", "movers", "by_train", "by_unit", "walk", "reg", "wheel", "fast" }) do
 		t.expect_same(s[k], {}, k)
@@ -315,8 +315,8 @@ t.test("migrations: a new table becomes schema 1; it is never wiped; a newer sch
 	s.marker = "kept"
 	core.migrate(s)
 	t.expect_eq(s.marker, "kept")
-	local newer = { schema = 2, marker = "untouched" }
-	t.expect_error(function() core.migrate(newer) end, "schema 2 is newer")
+	local newer = { schema = #core.MIGRATIONS + 1, marker = "untouched" }
+	t.expect_error(function() core.migrate(newer) end, "is newer than this code")
 	t.expect_eq(newer.marker, "untouched")
 end)
 
@@ -338,16 +338,26 @@ t.test("heading: from the second carriage towards the leading one, or the carria
 	t.expect_near(core.turn(0.99, 0.01), 0.02, 1e-9, "turn wraps")
 end)
 
-t.test("next_read: the ticks a train takes to move STEP tiles, between 1 and SLOW", function()
-	t.expect_eq(core.next_read(1.2), 4)
-	t.expect_eq(core.next_read(-1), 4)
-	t.expect_eq(core.next_read(4), 1)
-	t.expect_eq(core.next_read(0.001), 120)
-	t.expect_true(core.WHEEL > core.SLOW)
-end)
+t.test("next_read: the ticks a train takes to move STEP tiles, between 1 and SLOW, sooner while it accelerates",
+	function()
+		t.expect_eq(core.STEP, 5)
+		t.expect_true(core.STEP < 5.0779, "less than the shortest curved piece (curved-rail-b)")
+		t.expect_eq(core.next_read(1.2), 4, "never more than STEP tiles")
+		t.expect_eq(core.next_read(1.3889), 3, "top speed: 4.17 tiles")
+		t.expect_eq(core.next_read(-1), 5)
+		t.expect_eq(core.next_read(6), 1)
+		t.expect_eq(core.next_read(0.001), core.SLOW)
+		t.expect_eq(core.SLOW, 30)
+		-- from 0.05 tiles a tick at 0.01 a tick per tick: 0.05 w + 0.005 w^2 = 5 at w = 27.0
+		t.expect_eq(core.next_read(0.05, 0.01), 27)
+		t.expect_eq(core.next_read(0.5, -0.01), 10, "braking: the current speed")
+		t.expect_true(core.WHEEL > core.SLOW)
+	end)
 
-local function read(x, y, tick, h, moving, fwd)
-	return { x = x, y = y, t = tick, h = h or 0.25, si = 1, moving = moving ~= false, fwd = fwd ~= false }
+--- A read of a train on a straight along x: rail distance u (the odometer), tick, speed v.
+local function read(u, tick, v, moving, fwd, gap)
+	return { x = u, y = 0, t = tick, h = 0.25, si = 1, moving = moving ~= false, fwd = fwd ~= false, v = v or 0,
+		u = u, gap = gap }
 end
 local function whys(out)
 	local w = {}
@@ -357,114 +367,173 @@ local function whys(out)
 	return table.concat(w, ",")
 end
 
-t.test("train emits: first, then on a straight at constant speed only when the read buffer fills or the heartbeat",
+t.test("train emits: first, then at constant speed only on the heartbeat; a full buffer keeps every other read",
 	function()
 		local m = {}
-		t.expect_eq(whys(core.train_read(m, read(0, 0, 0))), "first")
+		t.expect_eq(whys(core.train_read(m, read(0, 0, 0.4))), "first")
 		local sent = {}
 		for i = 1, 100 do
-			local out = core.train_read(m, read(4 * i, 0, 10 * i))
+			local out = core.train_read(m, read(4 * i, 10 * i, 0.4))
 			for _, e in ipairs(out) do
 				sent[#sent + 1] = e.why .. "@" .. e.read.t
 			end
+			t.expect_true(#m.buf <= core.BUF_MAX, "the buffer stays bounded")
 		end
-		t.expect_eq(sent[1], "full@170", "the 17th read finds 16 buffered")
-		t.expect_eq(#sent, 5, "a sample every 17 reads: " .. table.concat(sent, " "))
-		local slow = {}
-		core.train_read(slow, read(0, 0, 0))
-		local hb
-		for i = 1, 15 do
-			local out = core.train_read(slow, read(0.1 * i, 0, 50 * i))
-			if #out > 0 then
-				hb = out[1]
-			end
-		end
-		t.expect_true(hb and hb.why == "heartbeat" and hb.read.t == 600, "a slow train's heartbeat at 600")
+		t.expect_eq(table.concat(sent, " "), "heartbeat@600", "the timing model holds: nothing but the heartbeat")
 	end)
 
-t.test("train emits: a read off the chord sends the previous read as a vertex with its own tick", function()
+t.test("train emits: uniform acceleration fits the timing model; a change of acceleration sends a vertex", function()
 	local m = {}
-	core.train_read(m, read(0, 0, 0))
-	t.expect_eq(#core.train_read(m, read(4, 0, 10)), 0)
-	t.expect_eq(#core.train_read(m, read(8, 0, 20)), 0)
-	-- the track bends: (8, 0) lies 0.4 tiles off the chord from (0, 0) to (12, 1.2)
-	local out = core.train_read(m, read(12, 1.2, 30, 0.25))
-	t.expect_eq(whys(out), "chord")
-	t.expect_same({ out[1].read.x, out[1].read.y, out[1].read.t }, { 8, 0, 20 })
-	t.expect_eq(m.e.t, 20, "the vertex starts the next chord")
-	t.expect_eq(#m.buf, 1, "the current read is buffered")
-end)
-
-t.test("train emits: synchronised distance catches a train that brakes on a straight", function()
-	local m = {}
-	core.train_read(m, read(0, 0, 0))
-	t.expect_eq(#core.train_read(m, read(10, 0, 10)), 0)
-	t.expect_eq(#core.train_read(m, read(20, 0, 20)), 0)
-	-- then it nearly stops: at t = 20 a constant speed from 0 to 21 at t = 100 would put it at 4.2, not 20
-	local out = core.train_read(m, read(21, 0, 100))
-	t.expect_eq(whys(out), "chord")
-	t.expect_eq(out[1].read.x, 20)
-end)
-
-t.test("train emits: a heading change over 2 degrees sends; stop, start and an end switch send, the switch after the "
-	.. "old end's last read", function()
-	local m = {}
-	core.train_read(m, read(0, 0, 0, 0.25))
-	t.expect_eq(whys(core.train_read(m, read(4, 0, 10, 0.25 + 1 / 360))), "", "1 degree: nothing")
-	t.expect_eq(whys(core.train_read(m, read(8, 0, 20, 0.25 + 3 / 360))), "heading", "3 degrees: sent")
-	t.expect_eq(whys(core.train_read(m, read(12, 0, 30, 0.26))), "")
-	-- it reached x = 12 at t = 30 and stood: that read is off the time-interpolated chord, so it is a vertex
-	t.expect_eq(whys(core.train_read(m, read(12, 0, 40, 0.26, false))), "chord,stop", "stopped")
-	t.expect_eq(whys(core.train_read(m, read(12, 0, 50, 0.26, false))), "", "still at rest")
-	t.expect_eq(whys(core.train_read(m, read(12, 0, 60, 0.26, true))), "start", "moving again")
-	t.expect_eq(whys(core.train_read(m, read(16, 0, 70, 0.26, true))), "")
-	local out = core.train_read(m, read(-5, 0, 80, 0.76, true, false))
-	t.expect_eq(whys(out), "chord,es", "the old end's last read, then the switch")
-	t.expect_true(core.with_car("es") and core.with_car("stop") and core.with_car("start") and core.with_car("first"))
-	t.expect_true(not core.with_car("chord") and not core.with_car("heading"))
-	t.expect_eq(whys(core.train_read(m, read(-5, 0, 700, 0.76, false))), "stop")
-	t.expect_eq(whys(core.train_read(m, read(-5, 0, 1300, 0.76, false))), "heartbeat", "a parked train's heartbeat")
-end)
-
-t.test("train emits: the read buffer never holds more than BUF_MAX reads", function()
-	local m = {}
-	core.train_read(m, read(0, 0, 0))
-	for i = 1, 1000 do
-		core.train_read(m, read(i * 4, math.sin(i) * 0.1, i * 5))
-		t.expect_true(#(m.buf or {}) <= core.BUF_MAX)
+	-- from 0.2 tiles a tick at 0.005 a tick per tick for 60 ticks: the model is exact
+	core.train_read(m, read(0, 0, 0.2))
+	for k = 1, 6 do
+		local tau = 10 * k
+		t.expect_eq(whys(core.train_read(m, read(0.2 * tau + 0.0025 * tau * tau, tau, 0.2 + 0.005 * tau))), "")
 	end
-end)
-
-t.test("the polyline of train samples stays within CHORD_EPS of every read on a curve", function()
-	local R, m, samples, reads = 12, {}, {}, {}
-	for i = 0, 60 do
-		local th = i * 4 / R -- a 4-tile step along a circle of radius 12
-		local r = read(R * math.sin(th), R - R * math.cos(th), i * 6, (0.25 + th / (2 * math.pi)) % 1)
-		reads[#reads + 1] = r
-		for _, e in ipairs(core.train_read(m, r)) do
-			samples[#samples + 1] = e.read
+	-- then it cruises at 0.5: the reads after t = 60 no longer fit one cubic from t = 0
+	local u60, out = 0.2 * 60 + 0.0025 * 3600, nil
+	local sent = {}
+	for k = 1, 12 do
+		out = core.train_read(m, read(u60 + 0.5 * 10 * k, 60 + 10 * k, 0.5))
+		for _, e in ipairs(out) do
+			sent[#sent + 1] = e.why .. "@" .. e.read.t
 		end
 	end
-	local function seg_dist(p, a, b)
-		local dx, dy = b.x - a.x, b.y - a.y
-		local l2 = dx * dx + dy * dy
-		local f = l2 > 0 and math.max(0, math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2)) or 0
-		local ex, ey = p.x - a.x - dx * f, p.y - a.y - dy * f
-		return math.sqrt(ex * ex + ey * ey)
+	t.expect_true(#sent >= 1 and sent[1]:match("^vertex@"), "a vertex: " .. table.concat(sent, " "))
+	local vt = tonumber(sent[1]:match("@(%d+)"))
+	t.expect_true(vt >= 60 and vt <= 90, "near the change, at " .. vt)
+end)
+
+t.test("train emits: a stop read late is braking that ended early; stop, start and end switch send", function()
+	local m = {}
+	core.train_read(m, read(0, 0, 0.3))
+	-- brakes uniformly from 0.3 to rest in 60 ticks (9 tiles), read at 20 and 40; the stop read at 75
+	t.expect_eq(whys(core.train_read(m, read(0.3 * 20 - 0.0025 * 400, 20, 0.25))), "")
+	t.expect_eq(whys(core.train_read(m, read(0.3 * 40 - 0.0025 * 1600, 40, 0.2 - 0.1))), "")
+	t.expect_eq(whys(core.train_read(m, read(9, 75, 0, false))), "stop", "one sample: the model stops early")
+	t.expect_eq(whys(core.train_read(m, read(9, 90, 0, false))), "", "still at rest")
+	t.expect_eq(whys(core.train_read(m, read(9.5, 130, 0.1, true))), "start", "moving again")
+	t.expect_eq(whys(core.train_read(m, read(12, 150, 0.15, true))), "")
+	local out = core.train_read(m, read(-5, 160, 0.2, true, false))
+	t.expect_eq(whys(out), "vertex,es", "the old end's last read, then the switch")
+	t.expect_true(core.with_car("first") and core.with_car("surface"))
+	t.expect_true(not core.with_car("vertex") and not core.with_car("gap") and not core.with_car("heartbeat")
+		and not core.with_car("stop") and not core.with_car("start") and not core.with_car("es"))
+	t.expect_eq(core.rp_start(nil), core.RP_START_MAX)
+	t.expect_eq(core.rp_start(3), core.RP_START_MAX)
+	t.expect_eq(core.rp_start(108), 8, "a long train's car leaves little room")
+	t.expect_true(core.run_start("first") and core.run_start("es") and core.run_start("gap"))
+	t.expect_true(not core.run_start("stop") and not core.run_start("start") and not core.run_start("vertex"))
+	t.expect_eq(whys(core.train_read(m, read(-5, 700, 0, false, false))), "stop")
+	t.expect_eq(whys(core.train_read(m, read(-5, 1300, 0, false, false))), "heartbeat", "a parked train's heartbeat")
+end)
+
+t.test("train emits: a gap sends the last read before it, then the read that found it", function()
+	local m = {}
+	core.train_read(m, read(0, 0, 0.4))
+	core.train_read(m, read(4, 10, 0.4))
+	t.expect_eq(whys(core.train_read(m, read(8, 20, 0.4, true, true, true))), "vertex,gap")
+	local full = read(12, 30, 0.4)
+	full.full = true
+	t.expect_eq(whys(core.train_read(m, full)), "heartbeat", "RP_MAX pieces waiting send a sample")
+end)
+
+t.test("timing model: braking, starting and cruising as RAIL-GEOMETRY.md 8", function()
+	t.expect_near(core.timing_u(30, 60, 0.5, 0.5, 30), 15, 1e-12)
+	t.expect_eq(core.timing_u(2, 100, 0, 0.2, 50), 0, "a late start stands first")
+	t.expect_near(core.timing_u(2, 100, 0, 0.2, 90), 0.5, 1e-12)
+	t.expect_near(core.timing_u(3, 100, 0.2, 0, 30), 3, 1e-12, "a late stop stopped early")
+	t.expect_eq(core.timing_u(5, 0, 1, 1, 0), 5)
+end)
+
+-- The shared rail geometry vectors (docs/v3/RAIL-GEOMETRY.md 7; run_unit.mjs passes them as __vectors).
+local KIND = { ["curved-rail-a"] = 1, ["elevated-curved-rail-a"] = 1, ["curved-rail-b"] = 2,
+	["elevated-curved-rail-b"] = 2, ["legacy-curved-rail"] = 3, ["rail-ramp"] = 4 }
+
+t.test("rail vectors: piece ends match the game's", function()
+	local V = __vectors()
+	local n = 0
+	for _, p in ipairs(V.pieces) do
+		local k = KIND[p.type]
+		t.expect_eq(core.RAIL_KINDS[p.type], k, p.type)
+		if k then
+			local e = core.piece_ends(k, p.dir)
+			t.expect_same({ p.x + e[1], p.y + e[2], e[3] }, p.front_end, p.type .. "/" .. p.dir .. " front end")
+			t.expect_same({ p.x + e[4], p.y + e[5], e[6] }, p.back_end, p.type .. "/" .. p.dir .. " back end")
+			n = n + 1
+		end
 	end
-	-- the last reads after the last sample are not covered yet; the next sample would cover them
-	local last = samples[#samples].t
-	local worst = 0
-	for _, r in ipairs(reads) do
-		if r.t <= last then
-			local best = math.huge
-			for i = 1, #samples - 1 do
-				best = math.min(best, seg_dist(r, samples[i], samples[i + 1]))
+	t.expect_true(n >= 40, n .. " pieces")
+end)
+
+t.test("rail vectors: consecutive curved pieces of every recorded train path connect, run the right way round",
+	function()
+		local V = __vectors()
+		local pairs_checked = 0
+		for _, tr in ipairs(V.trains) do
+			local prev -- the exit end of the previous curved piece: { x, y, outward direction }
+			for _, p in ipairs(tr.path) do
+				local k = KIND[p.type]
+				if k then
+					local e = core.piece_ends(k, p.dir)
+					-- a piece run back to front (rev) is entered at its back end
+					local ix, iy, id = p.x + e[1], p.y + e[2], e[3]
+					local xx, xy, xd = p.x + e[4], p.y + e[5], e[6]
+					if p.rev then
+						ix, iy, id, xx, xy, xd = xx, xy, xd, ix, iy, id
+					end
+					if prev then
+						t.expect_true(core.connects(prev[1], prev[2], prev[3], ix, iy, id), tr.source .. ": " .. p.type)
+						t.expect_true(not core.connects(prev[1], prev[2], prev[3], xx, xy, xd),
+							tr.source .. ": not the other way round")
+						pairs_checked = pairs_checked + 1
+					end
+					prev = { xx, xy, xd }
+				end
 			end
-			worst = math.max(worst, best)
+		end
+		t.expect_true(pairs_checked >= 10, pairs_checked .. " pairs")
+		t.expect_true(not core.connects(0, 0, 4, 3, 1, 12), "off the line")
+		t.expect_true(not core.connects(0, 0, 4, -3, 0, 12), "behind")
+		t.expect_true(core.connects(0, 0, 5, 4, 2, 13), "two half-diagonal tiles on")
+	end)
+
+t.test("off_timing: the same verdict as core.timing_u read by read", function()
+	-- reads along a train's true motion (cruising, accelerating, a late start, a late stop) and offsets around the
+	-- tolerance, checked against the plain loop
+	local function slow(e, buf, c)
+		for _, q in ipairs(buf) do
+			local d = q.u - e.u - core.timing_u(c.u - e.u, c.t - e.t, e.v, c.v, q.t - e.t)
+			if math.abs(d) > core.TIME_EPS then
+				return true
+			end
+		end
+		return false
+	end
+	local n, off = 0, 0
+	for _, case in ipairs({ { 30, 60, 0.5, 0.5 }, { 8, 40, 0, 0.4 }, { 2, 100, 0, 0.2 }, { 3, 100, 0.2, 0 },
+		{ 24, 30, 1.0, 0.6 }, { 60, 120, 0.9, 0.1 }, { -4, 30, 0.1, 0.1 }, { 5, 0, 1, 1 } }) do
+		local L, T, va, vb = case[1], case[2], case[3], case[4]
+		for _, shift in ipairs({ -0.15, -0.099, 0, 0.099, 0.15 }) do
+			for k = 1, 15 do
+				local tau = T * k / 16
+				local buf = { { t = 100 + tau, u = 7 + core.timing_u(L, T, va, vb, tau) + (k == 8 and shift or 0) } }
+				local e, c = { t = 100, u = 7, v = va }, { t = 100 + T, u = 7 + L, v = vb }
+				local want = slow(e, buf, c)
+				t.expect_eq(core.off_timing(e, buf, c), want, string.format("L %g T %g k %d shift %g", L, T, k, shift))
+				n, off = n + 1, off + (want and 1 or 0)
+			end
 		end
 	end
-	t.expect_true(worst <= core.CHORD_EPS + 1e-9, "worst " .. worst)
-	-- 19 degrees a read: the heading rule sends every read on a curve this tight
-	t.expect_eq(#samples, #reads, "a sample a read")
+	t.expect_true(off > 10 and off < n, off .. " of " .. n .. " off")
+end)
+
+t.test("rail vectors: the timing model", function()
+	local V = __vectors()
+	t.expect_true(#V.timing >= 50)
+	for _, c in ipairs(V.timing) do
+		local L, T, va, vb, tau, u = c[1], c[2], c[3], c[4], c[5], c[6]
+		t.expect_near(core.timing_u(L, T, va, vb, tau), u, 1e-8, string.format("L %g T %g va %g vb %g tau %g", L, T, va,
+			vb, tau))
+	end
 end)

@@ -170,9 +170,11 @@ local function s_rail(x, y)
 	return game.get_surface(SURFACE).find_entities_filtered{ name = "straight-rail", position = { x, y }, radius = 1 }[1]
 end
 
+--- Drive train tr towards speed v at 0.01 tiles a tick per tick, as a train accelerates and brakes (a speed that jumps
+--- is no motion a game makes).
 local function speed(tr, v)
 	if tr and tr.valid then
-		tr.speed = v
+		tr.speed = tr.speed + math.max(-0.01, math.min(0.01, v - tr.speed))
 	end
 end
 
