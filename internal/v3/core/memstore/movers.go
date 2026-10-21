@@ -229,6 +229,9 @@ func buildWindow(sfc core.SurfaceKey, kind core.WindowKind, start, length core.T
 			Orientation: r.s.Orientation,
 			Flags:       r.s.Flags,
 			Carriages:   append([]core.Carriage(nil), r.s.Carriages...),
+			Speed:       r.s.Speed,
+			Rail:        append([]core.RailPiece(nil), r.s.Rail...),
+			RailStart:   r.s.RailStart,
 		})
 	}
 	sort.Slice(w.Rows, func(i, j int) bool {
@@ -248,6 +251,7 @@ func CloneWindow(w *core.MoverWindow) *core.MoverWindow {
 	c.Rows = make([]core.MoverRow, len(w.Rows))
 	for i, r := range w.Rows {
 		r.Carriages = append([]core.Carriage(nil), r.Carriages...)
+		r.Rail = append([]core.RailPiece(nil), r.Rail...)
 		c.Rows[i] = r
 	}
 	return &c

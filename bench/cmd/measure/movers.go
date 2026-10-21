@@ -36,7 +36,8 @@ type exportJourney struct {
 	// Metas lists [carriages, kinds, colour] variants; each row's last element indexes it.
 	Metas [][3]any `json:"metas"`
 	// Rows are [t, tick or null, x, y, orientation or null, flags, meta, carriages or
-	// null] in time order; flags are core.MoverFlags.
+	// null] in time order, and for rail path rows (core.FlagRail) also [speed, rail pieces
+	// as [x, y, direction, kind] or null, rail start]; flags are core.MoverFlags.
 	Rows [][]any `json:"rows"`
 }
 
@@ -142,7 +143,19 @@ func exportMovers(db, surface string, kind core.MoverKind) (*moversExport, error
 				}
 				cars = cs
 			}
-			st.j.Rows = append(st.j.Rows, []any{int64(r.T), tick, r.X, r.Y, orient, int(r.Flags), mi, cars})
+			row := []any{int64(r.T), tick, r.X, r.Y, orient, int(r.Flags), mi, cars}
+			if r.Flags&core.FlagRail != 0 {
+				var rail any
+				if len(r.Rail) > 0 {
+					ps := make([][4]int, len(r.Rail))
+					for i, p := range r.Rail {
+						ps[i] = [4]int{int(p.X), int(p.Y), int(p.Dir), int(p.Kind)}
+					}
+					rail = ps
+				}
+				row = append(row, r.Speed, rail, r.RailStart)
+			}
+			st.j.Rows = append(st.j.Rows, row)
 			ex.Rows++
 		}
 	}

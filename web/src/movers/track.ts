@@ -3,14 +3,22 @@
 // newest one, straight bridges across instance handoffs), and a train's body built from
 // the head's spline history with carriages placed by arc length.
 //
+// Train samples of the rail path model (F_RAIL, docs/v3/RAIL-GEOMETRY.md 8) carry the
+// train's speed and the rail pieces since the sample before: their journey's rail path is
+// known exactly (railpath.ts), so between two of them the leading joint runs along it by
+// the timing model, and every carriage sits on it at its joint distances. Other samples
+// (imported data, older captures, the stretch around a missed piece) use the rest of this
+// file.
+//
 // Times are map-clock ms; positions are world tiles; velocities are tiles per second.
-// MVW3 stores no velocity (FORMAT.md 7.4), so velocities are derived here from the
-// neighbouring rows and, for direction, from the orientation.
+// MVW3 stores no velocity (FORMAT.md 7.4) except a rail sample's speed, so velocities are
+// derived here from the neighbouring rows and, for direction, from the orientation.
 //
 // DOM-free; imported by the mover layer, the tests and the train evaluator.
 
 import type { Carriage, MoverKind, MoverMeta } from "../api/types";
 import { Polyline, hermite, orientationDelta, orientationVector } from "./hermite";
+import { CONNECTION, JOINT, type Piece, RailChain, pieceLength, timingU } from "./railpath";
 import { Segment } from "./segment";
 
 // Row flags (FORMAT.md 7.4). Local copies so this file needs no runtime import of types.ts.
@@ -20,6 +28,8 @@ export const F_HANDOFF = 1 << 2;
 export const F_END_SWITCH = 1 << 3;
 export const F_NO_TICK = 1 << 4;
 export const F_NO_HEADING = 1 << 5;
+/** A rail path sample: o is the leading carriage's own orientation, v its speed, rp its new rail pieces. */
+export const F_RAIL = 1 << 7;
 
 /** A gone followed by a sample of the same journey within this is a handoff (PLAN §4.4). */
 export const HANDOFF_MS = 10_000;
@@ -86,6 +96,10 @@ export interface Sample {
   flags: number;
   car: Carriage[] | null;
   meta: MoverMeta;
+  /** With F_RAIL: speed (tiles a tick), the rail pieces entered since the sample before, and whether a new rail path begins. */
+  v: number;
+  rp: Piece[] | null;
+  ru: boolean;
   /** Derived velocity (tiles/s), valid while `vv` equals the track version. */
   vx: number;
   vy: number;
@@ -95,8 +109,11 @@ export interface Sample {
   sv: number;
 }
 
-export function makeSample(meta: MoverMeta, t: number, x: number, y: number, o: number, flags = 0, car: Carriage[] | null = null, tick: number | null = null): Sample {
-  return { t, tick, x, y, o, flags, car, meta, vx: 0, vy: 0, vv: -1, seg: null, sv: -1 };
+export function makeSample(
+  meta: MoverMeta, t: number, x: number, y: number, o: number, flags = 0, car: Carriage[] | null = null, tick: number | null = null,
+  v = NaN, rp: Piece[] | null = null, ru = false,
+): Sample {
+  return { t, tick, x, y, o, flags, car, meta, v, rp, ru, vx: 0, vy: 0, vv: -1, seg: null, sv: -1 };
 }
 
 /** A journey's samples, sorted by t, unique per t. */
@@ -108,6 +125,8 @@ export class Track {
   version = 0;
   /** Number of samples with carriage geometry. */
   withCars = 0;
+  /** The rail runs (railRuns), valid while their version equals the track's. */
+  rr: RailRuns | null = null;
 
   constructor(id: string, meta: MoverMeta) {
     this.id = id;
@@ -209,7 +228,9 @@ export class Track {
     for (let k = j; k < s.length && !newer && this.withCars > 0; k++) {
       newer = s[k].car !== null;
     }
-    const kept = carIdx >= 0 && !newer ? [s[carIdx]] : [];
+    // (kept apart from the rail path: the samples between it and the rest are gone, so it does not
+    // begin the rest's run)
+    const kept: Sample[] = carIdx >= 0 && !newer ? [{ ...s[carIdx], flags: s[carIdx].flags & ~F_RAIL, seg: null, sv: -1, vv: -1 }] : [];
     for (let k = 0; k < j; k++) {
       if (s[k].car && s[k] !== kept[0]) {
         this.withCars--;
@@ -228,6 +249,17 @@ export class Track {
         rest[rest.length - 1] = x;
       } else {
         rest.push(x);
+      }
+    }
+    // The first kept rail sample begins a rail path of its own: the pieces of its run's chain
+    // under the body behind it (reach), so the run without the dropped samples still holds the
+    // train (railRuns).
+    const f = rest[0];
+    if (j > 0 && f && f === s[j] && (f.flags & F_RAIL) !== 0) {
+      const rr = railRuns(this);
+      if (rr.run[j] >= 0 && !Number.isNaN(rr.u[j])) {
+        const pieces = rr.chains[rr.run[j]].piecesBetween(rr.u[j] - reach - 8, rr.u[j]);
+        rest[0] = { ...f, rp: pieces.length > 0 ? pieces : null, ru: true, seg: null, sv: -1, vv: -1 };
       }
     }
     const next = kept.concat(rest);
@@ -266,6 +298,337 @@ export function pitches(tr: Track, upTo: number, out: number[]): number[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------------------
+// Rail path samples (F_RAIL)
+
+/**
+ * A track's rail runs: per sample the run index (-1: none) and the leading joint's rail
+ * distance on its chain (NaN: unknown); `ub` is a sample's rail distance on the next
+ * sample's chain when that one begins a new run whose pieces reach back to it (NaN else).
+ */
+export interface RailRuns {
+  version: number;
+  run: Int32Array;
+  u: Float64Array;
+  ub: Float64Array;
+  chains: RailChain[];
+  /** Rail distances between carriages from the `car` of a sample (by index), cached (railGaps). */
+  pitches: Map<number, number[] | null>;
+}
+
+/** A sample's leading joint lies this far at most from its run's chain, or its rail distance is unknown. */
+const RAIL_SNAP = 0.35;
+
+function isRail(x: Sample): boolean {
+  return (x.flags & (F_RAIL | F_GONE)) === F_RAIL && !Number.isNaN(x.v) && !Number.isNaN(x.o) && x.tick !== null;
+}
+
+/**
+ * The rail runs of a train's track: consecutive rail samples whose pieces continue one rail
+ * path. A run begins at a sample with `ru`, after a gone, a sample that is not a rail sample
+ * or an end switch, and where a piece does not continue the path (a missed piece). Each
+ * sample's leading joint (its centre plus half the joint distance along its orientation)
+ * is projected onto the run's chain.
+ */
+export function railRuns(tr: Track): RailRuns {
+  if (tr.rr && tr.rr.version === tr.version) {
+    return tr.rr;
+  }
+  const s = tr.s;
+  const n = s.length;
+  const run = new Int32Array(n).fill(-1);
+  const u = new Float64Array(n).fill(NaN);
+  const ub = new Float64Array(n).fill(NaN);
+  const chains: RailChain[] = [];
+  let chain: RailChain | null = null;
+  let members: number[] = [];
+  // where the run's first sample can lie: on the chain it started with (a later pass of the
+  // path near it does not count)
+  let firstTo = Infinity;
+  // ...and no earlier than the last piece it began with: a loop's earlier pass is not it either
+  let firstFrom = -Infinity;
+  // the sample before the run, when the run's pieces may reach back to it (see below)
+  let back = -1;
+  const close = (): void => {
+    if (!chain) {
+      return;
+    }
+    let from = firstFrom;
+    // each sample no further ahead than the faster end speed (plus half) allows since the last
+    // placed one, or than the run's first sample may lie
+    let refU = firstTo;
+    let ref = s[members[0]];
+    for (const k of members) {
+      const x = s[k];
+      const to = refU + 1.5 * Math.max(ref.v, x.v) * (x.tick! - ref.tick!) + 4;
+      // where the speeds put it (the mean of the two over the ticks between); the run's first
+      // sample nearest the start of its range: its pieces are the run's first, and a later pass
+      // of the same rails (a loop) comes from later samples' pieces
+      const expect = k === members[0] ? (Number.isFinite(from) ? from : NaN)
+        : Number.isFinite(refU) ? refU + ((ref.v + x.v) / 2) * (x.tick! - ref.tick!) : NaN;
+      const [ux, uy] = orientationVector(x.o);
+      const q = chain.project(x.x + (JOINT / 2) * ux, x.y + (JOINT / 2) * uy, from, to, expect);
+      if (chain.lastDistance <= RAIL_SNAP) {
+        u[k] = q;
+        from = q;
+        refU = q;
+        ref = x;
+      }
+    }
+    const first = members[0];
+    if (back >= 0 && !Number.isNaN(u[first])) {
+      // A new rail path (a first sight after a resync, a missed piece) whose pieces under the
+      // train, or straight line without any, reach back to the sample before: that segment
+      // runs on the new chain, behind the run's first sample.
+      const p = s[back];
+      const [px, py] = orientationVector(p.o);
+      const q = chain.project(p.x + (JOINT / 2) * px, p.y + (JOINT / 2) * py, -Infinity, u[first]);
+      if (chain.lastDistance <= RAIL_SNAP && q <= u[first] + 1e-6) {
+        ub[back] = q;
+      }
+    }
+  };
+  for (let k = 0; k < n; k++) {
+    const x = s[k];
+    if (tr.kind !== "t" || !isRail(x)) {
+      close();
+      chain = null;
+      continue;
+    }
+    const prev = k > 0 ? s[k - 1] : null;
+    let start = chain === null || x.ru || !prev || !isRail(prev) || (x.flags & F_END_SWITCH) !== 0;
+    if (!start && x.rp) {
+      for (const p of x.rp) {
+        if (!chain!.append(p)) {
+          start = true;
+          break;
+        }
+      }
+    }
+    if (start) {
+      close();
+      const [ux, uy] = orientationVector(x.o);
+      chain = new RailChain(x.x + (JOINT / 2) * ux, x.y + (JOINT / 2) * uy, ux, uy, x.rp ?? []);
+      // with `ru` the pieces were under the train: its leading joint is at most a train length
+      // past the last; else they were entered since the sample before (a stop sample's also lie
+      // under the train): at most as far past them as it went since, or a train length (a piece
+      // that did not continue the run), or a heartbeat at its speed without that sample (the
+      // first in view: a keyframe's, or the live payload's)
+      const len = (JOINT + CONNECTION) * Math.max(1, x.meta.n ?? 1);
+      const since = prev && isRail(prev) && x.tick! > prev.tick!
+        ? Math.max(len, 1.5 * Math.max(prev.v, x.v) * (x.tick! - prev.tick!) + 4) : len + x.v * 600;
+      // (without pieces the sample is the anchor: before the first piece appended later, u <= 0)
+      firstTo = !x.rp || x.rp.length === 0 ? 0 : x.ru ? chain.end + len : chain.end + since;
+      firstFrom = !x.rp || x.rp.length === 0 ? -Infinity : chain.end - pieceLength(x.rp[x.rp.length - 1].kind);
+      chains.push(chain);
+      members = [];
+      back = prev && isRail(prev) && (x.flags & F_END_SWITCH) === 0 ? k - 1 : -1;
+    }
+    members.push(k);
+    run[k] = chains.length - 1;
+  }
+  close();
+  tr.rr = { version: tr.version, run, u, ub, chains, pitches: new Map() };
+  return tr.rr;
+}
+
+/** Whether s[k] to s[k+1] is a rail segment: both on one rail run with known rail distances, no end switch between. */
+export function railLinked(tr: Track, k: number): boolean {
+  const a = tr.s[k];
+  const b = tr.s[k + 1];
+  if (!a || !b || !isRail(a) || !isRail(b) || (b.flags & F_END_SWITCH) !== 0) {
+    return false;
+  }
+  const rr = railRuns(tr);
+  if (rr.run[k + 1] < 0 || Number.isNaN(railFrom(rr, k)) || Number.isNaN(rr.u[k + 1])) {
+    return false;
+  }
+  // A parked train is not sampled until it moves: a stop sample links to the start however long it stood.
+  return b.t - a.t <= MAX_SEGMENT_MS || (a.flags & F_STOP) !== 0;
+}
+
+/** The rail distance of sample k on the chain of sample k+1's run (NaN: not on it). */
+function railFrom(rr: RailRuns, k: number): number {
+  return rr.run[k] === rr.run[k + 1] ? rr.u[k] : rr.ub[k];
+}
+
+/** Game ticks a second around sample k, from neighbouring samples' ticks (60 when unknown). */
+function ticksPerSecond(tr: Track, k: number): number {
+  const s = tr.s;
+  for (const [i, j] of [[k - 1, k], [k, k + 1], [k - 2, k - 1], [k + 1, k + 2]]) {
+    const a = s[i];
+    const b = s[j];
+    if (a && b && a.tick !== null && b.tick !== null && b.tick > a.tick && b.t > a.t && !isGone(a) && !isGone(b)) {
+      return ((b.tick - a.tick) * 1000) / (b.t - a.t);
+    }
+  }
+  return 60;
+}
+
+const rt = [0, 0];
+const rc = [0, 0, 0, 0];
+
+/** The head between rail samples k and k+1 (railLinked) at time t. */
+function railInterpolate(tr: Track, k: number, t: number, out: Head): void {
+  const a = tr.s[k];
+  const b = tr.s[k + 1];
+  const rr = railRuns(tr);
+  const T = b.tick! - a.tick!;
+  const f = b.t > a.t ? Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t))) : 1;
+  const ua = railFrom(rr, k);
+  timingU(rr.u[k + 1] - ua, T, a.v, b.v, f * T, rt);
+  const chain = rr.chains[rr.run[k + 1]];
+  const ru = ua + rt[0];
+  chain.carriage(ru, rc);
+  const tps = b.t > a.t ? (T * 1000) / (b.t - a.t) : 60;
+  out.visible = true;
+  out.x = rc[0];
+  out.y = rc[1];
+  out.vx = rc[2] * rt[1] * tps;
+  out.vy = rc[3] * rt[1] * tps;
+  out.k = k;
+  out.to = k + 1;
+  out.u = f;
+  out.rail = chain;
+  out.ru = ru;
+  out.moving = rt[1] > 0 || (f > 0 && f < 1 && rr.u[k + 1] !== ua);
+  out.mode = "interp";
+}
+
+/**
+ * The head past rail sample k at time t: on along the rail path at its speed (braking to a
+ * stop when it was braking), within the same caps as extrapolate(); held at the sample when
+ * it stands. Ahead of the newest piece the path is the straight it ended on.
+ */
+function railExtrapolate(tr: Track, k: number, t: number, horizon: number, end: number, out: Head): void {
+  const a = tr.s[k];
+  const rr = railRuns(tr);
+  const chain = rr.chains[rr.run[k]];
+  const tps = ticksPerSecond(tr, k);
+  let cap = Math.min(HEARTBEAT_MS, Math.max(0, horizon - a.t) + EXTRAPOLATE_MS, end - a.t);
+  if (end === Infinity && horizon - a.t > HEARTBEAT_MS + EXTRAPOLATE_MS) {
+    cap = 0; // the heartbeat is known missed: the data stopped (as extrapolate())
+  }
+  const v0 = (a.flags & F_STOP) !== 0 ? 0 : a.v * tps;
+  let acc = 0;
+  const p = k > 0 ? tr.s[k - 1] : null;
+  if (p && isRail(p) && p.t < a.t && p.v > a.v) {
+    acc = Math.max(-MAX_BRAKING, ((a.v - p.v) * tps * 1000) / (a.t - p.t));
+    if (v0 > 0) {
+      cap = Math.min(cap, (1000 * v0) / -acc);
+    }
+  }
+  const dt = Math.max(0, Math.min(t - a.t, cap)) / 1000;
+  const dist = Math.max(0, v0 * dt + 0.5 * acc * dt * dt);
+  const rate = Math.max(0, v0 + acc * dt);
+  const ru = rr.u[k] + dist;
+  chain.carriage(ru, rc);
+  const moving = v0 > 0 && rate > 0 && t - a.t < cap;
+  out.visible = true;
+  out.x = rc[0];
+  out.y = rc[1];
+  out.vx = moving ? rc[2] * rate : 0;
+  out.vy = moving ? rc[3] * rate : 0;
+  out.k = k;
+  out.to = -1;
+  out.u = 0;
+  out.ed = dist;
+  out.eth = Math.atan2(rc[3], rc[2]);
+  out.ek = 0;
+  out.el = 0;
+  out.rail = chain;
+  out.ru = ru;
+  out.mode = moving ? "extrap" : "hold";
+  out.moving = moving;
+}
+
+/** Whether sample k is a rail sample with a known place on its run's chain. */
+function railKnown(tr: Track, k: number): boolean {
+  const x = tr.s[k];
+  if (!x || !isRail(x)) {
+    return false;
+  }
+  const rr = railRuns(tr);
+  return rr.run[k] >= 0 && !Number.isNaN(rr.u[k]);
+}
+
+/**
+ * The rail distances between neighbouring carriages' front joints for a train drawn at sample
+ * k on a rail path, into gaps. From the newest carriage geometry (`car`) of the same run: each
+ * carriage's front joint (its centre plus 2 tiles along its axis, towards the leading end)
+ * projected onto the run's chain, so a pitch measured on a curve or a ramp is the rail
+ * distance and not the chord. Otherwise the centre distances (pitches()), taken as the vanilla
+ * joint + connection distance when they lie between 5.5 and 7.6 (a chord on a curve or a ramp
+ * is up to 10% short).
+ */
+export function railGaps(tr: Track, k: number, gaps: number[]): number[] {
+  pitches(tr, k, gaps);
+  const rr = railRuns(tr);
+  const run = rr.run[k];
+  let j = k;
+  while (j >= 0 && rr.run[j] === run && !tr.s[j].car) {
+    j--;
+  }
+  let measured: number[] | null = null;
+  if (run >= 0 && j >= 0 && rr.run[j] === run && !Number.isNaN(rr.u[j])) {
+    if (!rr.pitches.has(j)) {
+      rr.pitches.set(j, carGaps(tr.s[j], rr.chains[run], rr.u[j]));
+    }
+    measured = rr.pitches.get(j) ?? null;
+  }
+  for (let i = 0; i < gaps.length; i++) {
+    if (measured && i < measured.length) {
+      gaps[i] = measured[i];
+    } else if (gaps[i] >= 5.5 && gaps[i] <= 7.6) {
+      gaps[i] = JOINT + CONNECTION;
+    }
+  }
+  return gaps;
+}
+
+/** carGaps: the rail distances between the front joints of a sample's carriages on chain (u0: the leading joint's), or null. */
+function carGaps(x: Sample, chain: RailChain, u0: number): number[] | null {
+  const car = x.car!;
+  const out: number[] = [];
+  let prev = u0;
+  for (let i = 1; i < car.length; i++) {
+    const c = car[i];
+    let [ux, uy] = orientationVector(c.o);
+    // the axis pointed towards the carriage ahead
+    if (ux * (car[i - 1].x - c.x) + uy * (car[i - 1].y - c.y) < 0) {
+      ux = -ux;
+      uy = -uy;
+    }
+    const q = chain.project(c.x + (JOINT / 2) * ux, c.y + (JOINT / 2) * uy, prev - 20, prev - 3);
+    if (chain.lastDistance > RAIL_SNAP) {
+      return out.length > 0 ? out : null;
+    }
+    out.push(prev - q);
+    prev = q;
+  }
+  return out;
+}
+
+/**
+ * Carriages of a head on a rail path (head.rail): carriage i's front joint lies the sum of
+ * the gaps before it (railGaps) behind the leading one, its centre midway between its joints
+ * and its angle along their chord (RAIL-GEOMETRY.md 3).
+ */
+export function placeRailCarriages(head: Head, kinds: string, gaps: number[], out: Car[]): Car[] {
+  const chain = head.rail!;
+  out.length = 0;
+  let u = head.ru;
+  for (let i = 0; i <= gaps.length; i++) {
+    if (i > 0) {
+      u -= gaps[i - 1];
+    }
+    chain.carriage(u, rc);
+    const kind = kinds[i] ?? "C";
+    out.push({ x: rc[0], y: rc[1], a: Math.atan2(rc[3], rc[2]), loco: kind === "L" || kind === "l", kind });
+  }
+  return out;
+}
+
 /** Trains do not move faster than this (tiles/s); a faster step is a switch of the sampled carriage. */
 export const MAX_TRAIN_SPEED = 100;
 
@@ -280,7 +643,8 @@ export function isEndSwitch(tr: Track, k: number): boolean {
   if ((b.flags & F_END_SWITCH) !== 0) {
     return true;
   }
-  if (tr.kind !== "t" || isGone(a) || isGone(b)) {
+  if (tr.kind !== "t" || isGone(a) || isGone(b) || (b.flags & F_RAIL) !== 0) {
+    // a rail sample's capture flags every end switch
     return false;
   }
   const n = b.meta.n ?? 0;
@@ -327,6 +691,11 @@ export function linked(tr: Track, k: number): boolean {
   const a = tr.s[k];
   const b = tr.s[k + 1];
   if (!a || !b || isGone(a) || isGone(b) || b.t - a.t > MAX_SEGMENT_MS) {
+    return false;
+  }
+  if ((a.flags & b.flags & F_RAIL) !== 0 && b.ru && a.meta.n !== b.meta.n) {
+    // The train changed (a join or a split; its capture reads it at once): where the rail path
+    // does not link the two leading joints, the leading carriage changed. Hold, then jump.
     return false;
   }
   return !isEndSwitch(tr, k);
@@ -415,6 +784,14 @@ export function velocity(tr: Track, k: number): Sample {
   p.vx = 0;
   p.vy = 0;
   if (isGone(p) || (p.flags & F_STOP) !== 0) {
+    return p;
+  }
+  if (isRail(p)) {
+    // the captured speed along the leading carriage's own orientation (the rail tangent)
+    const [ux, uy] = orientationVector(p.o);
+    const sp = p.v * ticksPerSecond(tr, k);
+    p.vx = ux * sp;
+    p.vy = uy * sp;
     return p;
   }
   const hasPrev = k > 0 && linked(tr, k - 1);
@@ -540,10 +917,13 @@ export interface Head {
   eth: number;
   ek: number;
   el: number;
+  /** On a rail path: its chain and the leading joint's rail distance on it (else null). */
+  rail: RailChain | null;
+  ru: number;
 }
 
 export function newHead(): Head {
-  return { visible: false, x: 0, y: 0, vx: 0, vy: 0, k: -1, mode: "hidden", u: 0, to: -1, moving: false, ed: 0, eth: 0, ek: 0, el: 0 };
+  return { visible: false, x: 0, y: 0, vx: 0, vy: 0, k: -1, mode: "hidden", u: 0, to: -1, moving: false, ed: 0, eth: 0, ek: 0, el: 0, rail: null, ru: 0 };
 }
 
 /**
@@ -724,6 +1104,7 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
   out.ed = 0;
   out.ek = 0;
   out.el = 0;
+  out.rail = null;
   let k = tr.find(t);
   if (k < 0) {
     return out;
@@ -749,7 +1130,11 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
   }
   const next = s[k + 1];
   if (!next) {
-    extrapolate(tr, k, t, horizon, Infinity, out);
+    if (railKnown(tr, k)) {
+      railExtrapolate(tr, k, t, horizon, Infinity, out);
+    } else {
+      extrapolate(tr, k, t, horizon, Infinity, out);
+    }
     return out;
   }
   if (isGone(next)) {
@@ -759,15 +1144,25 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
       return out;
     }
     // Never towards a gone: run on (bounded) until it.
-    extrapolate(tr, k, t, Math.min(horizon, next.t), next.t, out);
+    if (railKnown(tr, k)) {
+      railExtrapolate(tr, k, t, Math.min(horizon, next.t), next.t, out);
+    } else {
+      extrapolate(tr, k, t, Math.min(horizon, next.t), next.t, out);
+    }
+    return out;
+  }
+  if (railLinked(tr, k)) {
+    railInterpolate(tr, k, t, out);
     return out;
   }
   if (!linked(tr, k)) {
-    if (t - s[k].t > HEARTBEAT_MS && !isEndSwitch(tr, k) && !stationary(tr, k)) {
+    const parked = (s[k].flags & (F_STOP | F_RAIL)) === (F_STOP | F_RAIL);
+    if (t - s[k].t > HEARTBEAT_MS && !isEndSwitch(tr, k) && !stationary(tr, k) && !parked) {
       // A data gap after which the mover is somewhere else (an instance down or a save
       // reloaded without a gone): where it was meanwhile is unknown, and the capture would
       // have sent a sample within a heartbeat had it still been here, so it is not drawn
-      // until the next sample instead of standing still and then jumping there.
+      // until the next sample instead of standing still and then jumping there. (A rail path
+      // capture sends nothing for a parked train: it stood at its stop sample until then.)
       return out;
     }
     // A data gap or an end switch: hold until the next sample (it is known, so running on

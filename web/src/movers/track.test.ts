@@ -582,3 +582,120 @@ test("a known data gap: hidden when the mover is elsewhere afterwards, held when
   T.headAt(parked, 60_000, Infinity, head);
   assert.ok(head.visible, "a parked train stays drawn across the gap");
 });
+
+/**
+ * A square loop of real rail pieces: four right quarter turns (curved-rail-a, b, b, a) joined by
+ * 40-tile straights, from (0, 1) east; ref runs it twice from 20 tiles before the start, and at(u)
+ * is the leading carriage's centre and orientation with its joint at u of ref (on a straight).
+ */
+async function squareLoop() {
+  const P = await import("./railpath.ts");
+  const pieces: { x: number; y: number; dir: number; kind: number }[] = [];
+  let x = 0;
+  let y = 1;
+  let d = 4;
+  const steps: Record<number, [number, number]> = { 0: [0, -1], 4: [1, 0], 8: [0, 1], 12: [-1, 0] };
+  const turns: { x: number; y: number; dir: number; kind: number }[][] = [];
+  for (let q = 0; q < 4; q++) {
+    x += 40 * steps[d][0];
+    y += 40 * steps[d][1];
+    const turn = [];
+    for (const kind of [P.KIND_CURVE_A, P.KIND_CURVE_B, P.KIND_CURVE_B, P.KIND_CURVE_A]) {
+      const want = (d + 8) % 16;
+      let placed = false;
+      for (let dir = 0; dir < 16 && !placed; dir++) {
+        const e = P.pieceEnds(kind, dir);
+        for (const [ix, iy, id, ox, oy, od] of [[e[0], e[1], e[2], e[3], e[4], e[5]], [e[3], e[4], e[5], e[0], e[1], e[2]]]) {
+          if (!placed && id === want && od === (d + 1) % 16) {
+            const p = { x: x - ix, y: y - iy, dir, kind };
+            turn.push(p);
+            x = p.x + ox;
+            y = p.y + oy;
+            d = od;
+            placed = true;
+          }
+        }
+      }
+      assert.ok(placed, `a piece of kind ${kind} turning from ${d}`);
+    }
+    turns.push(turn);
+    pieces.push(...turn);
+  }
+  assert.deepEqual([x, y, d], [0, 1, 4], "the loop closes");
+  // the reference path, two laps, from 20 tiles before the start
+  const ref = new P.RailChain(-20, 1, 1, 0, [...pieces, ...pieces]);
+  const lap = ref.project(0, 1, 100, 1e9) - ref.project(0, 1, -1e9, 0);
+  const at = (u: number): [number, number, number] => {
+    const pt = [0, 0, 0, 0];
+    ref.point(u, pt);
+    // the leading carriage's centre, 2 tiles behind its joint on a straight
+    return [pt[0] - 2 * pt[2], pt[1] - 2 * pt[3], H.vectorOrientation(pt[2], pt[3])];
+  };
+  return { P, pieces, turns, ref, lap, at };
+}
+
+test("rail runs: a run's first sample lies on the first pass of its rails, not on a later lap", async () => {
+  const { P, turns, ref, lap, at } = await squareLoop();
+  const m = { ...meta, id: "loop", n: 1, o: "L" };
+  const tr = new T.Track("loop", m);
+  // the first sample's heading is a little off the rails, so the turn's pieces do not continue its anchor line and the
+  // next sample begins a run of its own (a keyframe's row on a curve leaves such a line)
+  const turnEnd = (lapNo: number, q: number): number => {
+    // u just past turn q of lap lapNo: project the exit of its last piece
+    const last = turns[q][3];
+    const e = P.pieceEnds(last.kind, last.dir);
+    const exits = [[last.x + e[0], last.y + e[1]], [last.x + e[3], last.y + e[4]]];
+    const us = exits.map(([ex, ey]) => ref.project(ex, ey, lapNo * lap, lapNo * lap + lap));
+    return Math.max(...us);
+  };
+  const v = 1;
+  const add = (u: number, rp: typeof pieces | null, tweak = 0) => {
+    const [cx, cy, o] = at(u);
+    tr.insert(T.makeSample(m, 1000 + u * (1000 / 60), cx, cy, o + tweak, T.F_RAIL, null, 1000 + u, v, rp));
+  };
+  add(30, null, 0.01);
+  for (let lapNo = 0; lapNo < 2; lapNo++) {
+    for (let q = 0; q < 4; q++) {
+      add(turnEnd(lapNo, q) + 10, turns[q]);
+    }
+  }
+  const rr = T.railRuns(tr);
+  assert.equal(rr.run[1], rr.run[8], "one run from the second sample on");
+  const u1 = rr.u[1];
+  assert.ok(Math.abs(rr.u[5] - u1 - lap) < 0.01, `the second lap is a lap on (${u1}, ${rr.u[5]}, lap ${lap})`);
+  for (let k = 2; k <= 8; k++) {
+    assert.ok(rr.u[k] > rr.u[k - 1], `rail distances increase: ${k}`);
+  }
+});
+
+test("rail runs: a stop sample listing the pieces under a long train places it from a trail's first row on", async () => {
+  // the live payload's trail can begin after the train's earlier pieces: its stop sample's pieces then begin a run
+  const { P, turns, ref, at } = await squareLoop();
+  const n = 30;
+  const m = { ...meta, id: "long", n, o: "L" + "C".repeat(n - 1) };
+  const exit = (q: number): number => {
+    const last = turns[q][3];
+    const e = P.pieceEnds(last.kind, last.dir);
+    return Math.max(ref.project(last.x + e[0], last.y + e[1], 0, 250), ref.project(last.x + e[3], last.y + e[4], 0, 250));
+  };
+  // the trail's first row 3 tiles before the stop, braking; the stop 38 tiles past the last curved piece
+  const uh = exit(2) + 38;
+  const u0 = uh - 3;
+  const tr = new T.Track("long", m);
+  const [x0, y0, o0] = at(u0);
+  tr.insert(T.makeSample(m, 1000, x0, y0, o0, T.F_RAIL, null, 100, 0.3));
+  const [xh, yh, oh] = at(uh);
+  // a stop sample lists the pieces under the whole train, rear first (here all of turns 1 to 3)
+  const under = [...turns[0], ...turns[1], ...turns[2]];
+  const stopTick = 120;
+  tr.insert(T.makeSample(m, 1000 + (stopTick - 100) * (1000 / 60), xh, yh, oh, T.F_RAIL | T.F_STOP, null, stopTick, 0, under));
+  const rr = T.railRuns(tr);
+  assert.ok(Number.isFinite(rr.u[1]), `the stop sample lies on its run (${rr.u[1]})`);
+  const head = T.headAt(tr, 1000 + (stopTick - 100) * (1000 / 60) + 5000, Infinity, T.newHead());
+  const cars = T.placeRailCarriages(head, m.o, T.railGaps(tr, 1, []), []);
+  const c = [0, 0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    ref.carriage(uh - i * 7, c);
+    assert.ok(Math.hypot(cars[i].x - c[0], cars[i].y - c[1]) < 0.05, `carriage ${i}: ${cars[i].x}, ${cars[i].y} against ${c[0]}, ${c[1]}`);
+  }
+});

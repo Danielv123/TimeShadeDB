@@ -231,12 +231,27 @@ function truthLeads(truthText) {
 	return byTrain;
 }
 
-function segDist(p, a, b) {
-	const dx = b.x - a.x;
-	const dy = b.y - a.y;
-	const l2 = dx * dx + dy * dy;
-	const f = l2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2)) : 0;
-	return Math.hypot(p.x - a.x - dx * f, p.y - a.y - dy * f);
+/**
+ * What the viewer draws from a train's samples (web/src/movers/track.ts, history mode): the leading carriage's centre
+ * at every tick from the first sample to the last, as a function of the tick (null where it draws nothing).
+ */
+async function viewerHeads(list) {
+	await import("../../web/src/movers/eval/ts-resolve.mjs");
+	const T = await import("../../web/src/movers/track.ts");
+	const tr = new T.Track(list[0].j, { id: list[0].j, k: "t", f: list[0].f, name: list[0].name, n: list[0].n, o: list[0].o });
+	for (const e of list) {
+		// each sample's own carriages (a changed train has others)
+		const meta = { id: e.j, k: "t", f: e.f, name: e.name, n: e.n, o: e.o };
+		const flags = (e.stop ? T.F_STOP : 0) | (e.es ? T.F_END_SWITCH : 0) | (e.v !== undefined ? T.F_RAIL : 0);
+		const car = e.car ? e.car.map(([x, y, o]) => ({ x, y, o })) : null;
+		const rp = e.rp ? e.rp.map(([x, y, dir, kind]) => ({ x, y, dir, kind })) : null;
+		tr.insert(T.makeSample(meta, (e.__tick * 1000) / 60, e.x, e.y, e.h ?? NaN, flags, car, e.__tick, e.v ?? NaN, rp, !!e.ru));
+	}
+	const head = T.newHead();
+	return (tick) => {
+		T.headAt(tr, (tick * 1000) / 60, Infinity, head);
+		return head.visible ? { x: head.x, y: head.y, rail: head.rail !== null } : null;
+	};
 }
 
 function entries(msgs, pred) {
@@ -254,7 +269,7 @@ function entries(msgs, pred) {
 }
 
 /** The checks shared by the standalone and the Clusterio runs. */
-function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
+async function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
 	const spec = { x1: 0, y1: 0, x2: 20, y2: 20, flicker: { "3,3": 1, "4,4": 300 } };
 	// chunks: every chart decodes to the bytes the seam produced at the flush tick
 	const chunks = msgs.filter(m => m.type === "chunk");
@@ -285,7 +300,9 @@ function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
 	// trains
 	const truth = truthLeads(truthText);
 	const aJ = entries(msgs, e => results.a_id && e.j && e.j.endsWith(`.${results.a_id}`) && e.k === "t");
-	const bJ = entries(msgs, e => results.b_gone_id && e.j && e.j.endsWith(`.${results.b_gone_id}`));
+	// B's journey keeps the id minted for its first train through the split
+	const bId = results.b_id0 ?? results.b_gone_id;
+	const bJ = entries(msgs, e => bId && e.j && e.j.endsWith(`.${bId}`));
 	check(aJ.length > 0 && aJ[0].j.startsWith(journeyPrefix), `${label}: train A journey ${aJ[0]?.j} (prefix ${journeyPrefix})`);
 	for (const [name, list] of [["A", aJ], ["B", bJ.filter(e => !e.gone)]]) {
 		const tr = truth[name.toLowerCase()];
@@ -306,33 +323,43 @@ function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
 		}
 		check(wrongPos === 0, `${label}: train ${name}: ${wrongPos} of ${list.length} samples are not at the leading `
 			+ `carriage's position at their tick`);
-		// the polyline of samples over the moving period stays near every tick's true position
+		// every sample is a rail path sample (speed, pieces) and what the viewer draws from them stays on the train at
+		// every tick it moves (up to an end switch's sample the viewer still draws the old leading end)
+		check(list.every(e => typeof e.v === "number"), `${label}: train ${name}: every sample carries the speed`);
+		const pieces = list.reduce((n, e) => n + (e.rp ? e.rp.length : 0), 0);
 		const moving = list.filter(e => !e.gone);
+		const drawn = await viewerHeads(moving);
 		let worst = 0;
 		let worstTick = 0;
+		let onRails = 0;
+		let ticks = 0;
 		const first = moving[0].__tick;
 		const last = moving[moving.length - 1].__tick;
 		for (let t = first; t <= last; t++) {
 			const p = tr.ticks.get(t);
-			if (!p) {
+			// before an end switch's sample arrives the viewer cannot know the other end leads: it holds the old one
+			const i = moving.findIndex(e => e.__tick > t);
+			if (!p || p.speed === 0 || (i >= 0 && moving[i].es) || moving.some(e => e.es && e.__tick === t)) {
 				continue;
 			}
-			let best = Infinity;
-			for (let i = 0; i + 1 < moving.length; i++) {
-				if (moving[i].__tick <= t + 1 && moving[i + 1].__tick >= t - 1 && !moving[i + 1].es) {
-					best = Math.min(best, segDist(p, moving[i], moving[i + 1]));
-				}
+			const h = drawn(t);
+			if (!h) {
+				continue;
 			}
-			if (best !== Infinity && best > worst) {
-				worst = best;
+			ticks++;
+			onRails += h.rail ? 1 : 0;
+			const d = Math.hypot(h.x - p.x, h.y - p.y);
+			if (d > worst) {
+				worst = d;
 				worstTick = t;
 			}
 		}
-		check(worst <= 0.5, `${label}: train ${name}: the sample polyline is ${worst.toFixed(3)} tiles from the track at `
-			+ `tick ${worstTick}`);
+		check(worst <= 0.5, `${label}: train ${name}: the viewer draws the head ${worst.toFixed(3)} tiles from the `
+			+ `leading carriage at tick ${worstTick}`);
 		const cars = list.filter(e => e.car);
 		note(`${label}: train ${name}: ${list.length} samples (${withTick} with their own read tick, ${cars.length} with `
-			+ `car), polyline within ${worst.toFixed(3)} tiles of the true position over ticks ${first}-${last}`);
+			+ `car, ${pieces} rail pieces); the viewer's head within ${worst.toFixed(3)} tiles of the leading carriage over `
+			+ `${ticks} moving ticks (${onRails} on the rail path) from ${first} to ${last}`);
 		for (const e of cars) {
 			check(Array.isArray(e.car) && e.car.length === e.n && Math.abs(e.car[0][0] - e.x) < 0.01
 				&& Math.abs(e.car[0][1] - e.y) < 0.01, `${label}: train ${name}: car starts at the leading carriage`);
@@ -340,18 +367,49 @@ function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
 	}
 	if (aJ.length > 0) {
 		check(aJ[0].car && aJ[0].car.length === 3, `${label}: train A's first sample carries car`);
-		const stops = aJ.filter(e => e.stop && e.car);
-		check(stops.length >= 2, `${label}: train A's stops carry car (${stops.length})`);
+		const stops = aJ.filter(e => e.stop);
+		check(stops.length >= 2 && stops.every(e => e.v === 0), `${label}: train A's stops (${stops.length}) have speed 0`);
 		const es = aJ.filter(e => e.es);
 		check(es.length === 1, `${label}: train A switched ends once (${es.length} es samples)`);
 		if (es.length) {
 			const p = truth.a.ticks.get(es[0].__tick);
-			check(es[0].car && p && Math.abs(es[0].car[0][0] - p.bx) < 0.01, `${label}: after the switch car starts at the `
-				+ `back stock`);
+			check(es[0].ru && p && Math.abs(es[0].x - p.bx) < 0.01, `${label}: after the switch the samples follow the back `
+				+ `stock and begin a new rail path`);
 			check(es[0].o === "ccl" && aJ[0].o === "LCC", `${label}: kinds from the leading end (${aJ[0].o}, then ${es[0].o})`);
 		}
 		check(aJ.every(e => e.n === 3 && e.name === (e.o === "LCC" ? "locomotive" : "cargo-wagon") && e.f === "player"
 			&& typeof e.h === "number" && e.c), `${label}: train A sample fields (name of the leading carriage)`);
+	}
+	// B stood on a curve: its stop sample lists every curved piece under it and alone places the train there (a keyframe
+	// or the live payload hold only that row); then its locomotive was taken off, and the wagon's next sample, read at
+	// once, begins a new rail path with its carriages
+	const bs = results.b_stop;
+	if (check(bs && bs.under.length > 0, `${label}: train B stood on ${bs?.under.length} curved pieces before the split`)) {
+		const KIND = { "curved-rail-a": 1, "curved-rail-b": 2, "elevated-curved-rail-a": 1, "elevated-curved-rail-b": 2, "rail-ramp": 4 };
+		const stop = bJ.filter(e => e.stop && !e.ru && !e.gone && e.__tick <= bs.tick).pop();
+		const listed = new Set((stop?.rp ?? []).map(p => p.join(",")));
+		const missing = bs.under.filter(([x, y, dir, type]) => !listed.has([x, y, dir, KIND[type]].join(",")));
+		check(stop && missing.length === 0, `${label}: train B's stop sample lists the ${bs.under.length} pieces under it `
+			+ `(${missing.length} missing of ${stop?.rp?.length ?? 0} listed)`);
+		if (stop) {
+			await import("../../web/src/movers/eval/ts-resolve.mjs");
+			const { MoverView } = await import("../../web/src/movers/view.ts");
+			const T = await import("../../web/src/movers/track.ts");
+			const view = new MoverView();
+			const meta = { id: stop.j, k: "t", f: stop.f, name: stop.name, n: stop.n, o: stop.o };
+			view.add(meta, T.makeSample(meta, (stop.__tick * 1000) / 60, stop.x, stop.y, stop.h, T.F_RAIL | T.F_STOP, null,
+				stop.__tick, stop.v, stop.rp.map(([x, y, dir, kind]) => ({ x, y, dir, kind }))));
+			const cars = view.frame((bs.tick * 1000) / 60, Infinity, { bodies: true })[0]?.cars ?? [];
+			const off = cars.length === 2 ? Math.max(Math.hypot(cars[0].x - bs.front[0], cars[0].y - bs.front[1]),
+				Math.hypot(cars[1].x - bs.back[0], cars[1].y - bs.back[1])) : Infinity;
+			check(off < 0.3, `${label}: train B drawn from its stop sample alone: carriages within ${off.toFixed(3)} tiles`);
+			note(`${label}: train B stood on ${bs.under.length} curved pieces; its stop sample at tick ${stop.__tick} lists `
+				+ `${stop.rp.length} pieces and alone places both carriages within ${off.toFixed(3)} tiles; split at tick ${bs.tick}`);
+		}
+		const change = bJ.find(e => !e.gone && e.__tick > bs.tick);
+		check(change && change.ru && change.car && change.car.length === bs.rest_n && change.n === bs.rest_n
+			&& change.__tick <= bs.tick + 2, `${label}: after the split train B's next sample (tick ${change?.__tick}, split at `
+			+ `${bs.tick}) begins a new rail path with car of ${change?.car?.length} carriages`);
 	}
 	const gone = bJ.filter(e => e.gone);
 	check(gone.length === 1, `${label}: train B destroyed: one gone (${gone.length})`);
@@ -392,7 +450,7 @@ function checkScenario(label, msgs, results, truthText, { journeyPrefix }) {
 
 const TEST_TICKS = Number(option("--ticks", 2200));
 
-function runTest() {
+async function runTest() {
 	console.log("== test: standalone mod");
 	const build = buildCapture(path.join(root, "build"));
 	const box = sandbox("test", {
@@ -426,7 +484,7 @@ function runTest() {
 	}
 	const results = JSON.parse(fs.readFileSync(resultsPath, "utf8"));
 	const truth = fs.readFileSync(path.join(outDir, "timeshade-test", "truth.tsv"), "utf8");
-	checkScenario("test", msgs, results, truth, { journeyPrefix: "0." });
+	await checkScenario("test", msgs, results, truth, { journeyPrefix: "0." });
 	const cost = /TSTEST read_cost 1000 reads: .*?([\d.]+) ?ms/.exec(res.stdout);
 	const costBytes = /TSTEST read_cost_bytes (\d+)/.exec(res.stdout);
 	if (check(cost, "test: read_cost logged")) {
@@ -477,7 +535,7 @@ function writeFixture(lines, results) {
 	note(`test: wrote ${picked.length} of ${lines.length} lines to ${out} (${[...seen].sort().join(", ")})`);
 }
 
-function runClusterio() {
+async function runClusterio() {
 	console.log("== clusterio: save-patch module with a stub Clusterio API");
 	const build = buildCapture(path.join(root, "build-clusterio"));
 	const box = sandbox("clusterio", {
@@ -508,7 +566,7 @@ function runClusterio() {
 	check(!fs.existsSync(path.join(outDir, "timeshade")), "clusterio: the module writes no files");
 	const results = JSON.parse(fs.readFileSync(resultsPath, "utf8"));
 	const truth = fs.readFileSync(path.join(outDir, "timeshade-test", "truth.tsv"), "utf8");
-	checkScenario("clusterio", msgs, results, truth, { journeyPrefix: "4242." });
+	await checkScenario("clusterio", msgs, results, truth, { journeyPrefix: "4242." });
 	const start = msgs.find(m => m.type === "resynced" && m.trace === "start-1");
 	check(start, "clusterio: the start resync finished");
 }
@@ -657,10 +715,13 @@ function runBench() {
 	const variants = boxes("bench", build.modDir, build.moduleDir, true);
 	const box = variants.find(v => v[0] === "with")[1];
 	const save = path.join(box.dir, "bench.zip");
-	run(box, ["--create", save], "create");
 	// --compare <capture dir>: another version of the capture (an older checkout's capture/), built the same way and run
-	// on the same save in its own sandbox, interleaved with the others, so both versions see the same machine load
+	// on the same map in its own sandbox, interleaved with the others, so both versions see the same machine load. Each
+	// version gets its own save of the map (the same seed), made with it, since an older capture refuses a newer one's
+	// storage schema.
 	const compareDir = option("--compare", null);
+	const seed = compareDir ? ["--map-gen-seed", "20261021"] : [];
+	run(box, ["--create", save, ...seed], "create");
 	if (compareDir) {
 		const altOut = path.join(root, "build-alt");
 		execFileSync(process.execPath, [path.join(compareDir, "build.mjs"), "--out", altOut, "--test", "--no-zip",
@@ -668,6 +729,8 @@ function runBench() {
 		const altInfo = JSON.parse(fs.readFileSync(path.join(compareDir, "mod", "timeshade_capture", "info.json"), "utf8"));
 		const [alt] = boxes("bench-alt", path.join(altOut, `${altInfo.name}_${altInfo.version}`),
 			path.join(altOut, "clusterio_module"), false);
+		alt[1].save = path.join(alt[1].dir, "bench.zip");
+		run(alt[1], ["--create", alt[1].save, ...seed], "create-alt");
 		variants.push(["alt", alt[1], alt[2]]);
 		note(`bench: comparing with the capture in ${compareDir} ("alt")`);
 	}
@@ -680,7 +743,7 @@ function runBench() {
 	for (let r = 0; r < runs; r++) {
 		for (const [label, vbox, before] of variants) {
 			before();
-			const res = run(vbox, ["--benchmark", save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
+			const res = run(vbox, ["--benchmark", vbox.save ?? save, "--benchmark-ticks", String(ticks), "--benchmark-verbose", "all"],
 				`bench-${label}-${r}`);
 			if (label === "with" && r === 0 && host === "clusterio") {
 				const ipc = res.stdout.split(/\r?\n/).filter(l => l.startsWith("\f$ipc:timeshade:out?j"));
@@ -780,10 +843,10 @@ gameVersion = version();
 console.log(`Factorio ${gameVersion} at ${factorio}; sandbox ${root}`);
 try {
 	if (modeArg === "test" || modeArg === "all") {
-		runTest();
+		await runTest();
 	}
 	if (modeArg === "clusterio" || modeArg === "all") {
-		runClusterio();
+		await runClusterio();
 	}
 	if (modeArg === "bench") {
 		runBench();

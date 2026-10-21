@@ -88,15 +88,47 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
 - Forced reads (a resync, a deleted chunk) wait in their own queue, read first and not
   capped; while a resync runs one of its 4 reads a tick goes to chart events whenever any
   wait, so neither starves the other.
-- Trains: every sample carries its read tick (the envelope's, or its own `tick` for a chord
-  vertex sent one read late). A sample is sent when a read is off the chord from the last
-  sample by more than 0.25 tile (or 1 tile off its time-interpolated place), when the
-  heading turned more than 2 degrees, when 16 reads are buffered, or on the 600-tick
-  heartbeat. `car` (every carriage's position and orientation) comes with first sight,
-  stop, start, end switch (`es`), a changed train and resyncs. `h` points from the
-  carriage behind the leading one towards it, as in illisis (a single carriage: its own
-  orientation in the direction of travel). A parked train is not polled: after its stop
-  sample it is sent again only by a resync or when it moves. No `vx`/`vy`.
+- Trains are described by their rail path and the timing along it
+  ([RAIL-GEOMETRY.md](../docs/v3/RAIL-GEOMETRY.md) 8). Each read (every 5 tiles of travel,
+  sooner while accelerating, at most 30 ticks apart) notes the rail under the leading
+  carriage's front joint while the carriage turns or the last rail read was a curved piece
+  or ramp, and on a straight every third read (`LuaTrain.front_end`/`back_end`, three API
+  reads; the kind, direction and position of a rail are cached by unit number; on a straight
+  the orientation stays exactly the same, and a ramp, which shows no turn, is 16 tiles long,
+  more than three reads). The curved pieces and ramps
+  the joint enters go with the next sample (`rp`); rails between them are straight, so the
+  curve itself costs no sample. Every sample carries its read tick (the envelope's, or its
+  own `tick` for a vertex sent one read late), the speed (`v`) and the leading carriage's own
+  orientation turned to the direction of travel (`h`, the rail tangent). A sample is sent
+  when a read since the last sample lies more than 0.1 tile of rail distance off the timing
+  model from that sample to the current read (the previous read is sent as a vertex), at
+  least every 120 ticks while moving (60 below game speed 0.5: about 2 s of real time, so a
+  live viewer's next sample is never later; a read is scheduled for when that wait ends), on
+  the 600-tick heartbeat, on first sight, stop, start, end switch (`es`) and surface change,
+  when 32 pieces wait, and when the joint enters a piece that does not continue the path
+  recorded since the last sample. Then a read came late and a piece passed unseen: the read
+  walks back over the rails under the train (`LuaRailEnd.move_natural`, at most 64 rails) to
+  the last recorded one and records the pieces it passed; only if that fails it sends the
+  read before and the current read, which begins a new path. A turning carriage whose read
+  finds a straight rail under the train's end walks back the same way, at most 12 rails, for
+  a short piece that came and went under the end between reads that did not look. Reads are at most 5 tiles of
+  travel apart (the wait rounded down), less than the shortest curved piece. Where a new path begins (`ru`: first sight, a
+  changed train, end switch, surface change, a missed piece, a resync) the sample lists the pieces under the
+  whole train instead (`LuaTrain.get_rails`). Stop and start samples list the pieces under the
+  whole train as well as those entered since the last sample, without beginning a new path, because a
+  keyframe or the live payload holds only a parked train's stop sample (and the live payload's trail
+  often begins at a start). The reads kept for the check are at most 16; a
+  full buffer keeps every other one. `car` (every carriage's position and orientation, which
+  gives the viewer the carriages' pitches) comes with first sight, a changed train, a surface
+  change and resyncs; the rail path places the carriages at stops, starts and end switches. A parked train is
+  not polled: after its stop sample it is sent again only by a resync or when it moves. No
+  `vx`/`vy`. Deploy the server and viewer before this capture: an older viewer cannot read
+  rail rows, and an older server stores them as samples whose `h` and missing `car` it
+  misreads (PROTOCOL.md 3.1, deploy order). Storage schema 2 restarts the trains an older capture sampled (their next read
+  is a first sight). On the benchmark map (`bench/railbench`, 74 moving trains) this sends
+  3,470 samples per moving train-hour instead of 11,343 (16.9 per km of curve instead of
+  221), and the viewer draws every carriage within 0.144 tile of the game at p99 (2.31 before),
+  measured against the game's own positions at every tick.
 - Vehicles keep their heading; players are sent by dead reckoning as before.
 - Recipe and rail removals come from the mined and died events, so nothing new is registered
   for them.
@@ -144,11 +176,13 @@ patched save loads it, with a stub Clusterio API):
   the seam produced at that tick;
 - the debounce bound; a resync sends all 400 charted chunks and ends with `resynced`;
 - two trains, one on a straight track (east, stop, back west), one round a loop built with
-  `LuaRailEnd.get_rail_extensions` (straight, `curved-rail-a`, `curved-rail-b`): every
-  sample sits on the leading carriage at its tick, the polyline of samples stays within
-  0.5 tiles of the true position at every tick (measured 0.20 to 0.30), `car` comes with first sight, stops and the
-  end switch (and starts at the new leading carriage after it), kinds flip from `LCC` to
-  `ccl`, a destroyed train sends one `gone`;
+  `LuaRailEnd.get_rail_extensions` (straight, `curved-rail-a`, `curved-rail-b`), driven at
+  0.01 tiles a tick per tick towards their target speeds: every sample sits on the leading
+  carriage at its tick and carries the speed, and what the viewer draws from the samples
+  (`web/src/movers/track.ts`, history mode) stays within 0.5 tiles of the leading carriage at
+  every tick it moves (up to an end switch's sample the viewer draws the old end), `car`
+  comes with first sight, stops have speed 0, the end switch begins a new rail path at the
+  back stock, kinds flip from `LCC` to `ccl`, a destroyed train sends one `gone`;
 - a third train under a schedule (automatic mode, a temporary stop on a rail): its
   `LuaTrain.path` is a `LuaRailPath` (`size`, `current`, `total_distance`,
   `travelled_distance`, `rails`) while it drives, and its samples follow its line;
@@ -205,6 +239,19 @@ busy machine the baseline tick itself varied 2.3 times between pairs, and the ca
 0.19 to 0.47 ms/tick (0.27 to 0.41 before). The improvement over the earlier version
 reproduces in every run; the absolute budget is not confirmed on a quiet machine or on
 Linux.
+
+The rail path trains (2026-10-21), against the capture before them (`--compare` with
+`git archive 16406fd capture`; each version makes its own save of the map with the same seed,
+since the older capture refuses the newer storage schema), unpinned, 5 pairs: 0.253 ms/tick
+(pairs 0.245 to 0.268) against 0.241 (0.221 to 0.263), whole tick 0.279 against 0.271. On the
+real benchmark map (`bench/railbench`, `railbench.mjs ups --compare`, 74 moving trains, cores
+4-7, 4 pairs): 0.194 ms/tick (0.189 to 0.202) against 0.180 (0.175 to 0.187), more in every
+pair by 0.012 to 0.016; whole tick +0.176 against +0.168. A train read does more (the
+leading carriage's orientation, the odometer, the rail under the end while turning and every
+third read on a straight, the timing check) and sends 3.3 times fewer samples. Reading every
+4 tiles rounded down instead of 5 read 39% more often and cost 0.037 ms/tick more than the
+earlier capture; the timing check set up once per read instead of per buffered read saves
+about 1.5 µs a read (16 buffered reads: 1.8 µs before, `--micro`).
 
 Where a tick goes (`--profile`, which adds about 0.5 µs a wrapped call):
 

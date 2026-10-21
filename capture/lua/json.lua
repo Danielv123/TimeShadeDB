@@ -162,6 +162,27 @@ function json.encode_move(msg)
 				n = n + 1
 				out[n] = ',"es":true'
 			end
+			if e.v then
+				n = n + 1
+				out[n] = ',"v":' .. num(e.v)
+			end
+			if e.ru then
+				n = n + 1
+				out[n] = ',"ru":true'
+			end
+			local rp = e.rp
+			if rp then
+				-- rail pieces: [x, y, direction, kind], whole numbers
+				n = n + 1
+				out[n] = ',"rp":['
+				for k = 1, #rp do
+					local q = rp[k]
+					n = n + 1
+					out[n] = format(k > 1 and ',[%d,%d,%d,%d]' or '[%d,%d,%d,%d]', q[1], q[2], q[3], q[4])
+				end
+				n = n + 1
+				out[n] = "]"
+			end
 			n = n + 1
 			out[n] = "}"
 		else

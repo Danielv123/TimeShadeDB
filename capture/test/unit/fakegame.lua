@@ -27,7 +27,7 @@ function fake.install()
 	for i, n in ipairs(EVENTS) do
 		ev[n] = i
 	end
-	defines = { events = ev }
+	defines = { events = ev, rail_direction = { front = 0, back = 1 } }
 	local world = { surfaces = {}, by_index = {}, forces = {}, trains = {}, vehicles = {}, players = {}, charts = {},
 		tags = {}, entities = {}, regs = 0, encodes = 0 }
 	fake.world = world
@@ -199,22 +199,197 @@ function fake.chart(s, f, x, y, chart)
 	world.charts[key] = chart
 end
 
---- A path: straight east from (0, 0) for L tiles, a quarter circle of radius R turning south, then straight south.
---- Returns f(s) -> x, y, orientation for arc length s (negative s continues west).
-function fake.path_lc(L, R)
-	local quarter = math.pi * R / 2
-	return function(s)
-		if s <= L then
-			return s, 0, 0.25
-		end
-		local a = s - L
-		if a <= quarter then
-			local th = a / R -- 0 .. pi/2, centre at (L, R)
-			return L + R * math.sin(th), R - R * math.cos(th), 0.25 + th / (2 * math.pi)
-		end
-		local b = a - quarter
-		return L + R, R + b, 0.5
+-- Rails (docs/v3/RAIL-GEOMETRY.md): the shapes of curved-rail-a and curved-rail-b for the piece built facing north
+-- (spec 2.4, 2.5), placed by the spec's 8-fold symmetry (2.1).
+local RAIL_R, CURVE_A_LENGTH, CURVE_B_LENGTH = 13, 5.132284556, 5.077891568
+
+local function place8(i8, x, y)
+	if i8 % 2 == 1 then
+		x = -x
 	end
+	if math.floor(i8 / 2) % 2 == 1 then
+		x, y = -y, x
+	end
+	if i8 >= 4 then
+		x, y = -x, -y
+	end
+	return x, y
+end
+
+local function curve_offset(kind, dir, s)
+	local x, y
+	if kind == 1 then
+		local a = s / RAIL_R
+		x, y = RAIL_R * (math.cos(a) - 1), 2 - RAIL_R * math.sin(a)
+	else
+		local a = (CURVE_A_LENGTH + s) / RAIL_R
+		local r = RAIL_R + (s / CURVE_B_LENGTH) * (9 * math.sqrt(2) - RAIL_R)
+		x, y = -11 + r * math.cos(a), 7 - r * math.sin(a)
+	end
+	return place8(math.floor(dir / 2) % 8, x, y)
+end
+
+local STEPS = { [0] = { 0, -1 }, { 1, -2 }, { 1, -1 }, { 2, -1 }, { 1, 0 }, { 2, 1 }, { 1, 1 }, { 1, 2 }, { 0, 1 },
+	{ -1, 2 }, { -1, 1 }, { -2, 1 }, { -1, 0 }, { -2, -1 }, { -1, -1 }, { -1, -2 } }
+
+local next_unit = 10000
+
+--- A rail entity of the fake world: type, direction, position, unit number; s0 and len are its place on a path and
+--- `fwd` whether the path runs it from its front end to its back end. ends = { front, back } as { x, y, direction }.
+local function rail_entity(type, dir, x, y, s0, len, fwd, ends)
+	next_unit = next_unit + 1
+	return object("LuaEntity", { type = type, name = type, direction = dir, position = { x = x, y = y },
+		unit_number = next_unit, s0 = s0, len = len, fwd = fwd, ends = ends })
+end
+
+--- A rail path: straight east along y = 1 from x = -2000 to x = L (2-tile straight-rail pieces), a right turn of
+--- curved-rail-a, curved-rail-b, curved-rail-b, curved-rail-a (a 2.0 quarter turn), then straight south. path.point(s)
+--- gives the point at rail distance s (s = 0 at x = 0 on the first straight) and the unit direction of travel;
+--- path.rails lists the rail entities in order, path.at(s) the one holding s. path_lc's old signature is kept (R unused).
+--- With `ramp` (an even x below L - 16) a rail-ramp takes the 16 tiles of the first straight from x = ramp (in plan
+--- only: its rail distance here is its plan length).
+function fake.path_lc(L, _, ramp)
+	local core = require("core")
+	local path = { rails = {} }
+	local x, y, d = -2000, 1, 4
+	local s = -2000
+	local function add_straight(n)
+		local st = STEPS[d]
+		for _ = 1, n do
+			local x1, y1 = x + 2 * st[1], y + 2 * st[2]
+			-- a straight-rail facing north-south (0) or east-west (4); its front end is the one to the north or east
+			local ew = d == 4 or d == 12
+			local front_first = d == 0 or d == 4 -- runs from its back end towards its front end? (front end ahead)
+			local e = rail_entity("straight-rail", ew and 4 or 0, (x + x1) / 2, (y + y1) / 2, s, 2, not front_first, nil)
+			local back_end = { x, y, (d + 8) % 16 }
+			local front_end = { x1, y1, d }
+			if front_first then
+				e.ends = { front_end, back_end }
+			else
+				e.ends = { back_end, front_end }
+			end
+			path.rails[#path.rails + 1] = e
+			x, y, s = x1, y1, s + 2
+		end
+	end
+	local function add_curve(kind, turn)
+		local want_in, want_out = (d + 8) % 16, (d + turn) % 16
+		for dir = 0, 15 do
+			local en = core.piece_ends(kind, dir)
+			local fwd
+			if en[3] == want_in and en[6] == want_out then
+				fwd = true
+			elseif en[6] == want_in and en[3] == want_out then
+				fwd = false
+			end
+			if fwd ~= nil then
+				local px, py = x - (fwd and en[1] or en[4]), y - (fwd and en[2] or en[5])
+				local len = kind == 1 and CURVE_A_LENGTH or CURVE_B_LENGTH
+				local e = rail_entity(kind == 1 and "curved-rail-a" or "curved-rail-b", dir, px, py, s, len, fwd,
+					{ { px + en[1], py + en[2], en[3] }, { px + en[4], py + en[5], en[6] } })
+				path.rails[#path.rails + 1] = e
+				local out = fwd and e.ends[2] or e.ends[1]
+				x, y, d, s = out[1], out[2], out[3], s + len
+				return
+			end
+		end
+		error("no piece")
+	end
+	local function add_ramp()
+		for dir = 0, 12, 4 do
+			local en = core.piece_ends(4, dir)
+			if en[3] == (d + 8) % 16 then
+				local px, py = x - en[1], y - en[2]
+				local e = rail_entity("rail-ramp", dir, px, py, s, 16, true,
+					{ { px + en[1], py + en[2], en[3] }, { px + en[4], py + en[5], en[6] } })
+				path.rails[#path.rails + 1] = e
+				x, y, s = px + en[4], py + en[5], s + 16
+				return
+			end
+		end
+		error("no ramp")
+	end
+	if ramp then
+		add_straight(math.floor((ramp + 2000) / 2))
+		add_ramp()
+		add_straight(math.floor((L - ramp - 16) / 2))
+	else
+		add_straight(math.floor((L + 2000) / 2))
+	end
+	add_curve(1, 1)
+	add_curve(2, 1)
+	add_curve(2, 1)
+	add_curve(1, 1)
+	add_straight(4000)
+	function path.at(u)
+		local lo, hi = 1, #path.rails
+		while lo < hi do
+			local mid = math.floor((lo + hi + 1) / 2)
+			if path.rails[mid].s0 <= u then
+				lo = mid
+			else
+				hi = mid - 1
+			end
+		end
+		return path.rails[lo], lo
+	end
+	function path.point(u)
+		local r = path.at(u)
+		local q = math.max(0, math.min(r.len, u - r.s0))
+		if r.type == "straight-rail" or r.type == "rail-ramp" then
+			local a, b = r.ends[1], r.ends[2]
+			if not r.fwd then
+				a, b = b, a
+			end
+			local f, l = q / r.len, r.len
+			return a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, (b[1] - a[1]) / l, (b[2] - a[2]) / l
+		end
+		local sq = r.fwd and q or r.len - q
+		local ox, oy = curve_offset(r.type == "curved-rail-a" and 1 or 2, r.direction, sq)
+		local h = 1e-4
+		local ax, ay = curve_offset(r.type == "curved-rail-a" and 1 or 2, r.direction, math.max(0, sq - h))
+		local bx, by = curve_offset(r.type == "curved-rail-a" and 1 or 2, r.direction, math.min(r.len, sq + h))
+		local tx, ty = bx - ax, by - ay
+		local l = math.sqrt(tx * tx + ty * ty)
+		if not r.fwd then
+			tx, ty = -tx, -ty
+		end
+		return r.position.x + ox, r.position.y + oy, tx / l, ty / l
+	end
+	path.straight_end = math.floor((L + 2000) / 2) * 2 - 2000 -- where the turn begins
+	return path
+end
+
+--- The rail end of rail i of path p ahead of travel along the path (`ahead`) or behind it, as a LuaRailEnd (rail,
+--- direction, location, make_copy, flip_direction, move_natural; the path has no junctions).
+local function rail_end(p, i, ahead)
+	local le = {}
+	local function set()
+		local r = p.rails[i]
+		-- the front end is ends[1]; a rail run front to back (fwd) has its back end ahead
+		local back = r.fwd == ahead
+		local e = back and r.ends[2] or r.ends[1]
+		le.rail, le.direction = r, back and 1 or 0
+		le.location = { position = { x = e[1], y = e[2] }, direction = e[3] }
+	end
+	le.make_copy = function()
+		return rail_end(p, i, ahead)
+	end
+	le.flip_direction = function()
+		ahead = not ahead
+		set()
+	end
+	le.move_natural = function()
+		local j = i + (ahead and 1 or -1)
+		if not p.rails[j] then
+			return false
+		end
+		i = j
+		set()
+		return true
+	end
+	set()
+	return le
 end
 
 --- A train of `kinds` (e.g. "LCC") on surface s along path, its front carriage at arc length pos; carriages 7 tiles
@@ -237,13 +412,34 @@ function fake.train(s, kinds, path, pos)
 	return tr
 end
 
---- Put train tr's front carriage at arc length pos.
+--- Put train tr's leading joint at rail distance pos of its path: every carriage's joints 4 apart, carriages 7 apart
+--- (RAIL-GEOMETRY.md 3); its rail ends and get_rails follow.
 function fake.place(tr, pos)
 	tr.pos = pos
+	local path = tr.path_fn
+	local n = #tr.carriages
 	for i, c in ipairs(tr.carriages) do
-		local x, y, o = tr.path_fn(pos - (i - 1) * 7)
-		c.position = { x = x, y = y }
+		local uf = pos - (i - 1) * 7
+		local fx, fy = path.point(uf)
+		local bx, by = path.point(uf - 4)
+		c.position = { x = (fx + bx) / 2, y = (fy + by) / 2 }
+		local o = (math.atan(fx - bx, by - fy) / (2 * math.pi)) % 1
+		if not c.is_headed_to_trains_front then
+			o = (o + 0.5) % 1
+		end
 		c.orientation = o
+	end
+	local back = pos - 7 * (n - 1) - 4
+	tr.front_end = rail_end(path, select(2, path.at(pos)), true)
+	tr.back_end = rail_end(path, select(2, path.at(back)), false)
+	tr.get_rails = function()
+		local out = {}
+		local _, i0 = path.at(pos)
+		local _, i1 = path.at(back)
+		for i = i0, i1, -1 do
+			out[#out + 1] = path.rails[i]
+		end
+		return out
 	end
 end
 

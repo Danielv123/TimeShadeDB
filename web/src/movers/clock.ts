@@ -22,9 +22,23 @@ export const DELAY_HYSTERESIS_MS = 250;
  * (when its segment can be interpolated instead of extrapolated). The delay also covers
  * this quantile of it, up to READY_CAP_MS, because extrapolating a mover whose next sample
  * is not known yet is where drawn trains leave the rails and then have to be corrected.
- * Measured on the illisis test data (live model): see web/src/movers/README.md.
+ * Measured on the illisis test data (live model): see web/src/movers/README.md. With rows of
+ * the rail path model, until the first readiness is observed the delay is at least the
+ * prior of railPrior: that capture samples a moving train at least every 120 ticks at game
+ * speed 1 (60 below speed 0.5; capture/README.md) and posts about once a second, so the next
+ * sample of a train is that late at worst; with only arrival lags the viewer ran trains off
+ * the rails for their first seconds.
  */
-export const delayConfig = { readyQuantile: 0.95, readyCapMs: 6000, readyMarginMs: 250 };
+export const delayConfig = { readyQuantile: 0.95, readyCapMs: 6000, readyMarginMs: 250, readyPriorMs: 3500 };
+
+/**
+ * The readiness prior holds until this many readiness lags were observed: the first ones come
+ * from samples a few ticks apart (a first sight right after a load's resync) and say little.
+ */
+const PRIOR_UNTIL = 32;
+
+/** The rail path capture's longest wait between samples of a moving train (ticks at game speed 1). */
+export const RAIL_LIVE_GAP_TICKS = 120;
 
 /**
  * Collects arrival lags (data-clock time at arrival minus the row's time) of live rows and
@@ -43,6 +57,9 @@ export class DelayEstimator {
   private current_: number;
   private goal: number;
   private lastUpdate: number | null = null;
+
+  /** The readiness prior once rows of the rail path model were seen (railPrior), else 0. */
+  private prior = 0;
 
   /** `initial` is used until lags are observed (e.g. 2 s for the server, 2 x live_ms for static exports). */
   constructor(initial = 2000, size = 1024) {
@@ -64,6 +81,27 @@ export class DelayEstimator {
     this.readyNext = (this.readyNext + 1) % this.ready.length;
     this.readyN = Math.min(this.readyN + 1, this.ready.length);
     this.readySorted = null;
+  }
+
+  /**
+   * Rows of the rail path model (F_RAIL) arrived, from a game running `ticksPerMs` ticks a
+   * millisecond (NaN: unknown, taken as 60 a second): until PRIOR_UNTIL readiness lags are
+   * observed the delay is at least the capture's longest wait between samples of a moving train in real time
+   * plus delayConfig.readyPriorMs - 2 s for posting (3.5 s at game speed 1, the cap at 0.2),
+   * at once (displayed time steps back, before any mover has been interpolated).
+   */
+  railPrior(ticksPerMs = NaN): void {
+    const speed = Number.isFinite(ticksPerMs) && ticksPerMs > 0 ? (ticksPerMs * 1000) / 60 : 1;
+    const gapMs = (RAIL_LIVE_GAP_TICKS * Math.max(0.5, Math.min(1, speed)) * 1000) / (60 * speed);
+    const prior = Math.min(delayConfig.readyCapMs, gapMs + delayConfig.readyPriorMs - 2000);
+    if (prior <= this.prior) {
+      return;
+    }
+    this.prior = prior;
+    if (this.readyN < PRIOR_UNTIL && this.current_ < prior) {
+      this.current_ = clamp(prior);
+      this.goal = this.current_;
+    }
   }
 
   /** The q-quantile of the readiness lags, or NaN without observations. */
@@ -122,6 +160,9 @@ export class DelayEstimator {
     const r = this.readyQuantile(delayConfig.readyQuantile);
     if (!Number.isNaN(r)) {
       d = Math.max(d, Math.min(delayConfig.readyCapMs, r + delayConfig.readyMarginMs));
+    }
+    if (this.prior > 0 && this.readyN < PRIOR_UNTIL) {
+      d = Math.max(d, this.prior);
     }
     return clamp(d);
   }

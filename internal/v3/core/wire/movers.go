@@ -12,14 +12,21 @@ import (
 const (
 	// MoverHasTicks: the tick column holds data (at least one row has a tick).
 	MoverHasTicks uint16 = 1 << 0
+	// MoverHasRail: the speed and rail path columns follow the eight base columns (at
+	// least one row has core.FlagRail).
+	MoverHasRail uint16 = 1 << 1
 )
 
 // wireHasCarriages is the row-flag bit that marks a carriage block in the carriage
-// column. It exists only on the wire; core.MoverFlags uses bits 0-5.
+// column. It exists only on the wire; core.MoverFlags uses bits 0-5 and 7.
 const wireHasCarriages = 1 << 6
 
-// MoverColumns is the number of row columns after the mover table.
-const MoverColumns = 8
+// MoverColumns is the number of base row columns after the mover table; windows with
+// MoverHasRail have MoverRailColumns more.
+const (
+	MoverColumns     = 8
+	MoverRailColumns = 2
+)
 
 // MaxCarriages is the largest carriage count of one row that DecodeMoverWindow accepts.
 // Stores must reject samples with more, or they write windows they cannot read back.
@@ -92,25 +99,32 @@ func EncodeMoverWindow(w *core.MoverWindow) ([]byte, error) {
 				return nil, fmt.Errorf("wire: rows not sorted by (mover, t) at %d", i)
 			}
 		}
-		if r.Flags&(wireHasCarriages|0x80) != 0 {
+		if r.Flags&wireHasCarriages != 0 {
 			return nil, fmt.Errorf("wire: row %d uses reserved flag bits", i)
+		}
+		if r.Flags&core.FlagRail != 0 && len(r.Rail) > core.MaxRailPieces {
+			return nil, fmt.Errorf("wire: row %d has %d rail pieces", i, len(r.Rail))
 		}
 		counts[r.Mover]++
 		if r.Flags&core.FlagNoTick == 0 {
 			flags |= MoverHasTicks
 		}
+		if r.Flags&(core.FlagRail|core.FlagGone) == core.FlagRail {
+			flags |= MoverHasRail
+		}
 	}
-	var cols [MoverColumns]colWriter
+	var cols [MoverColumns + MoverRailColumns]colWriter
 	cCount, cDT, cTick, cX, cY, cO, cFlags, cCar := &cols[0], &cols[1], &cols[2], &cols[3], &cols[4], &cols[5], &cols[6], &cols[7]
+	cSpeed, cRail := &cols[8], &cols[9]
 	for _, n := range counts {
 		cCount.uvarint(n)
 	}
 	var prevT core.TimeMs
-	var prevTick, prevX, prevY int64
+	var prevTick, prevX, prevY, prevSpeed int64
 	var prevO uint16
 	for i, r := range w.Rows {
 		if i == 0 || r.Mover != w.Rows[i-1].Mover {
-			prevT, prevTick, prevX, prevY, prevO = w.Start, 0, 0, 0, 0
+			prevT, prevTick, prevX, prevY, prevO, prevSpeed = w.Start, 0, 0, 0, 0, 0
 		}
 		cDT.varint(int64(r.T - prevT))
 		prevT = r.T
@@ -127,7 +141,7 @@ func EncodeMoverWindow(w *core.MoverWindow) ([]byte, error) {
 			cX.varint(0)
 			cY.varint(0)
 			cO.varint(0)
-			cFlags.b = append(cFlags.b, f)
+			cFlags.b = append(cFlags.b, f&^byte(core.FlagRail))
 			continue
 		}
 		x, y := core.QuantizePos(r.X), core.QuantizePos(r.Y)
@@ -145,10 +159,35 @@ func EncodeMoverWindow(w *core.MoverWindow) ([]byte, error) {
 				cCar.uvarint(uint64(core.QuantizeOrientation(c.Orientation)))
 			}
 		}
+		if r.Flags&core.FlagRail != 0 {
+			// The speed as a difference from the previous rail row of the entry; the rail
+			// entry as uvarint (pieces << 1 | rail start), then each piece's tile position
+			// as a difference from the previous piece (the first from the row's tile) and
+			// a byte kind << 4 | direction.
+			sp := int64(core.QuantizeSpeed(r.Speed))
+			cSpeed.varint(sp - prevSpeed)
+			prevSpeed = sp
+			n := uint64(len(r.Rail)) << 1
+			if r.RailStart {
+				n |= 1
+			}
+			cRail.uvarint(n)
+			px, py := x>>4, y>>4
+			for _, p := range r.Rail {
+				cRail.varint(int64(p.X) - px)
+				cRail.varint(int64(p.Y) - py)
+				cRail.b = append(cRail.b, p.Kind<<4|p.Dir&15)
+				px, py = int64(p.X), int64(p.Y)
+			}
+		}
 		cFlags.b = append(cFlags.b, f)
 	}
+	ncols := MoverColumns
+	if flags&MoverHasRail != 0 {
+		ncols += MoverRailColumns
+	}
 	size := 32 + len(meta)
-	for i := range cols {
+	for i := range ncols {
 		size += 4 + len(cols[i].b)
 	}
 	out := make([]byte, 32, size)
@@ -162,7 +201,7 @@ func EncodeMoverWindow(w *core.MoverWindow) ([]byte, error) {
 	binary.LittleEndian.PutUint32(out[24:], uint32(len(w.Rows)))
 	binary.LittleEndian.PutUint32(out[28:], uint32(len(meta)))
 	out = append(out, meta...)
-	for i := range cols {
+	for i := range ncols {
 		out = binary.LittleEndian.AppendUint32(out, uint32(len(cols[i].b)))
 		out = append(out, cols[i].b...)
 	}
@@ -202,8 +241,12 @@ func DecodeMoverWindow(b []byte, sfc core.SurfaceKey) (*core.MoverWindow, error)
 		return nil, fmt.Errorf("%w: %d movers in table, header says %d", ErrFormat, len(w.Movers), nMovers)
 	}
 	off += metaLen
-	var cols [MoverColumns]colReader
-	for i := range cols {
+	ncols := MoverColumns
+	if flags&MoverHasRail != 0 {
+		ncols += MoverRailColumns
+	}
+	var cols [MoverColumns + MoverRailColumns]colReader
+	for i := range ncols {
 		if len(b)-off < 4 {
 			return nil, fmt.Errorf("%w: missing column %d", ErrFormat, i)
 		}
@@ -219,13 +262,14 @@ func DecodeMoverWindow(b []byte, sfc core.SurfaceKey) (*core.MoverWindow, error)
 		return nil, fmt.Errorf("%w: %d trailing bytes", ErrFormat, len(b)-off)
 	}
 	cCount, cDT, cTick, cX, cY, cO, cFlags, cCar := &cols[0], &cols[1], &cols[2], &cols[3], &cols[4], &cols[5], &cols[6], &cols[7]
+	cSpeed, cRail := &cols[8], &cols[9]
 	w.Rows = make([]core.MoverRow, 0, nRows)
 	for m := 0; m < nMovers; m++ {
 		n := int(cCount.uvarint())
 		if n > nRows-len(w.Rows) {
 			return nil, fmt.Errorf("%w: row counts exceed %d rows", ErrFormat, nRows)
 		}
-		prevT, prevTick, prevX, prevY, prevO := w.Start, int64(0), int64(0), int64(0), uint16(0)
+		prevT, prevTick, prevX, prevY, prevO, prevSpeed := w.Start, int64(0), int64(0), int64(0), uint16(0), int64(0)
 		for k := 0; k < n; k++ {
 			r := core.MoverRow{Mover: m}
 			prevT += core.TimeMs(cDT.varint())
@@ -262,10 +306,35 @@ func DecodeMoverWindow(b []byte, sfc core.SurfaceKey) (*core.MoverWindow, error)
 					r.Carriages[i] = core.Carriage{X: float64(cx) / core.PosUnits, Y: float64(cy) / core.PosUnits, Orientation: float64(co) / core.OrientUnits}
 				}
 			}
+			if r.Flags&core.FlagRail != 0 && r.Flags&core.FlagGone == 0 {
+				if flags&MoverHasRail == 0 {
+					return nil, fmt.Errorf("%w: rail row without rail columns", ErrFormat)
+				}
+				prevSpeed += cSpeed.varint()
+				r.Speed = float64(prevSpeed) / core.SpeedUnits
+				head := cRail.uvarint()
+				np := head >> 1
+				if np > core.MaxRailPieces {
+					return nil, fmt.Errorf("%w: %d rail pieces", ErrFormat, np)
+				}
+				r.RailStart = head&1 != 0
+				if np > 0 {
+					r.Rail = make([]core.RailPiece, np)
+					px, py := prevX>>4, prevY>>4
+					for i := range r.Rail {
+						px += cRail.varint()
+						py += cRail.varint()
+						kd := cRail.byte()
+						r.Rail[i] = core.RailPiece{X: int32(px), Y: int32(py), Dir: kd & 15, Kind: kd >> 4}
+					}
+				}
+			} else {
+				r.Flags &^= core.FlagRail
+			}
 			w.Rows = append(w.Rows, r)
 		}
 	}
-	for i := range cols {
+	for i := range ncols {
 		if cols[i].err != nil {
 			return nil, cols[i].err
 		}

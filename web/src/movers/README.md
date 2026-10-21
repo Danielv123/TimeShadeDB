@@ -7,8 +7,9 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
 
 | File | Role |
 |---|---|
-| `track.ts` | Samples per journey; segment rules (gaps, gones, handoffs, end switches); derived velocities; head position; body path; carriage placement |
-| `segment.ts` | Geometry between two samples: line+arc or arc+line where it fits, cubic Hermite otherwise; arc-length timing |
+| `track.ts` | Samples per journey; rail runs of rail path samples; segment rules (gaps, gones, handoffs, end switches); derived velocities; head position; body path; carriage placement |
+| `railpath.ts` | The rail path model (docs/v3/RAIL-GEOMETRY.md 8): piece shapes and ends, the chain of a run, projection, carriage placement, the timing model |
+| `segment.ts` | Geometry between two samples without a rail path: line+arc or arc+line where it fits, cubic Hermite otherwise; arc-length timing |
 | `hermite.ts` | Hermite basis, orientation helpers, arc-length polyline |
 | `view.ts` | `MoverView`: tracks fed from windows and events, per-frame evaluation, never-snap corrections, trimming |
 | `clock.ts` | `DelayEstimator` (adaptive live delay and data horizon), `DataClock` |
@@ -21,11 +22,46 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
 
 ## How a train is drawn
 
+0. **Rail path samples.** A train sample with a speed (`F_RAIL`; PROTOCOL.md 3.1 `v`, `rp`,
+   `ru`) comes from the v3 capture's rail path model (docs/v3/RAIL-GEOMETRY.md 8). The track
+   groups such samples into runs (`railRuns`): a run begins at a sample with `ru`, after a
+   sample of another kind, at an end switch, or where a listed piece does not continue the
+   run's path; its chain (`railpath.ts`) is the curved pieces and ramps of its samples joined
+   by straight lines, the exact rail centre line. Each sample's leading joint (its centre plus
+   2 tiles along its own orientation) is projected onto the chain, in order and no further
+   than its speeds allow, so a train that comes back past a place is not put on its later
+   pass. Between two samples of a run the leading joint's rail distance follows the timing
+   model (stand-then-accelerate from a stop, brake-then-stand into one, else a cubic Hermite
+   in time with the captured speeds), the head is the midpoint of the joints at that rail
+   distance and 4 behind it, and every carriage sits on the chain at its joint distances
+   (`placeRailCarriages`; pitches within a quarter tile of 7 are taken as 7). Past the newest
+   sample the head runs on along the chain at its speed, braking to a stop when the last two
+   speeds fell, within the caps of step 4; ahead of the newest piece the chain is the straight
+   it ended on. A stop sample links to the start however long the train stood; it and the start
+   list the pieces under the whole train (those already on the chain are resends), so a parked
+   train drawn from its stop sample alone (a keyframe, the live payload) is on its rails. Carriages
+   are placed by vanilla joint distances (4 and 3, RAIL-GEOMETRY.md 8.2). A new run whose
+   pieces reach back to the sample before it (a first sight after a resync, a missed piece)
+   links that segment on its chain. Each sample is placed no further along than its speeds
+   allow and, among equally near points, nearest where they put it; a run's first sample no
+   earlier than its last listed piece (on loops and straights used both ways the path passes
+   a place more than once). Trimming (step 9) makes the first kept rail sample a run start
+   with the pieces of its chain under the body behind it, and the one older sample kept for
+   its carriage geometry stays out of the run. Everything below applies to other samples
+   (imported data, older captures) and to segments a run does not cover.
 1. **Delay behind live.** In live mode the drawn time is `now - delay`. The delay is the
    larger of the p99 of measured arrival lags plus 0.5 s (PLAN §4.8) and the p95 of
-   *readiness* plus 0.25 s, capped at 6 s. Readiness is, for a moving mover, the time from a
+   *readiness* plus 0.25 s, capped at 6 s. With rail path samples the delay is at least a
+   prior until 32 readiness lags were observed, set at once when the first such sample
+   arrives (`DelayEstimator.railPrior`): the capture's longest wait between samples of a
+   moving train in real time (120 ticks, 60 below game speed 0.5, at the game's tick rate)
+   plus 1.5 s, 3.5 s at speed 1 and the 6 s cap at speed 0.2. Without it a viewer that had
+   only arrival lags (and the readiness of samples a few ticks apart at a load) ran trains
+   off the rails for their first seconds. Readiness is, for a moving mover, the time from a
    sample until the next one has arrived: past it the segment can be interpolated instead of
-   extrapolated. The plan's rule alone extrapolates often on the test data, because MVW3
+   extrapolated. A rail path stop sample is not counted (the rail path holds the train there
+   until it starts; with a few samples a train-km, the station stops alone were more than 5%
+   of the lags and raised the delay on the benchmark map from 3.2 s to 4.5 s at p50). The plan's rule alone extrapolates often on the test data, because MVW3
    stores no velocity, so the viewer cannot dead-reckon as well as the illisis capture's own
    emit rule assumes (see Evaluating). The delay is clamped to 0.5-30 s, drops only when the
    estimate falls 250 ms below it, grows by at most 20% of elapsed time (time slows to 0.8x)

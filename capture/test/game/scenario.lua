@@ -146,7 +146,7 @@ function T.init(cfg)
 	car.get_fuel_inventory().insert{ name = "coal", count = 10 }
 	local asm = s.create_entity{ name = "assembling-machine-1", position = { 10.5, -60.5 }, force = "player",
 		recipe = "iron-gear-wheel" }
-	storage.t = { a = a, b = b, c = c, car = car, asm = asm, checks = checks, truth = {}, b_rails = {} }
+	storage.t = { a = a, b = b, b_id0 = b.id, c = c, car = car, asm = asm, checks = checks, truth = {}, b_rails = {} }
 	-- 2.0 train API checks
 	checks.train = {
 		front_end = a.front_end and a.front_end.object_name, back_end = a.back_end and a.back_end.object_name,
@@ -170,9 +170,11 @@ local function s_rail(x, y)
 	return game.get_surface(SURFACE).find_entities_filtered{ name = "straight-rail", position = { x, y }, radius = 1 }[1]
 end
 
+--- Drive train tr towards speed v at 0.01 tiles a tick per tick, as a train accelerates and brakes (a speed that jumps
+--- is no motion a game makes).
 local function speed(tr, v)
 	if tr and tr.valid then
-		tr.speed = v
+		tr.speed = tr.speed + math.max(-0.01, math.min(0.01, v - tr.speed))
 	end
 end
 
@@ -206,16 +208,43 @@ function T.tick(api, cfg, t)
 	elseif t > 1000 then
 		speed(g.a, 0)
 	end
-	-- train B round the loop
-	if t >= 100 and t <= 1800 then
+	-- train B round the loop; after 1700 it brakes once its leading end is on a curved rail, so it stands on the curve
+	-- (its stop sample alone must place it); 20 ticks after it stands its locomotive is taken off (a changed train: the
+	-- wagon keeps the journey and its leading carriage is 7 tiles back), and the wagon drives on for 60 ticks and stops
+	if t >= 100 and t <= 1700 then
 		speed(g.b, 0.4)
 		if g.b.valid and t % 10 == 0 then
 			for _, r in pairs(g.b.get_rails()) do
 				g.b_rails[r.type] = (g.b_rails[r.type] or 0) + 1
 			end
 		end
-	elseif t > 1800 then
-		speed(g.b, 0)
+	elseif t > 1700 and g.b.valid then
+		if not g.b_phase then
+			if g.b.front_end.rail.type:find("curved") then
+				g.b_phase = "brake"
+			end
+		elseif g.b_phase == "brake" and g.b.speed == 0 then
+			g.b_phase, g.b_at = "stood", t
+		elseif g.b_phase == "stood" and t >= g.b_at + 20 then
+			local under = {}
+			local rails = g.b.get_rails()
+			for i = #rails, 1, -1 do
+				local r = rails[i]
+				if r.type ~= "straight-rail" and r.type ~= "half-diagonal-rail" then
+					under[#under + 1] = { r.position.x, r.position.y, r.direction, r.type }
+				end
+			end
+			local f, b = g.b.front_stock.position, g.b.back_stock.position
+			g.b_stop = { tick = t, front = { f.x, f.y }, back = { b.x, b.y }, under = under }
+			local wagon = g.b.back_stock
+			g.b.front_stock.destroy{ raise_destroy = true }
+			g.b = wagon.train
+			g.b_phase, g.b_at = "rest", t
+			g.b_stop.rest_n = #g.b.carriages
+		elseif g.b_phase == "rest" and t >= g.b_at + 60 then
+			g.b_phase = "end"
+		end
+		speed(g.b, (not g.b_phase and 0.4) or (g.b_phase == "rest" and t > g.b_at and 0.3) or 0)
 	end
 	if t >= 100 and t <= 400 and g.car.valid then
 		g.car.speed = 0.2
@@ -285,7 +314,7 @@ function T.tick(api, cfg, t)
 		local res = { checks = g.checks, b_rails = g.b_rails, removed_rail = g.removed_rail, asm2 = g.asm2,
 			a_id = g.a.valid and g.a.id, c_id = g.c.valid and g.c.id, c_x = g.c.valid and g.c.front_stock.position.x,
 			car_unit = g.car.unit_number, asm_unit = g.asm.valid and g.asm.unit_number,
-			b_gone_id = g.b_gone_id }
+			b_gone_id = g.b_gone_id, b_id0 = g.b_id0, b_stop = g.b_stop }
 		if api.stats then
 			res.stats = api.stats()
 		end

@@ -195,7 +195,17 @@ export const MoverFlag = {
   EndSwitch: 1 << 3,
   NoTick: 1 << 4,
   NoHeading: 1 << 5,
+  /** A rail path sample (RAIL-GEOMETRY.md 8): o is the leading carriage's own orientation, speed and rail are set. */
+  Rail: 1 << 7,
 } as const;
+
+/** A curved rail piece or ramp of a train's rail path (PROTOCOL.md 3.1 `rp`). */
+export interface RailPiece {
+  x: number;
+  y: number;
+  dir: number;
+  kind: number;
+}
 
 export interface Carriage {
   x: number;
@@ -215,6 +225,10 @@ export interface MoverRow {
   o: number;
   flags: number;
   carriages: Carriage[] | null;
+  /** With MoverFlag.Rail: the train's speed (tiles a tick), the rail pieces since the previous row, and whether a new rail path begins here. */
+  speed?: number;
+  rail?: RailPiece[] | null;
+  railStart?: boolean;
 }
 
 export const WindowKind = { Closed: 1, Keyframe: 2, Live: 3 } as const;
@@ -301,8 +315,13 @@ export interface LiveHorizonEvent {
   now: TimeMs;
 }
 
-/** [entry, t, tick | null, x, y, o, flags, carriages | null]; entry indexes `movers`. */
-export type LiveMoverRow = [number, TimeMs, number | null, number, number, number, number, [number, number, number][] | null];
+/**
+ * [entry, t, tick | null, x, y, o, flags, carriages | null], and for rail path rows (MoverFlag.Rail)
+ * also [speed, rail pieces as [x, y, dir, kind] | null, rail start]; entry indexes `movers`.
+ */
+export type LiveMoverRow =
+  | [number, TimeMs, number | null, number, number, number, number, [number, number, number][] | null]
+  | [number, TimeMs, number | null, number, number, number, number, [number, number, number][] | null, number, [number, number, number, number][] | null, boolean];
 
 export interface LiveMoversEvent {
   sfc: string;

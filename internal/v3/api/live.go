@@ -337,7 +337,11 @@ func (n *notifier) SamplesApplied(samples []core.MoverSample) {
 			}
 			cars = cs
 		}
-		g.ev.Rows = append(g.ev.Rows, []any{e, q.T, tick, q.X, q.Y, q.Orientation, int(q.Flags), cars})
+		row := []any{e, q.T, tick, q.X, q.Y, q.Orientation, int(q.Flags), cars}
+		if q.Flags&core.FlagRail != 0 {
+			row = append(row, q.Speed, railJSON(q.Rail), q.RailStart)
+		}
+		g.ev.Rows = append(g.ev.Rows, row)
 	}
 	for _, g := range groups {
 		if len(g.ev.Rows) > 0 {
@@ -591,4 +595,16 @@ func (s *Server) checkCatalogWith(infos []core.DatastoreInfo, surfaces []core.Su
 			s.hub.publish("", "", event("catalog", map[string]any{"now": s.cfg.Clock()}))
 		}
 	}
+}
+
+// railJSON is a rail path row's pieces as [[x, y, direction, kind], ...], or nil.
+func railJSON(rail []core.RailPiece) any {
+	if len(rail) == 0 {
+		return nil
+	}
+	out := make([][4]int, len(rail))
+	for i, p := range rail {
+		out[i] = [4]int{int(p.X), int(p.Y), int(p.Dir), int(p.Kind)}
+	}
+	return out
 }

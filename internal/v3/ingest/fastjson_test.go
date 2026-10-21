@@ -65,6 +65,8 @@ var fastMsgCases = []struct {
 	{`{"type":"chunk","s":"nauvis","f":"player","x":null,"y":2}`, true},
 	{`{"type":"move","s":"nauvis","m":[{"j":"5.1.7","k":"t","f":"player","name":"locomotive","x":1.5,"y":2.5,"h":0.25,"n":2,"o":"LC","stop":true,"car":[[1.5,2.5,0.25],[1.5,9.5,0.25]]},{"j":"p:bob","k":"p","x":4,"y":4,"tick":590},{"j":"9","gone":true}]}`, true},
 	{`{"type":"move","s":"nauvis","m":[]}`, true},
+	{`{"type":"move","s":"nauvis","m":[{"j":"5.1.7","k":"t","x":1,"y":2,"h":0.25,"v":0.4375,"ru":true,"rp":[[-1067,-764,0,1],[12,300,15,4]]}]}`, true},
+	{`{"type":"move","s":"nauvis","m":[{"j":"5.1.7","rp":[]}]}`, true},
 	{`{"type":"move","s":"nauvis","m":null}`, true},
 	{`{"type":"move","s":"nauvis","m":[{"j":"1","car":[]}]}`, true},
 	{`{"type":"move","s":"nauvis","m":[{"j":"1","es":false,"stop":null,"h":null}]}`, true},
@@ -91,6 +93,8 @@ var fastMsgCases = []struct {
 	{`{"dir":-0}`, false}, // found by FuzzFastJSON: encoding/json rejects -0 for uint8
 	{`{"type":"surfaces","list":[{"name":"nauvis","tile":true}],"created":true}`, false},
 	{`{"type":"move","m":[{"j":"1","car":[[1,2]]}]}`, false},
+	{`{"type":"move","m":[{"j":"1","rp":[[1,2,3]]}]}`, false},
+	{`{"type":"move","m":[{"j":"1","rp":[[1.5,2,3,1]]}]}`, false},
 	{`{"type":"move","m":[null]}`, false},
 	{`{"type":"move","m":[{"j":"1"}],"m":[{"j":"2"}]}`, false},
 	{`{"type":"move","m":[{"j":"1","extra":1}]}`, false},

@@ -2,7 +2,8 @@
 -- Ported from illisis/minimap module/capture_core.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
 -- Pure rules of the TimeShadeDB capture (docs/v3/PROTOCOL.md): constants, the gridworld clip, chunk keys, FIFO
--- queues, the chart debounce, the bounded chart cache, train emission (chord, heading, heartbeat), dead reckoning for
+-- queues, the chart debounce, the bounded chart cache, train emission (the timing model along the rail path, rail piece
+-- ends, docs/v3/RAIL-GEOMETRY.md), dead reckoning for
 -- vehicles and players, journeys, the byte-exact line cut, and the storage migrations. State comes in as arguments and
 -- no Factorio global is touched, so these run in plain Lua (capture/test/run_unit.mjs) as well as in the game.
 --
@@ -28,15 +29,19 @@ core.RAW_QUEUE = 256 -- a chunk re-queued behind this many reads drops its raw c
 core.WALK = 8 -- movers polled a tick
 core.SCAN = 30 -- ticks at least from one scan to the next
 core.EPS = 1 -- tiles off the dead-reckoned prediction before a vehicle or player sample
-core.STEP = 4 -- tiles a moving train goes between reads
-core.SLOW = 120 -- the longest wait between reads of a crawling train
+core.STEP = 5 -- tiles a moving train goes at most between reads (less than the shortest curved piece, 5.078)
+core.SLOW = 30 -- the longest wait between reads of a moving train (a crawling or just started one)
 core.WHEEL = 128 -- slots of the wheel of due reads; more than core.SLOW
 core.FAST = 32 -- train reads a tick at most
 core.HEARTBEAT = 600 -- ticks from a mover's sample to its next while nothing else asks for one
-core.CHORD_EPS = 0.25 -- tiles a read may lie off the chord from the last sample to the current read (trains)
-core.SED_EPS = 1 -- tiles a read may lie off its time-interpolated place on that chord (trains)
-core.HEAD_EPS = 2 / 360 -- orientation change since the last sample that sends one (trains; about 2 degrees)
-core.BUF_MAX = 16 -- reads kept since a train's last sample; a full buffer sends one
+core.TIME_EPS = 0.1 -- rail distance a train's read may lie off the timing model from the last sample to the current read
+core.BUF_MAX = 16 -- reads kept since a train's last sample for that check; a full buffer keeps every other one
+core.RP_MAX = 32 -- rail pieces a train sample lists; a train that entered this many since its last sample sends one
+core.RP_START_MAX = 120 -- rail pieces under the train a sample lists where a new rail path begins (fewer with `car`)
+core.FILL_MAX = 64 -- rails a train's read walks back to find a curved piece it passed unseen (a read came late)
+core.RAMP_READS = 3 -- on a straight a train's read looks at the rail under its leading joint every this many reads (ramps)
+core.SEEN_MAX = 12 -- rails a turning train's read walks back over a straight to find a piece the reads between missed
+core.LIVE_GAP = 120 -- ticks at game speed 1 a moving train goes without a sample at most, so live viewers stay ~2 s behind
 core.CAR_MAX = 100 -- carriages listed in `car`; with 200 kinds and a 200-byte name a sample stays under a line
 
 -- Transport.
@@ -350,9 +355,18 @@ function core.forward(prev, speed)
 	return prev ~= false
 end
 
---- Ticks until a train at `speed` (tiles a tick, not 0) is read again: core.STEP tiles on, within [1, core.SLOW].
-function core.next_read(speed)
-	return math.min(core.SLOW, math.max(1, math.ceil(core.STEP / math.abs(speed))))
+--- Ticks until a train at `speed` (tiles a tick, not 0), accelerating by `accel` (tiles a tick per tick, or nil), is
+--- read again: before it has gone more than core.STEP tiles (rounded down, so a train at 1.3 tiles a tick is read every
+--- 3 ticks, not 4), within [1, core.SLOW]. No curved piece may pass between two reads (docs/v3/RAIL-GEOMETRY.md 8). With
+--- 5 tiles a train is read about as often as with the 2026-10 rule (4 tiles rounded up); 4 rounded down read 39% more on
+--- the benchmark map.
+function core.next_read(speed, accel)
+	local v = math.abs(speed)
+	local w = core.STEP / v
+	if accel and accel > 1e-6 then
+		w = (math.sqrt(v * v + 2 * accel * core.STEP) - v) / accel
+	end
+	return math.min(core.SLOW, math.max(1, math.floor(w)))
 end
 
 local SCALE = { [0] = 1, 10, 100, 1000 }
@@ -414,47 +428,175 @@ function core.poll(m, x, y, si, tick, how)
 	return due
 end
 
---- Whether some buffered read lies too far from the chord e -> c: more than core.CHORD_EPS off the line, or more than
---- core.SED_EPS off where linear motion in time along the chord puts it (synchronised distance).
-function core.off_chord(e, buf, c)
-	local ex0, ey0, et0 = e.x, e.y, e.t
-	local dx, dy, dt = c.x - ex0, c.y - ey0, c.t - et0
-	local len2 = dx * dx + dy * dy
-	-- squared distances against squared limits: the same test without a square root per read (this runs for every
-	-- buffered read at every train read)
-	local chord2, sed2 = core.CHORD_EPS * core.CHORD_EPS, core.SED_EPS * core.SED_EPS
-	local lim = chord2 * len2
-	for i = 1, #buf do
-		local p = buf[i]
-		local px, py = p.x - ex0, p.y - ey0
-		if len2 < 1e-12 then
-			if px * px + py * py > chord2 then
-				return true
+-- Rail pieces (docs/v3/RAIL-GEOMETRY.md 2 and 8). The capture records the curved pieces and ramps a train's leading
+-- joint enters; between them rails are straight. Kinds as PROTOCOL.md 3.1 `rp`: elevated pieces share the ground ones'.
+core.RAIL_KINDS = { ["curved-rail-a"] = 1, ["elevated-curved-rail-a"] = 1, ["curved-rail-b"] = 2,
+	["elevated-curved-rail-b"] = 2, ["legacy-curved-rail"] = 3, ["rail-ramp"] = 4 }
+
+-- Each kind's ends for the piece built facing north (direction 0): front end offset and outward direction, then the back
+-- end's (LuaEntity.get_rail_end). The other directions follow by the spec's 8-fold placement (2.1); ramps turn a quarter
+-- per 4 of the direction.
+local CANON = { { 0, 2, 8, -1, -3, 15 }, { 1, 2, 7, -2, -2, 14 }, { 1, 4, 8, -2, -3, 14 } }
+
+local function place(i8, x, y)
+	if i8 % 2 == 1 then
+		x = -x
+	end
+	if math.floor(i8 / 2) % 2 == 1 then
+		x, y = -y, x
+	end
+	if i8 >= 4 then
+		x, y = -x, -y
+	end
+	return x, y
+end
+
+local function place_dir(i8, d)
+	if i8 % 2 == 1 then
+		d = (16 - d) % 16
+	end
+	if math.floor(i8 / 2) % 2 == 1 then
+		d = (d + 4) % 16
+	end
+	if i8 >= 4 then
+		d = (d + 8) % 16
+	end
+	return d
+end
+
+local ENDS = {}
+for kind = 1, 4 do
+	for dir = 0, 15 do
+		local e
+		if kind == 4 then
+			local fx, fy = 0, 8
+			for _ = 1, math.floor(dir / 4) % 4 do
+				fx, fy = -fy, fx
 			end
+			local fd = (8 + dir - dir % 4) % 16
+			e = { fx, fy, fd, -fx, -fy, (fd + 8) % 16 }
 		else
-			local cross = dx * py - dy * px
-			if cross * cross > lim then
+			local c, i8 = CANON[kind], math.floor(dir / 2) % 8
+			local fx, fy = place(i8, c[1], c[2])
+			local bx, by = place(i8, c[4], c[5])
+			e = { fx, fy, place_dir(i8, c[3]), bx, by, place_dir(i8, c[6]) }
+		end
+		ENDS[kind * 16 + dir] = e
+	end
+end
+
+--- A piece's ends as offsets from its position: { front x, y, outward direction, back x, y, outward direction }.
+function core.piece_ends(kind, dir)
+	return ENDS[kind * 16 + dir]
+end
+
+-- Integer steps of the 16 rail directions: even ones the compass directions, odd ones the half-diagonals (1:2).
+local DIR_STEPS = { [0] = { 0, -1 }, { 1, -2 }, { 1, -1 }, { 2, -1 }, { 1, 0 }, { 2, 1 }, { 1, 1 }, { 1, 2 }, { 0, 1 },
+	{ -1, 2 }, { -1, 1 }, { -2, 1 }, { -1, 0 }, { -2, -1 }, { -1, -1 }, { -1, -2 } }
+
+--- Whether the rail end (sx, sy) facing sd (outward) continues the end (ex, ey) facing ed: they face each other and the
+--- first lies straight ahead of the second, on it or joined by straight rails.
+function core.connects(ex, ey, ed, sx, sy, sd)
+	if sd ~= (ed + 8) % 16 then
+		return false
+	end
+	local st = DIR_STEPS[ed]
+	local px, py = sx - ex, sy - ey
+	return math.abs(px * st[2] - py * st[1]) < 1e-6 and px * st[1] + py * st[2] > -1e-6
+end
+
+--- The timing model between two samples (docs/v3/RAIL-GEOMETRY.md 8): the rail distance tau ticks after the first, for
+--- samples T ticks and L rail distance apart with speeds va and vb (tiles a tick). From rest, when uniform acceleration
+--- to vb covers L in less than T, it stands until then; to rest, when uniform braking from va covers L in less than T,
+--- it stops early and stands; otherwise a cubic Hermite in time, held within [0, L].
+function core.timing_u(L, T, va, vb, tau)
+	if T <= 0 then
+		return L
+	end
+	if L > 0 then
+		if va <= 0 and vb > 0 and 2 * L < vb * T then
+			local tm = 2 * L / vb
+			local s = tau - (T - tm)
+			if s <= 0 then
+				return 0
+			end
+			return vb * s * s / (2 * tm)
+		end
+		if vb <= 0 and va > 0 and 2 * L < va * T then
+			local tm = 2 * L / va
+			local s = math.min(tau, tm)
+			return va * s - va * s * s / (2 * tm)
+		end
+	end
+	local f = tau / T
+	local f2 = f * f
+	local f3 = f2 * f
+	local u = (f3 - 2 * f2 + f) * T * va + (3 * f2 - 2 * f3) * L + (f3 - f2) * T * vb
+	local lo, hi = 0, L
+	if L < 0 then
+		lo, hi = L, 0
+	end
+	if u < lo then
+		return lo
+	elseif u > hi then
+		return hi
+	end
+	return u
+end
+
+--- Whether some buffered read lies more than core.TIME_EPS of rail distance off where the timing model from e to c puts
+--- it. Reads carry u, the rail distance the leading joint has gone (an odometer), v, the speed, and t, the tick.
+function core.off_timing(e, buf, c)
+	local L, T, eu = c.u - e.u, c.t - e.t, e.u
+	local va, vb, et, eps = e.v, c.v, e.t, core.TIME_EPS
+	if T > 0 and not (L > 0 and ((va <= 0 and vb > 0 and 2 * L < vb * T) or (vb <= 0 and va > 0 and 2 * L < va * T))) then
+		-- core.timing_u's cubic Hermite, as a polynomial in tau set up once (this runs for every buffered read at every
+		-- train read): u = tau (va + tau (c2 + tau c3)), held within [0, L]
+		local c2 = (3 * L / T - 2 * va - vb) / T
+		local c3 = (va + vb - 2 * L / T) / (T * T)
+		local lo, hi = 0, L
+		if L < 0 then
+			lo, hi = L, 0
+		end
+		for i = 1, #buf do
+			local q = buf[i]
+			local tau = q.t - et
+			local u = tau * (va + tau * (c2 + tau * c3))
+			if u < lo then
+				u = lo
+			elseif u > hi then
+				u = hi
+			end
+			local d = q.u - eu - u
+			if d > eps or d < -eps then
 				return true
 			end
 		end
-		local f = dt > 0 and (p.t - et0) / dt or 0
-		local qx, qy = px - dx * f, py - dy * f
-		if qx * qx + qy * qy > sed2 then
+		return false
+	end
+	local timing = core.timing_u
+	for i = 1, #buf do
+		local q = buf[i]
+		local d = q.u - eu - timing(L, T, va, vb, q.t - et)
+		if d > eps or d < -eps then
 			return true
 		end
 	end
 	return false
 end
 
---- One read r = { x, y, t, h, si, moving, fwd } of train m. Returns the emits: a list of { read, why } in order, where
---- why is "first", "stop", "start", "es" (leading end switched), "surface", "heartbeat", "heading", "full" (the read
---- buffer is full) or "chord" (a past read sent as a vertex; it carries its own tick). core.with_car tells which carry
---- the carriage geometry. m keeps the last sent read (m.e), the reads since (m.buf) and the moving and leading-end state.
+--- One read r = { x, y, t, h, si, moving, fwd, v, u, gap, full, changed } of train m. Returns the emits: a list of
+--- { read, why } in order, where why is "first", "change" (r.changed: the train changed since the last read, a join or a
+--- split), "stop", "start", "es" (leading end switched), "surface", "gap" (the leading joint entered a curved piece that
+--- does not continue the rail path recorded since the last sample: one was missed), "heartbeat" (also when r.full:
+--- core.RP_MAX pieces wait to be sent) or "vertex" (a past read sent late; it carries its own tick). core.with_car tells which carry the carriage geometry,
+--- core.run_start which begin a new rail path (PROTOCOL.md 3.1 `ru`). m keeps the last sent read (m.e), the reads since
+--- (m.buf) and the moving and leading-end state.
 ---
---- The chord rule: the reads since the last sample must all lie within core.CHORD_EPS of the straight line from that
---- sample to the current read, and within core.SED_EPS of where constant speed along it puts them. When one does not, the
---- previous read is sent as a vertex and becomes the chord's new start. So the polyline of samples stays within a
---- quarter tile of every read, which are core.STEP tiles apart.
+--- The rail path from the last sample is known exactly (the pieces in `rp`), so only the timing needs samples: the reads
+--- since the last sample must all lie within core.TIME_EPS of rail distance of where the timing model from that sample to
+--- the current read puts them. When one does not, the previous read is sent as a vertex and becomes the new start (every
+--- buffered read fitted the model to it when it was read). A full buffer keeps every other read.
 function core.train_read(m, r)
 	local out = {}
 	local e = m.e
@@ -463,6 +605,8 @@ function core.train_read(m, r)
 		why = "first"
 	elseif r.si ~= e.si then
 		why = "surface"
+	elseif r.changed then
+		why = "change"
 	elseif not r.moving then
 		if m.moving then
 			why = "stop"
@@ -473,24 +617,27 @@ function core.train_read(m, r)
 		why = "es" -- also when it starts off the other way after a stop
 	elseif not m.moving then
 		why = "start"
-	elseif r.t - e.t >= core.HEARTBEAT then
+	elseif r.gap then
+		why = "gap"
+	elseif r.full or r.t - e.t >= core.HEARTBEAT then
 		why = "heartbeat"
 	end
 	local buf = m.buf or {}
 	if why ~= "first" and why ~= "surface" and #buf > 0 then
-		-- before an end switch the last read of the old leading end is always sent: the new end is a train length away
-		if why == "es" or core.off_chord(e, buf, r) then
+		-- before an end switch, a gap or a changed train the last read before it is always sent: the new end is a train
+		-- length away, the path after a gap is not known, a changed train's leading joint may have jumped
+		if why == "es" or why == "gap" or why == "change" or core.off_timing(e, buf, r) then
 			local v = buf[#buf]
-			out[#out + 1] = { read = v, why = "chord" }
+			out[#out + 1] = { read = v, why = "vertex" }
 			e, buf = v, {}
 		end
 	end
-	if why == nil and r.moving then
-		if r.h and e.h and core.turn(r.h, e.h) > core.HEAD_EPS then
-			why = "heading"
-		elseif #buf >= core.BUF_MAX then
-			why = "full"
+	if why == nil and r.moving and #buf >= core.BUF_MAX then
+		local kept = {}
+		for i = 2, #buf, 2 do
+			kept[#kept + 1] = buf[i]
 		end
+		buf = kept
 	end
 	if why then
 		out[#out + 1] = { read = r, why = why }
@@ -505,9 +652,68 @@ function core.train_read(m, r)
 	return out
 end
 
---- Whether an emit's why sends the carriage geometry.
+--- Whether an emit's why begins a new rail path: its sample carries `ru` and the pieces under the whole train.
+function core.run_start(why)
+	return why == "first" or why == "surface" or why == "es" or why == "gap" or why == "change"
+end
+
+--- Whether an emit's why sends the carriage geometry: on first sight, a surface change and a changed train (also the
+--- next sample after a crossing, movers.lua's m.reshape). The rail path places every carriage at stops, starts and end
+--- switches (RAIL-GEOMETRY.md 8); `car` gives the viewer the carriages' pitches.
 function core.with_car(why)
-	return why == "first" or why == "stop" or why == "start" or why == "es" or why == "force"
+	return why == "first" or why == "surface" or why == "change"
+end
+
+local function same_piece(a, b)
+	return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
+end
+
+--- The pieces a stop or start sample lists (PROTOCOL.md 3.1 `rp`): `sent`, the pieces entered since the last sample (travel
+--- order, or nil), with the pieces under the train (`under`, rear first, or nil) that came before them added in front and
+--- any after them (a piece under the train's end that no read looked at) behind, so a parked train's last sample alone
+--- describes its whole body (a keyframe or the live payload holds only that row). Entered pieces that left the train's
+--- rear stay. At most max pieces besides the entered ones: pieces under the train nearest its rear are dropped first.
+--- Returns nil for none.
+function core.stop_pieces(sent, under, max)
+	if not under or #under == 0 then
+		return sent
+	end
+	sent = sent or {}
+	-- under[a..b] are entered pieces; with none, every piece under the train comes after them
+	local a, b
+	for i, q in ipairs(under) do
+		for _, p in ipairs(sent) do
+			if same_piece(p, q) then
+				a, b = a or i, i
+				break
+			end
+		end
+	end
+	local before = a and a - 1 or 0
+	local room = math.max(0, max - #sent)
+	local after = math.min(#under - (b or 0), room)
+	local keep = math.min(before, room - after)
+	local out = {}
+	for i = before - keep + 1, before do
+		out[#out + 1] = under[i]
+	end
+	for _, p in ipairs(sent) do
+		out[#out + 1] = p
+	end
+	for i = #under - after + 1, #under do
+		out[#out + 1] = under[i]
+	end
+	return #out > 0 and out or nil
+end
+
+--- How many rail pieces under the train a run start lists: at most core.RP_START_MAX, and with `car` of n carriages
+--- what fits beside it in a line (about 26 bytes a carriage, 18 a piece), at least 8.
+function core.rp_start(ncar)
+	if not ncar then
+		return core.RP_START_MAX
+	end
+	local fit = math.floor((2600 - 26 * math.min(ncar, core.CAR_MAX)) / 18)
+	return math.max(8, math.min(core.RP_START_MAX, fit))
 end
 
 --- A journey id, "<instance>.<tick>.<train id>", or "<instance>.<tick>.v<unit>" for a vehicle.
@@ -555,6 +761,7 @@ function core.train_created(st, old1, old2, id, ref, n, register)
 	local j = j1 or j2
 	if j then
 		core.claim(st, j, "t", id, ref, n, register)
+		st.movers[j].changed = true -- its next read begins a new rail path (core.train_read "change")
 	end
 	if j1 and j2 and j1 ~= j2 then
 		return j2
@@ -634,6 +841,15 @@ core.MIGRATIONS = {
 		s.reg = {}
 		s.wheel, s.fast, s.carry = {}, {}, core.queue()
 		s.file_seq = 0
+	end,
+	--- 2: train reads carry the odometer and speed of the timing model (core.train_read). Trains sampled by an older
+	--- capture start afresh: their next read is a first sight.
+	function(s)
+		for _, m in pairs(s.movers or {}) do
+			if m.kind == "t" then
+				m.e, m.buf, m.moving, m.fwd = nil, nil, nil, nil
+			end
+		end
 	end,
 }
 

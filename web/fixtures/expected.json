@@ -169,6 +169,109 @@
     "rows": 3,
     "start": 1791633610000
   },
+  "movers_rail.bin": {
+    "first": {
+      "carriages": null,
+      "flags": 128,
+      "mover": 0,
+      "o": 0.25,
+      "rail": [
+        [
+          -110,
+          -177,
+          12,
+          1
+        ]
+      ],
+      "rail_start": true,
+      "speed": 0.5,
+      "t": 1791630001000,
+      "tick": 60,
+      "x": -100,
+      "y": -176
+    },
+    "flagged": [
+      {
+        "carriages": null,
+        "flags": 128,
+        "mover": 0,
+        "o": 0.25,
+        "rail": [
+          [
+            -110,
+            -177,
+            12,
+            1
+          ]
+        ],
+        "rail_start": true,
+        "speed": 0.5,
+        "t": 1791630001000,
+        "tick": 60,
+        "x": -100,
+        "y": -176
+      },
+      {
+        "carriages": null,
+        "flags": 128,
+        "mover": 0,
+        "o": 0.3125,
+        "rail": [
+          [
+            2,
+            -175,
+            4,
+            1
+          ],
+          [
+            7,
+            -173,
+            4,
+            2
+          ]
+        ],
+        "rail_start": false,
+        "speed": 0.375,
+        "t": 1791630005000,
+        "tick": 300,
+        "x": 10.5,
+        "y": -176
+      },
+      {
+        "carriages": null,
+        "flags": 129,
+        "mover": 0,
+        "o": 0.375,
+        "rail": [],
+        "rail_start": false,
+        "speed": 0,
+        "t": 1791630009000,
+        "tick": 540,
+        "x": 20,
+        "y": -160
+      }
+    ],
+    "kind": 1,
+    "last": {
+      "carriages": null,
+      "flags": 129,
+      "mover": 0,
+      "o": 0.375,
+      "rail": [],
+      "rail_start": false,
+      "speed": 0,
+      "t": 1791630009000,
+      "tick": 540,
+      "x": 20,
+      "y": -160
+    },
+    "len": 300000,
+    "movers": [
+      "248495586.1000.7"
+    ],
+    "rows": 3,
+    "start": 1791630000000
+  },
   "movers_window.bin": {
     "first": {
       "carriages": [

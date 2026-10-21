@@ -25,7 +25,10 @@ export const POS_UNITS = 16;
 export const ORIENT_UNITS = 65536;
 
 const MOVER_HAS_TICKS = 1;
+const MOVER_HAS_RAIL = 2;
 const WIRE_HAS_CARRIAGES = 1 << 6;
+const FLAG_RAIL = 1 << 7;
+const SPEED_UNITS = 8192;
 const FLAG_GONE = 1 << 1;
 const FLAG_NO_TICK = 1 << 4;
 
@@ -248,7 +251,8 @@ export function decodeMoverWindow(buf: ArrayBuffer | ArrayBufferView): MoverWind
   }
   off += metaLen;
   const cols: Column[] = [];
-  for (let i = 0; i < 8; i++) {
+  const hasRail = (flags & MOVER_HAS_RAIL) !== 0;
+  for (let i = 0; i < (hasRail ? 10 : 8); i++) {
     if (v.byteLength - off < 4) {
       throw new WireError(`missing column ${i}`);
     }
@@ -263,7 +267,7 @@ export function decodeMoverWindow(buf: ArrayBuffer | ArrayBufferView): MoverWind
   if (off !== v.byteLength) {
     throw new WireError("trailing bytes");
   }
-  const [cCount, cDT, cTick, cX, cY, cO, cFlags, cCar] = cols;
+  const [cCount, cDT, cTick, cX, cY, cO, cFlags, cCar, cSpeed, cRail] = cols;
   const hasTicks = (flags & MOVER_HAS_TICKS) !== 0;
   const rows: MoverRow[] = [];
   for (let m = 0; m < nMovers; m++) {
@@ -276,6 +280,7 @@ export function decodeMoverWindow(buf: ArrayBuffer | ArrayBufferView): MoverWind
     let x = 0;
     let y = 0;
     let o = 0;
+    let speed = 0;
     for (let k = 0; k < n; k++) {
       t += cDT.varint();
       const dTick = hasTicks ? cTick.varint() : 0;
@@ -314,7 +319,36 @@ export function decodeMoverWindow(buf: ArrayBuffer | ArrayBufferView): MoverWind
           carriages.push({ x: cx / POS_UNITS, y: cy / POS_UNITS, o: co / ORIENT_UNITS });
         }
       }
-      rows.push({ mover: m, t, tick: rowTick, x: rx, y: ry, o: ro, flags: rowFlags, carriages });
+      const row: MoverRow = { mover: m, t, tick: rowTick, x: rx, y: ry, o: ro, flags: rowFlags, carriages };
+      if ((rowFlags & FLAG_RAIL) !== 0 && (rowFlags & FLAG_GONE) === 0) {
+        // FORMAT.md 7.4: speed column and rail column
+        if (!hasRail) {
+          throw new WireError("rail row without rail columns");
+        }
+        speed += cSpeed.varint();
+        row.speed = speed / SPEED_UNITS;
+        const head = cRail.uvarint();
+        const np = Math.floor(head / 2);
+        if (np > 1024) {
+          throw new WireError(`${np} rail pieces`);
+        }
+        row.railStart = head % 2 === 1;
+        row.rail = null;
+        if (np > 0) {
+          row.rail = [];
+          let px = Math.floor(x / POS_UNITS);
+          let py = Math.floor(y / POS_UNITS);
+          for (let i = 0; i < np; i++) {
+            px += cRail.varint();
+            py += cRail.varint();
+            const kd = cRail.byte();
+            row.rail.push({ x: px, y: py, dir: kd & 15, kind: kd >> 4 });
+          }
+        }
+      } else {
+        row.flags &= ~FLAG_RAIL;
+      }
+      rows.push(row);
     }
   }
   if (!cols.every(c => c.done())) {

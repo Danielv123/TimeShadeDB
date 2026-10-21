@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -180,6 +181,54 @@ func TestIngestMapsMessages(t *testing.T) {
 	}
 	if again, _ := OpenMaps(filepath.Dir(f.maps.path)); len(again.list) != 1 {
 		t.Fatal("maps.json does not reload")
+	}
+}
+
+// TestIngestRailSamples: a train sample with a speed is a rail path sample (FlagRail) with
+// its pieces; one with a piece that is not valid starts a new rail path instead; without
+// a speed it is an older capture's sample.
+func TestIngestRailSamples(t *testing.T) {
+	f := newFixture(t, Options{})
+	ctx := context.Background()
+	train := func(j string, x float64, extra map[string]any) map[string]any {
+		m := map[string]any{"j": j, "k": "t", "f": "player", "name": "locomotive", "x": x, "y": 1, "h": 0.25, "n": 1, "o": "L"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	body := line(t, env{V: 1, Tick: 600, Src: "clusterio:5", Map: "gw-a.1", Inst: 5, RecvMs: int64(base), Msgs: []any{
+		map[string]any{"type": "move", "s": "nauvis", "m": []any{
+			train("5.1.7", 1, map[string]any{"v": 0.4375, "ru": true, "rp": [][4]int{{-3, 0, 12, 1}, {2, 1, 4, 4}}}),
+			train("5.1.8", 1, map[string]any{"v": 0.5, "rp": [][4]int{{-3, 0, 12, 9}}}),
+			train("5.1.9", 1, nil),
+		}},
+	}})
+	resp := f.ingest(t, body)
+	if resp.Samples.Accepted != 3 || len(resp.Errors) != 0 {
+		t.Fatalf("resp %+v", resp)
+	}
+	if err := f.mov.Commit(ctx, base+10*core.Minute); err != nil {
+		t.Fatal(err)
+	}
+	w, err := f.mov.Window(ctx, core.SurfaceKey{Map: "gw-a.1", Surface: "nauvis"}, core.WindowStart(base, core.MoverWindowLen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]core.MoverRow{}
+	for _, r := range w.Rows {
+		got[w.Movers[r.Mover].ID] = r
+	}
+	a := got["5.1.7"]
+	want := []core.RailPiece{{X: -3, Y: 0, Dir: 12, Kind: core.RailKindCurveA}, {X: 2, Y: 1, Dir: 4, Kind: core.RailKindRamp}}
+	if a.Flags&core.FlagRail == 0 || a.Speed != 0.4375 || !a.RailStart || !reflect.DeepEqual(a.Rail, want) {
+		t.Fatalf("rail row %+v", a)
+	}
+	if b := got["5.1.8"]; b.Flags&core.FlagRail == 0 || !b.RailStart || len(b.Rail) != 0 {
+		t.Fatalf("a bad piece starts a new rail path: %+v", b)
+	}
+	if c := got["5.1.9"]; c.Flags&core.FlagRail != 0 {
+		t.Fatalf("an older capture's row: %+v", c)
 	}
 }
 
