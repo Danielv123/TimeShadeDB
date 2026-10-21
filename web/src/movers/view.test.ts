@@ -240,8 +240,17 @@ test("bounds filter and trim", () => {
 });
 
 test("delay estimator: p99 lag + 0.5 s, clamped, changing smoothly", () => {
+  const prior = new DelayEstimator(2000);
+  prior.observe(1000);
+  assert.ok(Math.abs(prior.target() - 1500) < 1e-9, "older data: p99 lag + 0.5 s");
+  prior.railPrior();
+  assert.equal(prior.current, delayConfig.readyPriorMs, "rail path rows: the prior at once");
+  assert.equal(prior.target(), delayConfig.readyPriorMs, "no readiness observed yet: the prior");
+  prior.railPrior(12 / 1000); // a game at speed 0.2: 60 ticks are 5 s
+  assert.equal(prior.target(), delayConfig.readyCapMs, "a slow game's prior: up to the cap");
   const d = new DelayEstimator(2000);
   assert.equal(d.current, 2000);
+  d.observeReady(100);
   for (let i = 0; i < 1000; i++) {
     d.observe(150 + (i % 100) * 10); // 150..1140 ms
   }
@@ -286,6 +295,21 @@ test("delay estimator: hysteresis, and readiness of moving movers raises the del
     d.observeReady(20_000);
   }
   assert.equal(d.target(), delayConfig.readyCapMs);
+});
+
+test("readiness: the wait after a rail path stop sample is not a moving train's", () => {
+  for (const rail of [true, false]) {
+    const v = new MoverView();
+    const f = rail ? T.F_RAIL : 0;
+    const add = (t: number, x: number, flags: number) =>
+      v.add(meta, T.makeSample(meta, t, x, 0, 0.25, flags, null, t / 50, rail ? 0.1 : NaN));
+    add(0, 0, f);
+    add(1000, 5, f | T.F_STOP);
+    assert.equal(v.prevT, 0, "a moving sample before the stop");
+    add(31_000, 5.1, f);
+    // a rail path holds the stopped train until its start; older data keeps counting it
+    assert.equal(Number.isNaN(v.prevT), rail, `rail ${rail}: prevT ${v.prevT}`);
+  }
 });
 
 test("data clock never goes back", () => {

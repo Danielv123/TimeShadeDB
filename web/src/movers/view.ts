@@ -14,6 +14,8 @@ import {
   F_GONE,
   F_NO_HEADING,
   F_NO_TICK,
+  F_RAIL,
+  F_STOP,
   HANDOFF_MS,
   PITCH,
   type Head,
@@ -25,6 +27,8 @@ import {
   newHead,
   pitches,
   placeCarriages,
+  placeRailCarriages,
+  railGaps,
 } from "./track";
 
 /** New data that moves a drawn mover is blended in over at least this long. */
@@ -159,7 +163,8 @@ export class MoverView {
       const meta = w.movers[r.mover];
       const o = (r.flags & F_NO_HEADING) !== 0 ? NaN : r.o;
       const tick = (r.flags & F_NO_TICK) !== 0 ? null : r.tick;
-      if (this.add(meta, makeSample(meta, r.t, r.x, r.y, o, r.flags, r.carriages, tick)) && onRow) {
+      const s = makeSample(meta, r.t, r.x, r.y, o, r.flags, r.carriages, tick, r.speed ?? NaN, r.rail ?? null, r.railStart ?? false);
+      if (this.add(meta, s) && onRow) {
         onRow(r.t, this.prevT);
       }
     }
@@ -167,13 +172,17 @@ export class MoverView {
 
   /** Adds the rows of a live `movers` event. */
   addLive(e: LiveMoversEvent, onRow?: (t: number, prevT: number) => void): void {
-    for (const [entry, t, tick, x, y, o, flags, car] of e.rows) {
+    for (const row of e.rows) {
+      const [entry, t, tick, x, y, o, flags, car] = row;
       const meta = e.movers[entry];
       if (!meta) {
         continue;
       }
       const carriages = car ? car.map(([cx, cy, co]) => ({ x: cx, y: cy, o: co })) : null;
-      const s = makeSample(meta, t, x, y, (flags & F_NO_HEADING) !== 0 ? NaN : o, flags, carriages, tick);
+      // a rail path row (F_RAIL) adds [speed, pieces, rail start]
+      const rail = row.length > 8 ? (row[9] ?? []).map(([px, py, dir, kind]) => ({ x: px, y: py, dir, kind })) : null;
+      const s = makeSample(meta, t, x, y, (flags & F_NO_HEADING) !== 0 ? NaN : o, flags, carriages, tick,
+        row.length > 8 ? (row[8] ?? NaN) : NaN, rail && rail.length > 0 ? rail : null, row.length > 8 ? !!row[10] : false);
       if (this.add(meta, s) && onRow) {
         onRow(t, this.prevT);
       }
@@ -186,9 +195,17 @@ export class MoverView {
    */
   prevT = NaN;
 
+  /** Whether a sample of the rail path model (F_RAIL) was added (DelayEstimator.railPrior). */
+  sawRail = false;
+  /** Game ticks a millisecond between the last two samples with ticks of a track (NaN: none yet). */
+  tickRate = NaN;
+
   /** Adds one sample; returns false when the track already had this row. */
   add(meta: MoverMeta, s: Sample): boolean {
     this.prevT = NaN;
+    if ((s.flags & F_RAIL) !== 0) {
+      this.sawRail = true;
+    }
     let tr = this.tracks.get(meta.id);
     if (!tr) {
       tr = new Track(meta.id, meta);
@@ -205,7 +222,14 @@ export class MoverView {
     const n = tr.s.length;
     if (n >= 2 && tr.s[n - 1] === s) {
       const p = tr.s[n - 2];
-      if (((p.flags | s.flags) & F_GONE) === 0 && (p.x !== s.x || p.y !== s.y)) {
+      if (p.tick !== null && s.tick !== null && s.t > p.t && s.tick > p.tick) {
+        this.tickRate = (s.tick - p.tick) / (s.t - p.t);
+      }
+      // A rail path stop sample is not a moving mover's: the rail path holds the train there until
+      // it starts, so the wait for the start says nothing about readiness. (With few samples a
+      // train, the station stops alone would be over 5% of the readiness lags and set the delay.)
+      const railStop = (p.flags & (F_STOP | F_RAIL)) === (F_STOP | F_RAIL);
+      if (((p.flags | s.flags) & F_GONE) === 0 && (p.x !== s.x || p.y !== s.y) && !railStop) {
         this.prevT = p.t;
       }
     }
@@ -462,6 +486,11 @@ function rawBody(tr: Track, st: RenderState, head: Head, t: number, meta: MoverM
 }
 
 function buildBody(tr: Track, head: Head, t: number, meta: MoverMeta, poly: Polyline, gaps: number[], out: Car[]): void {
+  if (head.rail) {
+    railGaps(tr, head.k, gaps);
+    placeRailCarriages(head, meta.o ?? "", gaps, out);
+    return;
+  }
   pitches(tr, head.k, gaps);
   let length = 4;
   for (const g of gaps) {

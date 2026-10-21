@@ -267,6 +267,9 @@ export class MoverFeed {
   }
 
   private see(t: number, arrived: number, count: boolean, prevT: number): void {
+    if (this.view.sawRail) {
+      this.delay.railPrior(this.view.tickRate);
+    }
     if (count && Number.isFinite(this.newest) && !Number.isNaN(prevT)) {
       this.delay.observeReady(arrived - prevT);
     }
