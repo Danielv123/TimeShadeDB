@@ -1,5 +1,6 @@
 // Before/after tables of railbench runs (RESULT.md): samples, storage on disk, and what the viewer draws in history and
-// live mode against the game, from eval.mjs and raildisk outputs.
+// live mode against the game (and, where eval.mjs ran them, after a seek to a keyframe and on opening the live map, and
+// for standing trains), from eval.mjs and raildisk outputs.
 //
 //   node bench/railbench/compare.mjs --row "<label>=<run dir>[,eval=<file>][,disk=<file>]" ... [--out <file.md>]
 //
@@ -45,10 +46,11 @@ table(["Run", "Samples", "per train-hour", "per train-km", "curve per train-hour
 }));
 
 lines.push("### Mover storage (zstd, train rows)", "");
-table(["Run", "Train rows", "Train-row bytes", "B/row", "B per train-hour", "`car` share", "rail pieces", "rail pieces share"],
+table(["Run", "Train rows", "Train-row bytes", "B/row", "B per train-hour", "`car` share", "rail pieces", "rail pieces share",
+	"Whole mover directory, B per train-hour"],
 	rows.map(({ label, ev, disk }) => {
 		if (!disk) {
-			return [label, "-", "-", "-", "-", "-", "-", "-"];
+			return [label, "-", "-", "-", "-", "-", "-", "-", "-"];
 		}
 		const sum = (k) => disk.reduce((a, d) => a + (d[k] ?? 0), 0);
 		const bytes = sum("train_only_bytes");
@@ -56,13 +58,19 @@ table(["Run", "Train rows", "Train-row bytes", "B/row", "B per train-hour", "`ca
 		const noCar = sum("train_nocar_bytes");
 		const noRail = disk.some(d => d.train_norail_bytes !== undefined) ? sum("train_norail_bytes") : null;
 		return [label, n0(trainRows), n0(bytes), f(bytes / trainRows, 2), n0(bytes / ev.samples.moving_train_hours), pct(bytes - noCar, bytes),
-			noRail === null ? "-" : n0(sum("rail_pieces")), noRail === null ? "-" : pct(bytes - noRail, bytes)];
+			noRail === null ? "-" : n0(sum("rail_pieces")), noRail === null ? "-" : pct(bytes - noRail, bytes),
+			disk.some(d => d.disk_bytes !== undefined) ? n0(sum("disk_bytes") / ev.samples.moving_train_hours) : "-"];
 	}));
 
-for (const mode of ["history", "live"]) {
-	lines.push(`### ${mode === "history" ? "History playback" : "Live model"} against the game (moving train-ticks)`, "");
+const TITLES = { history: "History playback", live: "Live model", seek: "After a seek to a keyframe", open: "After opening the live map" };
+const live = (mode) => mode === "live" || mode === "open";
+for (const mode of ["history", "live", "seek", "open"]) {
+	if (!rows.some(r => r.ev.modes[mode])) {
+		continue;
+	}
+	lines.push(`### ${TITLES[mode]} against the game (moving train-ticks)`, "");
 	table(["Run", "Head p50 / p90 / p99 / max", "Carriage p50 / p99 / max", "Angle p99 / max (deg)", "Spacing p99 / max",
-		"Carriage-frames > 1 / > 2 tiles", "Jumps (head / carriage)", ...(mode === "live" ? ["Display delay p50 / p90 / max (s)"] : [])],
+		"Carriage-frames > 1 / > 2 tiles", "Jumps (head / carriage)", ...(live(mode) ? ["Display delay p50 / p90 / max (s)"] : [])],
 	rows.filter(r => r.ev.modes[mode]).map(({ label, ev }) => {
 		const m = ev.modes[mode];
 		const d = m.display_delay_ms;
@@ -70,8 +78,19 @@ for (const mode of ["history", "live"]) {
 			`${f(m.car_position.p50)} / ${f(m.car_position.p99)} / ${f(m.car_position.max)}`, `${f(m.car_angle_deg.p99, 2)} / ${f(m.car_angle_deg.max, 2)}`,
 			`${f(m.spacing.p99)} / ${f(m.spacing.max)}`, `${pct(m.car_over_1, m.car_frames)} / ${pct(m.car_over_2, m.car_frames)}`,
 			`${m.jumps} / ${m.car_jumps}`,
-			...(mode === "live" ? [d ? `${f(d.p50 / 1000, 2)} / ${f(d.p90 / 1000, 2)} / ${f(d.max / 1000, 2)}` : "-"] : [])];
+			...(live(mode) ? [d ? `${f(d.p50 / 1000, 2)} / ${f(d.p90 / 1000, 2)} / ${f(d.max / 1000, 2)}` : "-"] : [])];
 	}));
+	const stood = rows.filter(r => r.ev.modes[mode]?.stopped?.frames);
+	if (stood.length) {
+		lines.push(`Standing trains (${TITLES[mode].toLowerCase()}, every ${stood[0].ev.stopped_every_ticks} ticks):`, "");
+		table(["Run", "Train-frames", "Head p99 / max", "Carriage p50 / p99 / max", "Carriage-frames > 1 / > 2 tiles", "Jumps (head / carriage)"],
+			stood.map(({ label, ev }) => {
+				const m = ev.modes[mode].stopped;
+				return [label, n0(m.frames), `${f(m.head.p99)} / ${f(m.head.max)}`,
+					`${f(m.car_position.p50)} / ${f(m.car_position.p99)} / ${f(m.car_position.max)}`,
+					`${pct(m.car_over_1, m.car_frames)} / ${pct(m.car_over_2, m.car_frames)}`, `${m.jumps} / ${m.car_jumps}`];
+			}));
+	}
 	lines.push(`Head error p99 / max by track kind (${mode}, with stop/start):`, "");
 	table(["Run", "straight", "diagonal", "curve", "junction", "stopstart"], rows.filter(r => r.ev.modes[mode]).map(({ label, ev }) => {
 		const k = ev.modes[mode].head_by_kind;

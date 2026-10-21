@@ -29,6 +29,7 @@ import { KINDS, K, STOPSTART_TICKS, prepareTrain, head, truthAt } from "./truth.
 const here = path.dirname(fileURLToPath(import.meta.url));
 const { MoverView } = await import("../../web/src/movers/view.ts");
 const { DelayEstimator } = await import("../../web/src/movers/clock.ts");
+const { LiveLags } = await import("../../web/src/movers/feed.ts");
 const { makeSample, headAt, newHead, railRuns, F_STOP, F_GONE, F_END_SWITCH, F_NO_HEADING, F_NO_TICK } = await import("../../web/src/movers/track.ts");
 const debugLive = [];
 
@@ -45,6 +46,13 @@ const batchMs = Number(option("--batch-ms", 1000));
 const extraMs = Number(option("--extra-ms", 150));
 const maxJourneys = Number(option("--journeys", 0));
 const liveEstimator = option("--live-estimator", "shared");
+// standing trains are scored every this many ticks (moving ones every tick), in a bucket of their own
+const stoppedEvery = Number(option("--stopped-every", 10));
+// seek and open modes: a session (a seek to a keyframe, an opening of the live map) every this much map time, each
+// scored until the next
+const sessionMs = Number(option("--session-ms", 60000));
+const LIVE_TRAIL_MS = 60000; // core.LiveTrail: the live payload's trail
+const LOOKAHEAD = 60000; // the feed's history lookahead (feed.ts LOOKAHEAD_MS)
 const measureBin = option("--measure", path.join(work, "bin", "measure.exe"));
 
 /** Histogram with fixed bins and an exact maximum. */
@@ -278,18 +286,21 @@ function newModeStats() {
 	};
 }
 
-function sessionFor(j) {
-	const view = new MoverView();
-	const metas = j.metas.map(([n, kinds, colour]) => ({ id: j.id, k: "t", f: j.force, name: j.name, n, o: kinds, c: colour || undefined }));
-	const samples = j.rows.map((r) => {
-		const [tt, tick, x, y, h, flags, mi, car, v, rp, ru] = r;
-		const meta = metas[mi];
+/** Fresh samples of journey j's rows [from, to) (a view keeps state in its samples, so each view gets its own). */
+function samplesOf(j, from = 0, to = j.rows.length) {
+	if (!j.metaList) {
+		j.metaList = j.metas.map(([n, kinds, colour]) => ({ id: j.id, k: "t", f: j.force, name: j.name, n, o: kinds, c: colour || undefined }));
+	}
+	const out = [];
+	for (let i = from; i < to; i++) {
+		const [tt, tick, x, y, h, flags, mi, car, v, rp, ru] = j.rows[i];
+		const meta = j.metaList[mi];
 		const c = car ? car.map(([cx, cy, co]) => ({ x: cx, y: cy, o: co })) : null;
 		// rail path rows (F_RAIL) also carry the speed, the rail pieces and the rail start
 		const pieces = rp ? rp.map(([px, py, dir, kind]) => ({ x: px, y: py, dir, kind })) : null;
-		return { meta, s: makeSample(meta, tt, x, y, h === null ? NaN : h, flags, c, tick, v ?? NaN, pieces, !!ru) };
-	});
-	return { view, samples };
+		out.push({ meta, s: makeSample(meta, tt, x, y, h === null ? NaN : h, flags, c, tick, v ?? NaN, pieces, !!ru) });
+	}
+	return out;
 }
 
 const truth = { c: new Float64Array(3 * 10000), n: 0, speed: 0, k: 0, moving: false };
@@ -380,7 +391,7 @@ function score(st, shown, tr, kind, prev) {
 }
 
 const report = { run: name, save: run.save, game: run.game, ticks: run.ticks, clock: { a0, residual_ms: clockResid },
-	samples: sampleReport, live_estimator: liveEstimator, modes: {} };
+	samples: sampleReport, live_estimator: liveEstimator, stopped_every_ticks: stoppedEvery, session_ms: sessionMs, modes: {} };
 let list = journeys.filter(j => (matched.get(j.id) ?? []).length > 0);
 if (maxJourneys > 0) {
 	list = list.slice(0, maxJourneys);
@@ -407,47 +418,161 @@ function trainFinder(j) {
 	};
 }
 
+const lastMs = msOf(gt.lastTick);
 /**
- * The live model with one view and one delay estimator for all journeys of a surface (the viewer's MoverFeed): rows
- * arrive in batches, every train is drawn at the delayed display time and scored against its truth.
+ * Journey j's span: its first row and its end (its gone, else the end of the recording: a parked train stays drawn from
+ * its last row), and its truth finder.
  */
-function liveShared(st, js) {
+function info(j) {
+	if (!j.info) {
+		const last = j.rows[j.rows.length - 1];
+		j.info = { firstT: j.rows.find(r => !(r[5] & F_GONE))?.[0], endT: last[5] & F_GONE ? last[0] : Math.max(last[0], lastMs),
+			trainAt: trainFinder(j) };
+	}
+	return j.info;
+}
+
+/** Index of journey j's last row at or before t (-1: none). */
+function rowAt(j, t) {
+	let lo = 0;
+	let hi = j.rows.length - 1;
+	if (hi < 0 || j.rows[0][0] > t) {
+		return -1;
+	}
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (j.rows[mid][0] <= t) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	return lo;
+}
+
+/**
+ * Scores the train drawn for journey state q at map time ms (fractional tick tau) against its truth: a moving frame in
+ * st, a standing one (when `standing`: every --stopped-every ticks) in st.stop. shown() draws it. q.prev and q.prevS
+ * keep the last scored frames for jumps.
+ */
+function scoreAt(st, q, ms, tau, dtTicks, standing, shown) {
+	const tr = q.trainAt(ms);
+	// (after the recording's last tick a train only looks standing)
+	if (tau > gt.lastTick || (tr.gone !== null && tau >= tr.gone) || !truthAt(tr, tau, truth)) {
+		q.prev = q.prevS = null;
+		return;
+	}
+	truth.tick = tau;
+	if (truth.moving) {
+		q.prevS = null;
+		const p = score(st, shown(), tr, tr.kindOf(truth.k), q.prev);
+		q.prev = p ? { ...p, dtTicks } : null;
+		return;
+	}
+	q.prev = null;
+	if (standing) {
+		const p = score(st.stop, shown(), tr, K.stopstart, q.prevS);
+		q.prevS = p ? { ...p, dtTicks: stoppedEvery } : null;
+	}
+}
+
+/** History playback of journey j drawn from `samples` (every row known), scored at every tick in [fromT, toT). */
+function playback(st, j, samples, fromT, toT) {
+	const view = new MoverView();
+	for (const x of samples) {
+		view.add(x.s.meta, x.s);
+	}
+	const q = { trainAt: info(j).trainAt, prev: null, prevS: null, ms: 0 };
+	const shown = () => view.frame(q.ms, Infinity, { bodies: true })[0];
+	for (let tick = Math.ceil(tickOf(fromT)); msOf(tick) < toT; tick++) {
+		q.ms = msOf(tick);
+		scoreAt(st, q, q.ms, tick, 1, tick % stoppedEvery === 0, shown);
+	}
+}
+
+/**
+ * The live model with one view and one delay estimator for all journeys of a surface, as the viewer's MoverFeed: rows
+ * arrive in batches and are added with the feed's own lag bookkeeping (feed.ts LiveLags), every train is drawn at the
+ * delayed display time and scored against its truth. With `open` ({ at, until }) the viewer opens the live map at map
+ * time `at`: it gets the live payload then (the rows that arrived within the last core.LiveTrail and each live
+ * journey's last row; their lags do not count), then the rows arriving later, and is scored until `until`.
+ */
+function liveShared(st, js, open = null) {
 	const view = new MoverView();
 	const est = new DelayEstimator(2000); // as the viewer's (layer.ts)
+	const lags = new LiveLags(view, est);
 	const arrival = (ms) => Math.ceil(ms / batchMs) * batchMs + extraMs;
 	const all = [];
+	const payload = [];
 	const per = new Map();
 	let t0 = Infinity;
 	let t1 = -Infinity;
 	for (const j of js) {
-		const { samples } = sessionFor(j);
-		const firstT = samples.find(x => !(x.s.flags & F_GONE))?.s.t;
-		const lastT = samples[samples.length - 1].s.t;
-		per.set(j.id, { firstT, lastT, trainAt: trainFinder(j), prev: null });
-		t0 = Math.min(t0, firstT);
-		t1 = Math.max(t1, lastT);
-		for (const x of samples) {
-			all.push(x);
+		const q = info(j);
+		if (open && (q.endT <= open.at || q.firstT >= open.until)) {
+			continue;
 		}
+		per.set(j.id, { firstT: q.firstT, endT: q.endT, trainAt: q.trainAt, prev: null, prevS: null });
+		t0 = Math.min(t0, q.firstT);
+		t1 = Math.max(t1, q.endT);
+		if (!open) {
+			all.push(...samplesOf(j));
+			continue;
+		}
+		// the rows that arrived before the live map opens: the trail, and the last row of a live (not gone) journey
+		let k = j.rows.length;
+		while (k > 0 && arrival(j.rows[k - 1][0]) > open.at) {
+			k--;
+		}
+		let from = k;
+		while (from > 0 && j.rows[from - 1][0] > open.at - LIVE_TRAIL_MS) {
+			from--;
+		}
+		if (from === k && k > 0 && !(j.rows[k - 1][5] & F_GONE)) {
+			from = k - 1;
+		}
+		payload.push(...samplesOf(j, from, k));
+		let to = k;
+		while (to < j.rows.length && j.rows[to][0] <= open.until + 20000) {
+			to++;
+		}
+		all.push(...samplesOf(j, k, to));
 	}
 	all.sort((a, b) => arrival(a.s.t) - arrival(b.s.t) || a.s.t - b.s.t);
+	payload.sort((a, b) => a.s.t - b.s.t);
+	let now = t0 + 1000;
+	let end = t1 + 20000;
+	if (open) {
+		now = open.at;
+		end = open.until;
+		for (const x of payload) {
+			if (view.add(x.s.meta, x.s)) {
+				lags.see(x.s.t, now, false, view.prevT);
+			}
+		}
+	}
 	let fed = 0;
 	let perf = 0;
 	const step = msPerTick;
-	for (let now = t0 + 1000; now <= t1 + 20000; now += step, perf += step) {
+	let tv = 0;
+	let horizon = 0;
+	let frame = null;
+	const shownOf = (id) => () => {
+		if (!frame) {
+			frame = new Map(view.frame(tv, horizon, { bodies: true }).map(x => [x.id, x]));
+		}
+		return frame.get(id);
+	};
+	for (let n = 0; now < end; now += step, perf += step, n++) {
 		while (fed < all.length && arrival(all[fed].s.t) <= now) {
 			const x = all[fed];
-			if (view.add(x.s.meta, x.s) && !Number.isNaN(view.prevT)) {
-				est.observeReady(now - view.prevT);
+			if (view.add(x.s.meta, x.s)) {
+				lags.see(x.s.t, now, true, view.prevT);
 			}
-			if (view.sawRail) {
-				est.railPrior(view.tickRate); // as the viewer's MoverFeed
-			}
-			est.observe(now - x.s.t);
 			fed++;
 		}
-		const tv = now - est.delay(perf);
-		const horizon = est.horizon(now);
+		tv = now - est.delay(perf);
+		horizon = est.horizon(now);
 		if (Math.floor(perf / 1000) !== Math.floor((perf - step) / 1000)) {
 			st.delay.add(now - tv);
 		}
@@ -457,122 +582,56 @@ function liveShared(st, js) {
 				console.log(`  delay ${est.current.toFixed(0)} ms, readiness p50 ${est.readyQuantile(0.5).toFixed(0)} p95 ${est.readyQuantile(0.95).toFixed(0)} p99 ${est.readyQuantile(0.99).toFixed(0)}, lag p99 ${est.quantile(0.99).toFixed(0)}`);
 			}
 		}
-		const shown = new Map(view.frame(tv, horizon, { bodies: true }).map(x => [x.id, x]));
+		// every frame draws every train (the viewer's frame), once something is scored
+		frame = null;
 		const tau = tickOf(tv);
 		for (const [id, q] of per) {
-			if (tv < q.firstT || tv > q.lastT) {
-				q.prev = null;
+			if (tv < q.firstT || tv >= q.endT) {
+				q.prev = q.prevS = null;
 				continue;
 			}
-			const tr = q.trainAt(tv);
-			if (!truthAt(tr, tau, truth) || !truth.moving) {
-				q.prev = null;
-				continue;
+			const shown = shownOf(id);
+			scoreAt(st, q, tv, tau, step / msPerTick, n % stoppedEvery === 0, shown);
+			if (process.env.RAILBENCH_DEBUG_DELAY && q.prev) {
+				const sh = shown();
+				if (sh && Math.hypot(sh.x - truth.c[0], sh.y - truth.c[1]) > Number(process.env.RAILBENCH_DEBUG_DELAY)) {
+					const track = view.tracks.get(id);
+					const h = headAt(track, tv, horizon, newHead());
+					const nx = track.s[h.k + 1];
+					debugLive.push({ train: q.trainAt(tv).id, tick: Math.round(tau), e: +Math.hypot(sh.x - truth.c[0], sh.y - truth.c[1]).toFixed(2),
+						mode: h.mode, rail: !!h.rail, sinceSample: Math.round(tv - track.s[h.k].t), next: nx ? Math.round(nx.t - tv) : null,
+						delay: Math.round(now - tv), drawnVsHead: +Math.hypot(sh.x - h.x, sh.y - h.y).toFixed(2),
+						k: h.k, n: track.s.length, rr: (() => { const r = railRuns(track); return [r.run[h.k], r.run[h.k + 1], r.u[h.k], r.u[h.k + 1], r.ub[h.k]]; })(),
+						a: { f: track.s[h.k].flags, v: track.s[h.k].v, rp: track.s[h.k].rp?.length, ru: track.s[h.k].ru, tick: track.s[h.k].tick },
+						b: nx ? { f: nx.flags, v: nx.v, rp: nx.rp?.length, ru: nx.ru, tick: nx.tick } : null });
+				}
 			}
-			truth.tick = tau;
-			const kind = tr.kindOf(truth.k);
-			const sh = shown.get(id);
-			const p = score(st, sh, tr, kind, q.prev);
-			if (process.env.RAILBENCH_DEBUG_DELAY && sh && Math.hypot(sh.x - truth.c[0], sh.y - truth.c[1]) > Number(process.env.RAILBENCH_DEBUG_DELAY)) {
-				const track = view.tracks.get(id);
-				const h = headAt(track, tv, horizon, newHead());
-				const nx = track.s[h.k + 1];
-				debugLive.push({ train: tr.id, tick: Math.round(tau), e: +Math.hypot(sh.x - truth.c[0], sh.y - truth.c[1]).toFixed(2),
-					mode: h.mode, rail: !!h.rail, sinceSample: Math.round(tv - track.s[h.k].t), next: nx ? Math.round(nx.t - tv) : null,
-					delay: Math.round(now - tv), drawnVsHead: +Math.hypot(sh.x - h.x, sh.y - h.y).toFixed(2),
-					k: h.k, n: track.s.length, rr: (() => { const r = railRuns(track); return [r.run[h.k], r.run[h.k + 1], r.u[h.k], r.u[h.k + 1], r.ub[h.k]]; })(),
-					a: { f: track.s[h.k].flags, v: track.s[h.k].v, rp: track.s[h.k].rp?.length, ru: track.s[h.k].ru, tick: track.s[h.k].tick },
-					b: nx ? { f: nx.flags, v: nx.v, rp: nx.rp?.length, ru: nx.ru, tick: nx.tick } : null });
-			}
-			q.prev = p ? { ...p, dtTicks: step / msPerTick } : null;
 		}
 	}
 }
 
-for (const mode of modes) {
-	const st = newModeStats();
-	t = performance.now();
-	const shared = mode === "live" && liveEstimator === "shared";
-	if (shared) {
-		const bySurface = new Map();
-		for (const j of list) {
-			bySurface.set(j.surfaceName, [...(bySurface.get(j.surfaceName) ?? []), j]);
-		}
-		for (const js of bySurface.values()) {
-			liveShared(st, js);
-		}
+/** Sessions of the seek and open modes: one every sessionMs from the first row on, each until the next. */
+function sessions(js) {
+	let t0 = Infinity;
+	let t1 = -Infinity;
+	for (const j of js) {
+		t0 = Math.min(t0, info(j).firstT);
+		t1 = Math.max(t1, info(j).endT);
 	}
-	for (const j of shared ? [] : list) {
-		const m = matched.get(j.id);
-		const { view, samples } = sessionFor(j);
-		const firstT = samples.find(x => !(x.s.flags & F_GONE))?.s.t;
-		const lastT = samples[samples.length - 1].s.t;
-		const trainAt = trainFinder(j);
-		let prev = null;
-		if (mode === "history") {
-			for (const x of samples) {
-				view.add(x.s.meta, x.s);
-			}
-			const tick0 = Math.ceil(tickOf(firstT));
-			const tick1 = Math.floor(tickOf(lastT));
-			for (let tick = tick0; tick <= tick1; tick++) {
-				const ms = msOf(tick);
-				const tr = trainAt(ms);
-				if (!truthAt(tr, tick, truth) || !truth.moving) {
-					prev = null;
-					continue;
-				}
-				truth.tick = tick;
-				const shown = view.frame(ms, Infinity, { bodies: true })[0];
-				const kind = tr.kindOf(truth.k);
-				const p = score(st, shown, tr, kind, prev);
-				prev = p ? { ...p, dtTicks: 1 } : null;
-			}
-		} else {
-			const est = new DelayEstimator(2000);
-			let fed = 0;
-			const arrival = (ms) => Math.ceil(ms / batchMs) * batchMs + extraMs;
-			let perf = 0;
-			const step = msPerTick;
-			for (let now = firstT + 1000; now <= lastT + 20000; now += step, perf += step) {
-				while (fed < samples.length && arrival(samples[fed].s.t) <= now) {
-					const x = samples[fed];
-					if (view.add(x.s.meta, x.s) && !Number.isNaN(view.prevT)) {
-						est.observeReady(now - view.prevT);
-					}
-					if (view.sawRail) {
-						est.railPrior(view.tickRate);
-					}
-					est.observe(now - x.s.t);
-					fed++;
-				}
-				const tv = now - est.delay(perf);
-				const horizon = est.horizon(now);
-				if (Math.floor(perf / 1000) !== Math.floor((perf - step) / 1000)) {
-					st.delay.add(now - tv);
-				}
-				if (Math.round(perf) % 10000 === 0) {
-					view.trim(tv);
-				}
-				if (tv < firstT || tv > lastT) {
-					prev = null;
-					continue;
-				}
-				const tau = tickOf(tv);
-				const tr = trainAt(tv);
-				if (!truthAt(tr, tau, truth) || !truth.moving) {
-					prev = null;
-					continue;
-				}
-				truth.tick = tau;
-				const shown = view.frame(tv, horizon, { bodies: true })[0];
-				const kind = tr.kindOf(truth.k);
-				const p = score(st, shown, tr, kind, prev);
-				prev = p ? { ...p, dtTicks: step / msPerTick } : null;
-			}
-		}
+	const out = [];
+	for (let at = t0 + sessionMs; at < t1; at += sessionMs) {
+		out.push({ at, until: Math.min(t1, at + sessionMs) });
 	}
-	const secs = (performance.now() - t) / 1000;
+	return out;
+}
+
+const bySurface = new Map();
+for (const j of list) {
+	bySurface.set(j.surfaceName, [...(bySurface.get(j.surfaceName) ?? []), j]);
+}
+
+/** A mode's statistics as reported. */
+function summarize(st) {
 	const r = {
 		frames: st.frames, not_drawn: st.notDrawn, head: st.headAll.summary(), head_by_kind: {},
 		head_over_1: st.headOver1, head_over_2: st.headOver2,
@@ -584,18 +643,80 @@ for (const mode of modes) {
 		r.head_by_kind[k] = st.head[i].summary();
 		r.car_by_kind[k] = st.carByKind[i].summary();
 	}
-	report.modes[mode] = r;
-	fs.writeFileSync(path.join(dir, `worst${tag}-${mode}.json`), JSON.stringify({ head: st.worst, carriages: st.worstCar }));
-	console.log(`\n${mode} (${secs.toFixed(1)} s): ${st.frames} train-frames, ${st.notDrawn} not drawn`);
-	console.log(`  head error   ${fmt(r.head)}; > 1 tile ${st.headOver1}, > 2 tiles ${st.headOver2}`);
+	return r;
+}
+
+function print(label, r) {
+	console.log(`  ${label}: ${r.frames} train-frames, ${r.not_drawn} not drawn`);
+	if (!r.head.n) {
+		return;
+	}
+	console.log(`    head error   ${fmt(r.head)}; > 1 tile ${r.head_over_1}, > 2 tiles ${r.head_over_2}`);
 	for (const k of KINDS) {
-		if (r.head_by_kind[k].n) {
-			console.log(`    ${k.padEnd(9)} ${fmt(r.head_by_kind[k])}`);
+		if (r.head_by_kind[k].n && label === "moving") {
+			console.log(`      ${k.padEnd(9)} ${fmt(r.head_by_kind[k])}`);
 		}
 	}
-	console.log(`  carriages   ${fmt(r.car_position)}; angle ${fmt(r.car_angle_deg, " deg")}; spacing ${fmt(r.spacing)}`);
-	console.log(`  carriage-frames ${st.carFrames}: > 1 tile ${st.over1} (${(100 * st.over1 / st.carFrames).toFixed(3)}%), `
-		+ `> 2 tiles ${st.over2} (${(100 * st.over2 / st.carFrames).toFixed(3)}%); jumps ${st.jumps}, carriage jumps ${st.carJumps}`);
+	console.log(`    carriages   ${fmt(r.car_position)}; angle ${fmt(r.car_angle_deg, " deg")}; spacing ${fmt(r.spacing)}`);
+	console.log(`    carriage-frames ${r.car_frames}: > 1 tile ${r.car_over_1} (${(100 * r.car_over_1 / r.car_frames).toFixed(3)}%), `
+		+ `> 2 tiles ${r.car_over_2} (${(100 * r.car_over_2 / r.car_frames).toFixed(3)}%); jumps ${r.jumps}, carriage jumps ${r.car_jumps}`);
+}
+
+for (const mode of modes) {
+	const st = newModeStats();
+	st.stop = newModeStats();
+	t = performance.now();
+	if (mode === "history") {
+		for (const j of list) {
+			playback(st, j, samplesOf(j), info(j).firstT, info(j).endT);
+		}
+	} else if (mode === "seek") {
+		// a seek to a keyframe at the session's start: each journey's last row at or before it (its keyframe row, unless
+		// a gone), then the rows after it up to the history lookahead past the session
+		for (const s of sessions(list)) {
+			for (const j of list) {
+				const q = info(j);
+				if (q.endT <= s.at || q.firstT >= s.until) {
+					continue;
+				}
+				let from = rowAt(j, s.at);
+				if (from >= 0 && j.rows[from][5] & F_GONE) {
+					from++;
+				}
+				from = Math.max(0, from);
+				let to = from;
+				while (to < j.rows.length && j.rows[to][0] <= s.until + LOOKAHEAD) {
+					to++;
+				}
+				playback(st, j, samplesOf(j, from, to), Math.max(s.at, q.firstT), Math.min(s.until, q.endT));
+			}
+		}
+	} else if (mode === "live" || mode === "open") {
+		for (const js of bySurface.values()) {
+			if (mode === "open") {
+				for (const s of sessions(js)) {
+					liveShared(st, js, s);
+				}
+			} else if (liveEstimator === "shared") {
+				liveShared(st, js);
+			} else {
+				for (const j of js) {
+					liveShared(st, [j]);
+				}
+			}
+		}
+	} else {
+		throw new Error(`unknown mode ${mode}`);
+	}
+	const secs = (performance.now() - t) / 1000;
+	const r = summarize(st);
+	r.stopped = summarize(st.stop);
+	report.modes[mode] = r;
+	fs.writeFileSync(path.join(dir, `worst${tag}-${mode}.json`), JSON.stringify({ head: st.worst, carriages: st.worstCar,
+		stopped: { head: st.stop.worst, carriages: st.stop.worstCar } }));
+	console.log(`\n${mode} (${secs.toFixed(1)} s)`);
+	print("moving", r);
+	print("standing", r.stopped);
 	if (r.display_delay_ms) {
 		console.log(`  display delay ms ${fmt(r.display_delay_ms)}`);
 	}

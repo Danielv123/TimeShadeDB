@@ -8,6 +8,8 @@
 //
 // --reads accel schedules the next read where constant acceleration (measured since the previous read) puts the train
 // core.STEP tiles on, instead of core.STEP tiles at the current speed (which waits up to core.SLOW ticks after a start).
+// --reads shipped is the rail path capture's own schedule (core.next_read): 5 tiles rounded down, sooner while
+// accelerating, at most 30 ticks (--slow still overrides the 30).
 //
 // Rules:
 //   current      capture/lua/core.lua train_read (chord 0.25 tile, SED 1 tile, heading 2 degrees, 16 reads, heartbeat);
@@ -60,15 +62,16 @@ const THIN = args.includes("--thin");
 // more than N ticks behind the train
 const MAX_GAP = Number(option("--max-gap", Infinity));
 const ruleNames = option("--rules", "current,railshape,railshape-h,railpath,railpath-v,matched").split(",");
-// read schedule: "capture" as core.next_read (core.STEP tiles at the current speed, at most core.SLOW ticks), or
-// "accel": core.STEP tiles at the current speed and the acceleration since the previous read
+// read schedule: "capture" as the 2026-10 core.next_read (core.STEP tiles at the current speed rounded up, at most
+// core.SLOW ticks), "accel": core.STEP tiles at the current speed and the acceleration since the previous read, or
+// "shipped": the rail path capture's (5 tiles rounded down, the acceleration since the previous read, at most 30 ticks)
 const READS = option("--reads", "capture");
 
-// capture/lua/core.lua constants of the 2026-10 capture: reads every 4 tiles rounded up. (The rail path capture reads
-// every 5 rounded down, 1.4% more reads on the benchmark map; the rules here keep the old schedule.)
-const STEP = 4;
+// capture/lua/core.lua constants of the 2026-10 capture: reads every 4 tiles rounded up, at most 120 ticks apart; the
+// rail path capture's are 5 tiles rounded down and 30 ticks
+const STEP = READS === "shipped" ? 5 : 4;
 // core.SLOW: the longest wait between reads of a moving train (--slow overrides it to try shorter ones)
-const SLOW = Number(option("--slow", 120));
+const SLOW = Number(option("--slow", READS === "shipped" ? 30 : 120));
 const HEARTBEAT = 600;
 const CHORD_EPS = 0.25;
 const SED_EPS = 1;
@@ -464,7 +467,16 @@ for (const rname of ruleNames) {
 				}
 				const v = Math.abs(tr.speed[k]) / 1e5;
 				let wait = Math.min(SLOW, Math.max(1, Math.ceil(STEP / v)));
-				if (READS === "accel" && lastRead && tick > lastRead.t) {
+				if (READS === "shipped") {
+					// core.next_read: where v w + a w^2 / 2 = STEP, rounded down, with the acceleration since the previous read
+					const a = lastRead && tick > lastRead.t && tick - lastRead.t <= 2 * SLOW ? (v - lastRead.v) / (tick - lastRead.t) : 0;
+					const w = a > 1e-6 ? (Math.sqrt(v * v + 2 * a * STEP) - v) / a : STEP / v;
+					wait = Math.min(SLOW, Math.max(1, Math.floor(w)));
+					if (m.e && m.moving && tick + wait > m.e.t + MAX_GAP) {
+						// read when the live gap ends (movers.lua)
+						wait = Math.max(1, m.e.t + MAX_GAP - tick);
+					}
+				} else if (READS === "accel" && lastRead && tick > lastRead.t) {
 					// the time to go core.STEP tiles at constant acceleration (measured since the previous read)
 					const a = (v - lastRead.v) / (tick - lastRead.t);
 					if (a > 1e-6) {

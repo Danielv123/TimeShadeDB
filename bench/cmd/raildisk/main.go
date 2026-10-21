@@ -4,7 +4,8 @@
 // geometry (`car`), and the size the same windows would have after zstd without the
 // carriage column and without non-train rows, so the share of `car` and of keyframes in
 // the bytes per train-hour can be given; for rail path rows (core.FlagRail) also their
-// count, their rail pieces and the size without the pieces.
+// count, their rail pieces and the size without the pieces; and every file of the surface's
+// mover directory (windows, keyframes, day indexes, meta) as it lies on disk.
 //
 //	raildisk -db <v3 db> [-out disk.json]
 package main
@@ -32,6 +33,10 @@ type surfaceDisk struct {
 	Windows       int   `json:"windows"`
 	KeyframeBytes int64 `json:"keyframe_bytes"`
 	Keyframes     int   `json:"keyframes"`
+	// Every file under the surface's mover directory, and the bytes of those that are
+	// neither windows nor keyframes (day indexes, meta.json).
+	DiskBytes  int64 `json:"disk_bytes"`
+	IndexBytes int64 `json:"index_bytes"`
 	// Rows of the closed windows.
 	Rows      int `json:"rows"`
 	TrainRows int `json:"train_rows"`
@@ -72,6 +77,14 @@ func main() {
 			continue
 		}
 		sd := surfaceDisk{Surface: e.Name()}
+		filepath.WalkDir(filepath.Join(root, e.Name()), func(p string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				if info, err := d.Info(); err == nil {
+					sd.DiskBytes += info.Size()
+				}
+			}
+			return nil
+		})
 		for _, kind := range []string{"windows", "keyframes"} {
 			var files []string
 			filepath.WalkDir(filepath.Join(root, e.Name(), kind), func(p string, d fs.DirEntry, err error) error {
@@ -141,6 +154,7 @@ func main() {
 				sd.TrainNoCarBytes += int64(len(enc.EncodeAll(body, nil)))
 			}
 		}
+		sd.IndexBytes = sd.DiskBytes - sd.WindowBytes - sd.KeyframeBytes
 		res = append(res, sd)
 	}
 	b, err := json.MarshalIndent(res, "", "  ")
