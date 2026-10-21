@@ -323,3 +323,67 @@ test("data clock never goes back", () => {
   c.see(5000);
   assert.equal(c.now(), 5000);
 });
+
+test("a parked train is placed from its stop sample alone (a keyframe, live.bin) when it lists the pieces under it", async () => {
+  // the real-game trains of the shared rail vectors (docs/v3/rail-geometry-vectors.json)
+  const P = await import("./railpath.ts");
+  const vectors = JSON.parse(readFileSync(new URL("../../../docs/v3/rail-geometry-vectors.json", import.meta.url), "utf8"));
+  const kindOf = (type: string): number =>
+    ({ "curved-rail-a": P.KIND_CURVE_A, "curved-rail-b": P.KIND_CURVE_B, "legacy-curved-rail": P.KIND_LEGACY_CURVE, "rail-ramp": P.KIND_RAMP })[
+      type.replace(/^elevated-/, "")
+    ] ?? 0;
+  let curved = 0;
+  let worstOld = 0;
+  for (const t of vectors.trains) {
+    const pieces = t.path.filter((r: { type: string }) => kindOf(r.type)).map((r: { type: string; x: number; y: number; dir: number }) =>
+      ({ x: r.x, y: r.y, dir: r.dir, kind: kindOf(r.type) }));
+    if (pieces.length === 0) {
+      continue;
+    }
+    curved++;
+    // the leading carriage's own orientation turned to the direction of travel: along its axis from its centre towards
+    // the leading joint (the joint is the rail point a train length ahead of the rear)
+    const [cx, cy, co] = t.game_carriages[0];
+    const [nx, ny] = t.game_carriages[1];
+    const a = 2 * Math.PI * co;
+    const ahead = Math.sin(a) * (cx - nx) - Math.cos(a) * (cy - ny) > 0;
+    const o = (co + (ahead ? 0 : 0.5)) % 1;
+    const m = { id: t.source, k: "t" as const, f: "player", name: "locomotive", n: t.game_carriages.length, o: "L" + "C".repeat(t.game_carriages.length - 1) };
+    const draw = (rp: typeof pieces) => {
+      const v = new MoverView();
+      v.add(m, T.makeSample(m, 1000, cx, cy, o, T.F_RAIL | T.F_STOP, null, 600, 0, rp));
+      const shown = v.frame(61_000, Infinity, { bodies: true })[0];
+      assert.equal(shown.cars.length, t.game_carriages.length);
+      let worst = 0;
+      for (const [i, [x, y]] of t.game_carriages.entries()) {
+        worst = Math.max(worst, Math.hypot(shown.cars[i].x - x, shown.cars[i].y - y));
+      }
+      return worst;
+    };
+    const e = draw(pieces);
+    // within 0.05 of the game, except where the leading carriage stands on a ramp's slope: its joint is taken 2 tiles
+    // ahead of its centre in plan, about 0.2 short there (RAIL-GEOMETRY.md 8.2)
+    assert.ok(e < (t.category === "rail-ramp" ? 0.25 : 0.05), `${t.source}: a carriage ${e.toFixed(3)} tiles off`);
+    // only the last piece (as a stop sample listing just the pieces entered since the sample before may): off the rails
+    worstOld = Math.max(worstOld, draw(pieces.slice(-1)));
+  }
+  assert.ok(curved >= 20, `${curved} trains on curved pieces or ramps`);
+  assert.ok(worstOld > 2, `without the pieces under it a parked train is drawn up to ${worstOld.toFixed(1)} tiles off`);
+});
+
+test("a changed train (a split at rest: a new rail path, fewer carriages) holds at its stop sample, then jumps", () => {
+  const v = new MoverView();
+  const m3 = { ...meta, id: "split", n: 3, o: "LCC" };
+  const m2 = { ...meta, id: "split", n: 2, o: "CC", name: "cargo-wagon" };
+  v.add(m3, T.makeSample(m3, 0, 0, 0, 0.25, T.F_RAIL, null, 0, 0.3));
+  v.add(m3, T.makeSample(m3, 1000, 18, 0, 0.25, T.F_RAIL | T.F_STOP, null, 60, 0));
+  // 40 s later its locomotive is taken off: the rest's leading carriage stands 7 tiles back
+  const car = [{ x: 11, y: 0, o: 0.25 }, { x: 4, y: 0, o: 0.25 }];
+  v.add(m2, T.makeSample(m2, 41_000, 11, 0, 0.25, T.F_RAIL | T.F_STOP, car, 2460, 0, null, true));
+  for (const t of [2000, 20_000, 40_900]) {
+    const shown = v.frame(t, Infinity)[0];
+    assert.ok(shown && Math.abs(shown.x - 18) < 1e-6, `at ${t}: held at the stop (${shown?.x})`);
+  }
+  const after = v.frame(41_000, Infinity)[0];
+  assert.ok(Math.abs(after.x - 11) < 1e-6, `then where the rest stands (${after.x})`);
+});

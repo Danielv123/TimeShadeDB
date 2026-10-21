@@ -39,6 +39,41 @@ export const TRIM_EVERY_MS = 10_000;
 /** A time unchanged for this long (real ms) counts as stopped, whatever the last speed. */
 export const QUIET_MS = 250;
 
+/**
+ * Arrival lags of live rows for the delay estimator (clock.ts), as MoverFeed feeds it: each new
+ * row's readiness lag (its arrival minus the time of the sample before it on a moving track,
+ * MoverView.add's prevT) and, for rows newer than any seen, its own arrival lag. Rows that do
+ * not count (a first live payload, a resync's) only advance the newest time. Shared with the
+ * railbench evaluator, so its live model is the viewer's.
+ */
+export class LiveLags {
+  /** Newest row time seen from live sources (rows newer than this count for lag stats). */
+  newest = -Infinity;
+  private readonly view: MoverView;
+  private readonly delay: DelayEstimator;
+
+  constructor(view: MoverView, delay: DelayEstimator) {
+    this.view = view;
+    this.delay = delay;
+  }
+
+  /** A row of time t that arrived at `arrived` was added (MoverView's onRow); `count`: it counts for the lags. */
+  see(t: number, arrived: number, count: boolean, prevT: number): void {
+    if (this.view.sawRail) {
+      this.delay.railPrior(this.view.tickRate);
+    }
+    if (count && Number.isFinite(this.newest) && !Number.isNaN(prevT)) {
+      this.delay.observeReady(arrived - prevT);
+    }
+    if (t > this.newest) {
+      if (count && Number.isFinite(this.newest)) {
+        this.delay.observe(arrived - t);
+      }
+      this.newest = t;
+    }
+  }
+}
+
 export interface FeedEvents {
   /** New data arrived; redraw. */
   changed(): void;
@@ -67,8 +102,7 @@ export class MoverFeed {
   private dayAbort = new AbortController();
   /** perf() of the last live.bin fetch made for history (throttled to liveMs). */
   private lastLiveFetch = -Infinity;
-  /** Newest row time seen from live sources (rows newer than this count for lag stats). */
-  private newest = -Infinity;
+  private readonly lags: LiveLags;
   private lastT = NaN;
   private lastPerf = NaN;
   private lastTrim = NaN;
@@ -99,6 +133,7 @@ export class MoverFeed {
     this.events = events;
     this.liveMs = liveMs;
     this.perf = perf;
+    this.lags = new LiveLags(view, delay);
   }
 
   /**
@@ -192,7 +227,7 @@ export class MoverFeed {
     this.to = NaN;
     this.loading = null;
     this.seekT = NaN;
-    this.newest = -Infinity;
+    this.lags.newest = -Infinity;
     this.lastLiveFetch = -Infinity;
     this.downSince = NaN;
     this.view.clear();
@@ -267,18 +302,7 @@ export class MoverFeed {
   }
 
   private see(t: number, arrived: number, count: boolean, prevT: number): void {
-    if (this.view.sawRail) {
-      this.delay.railPrior(this.view.tickRate);
-    }
-    if (count && Number.isFinite(this.newest) && !Number.isNaN(prevT)) {
-      this.delay.observeReady(arrived - prevT);
-    }
-    if (t > this.newest) {
-      if (count && Number.isFinite(this.newest)) {
-        this.delay.observe(arrived - t);
-      }
-      this.newest = t;
-    }
+    this.lags.see(t, arrived, count, prevT);
   }
 
   /** How far past the displayed time history is loaded, at the current playback speed. */

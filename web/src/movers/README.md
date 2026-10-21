@@ -37,7 +37,10 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    (`placeRailCarriages`; pitches within a quarter tile of 7 are taken as 7). Past the newest
    sample the head runs on along the chain at its speed, braking to a stop when the last two
    speeds fell, within the caps of step 4; ahead of the newest piece the chain is the straight
-   it ended on. A stop sample links to the start however long the train stood. A new run whose
+   it ended on. A stop sample links to the start however long the train stood; it lists the
+   pieces under the whole train (those already on the chain are resends), so a parked train
+   drawn from its stop sample alone (a keyframe, the live payload) is on its rails. Carriages
+   are placed by vanilla joint distances (4 and 3, RAIL-GEOMETRY.md 8.2). A new run whose
    pieces reach back to the sample before it (a first sight after a resync, a missed piece)
    links that segment on its chain. Each sample is placed no further along than its speeds
    allow and, among equally near points, nearest where they put it; a run's first sample no

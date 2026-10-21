@@ -686,6 +686,11 @@ export function linked(tr: Track, k: number): boolean {
   if (!a || !b || isGone(a) || isGone(b) || b.t - a.t > MAX_SEGMENT_MS) {
     return false;
   }
+  if ((a.flags & b.flags & F_RAIL) !== 0 && b.ru && a.meta.n !== b.meta.n) {
+    // The train changed (a join or a split; its capture reads it at once): where the rail path
+    // does not link the two leading joints, the leading carriage changed. Hold, then jump.
+    return false;
+  }
   return !isEndSwitch(tr, k);
 }
 
@@ -1144,11 +1149,13 @@ export function headAt(tr: Track, t: number, horizon: number, out: Head): Head {
     return out;
   }
   if (!linked(tr, k)) {
-    if (t - s[k].t > HEARTBEAT_MS && !isEndSwitch(tr, k) && !stationary(tr, k)) {
+    const parked = (s[k].flags & (F_STOP | F_RAIL)) === (F_STOP | F_RAIL);
+    if (t - s[k].t > HEARTBEAT_MS && !isEndSwitch(tr, k) && !stationary(tr, k) && !parked) {
       // A data gap after which the mover is somewhere else (an instance down or a save
       // reloaded without a gone): where it was meanwhile is unknown, and the capture would
       // have sent a sample within a heartbeat had it still been here, so it is not drawn
-      // until the next sample instead of standing still and then jumping there.
+      // until the next sample instead of standing still and then jumping there. (A rail path
+      // capture sends nothing for a parked train: it stood at its stop sample until then.)
       return out;
     }
     // A data gap or an end switch: hold until the next sample (it is known, so running on
