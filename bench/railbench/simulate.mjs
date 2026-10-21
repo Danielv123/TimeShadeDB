@@ -54,7 +54,8 @@ const Rc = Math.sqrt(R * R - J * J);
 const EPS = Number(option("--eps", 0.25));
 const SED = Number(option("--sed", 1));
 const BUF = Number(option("--buf", 16));
-const RP_BUF = Number(option("--rp-buf", 1e6));
+// the railpath rules' buffer: unbounded by default; with --reads shipped core.BUF_MAX (16), as the capture keeps
+const RP_BUF = Number(option("--rp-buf", args.includes("shipped") ? 16 : 1e6));
 // --thin: a full buffer keeps every other read instead of sending a sample (railpath rules), so the per-read check stays
 // bounded while a sample pair may span any number of reads
 const THIN = args.includes("--thin");

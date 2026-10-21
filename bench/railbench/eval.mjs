@@ -336,7 +336,7 @@ function score(st, shown, tr, kind, prev) {
 		const to = truth.c[3 * i + 2];
 		const ce = Math.hypot(c.x - tx, c.y - ty);
 		if (ce > Number(process.env.RAILBENCH_WORST_CAR ?? 5) && st.worstCar.length < 2000) {
-			st.worstCar.push({ tick: Number(truth.tick.toFixed(2)), train: tr.id, car: i, e: Number(ce.toFixed(2)), kind: KINDS[kind] });
+			st.worstCar.push({ tick: Number(truth.tick.toFixed(2)), train: tr.id, j: truth.j, car: i, e: Number(ce.toFixed(2)), kind: KINDS[kind] });
 		}
 		st.car.add(ce);
 		st.carByKind[kind].add(ce);
@@ -380,7 +380,7 @@ function score(st, shown, tr, kind, prev) {
 		}
 	}
 	if (e > 2 && st.worst.length < 2000) {
-		st.worst.push({ tick: Number(truth.tick.toFixed(2)), train: tr.id, e: Number(e.toFixed(2)), kind: KINDS[kind] });
+		st.worst.push({ tick: Number(truth.tick.toFixed(2)), train: tr.id, j: truth.j, e: Number(e.toFixed(2)), kind: KINDS[kind] });
 	}
 	const flat = new Array(2 * cars.length);
 	for (let i = 0; i < cars.length; i++) {
@@ -463,6 +463,7 @@ function scoreAt(st, q, ms, tau, dtTicks, standing, shown) {
 		return;
 	}
 	truth.tick = tau;
+	truth.j = q.id;
 	if (truth.moving) {
 		q.prevS = null;
 		const p = score(st, shown(), tr, tr.kindOf(truth.k), q.prev);
@@ -482,7 +483,7 @@ function playback(st, j, samples, fromT, toT) {
 	for (const x of samples) {
 		view.add(x.s.meta, x.s);
 	}
-	const q = { trainAt: info(j).trainAt, prev: null, prevS: null, ms: 0 };
+	const q = { id: j.id, trainAt: info(j).trainAt, prev: null, prevS: null, ms: 0 };
 	const shown = () => view.frame(q.ms, Infinity, { bodies: true })[0];
 	for (let tick = Math.ceil(tickOf(fromT)); msOf(tick) < toT; tick++) {
 		q.ms = msOf(tick);
@@ -512,7 +513,7 @@ function liveShared(st, js, open = null) {
 		if (open && (q.endT <= open.at || q.firstT >= open.until)) {
 			continue;
 		}
-		per.set(j.id, { firstT: q.firstT, endT: q.endT, trainAt: q.trainAt, prev: null, prevS: null });
+		per.set(j.id, { id: j.id, firstT: q.firstT, endT: q.endT, trainAt: q.trainAt, prev: null, prevS: null });
 		t0 = Math.min(t0, q.firstT);
 		t1 = Math.max(t1, q.endT);
 		if (!open) {
