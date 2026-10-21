@@ -4,7 +4,7 @@
 //
 //   node bench/railbench/simulate.mjs --run <name> [--radius 13] [--eps 0.25] [--sed 1] [--buf 16] [--rp-buf 1000000]
 //       [--rules current,railshape,railshape-h,railpath,railpath-v,matched] [--reads capture|accel]
-//       [--slow 120] [--stopstart-ticks 120] [--work <dir>] [--out <file>]
+//       [--slow 120] [--stopstart-ticks 120] [--thin] [--max-gap N] [--work <dir>] [--out <file>]
 //
 // --reads accel schedules the next read where constant acceleration (measured since the previous read) puts the train
 // core.STEP tiles on, instead of core.STEP tiles at the current speed (which waits up to core.SLOW ticks after a start).
@@ -21,6 +21,9 @@
 //                switch, heartbeat and --rp-buf reads); described by the model (railgeom.mjs): the leading joint at the
 //                time-interpolated arc length, the leading carriage centre between it and the joint 4 behind
 //   railpath-v   railpath with each sample's speed: the arc length between samples is a cubic Hermite in time
+//   railpath-t   railpath-v with the timing model of docs/v3/RAIL-GEOMETRY.md 8.3 (stand-then-accelerate from a
+//                stop, brake-then-stand into one), what the capture and viewer now use
+//   shape-v      railshape walked by the Hermite in time with the speeds, one tolerance (--eps) at the read's time
 //   matched     the samples of railpath, but the path between two samples is the shortest rail path through the
 //                network from the first sample's piece (in its direction of travel) to the second's: what a viewer
 //                that has the rail layer but no piece sequence would draw. Counts how often that is not the true path.
@@ -30,7 +33,7 @@ import path from "node:path";
 import { readGroundTruth } from "./gt.mjs";
 import { RailIndex } from "./rails.mjs";
 import { RailNet } from "./railnet.mjs";
-import { railPoint } from "./railgeom.mjs";
+import { buildRoutes, shortestRoute } from "./routes.mjs";
 import { KINDS, K, STOPSTART_TICKS, prepareTrain } from "./truth.mjs";
 import { dubins, distance, pointAt, still } from "./dubins.mjs";
 
@@ -50,6 +53,12 @@ const EPS = Number(option("--eps", 0.25));
 const SED = Number(option("--sed", 1));
 const BUF = Number(option("--buf", 16));
 const RP_BUF = Number(option("--rp-buf", 1e6));
+// --thin: a full buffer keeps every other read instead of sending a sample (railpath rules), so the per-read check stays
+// bounded while a sample pair may span any number of reads
+const THIN = args.includes("--thin");
+// --max-gap N: a moving train is sampled at least every N ticks (railpath rules), so a live viewer's data is never
+// more than N ticks behind the train
+const MAX_GAP = Number(option("--max-gap", Infinity));
 const ruleNames = option("--rules", "current,railshape,railshape-h,railpath,railpath-v,matched").split(",");
 // read schedule: "capture" as core.next_read (core.STEP tiles at the current speed, at most core.SLOW ticks), or
 // "accel": core.STEP tiles at the current speed and the acceleration since the previous read
@@ -186,6 +195,47 @@ export function hermiteU(e, c, f) {
 	return (2 * f3 - 3 * f2 + 1) * e.U + (f3 - 2 * f2 + f) * dt * e.v + (-2 * f3 + 3 * f2) * c.U + (f3 - f2) * dt * c.v;
 }
 
+/**
+ * The timing model of a sample pair (docs/v3/RAIL-GEOMETRY.md 8): arc length at fraction f between samples e and c with
+ * speeds. A pair that starts at rest (e.v = 0) stands until uniform acceleration from rest reaches c with c's speed,
+ * when that takes less than the pair's time; one that ends at rest decelerates uniformly from e's speed and stands.
+ * Otherwise a cubic Hermite in time with both speeds.
+ */
+export function timingU(e, c, f) {
+	const T = c.t - e.t;
+	const L = c.U - e.U;
+	if (T > 0 && L > 0) {
+		if (e.v <= 0 && c.v > 0 && (2 * L) / c.v < T) {
+			const tm = (2 * L) / c.v;
+			const s = T * f - (T - tm);
+			return s <= 0 ? e.U : e.U + (c.v * s * s) / (2 * tm);
+		}
+		if (c.v <= 0 && e.v > 0 && (2 * L) / e.v < T) {
+			const tm = (2 * L) / e.v;
+			const s = Math.min(T * f, tm);
+			return e.U + e.v * s - (e.v * s * s) / (2 * tm);
+		}
+	}
+	return Math.max(Math.min(e.U, c.U), Math.min(Math.max(e.U, c.U), hermiteU(e, c, f)));
+}
+
+/** railpath-t: as railpath-v with the stand-and-accelerate timing model (timingU). */
+function offPathT(e, buf, c) {
+	if (e.run !== c.run || Number.isNaN(e.U) || Number.isNaN(c.U)) {
+		return true;
+	}
+	const dt = c.t - e.t;
+	for (const q of buf) {
+		if (q.run !== e.run || Number.isNaN(q.U)) {
+			return true;
+		}
+		if (Math.abs(q.U - timingU(e, c, dt > 0 ? (q.t - e.t) / dt : 0)) > SED) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /** railpath-v: as offPath, against the Hermite in time with both samples' speeds. */
 function offPathV(e, buf, c) {
 	if (e.run !== c.run || Number.isNaN(e.U) || Number.isNaN(c.U)) {
@@ -197,6 +247,31 @@ function offPathV(e, buf, c) {
 			return true;
 		}
 		if (Math.abs(q.U - hermiteU(e, c, dt > 0 ? (q.t - e.t) / dt : 0)) > SED) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Arc length at fraction f of a path of length len between samples e and c: cubic Hermite in time with their speeds. */
+function hermiteS(len, e, c, f) {
+	const dt = c.t - e.t;
+	const f2 = f * f;
+	const f3 = f2 * f;
+	return Math.max(0, Math.min(len, (f3 - 2 * f2 + f) * dt * e.v + (-2 * f3 + 3 * f2) * len + (f3 - f2) * dt * c.v));
+}
+
+/** shape-v: the rail-shaped path with the own orientation, walked by the Hermite in time with the samples' speeds. */
+function offShapeV(e, buf, c) {
+	const p = railShape(e, c, "th");
+	if (!p) {
+		return true;
+	}
+	const dt = c.t - e.t;
+	const tmp = [0, 0, 0];
+	for (const q of buf) {
+		pointAt(p, hermiteS(p.len, e, c, dt > 0 ? (q.t - e.t) / dt : 0), tmp);
+		if (Math.hypot(q.x - tmp[0], q.y - tmp[1]) > EPS) {
 			return true;
 		}
 	}
@@ -218,7 +293,7 @@ function trainRead(m, r, rule) {
 		why = "es";
 	} else if (!m.moving) {
 		why = "start";
-	} else if (r.t - e.t >= HEARTBEAT) {
+	} else if (r.t - e.t >= HEARTBEAT || (rule.path && r.t - e.t >= MAX_GAP)) {
 		why = "heartbeat";
 	}
 	let buf = m.buf ?? [];
@@ -238,7 +313,11 @@ function trainRead(m, r, rule) {
 		} else if (rule.path && buf.length === 0 && (e.run !== r.run || Number.isNaN(r.U))) {
 			why = "shape"; // the route broke (a projection failed): send it
 		} else if (buf.length >= rule.buf) {
-			why = "full";
+			if (THIN && rule.path) {
+				buf = buf.filter((_, i) => i % 2 === 1);
+			} else {
+				why = "full";
+			}
 		}
 	}
 	if (why) {
@@ -261,219 +340,12 @@ const allRules = {
 	current: { off: offChord, heading: true, buf: BUF_MAX, describe: "polyline" },
 	railshape: { off: offShape("th"), heading: false, shape: "th", buf: BUF, describe: "shape" },
 	"railshape-h": { off: offShape("hh"), heading: false, shape: "hh", buf: BUF, describe: "shape" },
+	"shape-v": { off: offShapeV, heading: false, shape: "th", buf: BUF, describe: "shape", speeds: true },
 	railpath: { off: offPath, heading: false, path: true, buf: RP_BUF, describe: "route" },
 	"railpath-v": { off: offPathV, heading: false, path: true, buf: RP_BUF, describe: "route", speeds: true },
+	"railpath-t": { off: offPathT, heading: false, path: true, buf: RP_BUF, describe: "route", speeds: true, timing: true },
 	matched: { off: offPath, heading: false, path: true, buf: RP_BUF, describe: "matched" },
 };
-
-// ---------------------------------------------------------------------------------------------------------------
-// Routes: the leading joint's arc length along the rail path, per recorded line
-
-/** A route: pieces in travel order with cumulative start offsets; point(u) on it. */
-class Route {
-	constructor() {
-		this.pieces = [];
-		this.cum = [0];
-	}
-	push(c) {
-		this.pieces.push({ type: c.r.type, x: c.r.x, y: c.r.y, dir: c.r.dir, rev: c.rev, r: c.r });
-		this.cum.push(this.cum[this.cum.length - 1] + c.r.L);
-	}
-	get tail() {
-		return this.pieces[this.pieces.length - 1];
-	}
-	u(i, s) {
-		const p = this.pieces[i];
-		return this.cum[i] + (p.rev ? p.r.L - s : s);
-	}
-	point(u) {
-		let lo = 0;
-		let hi = this.pieces.length - 1;
-		if (u <= 0) {
-			hi = 0;
-		}
-		while (lo < hi) {
-			const mid = (lo + hi + 1) >> 1;
-			if (this.cum[mid] <= u) {
-				lo = mid;
-			} else {
-				hi = mid - 1;
-			}
-		}
-		const p = this.pieces[lo];
-		const L = p.r.L;
-		const t = Math.max(0, Math.min(L, u - this.cum[lo]));
-		const q = railPoint(p, p.rev ? L - t : t);
-		return q;
-	}
-	/** The leading carriage centre for a leading joint at u (the midpoint of the joints at u and u - 4). */
-	head(u) {
-		const a = this.point(u);
-		const b = this.point(u - 4);
-		return [(a.x + b.x) / 2, (a.y + b.y) / 2];
-	}
-}
-
-/** Leading joint of line k: { x, y } and the travel axis. */
-function leadingJoint(tr, k) {
-	const n = tr.n;
-	const fwd = tr.dir[k] > 0;
-	const b = k * tr.stride;
-	const i0 = fwd ? 0 : n - 1;
-	const x = tr.cars[b + 3 * i0] / 256;
-	const y = tr.cars[b + 3 * i0 + 1] / 256;
-	const o = (tr.cars[b + 3 * i0 + 2] / 65536) * 2 * Math.PI;
-	let ux = Math.sin(o);
-	let uy = -Math.cos(o);
-	if (n > 1) {
-		const i1 = fwd ? 1 : n - 2;
-		const sx = tr.cars[b + 3 * i1] / 256;
-		const sy = tr.cars[b + 3 * i1 + 1] / 256;
-		if (ux * (x - sx) + uy * (y - sy) < 0) {
-			ux = -ux;
-			uy = -uy;
-		}
-	} else if (!fwd) {
-		ux = -ux;
-		uy = -uy;
-	}
-	return { x: x + J * ux, y: y + J * uy, ux, uy };
-}
-
-/** Per line of a train: U (leading joint arc length on its run's route, NaN when unknown), run id; and the routes. */
-function buildRoutes(tr, net) {
-	const n = tr.ticks.length;
-	const U = new Float64Array(n).fill(NaN);
-	const run = new Int32Array(n).fill(-1);
-	const routes = [];
-	let route = null;
-	let pending = []; // lines before the route's direction is known: [{ k, p }]
-	let lastFwd = null;
-	const newRun = () => {
-		route = null;
-		pending = [];
-	};
-	for (let k = 0; k < n; k++) {
-		const fwd = tr.dir[k] > 0;
-		if (lastFwd !== null && fwd !== lastFwd) {
-			newRun();
-		}
-		lastFwd = fwd;
-		const j = leadingJoint(tr, k);
-		const c = net.near(tr.surface, j.x, j.y, j.ux, j.uy, 0.3, 0.9);
-		if (!c.length) {
-			newRun();
-			continue;
-		}
-		const p = c[0];
-		if (!route) {
-			const f = pending[0];
-			if (!f) {
-				pending.push({ k, p });
-				continue;
-			}
-			let seg = null;
-			if (p.r === f.p.r) {
-				if (Math.abs(p.s - f.p.s) < 1e-4) {
-					pending.push({ k, p });
-					continue;
-				}
-				seg = [{ r: p.r, rev: p.s < f.p.s }];
-			} else {
-				seg = net.chain(f.p.r, p.r, 6);
-				// the projection picked the joint's own direction of travel only if the chain runs that way
-			}
-			if (!seg) {
-				pending = [{ k, p }];
-				continue;
-			}
-			route = new Route();
-			for (const s of seg) {
-				route.push(s);
-			}
-			routes.push(route);
-			for (const q of [...pending, { k, p }]) {
-				const i = route.pieces.findIndex(x => x.r === q.p.r);
-				U[q.k] = route.u(i, q.p.s);
-				run[q.k] = routes.length - 1;
-			}
-			pending = [];
-			continue;
-		}
-		// on the route's tail or a recent piece (a projection that flips back across a shared end)
-		let i = -1;
-		for (let b = route.pieces.length - 1; b >= Math.max(0, route.pieces.length - 4); b--) {
-			if (route.pieces[b].r === p.r) {
-				i = b;
-				break;
-			}
-		}
-		if (i < 0) {
-			const seg = net.chain(route.tail.r, p.r, 6);
-			if (seg && seg[0].rev === route.tail.rev) {
-				for (const s of seg.slice(1)) {
-					route.push(s);
-				}
-				i = route.pieces.length - 1;
-			} else {
-				newRun();
-				pending.push({ k, p });
-				continue;
-			}
-		}
-		U[k] = route.u(i, p.s);
-		run[k] = routes.length - 1;
-	}
-	return { U, run, routes };
-}
-
-/**
- * The shortest rail path from (piece a, s, direction rev) to (piece b, s) through the network (Dijkstra over pieces,
- * directed): a Route and the arc length of both points on it, or null within maxLen.
- */
-function shortestRoute(net, a, b, maxLen) {
-	// state: piece entered, exit end; cost to the start of that piece
-	const startExit = a.rev ? 0 : 1;
-	const along = (p, rev, s) => (rev ? p.L - s : s);
-	const ua = along(a.r, a.rev, a.s);
-	const heap = [{ c: 0, r: a.r, exit: startExit, prev: null }];
-	const best = new Map();
-	while (heap.length) {
-		heap.sort((x, y) => y.c - x.c);
-		const node = heap.pop();
-		const key = `${node.r.unit}:${node.exit}`;
-		if (best.has(key)) {
-			continue;
-		}
-		best.set(key, node);
-		if (node.r === b.r && node.prev) {
-			const rev = node.exit === 0;
-			const route = new Route();
-			const list = [];
-			for (let x = node; x; x = x.prev) {
-				list.push({ r: x.r, rev: x.exit === 0 });
-			}
-			list.reverse();
-			for (const c of list) {
-				route.push(c);
-			}
-			return { route, ua, ub: route.cum[list.length - 1] + along(b.r, rev, b.s) };
-		}
-		if (node.r === b.r && !node.prev && (a.rev ? b.s <= a.s : b.s >= a.s)) {
-			const route = new Route();
-			route.push({ r: a.r, rev: a.rev });
-			return { route, ua, ub: along(b.r, a.rev, b.s) };
-		}
-		if (node.c > maxLen) {
-			continue;
-		}
-		for (const nb of net.neighbours(node.r, node.exit)) {
-			const c = node.c + node.r.L;
-			heap.push({ c, r: nb.r, exit: 1 - nb.e, prev: node });
-		}
-	}
-	return null;
-}
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -675,11 +547,11 @@ for (const rname of ruleNames) {
 				let cross = null;
 				let sed;
 				if (route) {
-					const [hx, hy] = route.head(rule.speeds ? hermiteU({ ...a, U: ua }, { ...b, U: ub }, f) : ua + (ub - ua) * f);
+					const [hx, hy] = route.head(rule.timing ? timingU({ ...a, U: ua }, { ...b, U: ub }, f) : rule.speeds ? hermiteU({ ...a, U: ua }, { ...b, U: ub }, f) : ua + (ub - ua) * f);
 					sed = Math.hypot(qr.x - hx, qr.y - hy);
 				} else if (p) {
 					cross = distance(p, qr.x, qr.y).d;
-					pointAt(p, f * p.len, tmp);
+					pointAt(p, rule.speeds ? hermiteS(p.len, a, b, f) : f * p.len, tmp);
 					sed = Math.hypot(qr.x - tmp[0], qr.y - tmp[1]);
 				} else {
 					const dx = b.x - a.x;
@@ -694,6 +566,9 @@ for (const rname of ruleNames) {
 					st.cross.push(cross);
 				}
 				st.sed.push(sed);
+				if (sed > 0.5 && process.env.SIM_WORST) {
+					(st.worst ??= []).push({ train: tr.id, tick: qr.t, sed: +sed.toFixed(3), kind: KINDS[tr.kindOf(kk)], a: { t: a.t, v: +a.v.toFixed(4), moving: a.moving, U: +a.U?.toFixed(2) }, b: { t: b.t, v: +b.v.toFixed(4), moving: b.moving, U: +b.U?.toFixed(2) }, v: +qr.v.toFixed(4), U: +qr.U?.toFixed(2) });
+				}
 				st.sedByKind[tr.kindOf(kk)].push(sed);
 			}
 		}
@@ -714,6 +589,11 @@ for (const rname of ruleNames) {
 			facing_switches_passed: st.facing, facing_switches_per_km: st.facing / res.km };
 	}
 	const r = res[rname];
+	if (st.worst) {
+		st.worst.sort((x, y) => y.sed - x.sed);
+		r.worst = st.worst.slice(0, 400);
+		r.over_half = st.worst.length;
+	}
 	console.log(`${rname}: ${total} samples (${r.per_train_hour.toFixed(0)}/train-hour, ${r.per_train_km.toFixed(1)}/train-km) from `
 		+ `${st.reads} reads; why ${JSON.stringify(st.why)}`);
 	console.log(`  by kind ${JSON.stringify(r.by_kind)}`);

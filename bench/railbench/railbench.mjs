@@ -274,12 +274,15 @@ async function feed() {
 		+ `${horizon > want ? "" : " NOT CLOSED"}`);
 }
 
-/** The standalone capture mod as shipped (not the test build), built into dir. Returns its directory. */
-function buildCapture(dir) {
+/**
+ * The standalone capture mod as shipped (not the test build), built into dir from the capture directory `capture`
+ * (default this checkout's). Returns its directory.
+ */
+function buildCapture(dir, capture = path.join(repo, "capture")) {
 	const mm = gameVersion().split(".").slice(0, 2).join(".");
-	execFileSync(process.execPath, [path.join(repo, "capture", "build.mjs"), "--out", dir, "--no-zip",
+	execFileSync(process.execPath, [path.join(capture, "build.mjs"), "--out", dir, "--no-zip",
 		"--factorio-version", mm], { encoding: "utf8" });
-	const info = JSON.parse(fs.readFileSync(path.join(repo, "capture", "mod", "timeshade_capture", "info.json"), "utf8"));
+	const info = JSON.parse(fs.readFileSync(path.join(capture, "mod", "timeshade_capture", "info.json"), "utf8"));
 	const modDir = path.join(dir, `${info.name}_${info.version}`);
 	// Benchmark mode has no server, but a save made in multiplayer keeps game.is_multiplayer() true, and the mod writes
 	// its files only for the server (for_player = 0), so nothing would be written. The harness's copy writes them as
@@ -352,7 +355,8 @@ function parseVerbose(file) {
 /**
  * Capture UPS cost on a real save: the same save with and without the shipped capture mod (recorder off), interleaved
  * pairs, Factorio's --benchmark-verbose timings. Steady state is measured from --from ticks (default: after the load
- * resync, which the capture runs on every load) to the end; the resync window is reported apart.
+ * resync, which the capture runs on every load) to the end; the resync window is reported apart. --compare <capture
+ * dir> also runs another version of capture/ (an older checkout's) in each pair, in its own sandbox.
  */
 async function ups() {
 	const save = positional()[0];
@@ -365,18 +369,28 @@ async function ups() {
 	const dir = path.join(work, "runs", name);
 	const capDir = buildCapture(path.join(dir, "build"));
 	const box = sandbox(dir, { mods: { timeshade_capture: (dst) => copyTree(capDir, dst) }, spaceAge: info.spaceAge });
-	const per = { with: [], without: [] };
+	const compare = option("--compare", null);
+	let altBox = null;
+	if (compare) {
+		const altDir = buildCapture(path.join(dir, "build-alt"), path.resolve(compare));
+		altBox = sandbox(path.join(dir, "alt"), { mods: { timeshade_capture: (dst) => copyTree(altDir, dst) }, spaceAge: info.spaceAge });
+		setEnabled(altBox, { timeshade_capture: true });
+	}
+	const per = { with: [], without: [], alt: [] };
 	const lines = [];
 	for (let r = 0; r < pairs; r++) {
-		for (const label of ["without", "with"]) {
-			setEnabled(box, { timeshade_capture: label === "with" });
-			const res = await runFactorio(box, ["--benchmark", path.resolve(save), "--benchmark-ticks", String(ticks),
+		for (const label of altBox ? ["without", "with", "alt"] : ["without", "with"]) {
+			const b = label === "alt" ? altBox : box;
+			if (label !== "alt") {
+				setEnabled(box, { timeshade_capture: label === "with" });
+			}
+			const res = await runFactorio(b, ["--benchmark", path.resolve(save), "--benchmark-ticks", String(ticks),
 				"--benchmark-runs", "1", "--benchmark-verbose", "all"], `ups-${label}-${r}`, { keepStdout: false, affinity });
 			const rows = parseVerbose(res.outPath);
 			const t0 = rows.length ? rows[0].tick : 0;
 			per[label].push(rows.map(x => ({ ...x, rel: x.tick - t0 })));
-			fs.rmSync(path.join(box.write, "script-output"), { recursive: true, force: true });
-			fs.rmSync(path.join(box.write, "temp"), { recursive: true, force: true });
+			fs.rmSync(path.join(b.write, "script-output"), { recursive: true, force: true });
+			fs.rmSync(path.join(b.write, "temp"), { recursive: true, force: true });
 		}
 		const mean = (rows, f, lo, hi) => {
 			const k = rows.filter(x => x.rel >= lo && x.rel < hi);
@@ -392,15 +406,23 @@ async function ups() {
 		line.luaDelta = line.luaWith - line.luaWithout;
 		line.wholeDelta = line.wholeWith - line.wholeWithout;
 		line.luaDeltaFirst = line.luaWithFirst - line.luaWithoutFirst;
+		if (altBox) {
+			const a = per.alt[r];
+			line.luaAlt = mean(a, lua, from, ticks);
+			line.luaDeltaAlt = line.luaAlt - line.luaWithout;
+			line.wholeDeltaAlt = mean(a, whole, from, ticks) - line.wholeWithout;
+		}
 		lines.push(line);
 		console.log(`pair ${r}: capture Lua ${line.luaDelta.toFixed(4)} ms/tick (ticks ${from}-${ticks}; baseline Lua `
 			+ `${line.luaWithout.toFixed(4)}, whole tick ${line.wholeWithout.toFixed(3)} -> ${line.wholeWith.toFixed(3)}); `
-			+ `first ${from} ticks (load resync) ${line.luaDeltaFirst.toFixed(4)}`);
+			+ `first ${from} ticks (load resync) ${line.luaDeltaFirst.toFixed(4)}`
+			+ `${altBox ? `; alt capture Lua ${line.luaDeltaAlt.toFixed(4)} ms/tick` : ""}`);
 	}
 	const res = { save: path.basename(save), ticks, from, pairs, affinity, game: gameVersion(), lines };
 	fs.writeFileSync(path.join(dir, "ups.json"), JSON.stringify(res, null, 2));
 	const avg = (k) => lines.reduce((n, l) => n + l[k], 0) / lines.length;
-	console.log(`mean capture Lua cost ${avg("luaDelta").toFixed(4)} ms/tick, whole tick ${avg("wholeDelta").toFixed(4)} ms/tick`);
+	console.log(`mean capture Lua cost ${avg("luaDelta").toFixed(4)} ms/tick, whole tick ${avg("wholeDelta").toFixed(4)} ms/tick`
+		+ `${altBox ? `; alt ${avg("luaDeltaAlt").toFixed(4)} ms/tick, whole tick ${avg("wholeDeltaAlt").toFixed(4)}` : ""}`);
 }
 
 const commands = { survey, feed, record, ups };

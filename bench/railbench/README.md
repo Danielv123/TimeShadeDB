@@ -37,10 +37,11 @@ node $R/railbench.mjs survey <save.zip>... [--ticks 18000]      # trains, moving
 node $R/railbench.mjs record <save.zip> --name <run> [--ticks 36000] [--refuel] [--no-capture]
 node $R/railbench.mjs feed --name <run> [--speed 1] [--db <name>] # capture envelopes -> serve-v3 -> <run>/db
 $WORK/bin/raildisk.exe -db $WORK/runs/<run>/db -out $WORK/runs/<run>/disk.json
-node $R/eval.mjs --run <run> [--db <name>] [--stopstart-ticks 120]
-node $R/simulate.mjs --run <run> [--reads capture|accel] [--sed 1] [--rules ...]
+node $R/eval.mjs --run <run> [--db <name>] [--stopstart-ticks 120] [--live-estimator shared|journey]
+node $R/simulate.mjs --run <run> [--reads capture|accel] [--sed 1] [--rules ...] [--thin] [--max-gap N]
 node $R/geometry.mjs --run <run> [--run <run2>...] [--every 10] [--train-every 30] [--out <file>]
-node $R/railbench.mjs ups <save.zip> --name ups-<run> [--pairs 3] [--ticks 7200] [--affinity FF00]
+node $R/railbench.mjs ups <save.zip> --name ups-<run> [--pairs 3] [--ticks 7200] [--affinity FF00] [--compare <capture dir>]
+node $R/compare.mjs --row "<label>=<run dir>[,eval=<file>]"... [--out <file.md>]  # before/after tables
 node $R/gen-vectors.mjs --run <run>... [--out docs/v3/rail-geometry-vectors.json]
 node --test $R/railgeom.test.mjs
 ```
@@ -51,10 +52,11 @@ node --test $R/railgeom.test.mjs
 | `record` | `<run>/run.json`, `write/script-output/railbench/gt-*.txt`, `write/script-output/timeshade/*.ndjson` | One game run with the shipped standalone capture mod (built by `capture/build.mjs`, patched only so it writes files in benchmark mode) and the recorder. `--refuel` tops up empty locomotives every 600 ticks (a documented minimal fix; no run so far needed it). |
 | `feed` | `<run>/db`, `feed.json` | Starts `serve-v3 --clock data` on a free loopback port, posts the envelopes in file order as `timeshadedb tail` does (gzip NDJSON, about one post per game second), with `recv_ms` = game time of the envelope's tick + 250 ms, then a trace 7 minutes later so every mover window closes, waits for the mover horizon and stops the server. Game time follows the envelope's `speed` (`--speed x` replays as if the game ran at x). |
 | `raildisk` | `disk.json` | Mover window and keyframe files on disk (zstd), rows, `car` rows, and the same windows re-encoded without the carriage column. |
-| `eval` | `eval.json`, `worst-*.json` | The viewer's `MoverView` fed with the stored rows (read back with `measure movers`), drawn at every tick in history mode (every row known) and in a live model (rows arrive in 1 s batches + 150 ms, `DelayEstimator` delay), against the recording. Samples per train-hour and train-km by track kind; head and carriage errors; spacing; jumps. |
-| `simulate` | `simulate-*.json` | Replays sampling rules on the recording with reads every `core.STEP` tiles (see the header of `simulate.mjs`): today's rule, pose-only rail shapes, the known rail path with and without speeds, and map matching on the rail network. |
+| `eval` | `eval.json`, `worst-*.json` | The viewer's `MoverView` fed with the stored rows (read back with `measure movers`, rail path rows with their speed and pieces), drawn at every tick in history mode (every row known) and in a live model (rows arrive in 1 s batches + 150 ms, `DelayEstimator` delay), against the recording. In the live model one view and one delay estimator serve all trains of a surface, as in the viewer (`--live-estimator journey`: one per journey, as the baseline of 2026-10-21 was measured). Samples per train-hour and train-km by track kind; head and carriage errors; spacing; jumps; the live display delay (now minus the drawn time, once a second). |
+| `simulate` | `simulate-*.json` | Replays sampling rules on the recording with reads every `core.STEP` tiles (see the header of `simulate.mjs`): the 2026-10 rule, pose-only rail shapes (also timed with speeds, `shape-v`), the known rail path with and without speeds (`railpath-t`: the timing model of RAIL-GEOMETRY.md 8.3, `--thin` keeps every other read of a full buffer, `--max-gap` samples at least every N ticks), and map matching on the rail network. Routes (the pieces under each recorded train) are built by `routes.mjs`. |
 | `geometry` | `geometry.json` | Checks the rail model against the recording: joint residuals per rail type, the carriage centre's offset from the rail, the game's rail distance against speed, carriage placement from the leading joint and the rail path, headings. |
-| `ups` | `ups-<run>/ups.json` | The save with and without the capture mod (recorder off), interleaved pairs, Factorio's `--benchmark-verbose` timings; the capture's Lua cost (`scriptUpdate + luaGarbageIncremental`) and whole-tick cost after the load resync, and during it. |
+| `ups` | `ups-<run>/ups.json` | The save with and without the capture mod (recorder off), interleaved pairs, Factorio's `--benchmark-verbose` timings; the capture's Lua cost (`scriptUpdate + luaGarbageIncremental`) and whole-tick cost after the load resync, and during it. `--compare <dir>` also runs the capture built from another `capture/` directory (an older checkout's, e.g. `git archive <rev> capture`) in each pair. |
+| `compare` | stdout or `--out` | Markdown tables of samples, storage, history and live accuracy for several runs (the before/after tables of a result report). |
 | `gen-vectors` | `docs/v3/rail-geometry-vectors.json` | Test vectors from the model and from recorded carriages. |
 
 ## Ground truth format

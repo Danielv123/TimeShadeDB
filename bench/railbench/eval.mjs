@@ -2,7 +2,15 @@
 // against the recorder's ground truth of the same game run, at every tick. See README.md for the metrics.
 //
 //   node bench/railbench/eval.mjs --run <name> [--work <dir>] [--modes history,live] [--batch-ms 1000]
-//       [--extra-ms 150] [--journeys N] [--out <file>]
+//       [--extra-ms 150] [--live-estimator shared|journey] [--journeys N] [--out <file>]
+//
+// --live-estimator: the live model's delay estimator (web/src/movers/clock.ts) is shared by every train of a surface,
+// as the viewer's is (default), or one per journey (each journey's live replay starts with no observations; the
+// baseline of 2026-10-21 was measured that way).
+//
+// Diagnostics: RAILBENCH_WORST_CAR=<tiles> lists carriages further off than that in worst-*.json (default 5);
+// RAILBENCH_DEBUG_DELAY=<tiles> prints the live delay every 10 s and writes debug-live.json with the head mode, rail
+// run state and neighbouring samples of every live frame whose head is further off than that.
 //
 // Inputs under <work>/runs/<name>: write/script-output/railbench/gt-*.txt (ground truth), db/ (the v3 database `feed`
 // filled), feed.json, run.json. The mover rows are read back from the database's closed windows with
@@ -21,7 +29,8 @@ import { KINDS, K, STOPSTART_TICKS, prepareTrain, head, truthAt } from "./truth.
 const here = path.dirname(fileURLToPath(import.meta.url));
 const { MoverView } = await import("../../web/src/movers/view.ts");
 const { DelayEstimator } = await import("../../web/src/movers/clock.ts");
-const { makeSample, F_STOP, F_GONE, F_END_SWITCH, F_NO_HEADING, F_NO_TICK } = await import("../../web/src/movers/track.ts");
+const { makeSample, headAt, newHead, railRuns, F_STOP, F_GONE, F_END_SWITCH, F_NO_HEADING, F_NO_TICK } = await import("../../web/src/movers/track.ts");
+const debugLive = [];
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -35,6 +44,7 @@ const modes = option("--modes", "history,live").split(",");
 const batchMs = Number(option("--batch-ms", 1000));
 const extraMs = Number(option("--extra-ms", 150));
 const maxJourneys = Number(option("--journeys", 0));
+const liveEstimator = option("--live-estimator", "shared");
 const measureBin = option("--measure", path.join(work, "bin", "measure.exe"));
 
 /** Histogram with fixed bins and an exact maximum. */
@@ -262,6 +272,8 @@ function newModeStats() {
 		car: new Hist(0.001, 200), carAngle: new Hist(0.01, 180), spacing: new Hist(0.001, 100),
 		carByKind: KINDS.map(() => new Hist(0.001, 200)),
 		frames: 0, carFrames: 0, over1: 0, over2: 0, headOver1: 0, headOver2: 0, jumps: 0, carJumps: 0, notDrawn: 0,
+		// the live model's display delay (now - drawn time), once a second of each live replay
+		delay: new Hist(10, 60000),
 		worst: [], worstCar: [],
 	};
 }
@@ -270,10 +282,12 @@ function sessionFor(j) {
 	const view = new MoverView();
 	const metas = j.metas.map(([n, kinds, colour]) => ({ id: j.id, k: "t", f: j.force, name: j.name, n, o: kinds, c: colour || undefined }));
 	const samples = j.rows.map((r) => {
-		const [tt, tick, x, y, h, flags, mi, car] = r;
+		const [tt, tick, x, y, h, flags, mi, car, v, rp, ru] = r;
 		const meta = metas[mi];
 		const c = car ? car.map(([cx, cy, co]) => ({ x: cx, y: cy, o: co })) : null;
-		return { meta, s: makeSample(meta, tt, x, y, h === null ? NaN : h, flags, c, tick) };
+		// rail path rows (F_RAIL) also carry the speed, the rail pieces and the rail start
+		const pieces = rp ? rp.map(([px, py, dir, kind]) => ({ x: px, y: py, dir, kind })) : null;
+		return { meta, s: makeSample(meta, tt, x, y, h === null ? NaN : h, flags, c, tick, v ?? NaN, pieces, !!ru) };
 	});
 	return { view, samples };
 }
@@ -310,7 +324,7 @@ function score(st, shown, tr, kind, prev) {
 		const ty = truth.c[3 * i + 1];
 		const to = truth.c[3 * i + 2];
 		const ce = Math.hypot(c.x - tx, c.y - ty);
-		if (ce > 5 && st.worstCar.length < 2000) {
+		if (ce > Number(process.env.RAILBENCH_WORST_CAR ?? 5) && st.worstCar.length < 2000) {
 			st.worstCar.push({ tick: Number(truth.tick.toFixed(2)), train: tr.id, car: i, e: Number(ce.toFixed(2)), kind: KINDS[kind] });
 		}
 		st.car.add(ce);
@@ -366,37 +380,134 @@ function score(st, shown, tr, kind, prev) {
 }
 
 const report = { run: name, save: run.save, game: run.game, ticks: run.ticks, clock: { a0, residual_ms: clockResid },
-	samples: sampleReport, modes: {} };
+	samples: sampleReport, live_estimator: liveEstimator, modes: {} };
 let list = journeys.filter(j => (matched.get(j.id) ?? []).length > 0);
 if (maxJourneys > 0) {
 	list = list.slice(0, maxJourneys);
 }
+/** The ground-truth train for a time of journey j: the one matched at the latest sample at or before it. */
+function trainFinder(j) {
+	const m = matched.get(j.id);
+	const mt = m.map(x => j.rows[x.i][0]);
+	return (ms) => {
+		let lo = 0;
+		let hi = m.length - 1;
+		if (ms < mt[0]) {
+			return m[0].tr;
+		}
+		while (lo < hi) {
+			const mid = (lo + hi + 1) >> 1;
+			if (mt[mid] <= ms) {
+				lo = mid;
+			} else {
+				hi = mid - 1;
+			}
+		}
+		return m[lo].tr;
+	};
+}
+
+/**
+ * The live model with one view and one delay estimator for all journeys of a surface (the viewer's MoverFeed): rows
+ * arrive in batches, every train is drawn at the delayed display time and scored against its truth.
+ */
+function liveShared(st, js) {
+	const view = new MoverView();
+	const est = new DelayEstimator(2000); // as the viewer's (layer.ts)
+	const arrival = (ms) => Math.ceil(ms / batchMs) * batchMs + extraMs;
+	const all = [];
+	const per = new Map();
+	let t0 = Infinity;
+	let t1 = -Infinity;
+	for (const j of js) {
+		const { samples } = sessionFor(j);
+		const firstT = samples.find(x => !(x.s.flags & F_GONE))?.s.t;
+		const lastT = samples[samples.length - 1].s.t;
+		per.set(j.id, { firstT, lastT, trainAt: trainFinder(j), prev: null });
+		t0 = Math.min(t0, firstT);
+		t1 = Math.max(t1, lastT);
+		for (const x of samples) {
+			all.push(x);
+		}
+	}
+	all.sort((a, b) => arrival(a.s.t) - arrival(b.s.t) || a.s.t - b.s.t);
+	let fed = 0;
+	let perf = 0;
+	const step = msPerTick;
+	for (let now = t0 + 1000; now <= t1 + 20000; now += step, perf += step) {
+		while (fed < all.length && arrival(all[fed].s.t) <= now) {
+			const x = all[fed];
+			if (view.add(x.s.meta, x.s) && !Number.isNaN(view.prevT)) {
+				est.observeReady(now - view.prevT);
+			}
+			if (view.sawRail) {
+				est.railPrior(view.tickRate); // as the viewer's MoverFeed
+			}
+			est.observe(now - x.s.t);
+			fed++;
+		}
+		const tv = now - est.delay(perf);
+		const horizon = est.horizon(now);
+		if (Math.floor(perf / 1000) !== Math.floor((perf - step) / 1000)) {
+			st.delay.add(now - tv);
+		}
+		if (Math.round(perf) % 10000 === 0) {
+			view.trim(tv);
+			if (process.env.RAILBENCH_DEBUG_DELAY) {
+				console.log(`  delay ${est.current.toFixed(0)} ms, readiness p50 ${est.readyQuantile(0.5).toFixed(0)} p95 ${est.readyQuantile(0.95).toFixed(0)} p99 ${est.readyQuantile(0.99).toFixed(0)}, lag p99 ${est.quantile(0.99).toFixed(0)}`);
+			}
+		}
+		const shown = new Map(view.frame(tv, horizon, { bodies: true }).map(x => [x.id, x]));
+		const tau = tickOf(tv);
+		for (const [id, q] of per) {
+			if (tv < q.firstT || tv > q.lastT) {
+				q.prev = null;
+				continue;
+			}
+			const tr = q.trainAt(tv);
+			if (!truthAt(tr, tau, truth) || !truth.moving) {
+				q.prev = null;
+				continue;
+			}
+			truth.tick = tau;
+			const kind = tr.kindOf(truth.k);
+			const sh = shown.get(id);
+			const p = score(st, sh, tr, kind, q.prev);
+			if (process.env.RAILBENCH_DEBUG_DELAY && sh && Math.hypot(sh.x - truth.c[0], sh.y - truth.c[1]) > Number(process.env.RAILBENCH_DEBUG_DELAY)) {
+				const track = view.tracks.get(id);
+				const h = headAt(track, tv, horizon, newHead());
+				const nx = track.s[h.k + 1];
+				debugLive.push({ train: tr.id, tick: Math.round(tau), e: +Math.hypot(sh.x - truth.c[0], sh.y - truth.c[1]).toFixed(2),
+					mode: h.mode, rail: !!h.rail, sinceSample: Math.round(tv - track.s[h.k].t), next: nx ? Math.round(nx.t - tv) : null,
+					delay: Math.round(now - tv), drawnVsHead: +Math.hypot(sh.x - h.x, sh.y - h.y).toFixed(2),
+					k: h.k, n: track.s.length, rr: (() => { const r = railRuns(track); return [r.run[h.k], r.run[h.k + 1], r.u[h.k], r.u[h.k + 1], r.ub[h.k]]; })(),
+					a: { f: track.s[h.k].flags, v: track.s[h.k].v, rp: track.s[h.k].rp?.length, ru: track.s[h.k].ru, tick: track.s[h.k].tick },
+					b: nx ? { f: nx.flags, v: nx.v, rp: nx.rp?.length, ru: nx.ru, tick: nx.tick } : null });
+			}
+			q.prev = p ? { ...p, dtTicks: step / msPerTick } : null;
+		}
+	}
+}
+
 for (const mode of modes) {
 	const st = newModeStats();
 	t = performance.now();
-	for (const j of list) {
+	const shared = mode === "live" && liveEstimator === "shared";
+	if (shared) {
+		const bySurface = new Map();
+		for (const j of list) {
+			bySurface.set(j.surfaceName, [...(bySurface.get(j.surfaceName) ?? []), j]);
+		}
+		for (const js of bySurface.values()) {
+			liveShared(st, js);
+		}
+	}
+	for (const j of shared ? [] : list) {
 		const m = matched.get(j.id);
 		const { view, samples } = sessionFor(j);
 		const firstT = samples.find(x => !(x.s.flags & F_GONE))?.s.t;
 		const lastT = samples[samples.length - 1].s.t;
-		// the ground-truth train for a time: the one matched at the latest sample at or before it
-		const mt = m.map(x => j.rows[x.i][0]);
-		const trainAt = (ms) => {
-			let lo = 0;
-			let hi = m.length - 1;
-			if (ms < mt[0]) {
-				return m[0].tr;
-			}
-			while (lo < hi) {
-				const mid = (lo + hi + 1) >> 1;
-				if (mt[mid] <= ms) {
-					lo = mid;
-				} else {
-					hi = mid - 1;
-				}
-			}
-			return m[lo].tr;
-		};
+		const trainAt = trainFinder(j);
 		let prev = null;
 		if (mode === "history") {
 			for (const x of samples) {
@@ -429,11 +540,17 @@ for (const mode of modes) {
 					if (view.add(x.s.meta, x.s) && !Number.isNaN(view.prevT)) {
 						est.observeReady(now - view.prevT);
 					}
+					if (view.sawRail) {
+						est.railPrior(view.tickRate);
+					}
 					est.observe(now - x.s.t);
 					fed++;
 				}
 				const tv = now - est.delay(perf);
 				const horizon = est.horizon(now);
+				if (Math.floor(perf / 1000) !== Math.floor((perf - step) / 1000)) {
+					st.delay.add(now - tv);
+				}
 				if (Math.round(perf) % 10000 === 0) {
 					view.trim(tv);
 				}
@@ -461,7 +578,7 @@ for (const mode of modes) {
 		head_over_1: st.headOver1, head_over_2: st.headOver2,
 		car_position: st.car.summary(), car_angle_deg: st.carAngle.summary(2), spacing: st.spacing.summary(),
 		car_frames: st.carFrames, car_over_1: st.over1, car_over_2: st.over2, jumps: st.jumps, car_jumps: st.carJumps,
-		car_by_kind: {},
+		car_by_kind: {}, display_delay_ms: st.delay.n ? st.delay.summary(0) : null,
 	};
 	for (const [i, k] of KINDS.entries()) {
 		r.head_by_kind[k] = st.head[i].summary();
@@ -479,12 +596,18 @@ for (const mode of modes) {
 	console.log(`  carriages   ${fmt(r.car_position)}; angle ${fmt(r.car_angle_deg, " deg")}; spacing ${fmt(r.spacing)}`);
 	console.log(`  carriage-frames ${st.carFrames}: > 1 tile ${st.over1} (${(100 * st.over1 / st.carFrames).toFixed(3)}%), `
 		+ `> 2 tiles ${st.over2} (${(100 * st.over2 / st.carFrames).toFixed(3)}%); jumps ${st.jumps}, carriage jumps ${st.carJumps}`);
+	if (r.display_delay_ms) {
+		console.log(`  display delay ms ${fmt(r.display_delay_ms)}`);
+	}
 }
 
 function fmt(s, unit = "") {
 	return `p50 ${s.p50}${unit} p90 ${s.p90} p99 ${s.p99} max ${s.max}`;
 }
 
+if (debugLive.length) {
+	fs.writeFileSync(path.join(dir, `debug-live${tag}.json`), JSON.stringify(debugLive));
+}
 const outPath = option("--out", path.join(dir, `eval${tag}.json`));
 fs.writeFileSync(outPath, JSON.stringify(report, null, 2));
 console.log(`\n-> ${outPath}`);
