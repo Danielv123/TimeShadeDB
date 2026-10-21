@@ -8,8 +8,9 @@
 -- it enters, joined by straight rails, are the train's exact path (docs/v3/RAIL-GEOMETRY.md 8), sent with the next
 -- sample (`rp`). So only the timing needs samples (core.train_read): a sample carries the game tick of its read, the
 -- speed (`v`) and the leading carriage's own orientation (`h`), every carriage's position and orientation (`car`) on
--- first sight, stop, start, end switch and resync, `es` when the leading end switched, and `ru` with the pieces under the
--- whole train where a new rail path begins. Vehicles and players are sent by dead reckoning (core.poll); vehicles carry
+-- first sight, a changed train, a surface change and resync, `es` when the leading end switched, and `ru` with the pieces
+-- under the whole train where a new rail path begins. A stop sample also lists the pieces under the whole train, so a
+-- parked train's last sample alone places it. Vehicles and players are sent by dead reckoning (core.poll); vehicles carry
 -- their orientation.
 --
 -- Journeys, registrations, the wheel and each mover's last sample live in storage and change only in events and
@@ -299,6 +300,12 @@ local function poll(st, j, t, how)
 		end
 		local e, pos, si, h, o = train_view(m, r, fwd)
 		local switched = m.fwd ~= nil and fwd ~= m.fwd
+		local changed = m.changed
+		if changed then
+			-- a join or a split since the last read: the leading joint may have jumped and the recorded path may not lead
+			-- to it, so this read begins a new rail path (core.train_read)
+			m.changed, m.jx, m.ex = nil, nil, nil
+		end
 		-- the leading joint: the carriage centre plus half the joint distance along its axis (RAIL-GEOMETRY.md 3)
 		local a = o * 2 * math.pi
 		local jx, jy = pos.x + 2 * math.sin(a), pos.y - 2 * math.cos(a)
@@ -391,7 +398,7 @@ local function poll(st, j, t, how)
 			m.ru = un
 		end
 		local read = { x = pos.x, y = pos.y, t = t, h = h, si = si, moving = speed ~= 0 and how ~= "stop", fwd = fwd,
-			v = v, u = m.odo or 0, np = m.rpn, gap = gap,
+			v = v, u = m.odo or 0, np = m.rpn, gap = gap, changed = changed,
 			full = #m.rp >= core.RP_MAX or (m.e ~= nil and m.moving and t - m.e.t >= live_gap) }
 		local emits = core.train_read(m, read)
 		if #emits == 0 then
@@ -431,6 +438,14 @@ local function poll(st, j, t, how)
 						end
 					end
 					s.rp, m.rp = sent, rest
+				end
+				if emit.why == "stop" then
+					-- and the pieces under the whole train (this is always the current read): a keyframe or the live payload
+					-- holds only a parked train's stop sample. The path goes on from the rail under the leading joint now, as
+					-- after a run start.
+					local max = core.rp_start(car and m.n or nil)
+					s.rp = core.stop_pieces(s.rp, rails_under(r, rv.fwd, max), max)
+					started = true
 				end
 			end
 			if car then
@@ -625,7 +640,10 @@ function movers.resync(st, t)
 	return n
 end
 
---- The new train takes old_train_id_1's journey, else old_train_id_2's; the other of two ends with gone.
+--- The new train takes old_train_id_1's journey, else old_train_id_2's; the other of two ends with gone. The journey's
+--- train is read on the next tick, standing or not: its leading carriage may have changed, and that read begins a new
+--- rail path where the train is now (core.train_read "change"), so a viewer neither runs the old body on nor waits for
+--- the train to move.
 function movers.on_train_created(st, e)
 	if not st then
 		return
@@ -634,6 +652,15 @@ function movers.on_train_created(st, e)
 	local ended = core.train_created(st, e.old_train_id_1, e.old_train_id_2, tr.id, tr, #tr.carriages, register)
 	if ended then
 		movers.gone(st, ended)
+	end
+	local j = st.by_train[tr.id]
+	if j then
+		local due = game.tick + 1
+		st.fast[j] = due
+		local slot = due % core.WHEEL
+		local list = st.wheel[slot] or {}
+		st.wheel[slot] = list
+		list[#list + 1] = j
 	end
 end
 

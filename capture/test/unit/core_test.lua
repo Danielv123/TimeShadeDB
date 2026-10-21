@@ -438,6 +438,49 @@ t.test("train emits: a gap sends the last read before it, then the read that fou
 	t.expect_eq(whys(core.train_read(m, full)), "heartbeat", "RP_MAX pieces waiting send a sample")
 end)
 
+t.test("train emits: a changed train sends the last read before it, then a new rail path with car", function()
+	local m = {}
+	core.train_read(m, read(0, 0, 0.4))
+	core.train_read(m, read(4, 10, 0.4))
+	local r = read(-3, 20, 0.4) -- a split took the front carriage: the leading joint jumped back
+	r.changed = true
+	local out = core.train_read(m, r)
+	t.expect_eq(whys(out), "vertex,change")
+	t.expect_true(core.run_start("change") and core.with_car("change"))
+	r = read(-3, 30, 0, false)
+	r.changed = true
+	t.expect_eq(whys(core.train_read(m, r)), "change", "changed while it stands: the change, at rest")
+	t.expect_eq(whys(core.train_read(m, read(-3, 60, 0.1))), "start")
+	local st = state()
+	local register = registrar()
+	core.claim(st, "j", "t", 1, { id = 1 }, 3, register)
+	st.by_train[1] = "j"
+	core.train_created(st, 1, nil, 2, { id = 2 }, 2, register)
+	t.expect_true(st.movers.j.changed, "train_created marks the journey's train changed")
+end)
+
+t.test("stop pieces: the pieces under the train before and after the entered ones, within the budget", function()
+	local function p(i)
+		return { i, 0, 4, 1 }
+	end
+	local function ids(list)
+		local out = {}
+		for i, q in ipairs(list or {}) do
+			out[i] = q[1]
+		end
+		return table.concat(out, ",")
+	end
+	t.expect_eq(core.stop_pieces(nil, nil, 120), nil)
+	t.expect_eq(ids(core.stop_pieces({ p(1) }, nil, 120)), "1")
+	t.expect_eq(ids(core.stop_pieces(nil, { p(1), p(2) }, 120)), "1,2", "none entered: every piece under the train")
+	t.expect_eq(ids(core.stop_pieces({ p(3), p(4) }, { p(1), p(2), p(3), p(4) }, 120)), "1,2,3,4")
+	t.expect_eq(ids(core.stop_pieces({ p(2), p(3) }, { p(3), p(4) }, 120)), "2,3,4",
+		"an entered piece that left the rear stays; one under the end no read looked at follows")
+	t.expect_eq(ids(core.stop_pieces({ p(3), p(4) }, { p(1), p(2), p(3), p(4) }, 3)), "2,3,4", "the rear dropped first")
+	t.expect_eq(ids(core.stop_pieces({ p(3), p(4) }, { p(1), p(2), p(3), p(4) }, 1)), "3,4", "entered pieces are kept")
+	t.expect_eq(ids(core.stop_pieces({ p(1) }, { p(5), p(6) }, 120)), "1,5,6", "nothing in common: entered first")
+end)
+
 t.test("timing model: braking, starting and cruising as RAIL-GEOMETRY.md 8", function()
 	t.expect_near(core.timing_u(30, 60, 0.5, 0.5, 30), 15, 1e-12)
 	t.expect_eq(core.timing_u(2, 100, 0, 0.2, 50), 0, "a late start stands first")

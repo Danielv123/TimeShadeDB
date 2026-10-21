@@ -112,14 +112,18 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   read before and the current read, which begins a new path. A turning carriage whose read
   finds a straight rail under the train's end walks back the same way, at most 12 rails, for
   a short piece that came and went under the end between reads that did not look. Reads are at most 5 tiles of
-  travel apart (the wait rounded down), less than the shortest curved piece. Where a new path begins (`ru`: first sight, end
-  switch, surface change, a missed piece, a resync) the sample lists the pieces under the
-  whole train instead (`LuaTrain.get_rails`). The reads kept for the check are at most 16; a
+  travel apart (the wait rounded down), less than the shortest curved piece. Where a new path begins (`ru`: first sight, a
+  changed train, end switch, surface change, a missed piece, a resync) the sample lists the pieces under the
+  whole train instead (`LuaTrain.get_rails`). A stop sample lists the pieces under the whole
+  train as well as those entered since the last sample, without beginning a new path, because a
+  keyframe or the live payload holds only a parked train's stop sample. The reads kept for the check are at most 16; a
   full buffer keeps every other one. `car` (every carriage's position and orientation, which
   gives the viewer the carriages' pitches) comes with first sight, a changed train, a surface
   change and resyncs; the rail path places the carriages at stops, starts and end switches. A parked train is
   not polled: after its stop sample it is sent again only by a resync or when it moves. No
-  `vx`/`vy`. Storage schema 2 restarts the trains an older capture sampled (their next read
+  `vx`/`vy`. Deploy the server and viewer before this capture: an older viewer cannot read
+  rail rows, and an older server stores them as samples whose `h` and missing `car` it
+  misreads (PROTOCOL.md 3.1, deploy order). Storage schema 2 restarts the trains an older capture sampled (their next read
   is a first sight). On the benchmark map (`bench/railbench`, 74 moving trains) this sends
   3,470 samples per moving train-hour instead of 11,343 (16.9 per km of curve instead of
   221), and the viewer draws every carriage within 0.144 tile of the game at p99 (2.31 before),

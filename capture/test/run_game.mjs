@@ -238,9 +238,10 @@ function truthLeads(truthText) {
 async function viewerHeads(list) {
 	await import("../../web/src/movers/eval/ts-resolve.mjs");
 	const T = await import("../../web/src/movers/track.ts");
-	const meta = { id: list[0].j, k: "t", f: list[0].f, name: list[0].name, n: list[0].n, o: list[0].o };
-	const tr = new T.Track(meta.id, meta);
+	const tr = new T.Track(list[0].j, { id: list[0].j, k: "t", f: list[0].f, name: list[0].name, n: list[0].n, o: list[0].o });
 	for (const e of list) {
+		// each sample's own carriages (a changed train has others)
+		const meta = { id: e.j, k: "t", f: e.f, name: e.name, n: e.n, o: e.o };
 		const flags = (e.stop ? T.F_STOP : 0) | (e.es ? T.F_END_SWITCH : 0) | (e.v !== undefined ? T.F_RAIL : 0);
 		const car = e.car ? e.car.map(([x, y, o]) => ({ x, y, o })) : null;
 		const rp = e.rp ? e.rp.map(([x, y, dir, kind]) => ({ x, y, dir, kind })) : null;
@@ -299,7 +300,9 @@ async function checkScenario(label, msgs, results, truthText, { journeyPrefix })
 	// trains
 	const truth = truthLeads(truthText);
 	const aJ = entries(msgs, e => results.a_id && e.j && e.j.endsWith(`.${results.a_id}`) && e.k === "t");
-	const bJ = entries(msgs, e => results.b_gone_id && e.j && e.j.endsWith(`.${results.b_gone_id}`));
+	// B's journey keeps the id minted for its first train through the split
+	const bId = results.b_id0 ?? results.b_gone_id;
+	const bJ = entries(msgs, e => bId && e.j && e.j.endsWith(`.${bId}`));
 	check(aJ.length > 0 && aJ[0].j.startsWith(journeyPrefix), `${label}: train A journey ${aJ[0]?.j} (prefix ${journeyPrefix})`);
 	for (const [name, list] of [["A", aJ], ["B", bJ.filter(e => !e.gone)]]) {
 		const tr = truth[name.toLowerCase()];
@@ -376,6 +379,37 @@ async function checkScenario(label, msgs, results, truthText, { journeyPrefix })
 		}
 		check(aJ.every(e => e.n === 3 && e.name === (e.o === "LCC" ? "locomotive" : "cargo-wagon") && e.f === "player"
 			&& typeof e.h === "number" && e.c), `${label}: train A sample fields (name of the leading carriage)`);
+	}
+	// B stood on a curve: its stop sample lists every curved piece under it and alone places the train there (a keyframe
+	// or the live payload hold only that row); then its locomotive was taken off, and the wagon's next sample, read at
+	// once, begins a new rail path with its carriages
+	const bs = results.b_stop;
+	if (check(bs && bs.under.length > 0, `${label}: train B stood on ${bs?.under.length} curved pieces before the split`)) {
+		const KIND = { "curved-rail-a": 1, "curved-rail-b": 2, "elevated-curved-rail-a": 1, "elevated-curved-rail-b": 2, "rail-ramp": 4 };
+		const stop = bJ.filter(e => e.stop && !e.ru && !e.gone && e.__tick <= bs.tick).pop();
+		const listed = new Set((stop?.rp ?? []).map(p => p.join(",")));
+		const missing = bs.under.filter(([x, y, dir, type]) => !listed.has([x, y, dir, KIND[type]].join(",")));
+		check(stop && missing.length === 0, `${label}: train B's stop sample lists the ${bs.under.length} pieces under it `
+			+ `(${missing.length} missing of ${stop?.rp?.length ?? 0} listed)`);
+		if (stop) {
+			await import("../../web/src/movers/eval/ts-resolve.mjs");
+			const { MoverView } = await import("../../web/src/movers/view.ts");
+			const T = await import("../../web/src/movers/track.ts");
+			const view = new MoverView();
+			const meta = { id: stop.j, k: "t", f: stop.f, name: stop.name, n: stop.n, o: stop.o };
+			view.add(meta, T.makeSample(meta, (stop.__tick * 1000) / 60, stop.x, stop.y, stop.h, T.F_RAIL | T.F_STOP, null,
+				stop.__tick, stop.v, stop.rp.map(([x, y, dir, kind]) => ({ x, y, dir, kind }))));
+			const cars = view.frame((bs.tick * 1000) / 60, Infinity, { bodies: true })[0]?.cars ?? [];
+			const off = cars.length === 2 ? Math.max(Math.hypot(cars[0].x - bs.front[0], cars[0].y - bs.front[1]),
+				Math.hypot(cars[1].x - bs.back[0], cars[1].y - bs.back[1])) : Infinity;
+			check(off < 0.3, `${label}: train B drawn from its stop sample alone: carriages within ${off.toFixed(3)} tiles`);
+			note(`${label}: train B stood on ${bs.under.length} curved pieces; its stop sample at tick ${stop.__tick} lists `
+				+ `${stop.rp.length} pieces and alone places both carriages within ${off.toFixed(3)} tiles; split at tick ${bs.tick}`);
+		}
+		const change = bJ.find(e => !e.gone && e.__tick > bs.tick);
+		check(change && change.ru && change.car && change.car.length === bs.rest_n && change.n === bs.rest_n
+			&& change.__tick <= bs.tick + 2, `${label}: after the split train B's next sample (tick ${change?.__tick}, split at `
+			+ `${bs.tick}) begins a new rail path with car of ${change?.car?.length} carriages`);
 	}
 	const gone = bJ.filter(e => e.gone);
 	check(gone.length === 1, `${label}: train B destroyed: one gone (${gone.length})`);

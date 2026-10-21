@@ -585,11 +585,11 @@ function core.off_timing(e, buf, c)
 	return false
 end
 
---- One read r = { x, y, t, h, si, moving, fwd, v, u, gap, full } of train m. Returns the emits: a list of { read, why } in
---- order, where why is "first", "stop", "start", "es" (leading end switched), "surface", "gap" (the leading joint entered
---- a curved piece that does not continue the rail path recorded since the last sample: one was missed), "heartbeat" (also
---- when r.full: core.RP_MAX pieces wait to be sent) or
---- "vertex" (a past read sent late; it carries its own tick). core.with_car tells which carry the carriage geometry,
+--- One read r = { x, y, t, h, si, moving, fwd, v, u, gap, full, changed } of train m. Returns the emits: a list of
+--- { read, why } in order, where why is "first", "change" (r.changed: the train changed since the last read, a join or a
+--- split), "stop", "start", "es" (leading end switched), "surface", "gap" (the leading joint entered a curved piece that
+--- does not continue the rail path recorded since the last sample: one was missed), "heartbeat" (also when r.full:
+--- core.RP_MAX pieces wait to be sent) or "vertex" (a past read sent late; it carries its own tick). core.with_car tells which carry the carriage geometry,
 --- core.run_start which begin a new rail path (PROTOCOL.md 3.1 `ru`). m keeps the last sent read (m.e), the reads since
 --- (m.buf) and the moving and leading-end state.
 ---
@@ -605,6 +605,8 @@ function core.train_read(m, r)
 		why = "first"
 	elseif r.si ~= e.si then
 		why = "surface"
+	elseif r.changed then
+		why = "change"
 	elseif not r.moving then
 		if m.moving then
 			why = "stop"
@@ -622,9 +624,9 @@ function core.train_read(m, r)
 	end
 	local buf = m.buf or {}
 	if why ~= "first" and why ~= "surface" and #buf > 0 then
-		-- before an end switch or a gap the last read before it is always sent: the new end is a train length away, the
-		-- path after a gap is not known
-		if why == "es" or why == "gap" or core.off_timing(e, buf, r) then
+		-- before an end switch, a gap or a changed train the last read before it is always sent: the new end is a train
+		-- length away, the path after a gap is not known, a changed train's leading joint may have jumped
+		if why == "es" or why == "gap" or why == "change" or core.off_timing(e, buf, r) then
 			local v = buf[#buf]
 			out[#out + 1] = { read = v, why = "vertex" }
 			e, buf = v, {}
@@ -652,14 +654,56 @@ end
 
 --- Whether an emit's why begins a new rail path: its sample carries `ru` and the pieces under the whole train.
 function core.run_start(why)
-	return why == "first" or why == "surface" or why == "es" or why == "gap" or why == "force"
+	return why == "first" or why == "surface" or why == "es" or why == "gap" or why == "change"
 end
 
---- Whether an emit's why sends the carriage geometry: on first sight and a surface change (and after the train changed,
---- movers.lua's m.reshape). The rail path places every carriage at stops, starts and end switches (RAIL-GEOMETRY.md 8);
---- `car` gives the viewer the carriages' pitches.
+--- Whether an emit's why sends the carriage geometry: on first sight, a surface change and a changed train (also the
+--- next sample after a crossing, movers.lua's m.reshape). The rail path places every carriage at stops, starts and end
+--- switches (RAIL-GEOMETRY.md 8); `car` gives the viewer the carriages' pitches.
 function core.with_car(why)
-	return why == "first" or why == "surface" or why == "force"
+	return why == "first" or why == "surface" or why == "change"
+end
+
+local function same_piece(a, b)
+	return a[1] == b[1] and a[2] == b[2] and a[3] == b[3] and a[4] == b[4]
+end
+
+--- The pieces a stop sample lists (PROTOCOL.md 3.1 `rp`): `sent`, the pieces entered since the last sample (travel
+--- order, or nil), with the pieces under the train (`under`, rear first, or nil) that came before them added in front and
+--- any after them (a piece under the train's end that no read looked at) behind, so a parked train's last sample alone
+--- describes its whole body (a keyframe or the live payload holds only that row). Entered pieces that left the train's
+--- rear stay. At most max pieces besides the entered ones: pieces under the train nearest its rear are dropped first.
+--- Returns nil for none.
+function core.stop_pieces(sent, under, max)
+	if not under or #under == 0 then
+		return sent
+	end
+	sent = sent or {}
+	-- under[a..b] are entered pieces; with none, every piece under the train comes after them
+	local a, b
+	for i, q in ipairs(under) do
+		for _, p in ipairs(sent) do
+			if same_piece(p, q) then
+				a, b = a or i, i
+				break
+			end
+		end
+	end
+	local before = a and a - 1 or 0
+	local room = math.max(0, max - #sent)
+	local after = math.min(#under - (b or 0), room)
+	local keep = math.min(before, room - after)
+	local out = {}
+	for i = before - keep + 1, before do
+		out[#out + 1] = under[i]
+	end
+	for _, p in ipairs(sent) do
+		out[#out + 1] = p
+	end
+	for i = #under - after + 1, #under do
+		out[#out + 1] = under[i]
+	end
+	return #out > 0 and out or nil
 end
 
 --- How many rail pieces under the train a run start lists: at most core.RP_START_MAX, and with `car` of n carriages
@@ -717,6 +761,7 @@ function core.train_created(st, old1, old2, id, ref, n, register)
 	local j = j1 or j2
 	if j then
 		core.claim(st, j, "t", id, ref, n, register)
+		st.movers[j].changed = true -- its next read begins a new rail path (core.train_read "change")
 	end
 	if j1 and j2 and j1 ~= j2 then
 		return j2

@@ -85,13 +85,25 @@ Gone: `{j, gone: true, tick?}`.
 | `h` | orientation 0..1 (0 north, 0.25 east). Trains with `v` (rail path samples): the leading carriage's own orientation turned to the direction of travel, which is the rail tangent at its centre (RAIL-GEOMETRY.md 5); trains without `v` (older captures, imported data): second carriage towards the first (a single carriage: its orientation in the direction of travel). Absent: unknown. |
 | `n`, `o`, `c` | train carriage count; kinds from the leading end (`L` loco, `C` cargo, `F` fluid, `A` artillery, lower case faces back; vehicles `S` spidertron or `C` car); colour `rrggbb` |
 | `tick` | the game tick of the read, when it is not the envelope's: a train's chord vertex is sent one read late |
-| `stop` | at rest. A parked train is not read again until it moves: after its stop sample it sends only resync samples |
+| `stop` | at rest. A parked train is not read again until it moves: after its stop sample it sends only resync samples. A rail path stop sample's `rp` describes the whole train (see `rp`), so a keyframe or the live payload, which hold only a parked train's last sample, place every carriage |
 | `es` | the leading end switched at this sample (also when a stopped train starts off the other way); the sample before it is the old leading end's last read |
-| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage (older captures also sent it on stop, start and end switch) |
+| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage (older captures also sent it on stop, start and end switch). The viewer places rail path samples' carriages by vanilla rolling stock's joint (4) and connection (3) distances, measured pitches from `car` aside (RAIL-GEOMETRY.md 3, 8.2) |
 | `v` | trains: the speed in tiles a tick (4 decimals, never negative). Its presence makes the sample a rail path sample (RAIL-GEOMETRY.md 8) |
-| `rp` | rail path samples: the curved rail pieces and rail ramps the leading carriage's front joint entered since the previous sample, in order, as `[x, y, direction, kind]`: the entity's position (whole tiles), its `defines.direction` and its kind, 1 `curved-rail-a`, 2 `curved-rail-b`, 3 `legacy-curved-rail`, 4 `rail-ramp` (the `elevated-` pieces share their ground piece's kind). Rails between them are straight, so the pieces are the exact path the leading joint ran along. Absent: none. With `ru`: the pieces under the whole train, rear first (at most 120, and with `car` as many as fit beside it in a line, at least 8) |
-| `ru` | a new rail path begins at this sample (first sight, end switch, surface change, a resync, or a piece that does not continue the recorded path: a missed piece); the path since the previous sample is not given |
+| `rp` | rail path samples: the curved rail pieces and rail ramps the leading carriage's front joint entered since the previous sample, in order, as `[x, y, direction, kind]`: the entity's position (whole tiles), its `defines.direction` and its kind, 1 `curved-rail-a`, 2 `curved-rail-b`, 3 `legacy-curved-rail`, 4 `rail-ramp` (the `elevated-` pieces share their ground piece's kind). Rails between them are straight, so the pieces are the exact path the leading joint ran along. Absent: none. With `ru`: the pieces under the whole train, rear first (at most 120, and with `car` as many as fit beside it in a line, at least 8). With `stop` (and no `ru`): the pieces entered since the previous sample, with the pieces under the train that came before them in front (rear first, at most 120 of those) and any under the train's leading end after them, so the stop sample alone describes the whole train; a reader that holds the samples before it already has those pieces and skips them (a piece already on the path that does not continue it is a resend) |
+| `ru` | a new rail path begins at this sample (first sight, a changed train (join, split), end switch, surface change, a resync, or a piece that does not continue the recorded path: a missed piece); the path since the previous sample is not given |
 | `vx`, `vy` | legacy (illisis), ignored |
+
+**Deploy order for rail path samples.** The fields `v`, `rp` and `ru` are additive for
+stored data and for readers: samples without `v` (older captures, imported data) keep their
+meaning, and a server and viewer that know `v` read both. They are not additive the other
+way. A capture that sends `v` changes what `h` means (the leading carriage's own
+orientation) and no longer sends `car` on stop, start and end switch, which an older viewer
+needs to draw a train's body; and an older viewer cannot decode windows, keyframes or live
+payloads that hold rail rows (FORMAT.md 7.4 header bit 1 adds two columns; it reports
+trailing bytes). So update the server and the viewer (one `timeshadedb` binary with its
+embedded web app) before the capture (the Clusterio plugin's module or the standalone mod).
+A capture running ahead of its server only loses train bodies and headings until the
+server is updated; nothing stored is damaged.
 
 ## 4. Clock anchors
 
@@ -181,9 +193,10 @@ These are protocol-level requirements; the Lua is WP9's.
   moving (60 below game speed 0.5), on a 600-tick heartbeat, on first sight, stop, start, end
   switch and surface change, and where the leading joint entered a piece that does not
   continue the recorded path and the pieces between were not found behind it (`ru`). Always
-  send the tick; send `car` on first sight, after the train changed, on a surface change and
-  in resyncs; set `es` on end switches. The path between samples is not sampled: the pieces
-  give it.
+  send the tick; send `car` on first sight, after the train changed (which also begins a new
+  rail path), on a surface change and in resyncs; set `es` on end switches. The path between
+  samples is not sampled: the pieces give it. A stop sample also lists the pieces under the
+  whole train, so a parked train's last sample places it alone.
 - Vehicles and players: emit when off the dead-reckoned position by more than 1 tile or on
   the heartbeat; send `h` for vehicles too.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for

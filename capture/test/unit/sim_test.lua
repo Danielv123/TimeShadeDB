@@ -434,6 +434,103 @@ t.test("trains: a ramp entered from a straight is recorded, though the train doe
 	end
 end)
 
+--- The `rp` entries of the curved pieces and ramps train tr stands on, rear first.
+local function under(tr)
+	local list = tr.get_rails()
+	local out = {}
+	for i = #list, 1, -1 do
+		local r = list[i]
+		local kind = ({ ["curved-rail-a"] = 1, ["curved-rail-b"] = 2, ["rail-ramp"] = 4 })[r.type]
+		if kind then
+			out[#out + 1] = { r.position.x, r.position.y, r.direction, kind }
+		end
+	end
+	return out
+end
+
+t.test("trains: a stop sample lists the pieces under the whole train, those sent before included", function()
+	local capture, world, log = boot()
+	local s = world.surfaces.nauvis
+	local path = fake.path_lc(0, 12)
+	local tr = fake.train(s, "LCC", path, -60)
+	local speed = 0.3
+	run(capture, 1, 400, function()
+		if tr.pos >= 11 then
+			speed = math.max(0, speed - 0.0125) -- brakes to rest with its body over the turn
+		end
+		tr.speed = speed
+		fake.place(tr, tr.pos + speed)
+	end)
+	local got = entries(log, storage.timeshade.by_train[tr.id])
+	local stop = got[#got]
+	t.expect_true(stop.stop and not stop.ru and not stop.car, "a stop sample, no new rail path")
+	local want = under(tr)
+	t.expect_true(#want >= 3, #want .. " pieces under the train")
+	t.expect_same(stop.rp, want, "the stop sample lists every piece under the train, rear first")
+	local before = 0
+	for i = 1, #got - 1 do
+		before = before + #(got[i].rp or {})
+	end
+	t.expect_true(before > 0, "some of them were sent before the stop too")
+	-- it moves on: the path continues from where it stood, without a new rail path or a gap
+	run(capture, 401, 700, function()
+		tr.speed = 0.3
+		fake.place(tr, tr.pos + 0.3)
+	end)
+	local after = entries(log, storage.timeshade.by_train[tr.id])
+	local pieces = {}
+	for i = #got + 1, #after do
+		t.expect_true(not after[i].ru, "no new rail path after the stop")
+		for _, q in ipairs(after[i].rp or {}) do
+			pieces[#pieces + 1] = q[4]
+		end
+	end
+	t.expect_same(pieces, { 1 }, "the turn's last piece")
+end)
+
+t.test("trains: a changed train begins a new rail path with car from its new leading carriage", function()
+	local capture, world, log = boot()
+	local s = world.surfaces.nauvis
+	local path = fake.path_lc(300, 12)
+	local tr = fake.train(s, "LCC", path, 0)
+	run(capture, 1, 100, function()
+		tr.speed = 0.3
+		fake.place(tr, tr.pos + 0.3)
+	end)
+	local j = storage.timeshade.by_train[tr.id]
+	local n0 = #entries(log, j)
+	-- a split takes the front carriage: the rest is a new train whose leading carriage is 7 tiles back
+	local rest = fake.train(s, "CC", path, tr.pos - 7)
+	tr.valid = false
+	fire(capture, "on_train_created", { train = rest, old_train_id_1 = tr.id })
+	local truth = {}
+	run(capture, 101, 300, function(tick)
+		rest.speed = 0.3
+		fake.place(rest, rest.pos + 0.3)
+		truth[tick] = rest.front_stock.position
+	end)
+	local got = entries(log, j)
+	local change
+	for i = n0 + 1, #got do
+		if got[i].ru then
+			change = change or got[i]
+		end
+	end
+	t.expect_true(change ~= nil, "a new rail path after the change")
+	t.expect_true(change.car and #change.car == 2, "with the new train's carriages")
+	t.expect_eq(change.n, 2)
+	local p = truth[change.__tick]
+	t.expect_true(math.abs(change.x - p.x) < 1e-9 and math.abs(change.y - p.y) < 1e-9, "at the new leading carriage")
+	local later = 0
+	for i = n0 + 1, #got do
+		if got[i] ~= change and got[i].__tick > change.__tick then
+			later = later + 1
+			t.expect_true(not got[i].ru, "one new rail path only")
+		end
+	end
+	t.expect_true(later <= 4, later .. " samples after the change at constant speed")
+end)
+
 t.test("trains: a train destroyed sends gone; a long train's car is capped and every line stays under the limit",
 	function()
 		local capture, world, log = boot()

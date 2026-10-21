@@ -295,10 +295,23 @@ next sample, and only the timing needs samples.
   looked at and records what continues the path. (Without that walk, a curved-rail-a of an
   S-bend on the Aron map was only found at the next curve 100 tiles on, and a live viewer
   drew the train off its path for 22 frames.)
-- Where a new path begins (first sight, end switch, surface change, a missed piece, a
-  resync) the sample lists the curved pieces and ramps under the whole train instead,
-  rear first: `LuaTrain.get_rails()` lists the rails under the train from its front end to
-  its back end (`src/Script/LuaTrain.cpp:627-638`, `src/Train/RailsUnderTrainIterator.cpp`).
+- Where a new path begins (first sight, a changed train, end switch, surface change, a
+  missed piece, a resync) the sample lists the curved pieces and ramps under the whole train
+  instead, rear first: `LuaTrain.get_rails()` lists the rails under the train from its front
+  end to its back end (`src/Script/LuaTrain.cpp:627-638`, `src/Train/RailsUnderTrainIterator.cpp`).
+  A changed train (`on_train_created` after a join or a split) begins a new path at its next
+  read: its leading joint may have jumped back (carriages taken from the leading end) or
+  ahead (carriages coupled there), and its last read before the change is sent first.
+- A stop sample lists, besides the pieces entered since the previous sample, the pieces
+  under the train that came before them (in front, rear first) and any under the train's
+  end after them (a piece no read looked at), but begins no new path: a viewer that has the
+  samples before it already holds those pieces and skips them as resends (8.2). A parked
+  train is not sampled again until it moves, so a keyframe or the live payload holds only its
+  stop sample, and that sample alone must place every carriage. (With only the pieces
+  entered since the previous sample, 11.7% of the parked trains on the benchmark map were
+  drawn more than 2 tiles off from a keyframe, up to 69 tiles: the body was laid along the
+  straight lead-in through the curves it stood on.) The path recorded for the next pieces
+  then goes on from the rail under the leading joint, as after a new path.
 
 ### 8.2 The chain
 
@@ -329,7 +342,16 @@ a heartbeat's run without), and at u <= 0 when it lists none (it is the anchor, 
 first piece appended later). A sample whose leading joint lies more than 0.35
 tiles from the chain has no rail distance, and the segments touching it are drawn without
 the rail path. A piece that a sample lists but the chain already holds, and that does not
-continue the chain, is a resend (after a resync) and is skipped.
+continue the chain, is a resend (after a resync, or the pieces under a stopped train) and is
+skipped.
+
+The viewer takes every carriage's joint distance as 4 and the distance between neighbouring
+carriages' facing joints as 3 (section 3: vanilla rolling stock), and a sample's leading
+joint 2 tiles ahead of its centre in plan (about 0.2 tile short while the leading carriage
+stands on a ramp's slope). Pitches measured from a run's `car` replace the 7 between
+carriages; a modded carriage with other joint distances is still placed by a leading joint 2
+tiles ahead of its centre, so its body is drawn off the rails by the difference (not measured:
+the benchmark maps are vanilla).
 
 When a new run begins and the previous sample's leading joint lies on the new chain behind
 the run's first sample (a first sight after a resync, a missed piece whose new path reaches
@@ -365,7 +387,8 @@ when that wait ends), on the 600-tick heartbeat, on first sight, stop, start, en
 surface change and a missed piece that the walk back did not find, and when 32 pieces wait.
 The reads kept for the check are at most 16; a full buffer keeps every other one. `car` goes
 with first sight, a changed train, a surface change and resyncs only: the path places every
-carriage, and `car` only tells the viewer the carriages' pitches.
+carriage, and `car` only tells the viewer the carriages' pitches. A stop sample lists the
+pieces under the whole train (8.1).
 
 ### 8.5 Test vectors
 
