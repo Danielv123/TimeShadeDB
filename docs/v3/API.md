@@ -190,7 +190,7 @@ Static: no; static viewers poll `catalog`, `timeline` and `live.bin` every `live
 | `hello` | `{"now": ms, "horizon": {"<ds or sfc id>": ms}}` sent first: the horizon of every subscribed datastore and surface that exists |
 | `tile` | `{"ds", "z", "x", "y", "v", "live"?, "ls"?, "now"}`: a version or live content changed |
 | `horizon` | `{"ds" or "sfc", "horizon", "now"}` after a commit |
-| `movers` | `{"sfc", "now", "movers": [MoverMeta], "rows": [[entry, t, tick or null, x, y, o, flags, carriages or null]]}` new samples, in arrival order; `entry` indexes this event's `movers`; `carriages` is `[[x, y, o], ...]`. Rows the store counted as invalid, or as late by the surface horizon of the last commit, are left out; a row the store rejected under another bound (its clock skew limits) can still appear |
+| `movers` | `{"sfc", "now", "movers": [MoverMeta], "rows": [[entry, t, tick or null, x, y, o, flags, carriages or null]]}` new samples, in arrival order; `entry` indexes this event's `movers`; `carriages` is `[[x, y, o], ...]`; a rail row (flag bit 7, FORMAT.md 7.4) has three more elements, `speed, rail pieces as [[x, y, direction, kind], ...] or null, rail start`. Rows the store counted as invalid, or as late by the surface horizon of the last commit, are left out; a row the store rejected under another bound (its clock skew limits) can still appear |
 | `catalog` | `{"now"}` the catalog changed; refetch it |
 
 A comment line (`: ping`) is sent every 15 s. Each client has a bounded buffer (default

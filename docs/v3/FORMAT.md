@@ -407,19 +407,19 @@ disk.
 | 0 | 4 | magic `MVW3` |
 | 4 | 1 | kind: 1 closed window, 2 keyframe, 3 live |
 | 5 | 1 | format version, 1 |
-| 6 | 2 | flags: bit 0 = the tick column holds data |
+| 6 | 2 | flags: bit 0 = the tick column holds data; bit 1 = the speed and rail columns (9, 10) follow |
 | 8 | 8 | start i64 (window start, keyframe time, or live "now") |
 | 16 | 4 | len u32 (window length; 0 for keyframes; trail length for live) |
 | 20 | 4 | number of mover table entries |
 | 24 | 4 | number of rows |
 | 28 | 4 | mover table length in bytes |
 | 32 | | mover table: UTF-8 JSON array of `MoverMeta` objects (`{"id","k","f","name","n"?,"o"?,"c"?}`) |
-| | | then 8 columns, each `u32 byte length` followed by its bytes |
+| | | then 8 columns (10 with header bit 1), each `u32 byte length` followed by its bytes |
 
 Rows are sorted by (mover entry, t), and (entry, t) is unique. A journey whose meta changes
 inside the window has one entry per meta, with the same `id`. Entries are sorted by
-(`id`, first row time). Per entry, the running values (`t`, tick, x, y, orientation) start
-at (start, 0, 0, 0, 0).
+(`id`, first row time). Per entry, the running values (`t`, tick, x, y, orientation, speed) start
+at (start, 0, 0, 0, 0, 0).
 
 | # | Column | Per | Encoding |
 |---|---|---|---|
@@ -431,6 +431,8 @@ at (start, 0, 0, 0, 0).
 | 6 | orientation | row | varint: (o - previous o) as a signed 16-bit difference, o in u16 units (65,536 per turn); gone rows write 0 |
 | 7 | flags | row | 1 byte (below) |
 | 8 | carriages | row with bit 6 | uvarint n, then per carriage: varint (cx - x) units, varint (cy - y) units, uvarint orientation u16 |
+| 9 | speed | row with bit 7 | varint: speed units - the entry's previous rail row's (8,192 units per tile a tick) |
+| 10 | rail | row with bit 7 | uvarint (pieces << 1 \| rail start), then per piece: varint (px - previous px), varint (py - previous py) in whole tiles, the first from the row's tile (x units >> 4, y units >> 4), and a byte kind << 4 \| direction (RAIL-GEOMETRY.md 8) |
 
 Row flags (`core.MoverFlags`; bit 6 exists only on the wire):
 
@@ -443,12 +445,14 @@ Row flags (`core.MoverFlags`; bit 6 exists only on the wire):
 | 4 | no-tick | tick unknown (imported data) |
 | 5 | no-heading | orientation unknown; derive it from the motion |
 | 6 | carriages | the carriage column has a block for this row |
-| 7 | reserved | 0 |
+| 7 | rail | a train's rail path sample (RAIL-GEOMETRY.md 8): the orientation is the leading carriage's own orientation (the rail tangent), and columns 9 and 10 have its speed, its rail pieces and whether a new rail path begins (PROTOCOL.md 3.1 `v`, `rp`, `ru`). Gone rows never have it |
 
 Positions: a train's x, y is its leading carriage centre; carriages list every carriage from
 the leading end. Orientation is Factorio's (0 north, 0.25 east); a train's points from the
-second carriage to the first. Velocity is not stored: viewers derive it from neighbouring
-rows (with ticks when present: `ticks / (60 * speed)` seconds).
+second carriage to the first, except on rail rows (bit 7), where it is the leading carriage's
+own orientation. Velocity is not stored except a rail row's speed: viewers derive it from
+neighbouring rows (with ticks when present: `ticks / (60 * speed)` seconds). Windows without
+rail rows keep the eight-column layout, so older readers read them unchanged.
 
 Measured on a synthetic train track (1,000 samples, 250-350 ms apart): 8.1 B/sample raw,
 2.1 B/sample after zstd (`wire.TestMoverWindowSizeOnTrainTrack`). The PLAN target is

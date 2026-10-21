@@ -27,6 +27,8 @@ import (
 //	'M' uvarint meta number, uvarint length, JSON {"s": SurfaceKey, "m": MoverMeta}
 //	'S' uvarint meta number, varint t, varint tick, varint x, varint y, uvarint o,
 //	    byte flags, uvarint n, n x (varint cx, varint cy, uvarint co)
+//	    [with core.FlagRail: uvarint speed, uvarint pieces << 1 | rail start,
+//	     pieces x (varint x, varint y, byte kind << 4 | direction)]
 //
 // Meta numbers are local to the file and never reused within it. At every commit that
 // closes a window the log is rewritten (tmp + rename) with only the rows still open, so
@@ -187,6 +189,23 @@ func decodeWALFrame(p []byte, metas map[uint64]walMetaJSON, ptrs map[uint64]*cor
 					x.car[i] = carriage{x: int32(r.varint()), y: int32(r.varint()), o: uint16(r.uvarint())}
 				}
 			}
+			if x.flags&core.FlagRail != 0 {
+				x.speed = uint32(r.uvarint())
+				head := r.uvarint()
+				np := head >> 1
+				if np > core.MaxRailPieces || int(np) > len(r.b)-r.off {
+					return fmt.Errorf("wal: %d rail pieces", np)
+				}
+				x.rstart = head&1 != 0
+				if np > 0 {
+					x.rail = make([]core.RailPiece, np)
+					for i := range x.rail {
+						px, py := int32(r.varint()), int32(r.varint())
+						kd := r.byte()
+						x.rail[i] = core.RailPiece{X: px, Y: py, Dir: kd & 15, Kind: kd >> 4}
+					}
+				}
+			}
 			rows = append(rows, pending{m.S, x})
 		default:
 			return fmt.Errorf("wal: unknown record")
@@ -245,6 +264,19 @@ func encodeEntries(buf []byte, frameStart int, entries []walEntry, ids map[walMe
 			buf = binary.AppendVarint(buf, int64(c.x))
 			buf = binary.AppendVarint(buf, int64(c.y))
 			buf = binary.AppendUvarint(buf, uint64(c.o))
+		}
+		if r.flags&core.FlagRail != 0 {
+			buf = binary.AppendUvarint(buf, uint64(r.speed))
+			head := uint64(len(r.rail)) << 1
+			if r.rstart {
+				head |= 1
+			}
+			buf = binary.AppendUvarint(buf, head)
+			for _, p := range r.rail {
+				buf = binary.AppendVarint(buf, int64(p.X))
+				buf = binary.AppendVarint(buf, int64(p.Y))
+				buf = append(buf, p.Kind<<4|p.Dir&15)
+			}
 		}
 	}
 	return buf, frameStart

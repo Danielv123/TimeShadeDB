@@ -192,6 +192,16 @@ func buildFixtures(t *testing.T) *fixtures {
 	moverFile("movers_window.bin", get(mv.Window(ctx, fixSfc, T0))(t))
 	moverFile("movers_keyframe.bin", get(mv.Keyframe(ctx, fixSfc, T0+core.Hour))(t))
 	moverFile("movers_live.bin", get(mv.Live(ctx, fixSfc, T0+core.Hour+10_000))(t))
+	// Rail path rows (FORMAT.md 7.4 columns 9 and 10).
+	rail := &core.MoverWindow{Surface: fixSfc, Kind: core.WindowClosed, Start: T0, Len: core.MoverWindowLen, Movers: []core.MoverMeta{trainMeta},
+		Rows: []core.MoverRow{
+			{T: T0 + 1000, Tick: 60, X: -100, Y: -176, Orientation: 0.25, Flags: core.FlagRail, Speed: 0.5, RailStart: true,
+				Rail: []core.RailPiece{{X: -110, Y: -177, Dir: 12, Kind: core.RailKindCurveA}}},
+			{T: T0 + 5000, Tick: 300, X: 10.5, Y: -176, Orientation: 0.3125, Flags: core.FlagRail, Speed: 0.375,
+				Rail: []core.RailPiece{{X: 2, Y: -175, Dir: 4, Kind: core.RailKindCurveA}, {X: 7, Y: -173, Dir: 4, Kind: core.RailKindCurveB}}},
+			{T: T0 + 9000, Tick: 540, X: 20, Y: -160, Orientation: 0.375, Flags: core.FlagRail | core.FlagStop},
+		}}
+	moverFile("movers_rail.bin", rail)
 	f.putJSON("movers_day.json", get(mv.Day(ctx, fixSfc, core.UTCDay(T0)))(t))
 
 	// Overlays.
@@ -260,7 +270,15 @@ func windowExpect(w *core.MoverWindow) map[string]any {
 		ids = append(ids, m.ID)
 	}
 	row := func(r core.MoverRow) map[string]any {
-		return map[string]any{"mover": r.Mover, "t": r.T, "tick": r.Tick, "x": r.X, "y": r.Y, "o": r.Orientation, "flags": r.Flags, "carriages": r.Carriages}
+		m := map[string]any{"mover": r.Mover, "t": r.T, "tick": r.Tick, "x": r.X, "y": r.Y, "o": r.Orientation, "flags": r.Flags, "carriages": r.Carriages}
+		if r.Flags&core.FlagRail != 0 {
+			pieces := [][4]int{}
+			for _, p := range r.Rail {
+				pieces = append(pieces, [4]int{int(p.X), int(p.Y), int(p.Dir), int(p.Kind)})
+			}
+			m["speed"], m["rail"], m["rail_start"] = r.Speed, pieces, r.RailStart
+		}
+		return m
 	}
 	out := map[string]any{"kind": w.Kind, "start": w.Start, "len": w.Len, "movers": ids, "rows": len(w.Rows)}
 	if len(w.Rows) > 0 {

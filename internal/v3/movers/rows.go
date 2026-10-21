@@ -9,9 +9,9 @@ import (
 	"timeshadedb/internal/v3/core/wire"
 )
 
-// storedFlags are the core.MoverFlags bits a store keeps. Bits 6 and 7 are wire-only or
-// reserved (docs/v3/FORMAT.md "MVW3"), so they are cleared on Append.
-const storedFlags = core.FlagStop | core.FlagGone | core.FlagHandoff | core.FlagEndSwitch | core.FlagNoTick | core.FlagNoHeading
+// storedFlags are the core.MoverFlags bits a store keeps. Bit 6 is wire-only
+// (docs/v3/FORMAT.md "MVW3"), so it is cleared on Append.
+const storedFlags = core.FlagStop | core.FlagGone | core.FlagHandoff | core.FlagEndSwitch | core.FlagNoTick | core.FlagNoHeading | core.FlagRail
 
 // MaxCarriages is the most carriages one sample may carry (wire.MaxCarriages, which the
 // MVW3 decoder enforces); samples with more are Invalid.
@@ -33,6 +33,10 @@ type row struct {
 	o     uint16
 	flags core.MoverFlags
 	car   []carriage
+	// With core.FlagRail: speed in core.SpeedUnits, the rail pieces and the rail start.
+	speed  uint32
+	rail   []core.RailPiece
+	rstart bool
 	// seq is the arrival order; for equal (journey, t) the highest seq wins.
 	seq uint64
 }
@@ -85,6 +89,21 @@ func makeRow(s *core.MoverSample, meta *core.MoverMeta, seq uint64) (row, bool) 
 	if len(s.Carriages) > MaxCarriages {
 		return r, false
 	}
+	if r.flags&core.FlagRail != 0 {
+		if s.Meta.Kind != core.KindTrain || len(s.Rail) > core.MaxRailPieces || math.IsNaN(s.Speed) {
+			return r, false
+		}
+		r.speed = core.QuantizeSpeed(s.Speed)
+		r.rstart = s.RailStart
+		if len(s.Rail) > 0 {
+			for _, p := range s.Rail {
+				if !p.Valid() {
+					return r, false
+				}
+			}
+			r.rail = append([]core.RailPiece(nil), s.Rail...)
+		}
+	}
 	if len(s.Carriages) > 0 {
 		r.car = make([]carriage, len(s.Carriages))
 		for i, c := range s.Carriages {
@@ -114,6 +133,13 @@ func (r *row) coreRow(i int) core.MoverRow {
 			mr.Carriages[k] = core.Carriage{X: float64(c.x) / core.PosUnits, Y: float64(c.y) / core.PosUnits, Orientation: float64(c.o) / core.OrientUnits}
 		}
 	}
+	if r.flags&core.FlagRail != 0 {
+		mr.Speed = float64(r.speed) / core.SpeedUnits
+		mr.RailStart = r.rstart
+		if len(r.rail) > 0 {
+			mr.Rail = append([]core.RailPiece(nil), r.rail...)
+		}
+	}
 	return mr
 }
 
@@ -130,6 +156,13 @@ func rowFromCore(meta *core.MoverMeta, mr *core.MoverRow) row {
 		r.car = make([]carriage, len(mr.Carriages))
 		for k, c := range mr.Carriages {
 			r.car[k] = carriage{x: int32(core.QuantizePos(c.X)), y: int32(core.QuantizePos(c.Y)), o: core.QuantizeOrientation(c.Orientation)}
+		}
+	}
+	if r.flags&core.FlagRail != 0 {
+		r.speed = core.QuantizeSpeed(mr.Speed)
+		r.rstart = mr.RailStart
+		if len(mr.Rail) > 0 {
+			r.rail = append([]core.RailPiece(nil), mr.Rail...)
 		}
 	}
 	return r

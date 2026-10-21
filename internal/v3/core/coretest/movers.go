@@ -31,7 +31,8 @@ func gone(meta core.MoverMeta, t core.TimeMs) core.MoverSample {
 
 func rowOf(s core.MoverSample, mover int) core.MoverRow {
 	q := s.Quantized()
-	return core.MoverRow{Mover: mover, T: q.T, Tick: q.Tick, X: q.X, Y: q.Y, Orientation: q.Orientation, Flags: q.Flags, Carriages: q.Carriages}
+	return core.MoverRow{Mover: mover, T: q.T, Tick: q.Tick, X: q.X, Y: q.Y, Orientation: q.Orientation, Flags: q.Flags, Carriages: q.Carriages,
+		Speed: q.Speed, Rail: q.Rail, RailStart: q.RailStart}
 }
 
 func sameRows(t *testing.T, what string, got, want []core.MoverRow) {
@@ -41,6 +42,9 @@ func sameRows(t *testing.T, what string, got, want []core.MoverRow) {
 		for i, r := range rows {
 			if len(r.Carriages) == 0 {
 				r.Carriages = nil
+			}
+			if len(r.Rail) == 0 {
+				r.Rail = nil
 			}
 			out[i] = r
 		}
@@ -92,6 +96,25 @@ func MoverStore(t *testing.T, open MoverFactory) {
 		if len(sfcs) != 1 || sfcs[0].Key != SFC || sfcs[0].ID != SFC.ID() || sfcs[0].Horizon != T0+W ||
 			sfcs[0].FirstT != T0+1000 || sfcs[0].LastT != T0+W+1000 || !reflect.DeepEqual(sfcs[0].Days, []string{core.UTCDay(T0)}) {
 			t.Fatalf("surfaces = %+v", sfcs)
+		}
+	})
+
+	t.Run("RailRows", func(t *testing.T) {
+		m := open(t)
+		defer m.Close()
+		a := sample(Train, T0+1000, 10, 20, 0.25)
+		a.Flags = core.FlagRail
+		a.Speed, a.RailStart = 0.5, true
+		a.Rail = []core.RailPiece{{X: -3, Y: 21, Dir: 12, Kind: core.RailKindCurveA}, {X: 2, Y: 19, Dir: 4, Kind: core.RailKindRamp}}
+		b := sample(Train, T0+2000, 40, 20, 0.25)
+		b.Flags = core.FlagRail | core.FlagStop
+		c := sample(Train, T0+3000, 40, 20, 0.25) // an older capture's row
+		ok(t, func() error { _, err := m.Append(ctx, []core.MoverSample{a, b, c}); return err }())
+		ok(t, m.Commit(ctx, T0+W))
+		w := get(m.Window(ctx, SFC, T0))(t)
+		sameRows(t, "window", w.Rows, []core.MoverRow{rowOf(a, 0), rowOf(b, 0), rowOf(c, 0)})
+		if w.Rows[0].Speed != 0.5 || !w.Rows[0].RailStart || len(w.Rows[0].Rail) != 2 || w.Rows[2].Flags&core.FlagRail != 0 {
+			t.Fatalf("rail rows: %+v", w.Rows)
 		}
 	})
 

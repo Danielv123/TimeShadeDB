@@ -73,7 +73,7 @@ earlier tick than the flush, for example).
 
 ### 3.1 Move entries
 
-Sample: `{j, k, f, name, x, y, h?, tick?, n?, o?, c?, stop?, es?, car?}`.
+Sample: `{j, k, f, name, x, y, h?, tick?, n?, o?, c?, stop?, es?, car?, v?, rp?, ru?}`.
 Gone: `{j, gone: true, tick?}`.
 
 | Field | Meaning |
@@ -82,12 +82,15 @@ Gone: `{j, gone: true, tick?}`.
 | `k` | `t` train, `v` vehicle, `p` player |
 | `f`, `name` | force; leading carriage or vehicle prototype, or player name |
 | `x`, `y` | tiles; a train's leading carriage centre |
-| `h` | orientation 0..1 (0 north, 0.25 east); trains: second carriage towards the first (a single carriage: its orientation in the direction of travel). Absent: unknown. |
+| `h` | orientation 0..1 (0 north, 0.25 east). Trains with `v` (rail path samples): the leading carriage's own orientation turned to the direction of travel, which is the rail tangent at its centre (RAIL-GEOMETRY.md 5); trains without `v` (older captures, imported data): second carriage towards the first (a single carriage: its orientation in the direction of travel). Absent: unknown. |
 | `n`, `o`, `c` | train carriage count; kinds from the leading end (`L` loco, `C` cargo, `F` fluid, `A` artillery, lower case faces back; vehicles `S` spidertron or `C` car); colour `rrggbb` |
 | `tick` | the game tick of the read, when it is not the envelope's: a train's chord vertex is sent one read late |
 | `stop` | at rest. A parked train is not read again until it moves: after its stop sample it sends only resync samples |
 | `es` | the leading end switched at this sample (also when a stopped train starts off the other way); the sample before it is the old leading end's last read |
-| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, on stop, on start, at end switches, after the train changed (join, split) and in resyncs |
+| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage (older captures also sent it on stop, start and end switch) |
+| `v` | trains: the speed in tiles a tick (4 decimals, never negative). Its presence makes the sample a rail path sample (RAIL-GEOMETRY.md 8) |
+| `rp` | rail path samples: the curved rail pieces and rail ramps the leading carriage's front joint entered since the previous sample, in order, as `[x, y, direction, kind]`: the entity's position (whole tiles), its `defines.direction` and its kind, 1 `curved-rail-a`, 2 `curved-rail-b`, 3 `legacy-curved-rail`, 4 `rail-ramp` (the `elevated-` pieces share their ground piece's kind). Rails between them are straight, so the pieces are the exact path the leading joint ran along. Absent: none. With `ru`: the pieces under the whole train, rear first (at most 120, and with `car` as many as fit beside it in a line, at least 8) |
+| `ru` | a new rail path begins at this sample (first sight, end switch, surface change, a resync, or a piece that does not continue the recorded path: a missed piece); the path since the previous sample is not given |
 | `vx`, `vy` | legacy (illisis), ignored |
 
 ## 4. Clock anchors
@@ -136,7 +139,7 @@ The ingest decoder (WP6) produces core values:
 |---|---|
 | `chunk` with `d` | `ChunkUpdate{DS: {map, s, f}, Chunk: {x, y}, T, Pixels: DecodeChart(d)}`; a chart that does not inflate to 2,048 bytes is a bad message |
 | `chunk` without `d` | `ChunkUpdate{..., Deleted: true}` |
-| `move` sample | `MoverSample{Surface: {map, s}, Meta: {j, k, f, name, n, o, c}, T, Tick, X, Y, Orientation: h, Flags, Carriages: car}` with `FlagStop` for `stop`, `FlagEndSwitch` for `es`, `FlagNoHeading` when `h` is absent |
+| `move` sample | `MoverSample{Surface: {map, s}, Meta: {j, k, f, name, n, o, c}, T, Tick, X, Y, Orientation: h, Flags, Carriages: car}` with `FlagStop` for `stop`, `FlagEndSwitch` for `es`, `FlagNoHeading` when `h` is absent; a train sample with `v` and `h` also gets `FlagRail`, `Speed: v`, `Rail: rp`, `RailStart: ru` (a piece with an unknown kind or direction drops `rp` and sets `RailStart`) |
 | `move` gone | `MoverSample{..., Flags: FlagGone}` with the journey's last known meta (ingest keeps the last meta per journey in a bounded map; unknown: kind from the id prefix, empty names) |
 | `tag` | `OverlayEvent{DS: {map, s, f}, T, Interval: {Kind: tag, Key: "<instance>/<n>", Instance, X, Y, Icon, Text}}`; no `x`: `Close` |
 | `recipe` | `OverlayEvent{Kind: recipe, Key: "<instance>/<u>", Recipe: r, Quality: q}`; no `r`: `Close` |
@@ -172,9 +175,15 @@ These are protocol-level requirements; the Lua is WP9's.
   `car`, every tag and recipe. The walk of charted chunks keeps pace with the chart reads
   (4 a tick while a resync runs, one of them kept for chart events while any wait), so
   50,000 chunks take 3.5 to 4.6 minutes.
-- Trains: emit when the chord error since the last sample exceeds 0.25 tile, when the
-  orientation changed by more than about 2 degrees, or on a 600-tick heartbeat while
-  moving; always send the tick; send `car` on stop, start, end switch and resync; set `es` on end switches.
+- Trains (rail path samples, RAIL-GEOMETRY.md 8): send `v`, `rp` and `ru` with every train
+  sample. Emit when a read since the last sample lies more than 0.1 tile of rail distance off
+  the timing model between that sample and the current read, at least every 120 ticks while
+  moving (60 below game speed 0.5), on a 600-tick heartbeat, on first sight, stop, start, end
+  switch and surface change, and where the leading joint entered a piece that does not
+  continue the recorded path and the pieces between were not found behind it (`ru`). Always
+  send the tick; send `car` on first sight, after the train changed, on a surface change and
+  in resyncs; set `es` on end switches. The path between samples is not sampled: the pieces
+  give it.
 - Vehicles and players: emit when off the dead-reckoned position by more than 1 tile or on
   the heartbeat; send `h` for vehicles too.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for

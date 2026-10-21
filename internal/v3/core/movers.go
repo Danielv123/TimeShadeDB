@@ -67,7 +67,38 @@ const (
 	// from the velocity in Orientation, which is wrong for a reversing car or a strafing
 	// spidertron.
 	FlagNoHeading MoverFlags = 1 << 5
+	// FlagRail: a train sample of the rail path model (docs/v3/RAIL-GEOMETRY.md 8).
+	// Orientation is the leading carriage's own orientation in the direction of travel
+	// (the rail tangent at its centre), Speed the train's speed, and Rail the curved
+	// pieces and ramps its leading joint entered since the previous sample; with
+	// RailStart a new rail path begins and Rail lists the pieces under the whole train.
+	FlagRail MoverFlags = 1 << 7
 )
+
+// RailPiece is a curved rail piece or rail ramp of a train's rail path: the entity's
+// position in whole tiles, its 16-way direction and its kind (RailKindCurveA ...).
+type RailPiece struct {
+	X, Y int32
+	Dir  uint8
+	Kind uint8
+}
+
+// Rail piece kinds (docs/v3/PROTOCOL.md 3.1 `rp`); elevated pieces share the ground ones'.
+const (
+	RailKindCurveA      = 1
+	RailKindCurveB      = 2
+	RailKindLegacyCurve = 3
+	RailKindRamp        = 4
+)
+
+// MaxRailPieces is the most rail pieces one sample may list.
+const MaxRailPieces = 1024
+
+// Valid reports whether p has a known kind and direction and a coordinate within a map.
+func (p RailPiece) Valid() bool {
+	return p.Kind >= RailKindCurveA && p.Kind <= RailKindRamp && p.Dir < 16 &&
+		p.X > -(1<<24) && p.X < 1<<24 && p.Y > -(1<<24) && p.Y < 1<<24
+}
 
 // Carriage is one carriage's centre and orientation, part of a train sample.
 type Carriage struct {
@@ -96,6 +127,10 @@ type MoverSample struct {
 	// Carriages, when present, lists every carriage from the leading end (WP9 sends them
 	// on stop, on start, in keyframes and at end switches).
 	Carriages []Carriage
+	// Speed (tiles a tick), Rail and RailStart are set with FlagRail (see there).
+	Speed     float64
+	Rail      []RailPiece
+	RailStart bool
 }
 
 // Quantization of stored mover positions and orientations (docs/v3/FORMAT.md).
@@ -104,7 +139,22 @@ const (
 	PosUnits = 16
 	// OrientUnits is the number of orientation units per turn (u16).
 	OrientUnits = 65536
+	// SpeedUnits is the number of speed units per tile a tick.
+	SpeedUnits = 8192
+	// MaxSpeed is the largest storable speed in tiles a tick.
+	MaxSpeed = 64
 )
+
+// QuantizeSpeed rounds a speed (tiles a tick) to the stored grid, clamped to [0, MaxSpeed].
+func QuantizeSpeed(v float64) uint32 {
+	if !(v > 0) {
+		return 0
+	}
+	if v > MaxSpeed {
+		v = MaxSpeed
+	}
+	return uint32(math.Round(v * SpeedUnits))
+}
 
 // QuantizePos rounds a coordinate to the stored grid and returns it in units.
 func QuantizePos(v float64) int64 { return int64(math.Round(v * PosUnits)) }
@@ -123,6 +173,16 @@ func (s MoverSample) Quantized() MoverSample {
 	q.Y = float64(QuantizePos(s.Y)) / PosUnits
 	q.Orientation = float64(QuantizeOrientation(s.Orientation)) / OrientUnits
 	q.Carriages = nil
+	q.Speed, q.Rail, q.RailStart = 0, nil, false
+	if s.Flags&FlagGone == 0 && s.Flags&FlagRail != 0 {
+		q.Speed = float64(QuantizeSpeed(s.Speed)) / SpeedUnits
+		q.RailStart = s.RailStart
+		if len(s.Rail) > 0 {
+			q.Rail = append([]RailPiece(nil), s.Rail...)
+		}
+	} else {
+		q.Flags &^= FlagRail
+	}
 	if s.Flags&FlagGone != 0 {
 		q.X, q.Y, q.Orientation = 0, 0, 0
 	} else if len(s.Carriages) > 0 {
@@ -161,6 +221,10 @@ type MoverRow struct {
 	Orientation float64
 	Flags       MoverFlags
 	Carriages   []Carriage
+	// Speed, Rail and RailStart as in MoverSample, with FlagRail.
+	Speed     float64
+	Rail      []RailPiece
+	RailStart bool
 }
 
 // MoverWindow is the decoded form of an MVW3 body (docs/v3/FORMAT.md): a mover table and

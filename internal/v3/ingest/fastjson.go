@@ -604,9 +604,73 @@ func (l *lexer) moveEntry(e *core.MoveEntry, in *interner) bool {
 			return l.boolVal(&e.ES)
 		case "car":
 			return l.carriages(&e.Car)
+		case "v":
+			return l.floatPtr(&e.V)
+		case "ru":
+			return l.boolVal(&e.RU)
+		case "rp":
+			return l.railPieces(&e.RP)
 		}
 		return false
 	})
+}
+
+// railPieces decodes [[x, y, direction, kind], ...] of whole numbers; anything else
+// takes the encoding/json path.
+func (l *lexer) railPieces(dst *[][4]int64) bool {
+	if l.isNull() {
+		*dst = nil
+		return true
+	}
+	if !l.eat('[') {
+		return false
+	}
+	out := [][4]int64{}
+	l.ws()
+	if l.eat(']') {
+		*dst = out
+		return true
+	}
+	for {
+		l.ws()
+		if !l.eat('[') {
+			return false
+		}
+		var c [4]int64
+		for k := range 4 {
+			l.ws()
+			raw, ok := l.num()
+			if !ok {
+				return false
+			}
+			v, err := strconv.ParseInt(string(raw), 10, 64)
+			if err != nil {
+				return false
+			}
+			c[k] = v
+			l.ws()
+			sep := byte(',')
+			if k == 3 {
+				sep = ']'
+			}
+			if !l.eat(sep) {
+				return false
+			}
+		}
+		out = append(out, c)
+		if len(out) > MaxMoveEntries {
+			return false
+		}
+		l.ws()
+		if l.eat(',') {
+			continue
+		}
+		if !l.eat(']') {
+			return false
+		}
+		*dst = out
+		return true
+	}
 }
 
 // carriages decodes [[x, y, o], ...]; inner arrays of another length take the

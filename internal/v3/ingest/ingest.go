@@ -981,6 +981,25 @@ func (b *batch) move(env *envHeader, m *wireMsg) error {
 				s.Carriages[i] = core.Carriage{X: c[0], Y: c[1], Orientation: c[2]}
 			}
 		}
+		if e.V != nil && s.Meta.Kind == core.KindTrain && e.H != nil {
+			// A rail path sample (docs/v3/RAIL-GEOMETRY.md 8). Pieces that are not valid
+			// make the path unknown here: the viewer starts a new rail path at the sample.
+			s.Flags |= core.FlagRail
+			s.Speed = *e.V
+			s.RailStart = e.RU
+			if len(e.RP) > 0 {
+				s.Rail = make([]core.RailPiece, 0, min(len(e.RP), core.MaxRailPieces))
+				for _, p := range e.RP {
+					q := core.RailPiece{X: int32(p[0]), Y: int32(p[1]), Dir: uint8(p[2]), Kind: uint8(p[3])}
+					if len(s.Rail) == core.MaxRailPieces || int64(q.X) != p[0] || int64(q.Y) != p[1] ||
+						int64(q.Dir) != p[2] || int64(q.Kind) != p[3] || !q.Valid() {
+						s.Rail, s.RailStart = nil, true
+						break
+					}
+					s.Rail = append(s.Rail, q)
+				}
+			}
+		}
 		b.moves = append(b.moves, s)
 	}
 	b.samples = b.journeys(env.Map).Move(env.Src, b.moves, b.samples)

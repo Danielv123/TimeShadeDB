@@ -118,6 +118,16 @@ func randomSamples(rng *rand.Rand, t0 core.TimeMs, span core.TimeMs, n int) []co
 		case 4:
 			s.Flags = core.FlagNoHeading
 		}
+		if meta.Kind == core.KindTrain && s.Flags&(core.FlagGone|core.FlagNoHeading) == 0 && rng.Intn(2) == 0 {
+			// a rail path sample (docs/v3/RAIL-GEOMETRY.md 8)
+			s.Flags |= core.FlagRail
+			s.Speed = rng.Float64() * 1.3
+			s.RailStart = rng.Intn(5) == 0
+			for k := rng.Intn(4); k > 0; k-- {
+				s.Rail = append(s.Rail, core.RailPiece{X: int32(s.X) + int32(rng.Intn(80)) - 40, Y: int32(s.Y) + int32(rng.Intn(80)) - 40,
+					Dir: uint8(rng.Intn(16)), Kind: uint8(1 + rng.Intn(4))})
+			}
+		}
 		out = append(out, s)
 		if rng.Intn(30) == 0 { // a duplicate (id, t) with different content
 			d := s
@@ -135,6 +145,9 @@ func sameWindow(t *testing.T, what string, got, want *core.MoverWindow) {
 		for i := range c.Rows {
 			if len(c.Rows[i].Carriages) == 0 {
 				c.Rows[i].Carriages = nil
+			}
+			if len(c.Rows[i].Rail) == 0 {
+				c.Rows[i].Rail = nil
 			}
 		}
 		if len(c.Movers) == 0 {

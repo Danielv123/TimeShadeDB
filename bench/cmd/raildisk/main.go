@@ -3,7 +3,8 @@
 // keyframe files as written (zstd), their rows by mover kind, the rows carrying carriage
 // geometry (`car`), and the size the same windows would have after zstd without the
 // carriage column and without non-train rows, so the share of `car` and of keyframes in
-// the bytes per train-hour can be given.
+// the bytes per train-hour can be given; for rail path rows (core.FlagRail) also their
+// count, their rail pieces and the size without the pieces.
 //
 //	raildisk -db <v3 db> [-out disk.json]
 package main
@@ -38,8 +39,12 @@ type surfaceDisk struct {
 	Carriages int `json:"carriages"`
 	// The windows re-encoded with the store's zstd level: only train rows; only train
 	// rows without the carriage column.
-	TrainOnlyBytes   int64 `json:"train_only_bytes"`
-	TrainNoCarBytes  int64 `json:"train_nocar_bytes"`
+	TrainOnlyBytes  int64 `json:"train_only_bytes"`
+	TrainNoCarBytes int64 `json:"train_nocar_bytes"`
+	// Rail path rows, their rail pieces, and the train-only windows without the pieces.
+	RailRows         int   `json:"rail_rows"`
+	RailPieces       int   `json:"rail_pieces"`
+	TrainNoRailBytes int64 `json:"train_norail_bytes"`
 	RawBodyBytes     int64 `json:"raw_body_bytes"`
 	RawTrainNoCarRaw int64 `json:"raw_train_nocar_body_bytes"`
 }
@@ -103,6 +108,10 @@ func main() {
 						sd.CarRows++
 						sd.Carriages += len(r.Carriages)
 					}
+					if r.Flags&core.FlagRail != 0 {
+						sd.RailRows++
+						sd.RailPieces += len(r.Rail)
+					}
 					mi, ok := remap[r.Mover]
 					if !ok {
 						mi = len(trains.Movers)
@@ -115,7 +124,15 @@ func main() {
 				body, err := wire.EncodeMoverWindow(trains)
 				check(err)
 				sd.TrainOnlyBytes += int64(len(enc.EncodeAll(body, nil)))
+				pieces := make([][]core.RailPiece, len(trains.Rows))
 				for i := range trains.Rows {
+					pieces[i], trains.Rows[i].Rail = trains.Rows[i].Rail, nil
+				}
+				body, err = wire.EncodeMoverWindow(trains)
+				check(err)
+				sd.TrainNoRailBytes += int64(len(enc.EncodeAll(body, nil)))
+				for i := range trains.Rows {
+					trains.Rows[i].Rail = pieces[i]
 					trains.Rows[i].Carriages = nil
 				}
 				body, err = wire.EncodeMoverWindow(trains)

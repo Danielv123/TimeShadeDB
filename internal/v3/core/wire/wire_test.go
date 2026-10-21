@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"encoding/binary"
 	"errors"
 	"math/rand"
 	"reflect"
@@ -180,6 +181,55 @@ func TestMoverWindowRoundTrip(t *testing.T) {
 	}
 	if got, err := DecodeMoverWindow(b, core.SurfaceKey{}); err != nil || len(got.Rows) != 0 || len(got.Movers) != 0 {
 		t.Fatalf("empty window: %+v %v", got, err)
+	}
+}
+
+// TestMoverWindowRail: rail path rows (core.FlagRail) round trip through the two extra
+// columns; a window without them keeps the eight-column layout older readers know.
+func TestMoverWindowRail(t *testing.T) {
+	w := sampleWindow()
+	plain, err := EncodeMoverWindow(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint16(plain[6:])&MoverHasRail != 0 {
+		t.Fatal("a window without rail rows announces rail columns")
+	}
+	w.Rows[0].Flags |= core.FlagRail
+	w.Rows[0].Speed = 0.25
+	w.Rows[0].RailStart = true
+	w.Rows[0].Rail = []core.RailPiece{{X: -1067, Y: -764, Dir: 0, Kind: core.RailKindCurveA}, {X: -1069, Y: -769, Dir: 15, Kind: core.RailKindCurveB}}
+	w.Rows[1].Flags |= core.FlagRail
+	w.Rows[1].Speed = 1.25
+	b, err := EncodeMoverWindow(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint16(b[6:])&MoverHasRail == 0 {
+		t.Fatal("rail columns not announced")
+	}
+	got, err := DecodeMoverWindow(b, w.Surface)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		g, x := got.Rows[i], w.Rows[i]
+		if g.Flags != x.Flags || g.Speed != x.Speed || g.RailStart != x.RailStart || !reflect.DeepEqual(g.Rail, x.Rail) {
+			t.Fatalf("row %d:\n got  %+v\n want %+v", i, g, x)
+		}
+	}
+	b2, err := EncodeMoverWindow(got)
+	if err != nil || string(b2) != string(b) {
+		t.Fatalf("re-encode differs (%v)", err)
+	}
+	// a rail flag on a gone row is dropped, and a rail row without the columns is refused
+	for i := range b {
+		if i == 6 {
+			b[i] &^= byte(MoverHasRail)
+		}
+	}
+	if _, err := DecodeMoverWindow(b, w.Surface); err == nil {
+		t.Fatal("rail rows without rail columns accepted")
 	}
 }
 

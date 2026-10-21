@@ -87,6 +87,14 @@ type MoveEntry struct {
 	ES   bool `json:"es,omitempty"`
 	// Car lists every carriage from the leading end as [x, y, orientation].
 	Car [][3]float64 `json:"car,omitempty"`
+	// V is a train's speed in tiles a tick. A train sample with V is a rail path sample
+	// (docs/v3/RAIL-GEOMETRY.md 8): H is then the leading carriage's own orientation.
+	V *float64 `json:"v,omitempty"`
+	// RP lists the curved rail pieces and ramps the leading joint entered since the
+	// previous sample as [x, y, direction, kind]; with RU a new rail path begins at this
+	// sample and RP lists the pieces under the whole train, rear first.
+	RP [][4]int64 `json:"rp,omitempty"`
+	RU bool       `json:"ru,omitempty"`
 }
 
 // MoveMsg carries samples of movers on surface S.

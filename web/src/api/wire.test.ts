@@ -82,6 +82,19 @@ test("mover windows", () => {
   }
 });
 
+test("mover windows with rail path rows", () => {
+  const want = expected["movers_rail.bin"];
+  const w = decodeMoverWindow(bin("movers_rail.bin"));
+  assert.equal(w.rows.length, want.rows);
+  for (const [i, r] of w.rows.entries()) {
+    const x = want.flagged[i]; // every row has the rail flag
+    assert.equal(r.flags, x.flags, `row ${i} flags`);
+    assert.equal(r.speed, x.speed, `row ${i} speed`);
+    assert.equal(r.railStart, x.rail_start, `row ${i} rail start`);
+    assert.deepEqual((r.rail ?? []).map(p => [p.x, p.y, p.dir, p.kind]), x.rail, `row ${i} pieces`);
+  }
+});
+
 test("json fixtures have the documented shapes", () => {
   const cat = json("catalog.json");
   assert.equal(cat.version, 1);
