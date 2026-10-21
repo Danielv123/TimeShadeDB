@@ -361,8 +361,11 @@ export function railRuns(tr: Track): RailRuns {
     for (const k of members) {
       const x = s[k];
       const to = refU + 1.5 * Math.max(ref.v, x.v) * (x.tick! - ref.tick!) + 4;
-      // where the speeds put it (the mean of the two over the ticks between)
-      const expect = Number.isFinite(refU) ? refU + ((ref.v + x.v) / 2) * (x.tick! - ref.tick!) : NaN;
+      // where the speeds put it (the mean of the two over the ticks between); the run's first
+      // sample nearest the start of its range: its pieces are the run's first, and a later pass
+      // of the same rails (a loop) comes from later samples' pieces
+      const expect = k === members[0] ? (Number.isFinite(from) ? from : NaN)
+        : Number.isFinite(refU) ? refU + ((ref.v + x.v) / 2) * (x.tick! - ref.tick!) : NaN;
       const [ux, uy] = orientationVector(x.o);
       const q = chain.project(x.x + (JOINT / 2) * ux, x.y + (JOINT / 2) * uy, from, to, expect);
       if (chain.lastDistance <= RAIL_SNAP) {
@@ -407,11 +410,13 @@ export function railRuns(tr: Track): RailRuns {
       const [ux, uy] = orientationVector(x.o);
       chain = new RailChain(x.x + (JOINT / 2) * ux, x.y + (JOINT / 2) * uy, ux, uy, x.rp ?? []);
       // with `ru` the pieces were under the train: its leading joint is at most a train length
-      // past the last; else (the first sample kept after a trim) they were entered since the sample
-      // before, at most a heartbeat ago
+      // past the last; else they were entered since the sample before: at most as far past them
+      // as it went since (a piece that did not continue the run), or a heartbeat at its speed
+      // without that sample (the first in view: a keyframe's, or the live payload's)
       const len = (JOINT + CONNECTION) * Math.max(1, x.meta.n ?? 1);
+      const since = prev && isRail(prev) && x.tick! > prev.tick! ? 1.5 * Math.max(prev.v, x.v) * (x.tick! - prev.tick!) + 4 : len + x.v * 600;
       // (without pieces the sample is the anchor: before the first piece appended later, u <= 0)
-      firstTo = !x.rp || x.rp.length === 0 ? 0 : x.ru ? chain.end + len : chain.end + len + x.v * 600;
+      firstTo = !x.rp || x.rp.length === 0 ? 0 : x.ru ? chain.end + len : chain.end + since;
       firstFrom = !x.rp || x.rp.length === 0 ? -Infinity : chain.end - pieceLength(x.rp[x.rp.length - 1].kind);
       chains.push(chain);
       members = [];
