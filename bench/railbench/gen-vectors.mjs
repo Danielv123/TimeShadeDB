@@ -5,8 +5,11 @@
 //   - trains: real carriages as the game placed them, with the rail path under them and the leading carriage's front
 //     joint fitted on it (trainfit.mjs), for checking an implementation's carriage placement against the game.
 //
+//   - timing: the timing model between two samples (section 8) at chosen points: [L, T, va, vb, tau, u, rate].
+//
 //   node bench/railbench/gen-vectors.mjs --run bizz --run aron --run l1n3 [--per 3] [--cars 4] [--work <dir>]
 //       [--out docs/v3/rail-geometry-vectors.json]
+//   node bench/railbench/gen-vectors.mjs --timing-only     (rewrites only the timing section of the existing file)
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,7 +18,7 @@ import { readGroundTruth } from "./gt.mjs";
 import { RailNet } from "./railnet.mjs";
 import { fitTrain, carriageAxes } from "./trainfit.mjs";
 import { railLength, railPoint, orientationOf, placeTrain, R, CURVE_A_LENGTH, CURVE_B_LENGTH, CURVE_B_END_RADIUS,
-	HALF_DIAGONAL_LENGTH, LEGACY_R, LEGACY_STRAIGHT, LEGACY_CURVE_LENGTH, RAMP_LENGTH } from "./railgeom.mjs";
+	HALF_DIAGONAL_LENGTH, LEGACY_R, LEGACY_STRAIGHT, LEGACY_CURVE_LENGTH, RAMP_LENGTH, timingU } from "./railgeom.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -31,6 +34,31 @@ const outPath = path.resolve(option("--out", path.join(here, "..", "..", "docs",
 
 const r6 = (v) => Number(v.toFixed(6));
 const r9 = (v) => Number(v.toFixed(9));
+
+/** Timing vectors: cruising, accelerating, braking, a start found late, a stop read late, a near stop, held cubics. */
+function timingVectors() {
+	const cases = [
+		[30, 60, 0.5, 0.5], [8, 40, 0, 0.4], [2, 100, 0, 0.2], [3, 100, 0.2, 0], [24, 30, 1.0, 0.6], [12, 30, 0.2, 0.6],
+		[60, 120, 0.9, 0.1], [5, 60, 0.4, 0.4], [0.5, 30, 0.01, 0.02], [40, 600, 0.05, 0.08], [10, 20, 1.2, 1.2],
+	];
+	const outT = [];
+	for (const [L, T, va, vb] of cases) {
+		for (const f of [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]) {
+			const tau = T * f;
+			const [u, rate] = timingU(L, T, va, vb, tau);
+			outT.push([L, T, va, vb, r9(tau), r9(u), r9(rate)]);
+		}
+	}
+	return outT;
+}
+
+if (args.includes("--timing-only")) {
+	const file = JSON.parse(fs.readFileSync(outPath, "utf8"));
+	file.timing = timingVectors();
+	fs.writeFileSync(outPath, JSON.stringify(file, null, 1) + "\n");
+	console.log(`${file.timing.length} timing vectors -> ${outPath}`);
+	process.exit(0);
+}
 
 const out = {
 	format: 1,
@@ -142,5 +170,6 @@ for (const name of runs) {
 	}
 }
 out.pieces.sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : a.dir - b.dir));
+out.timing = timingVectors();
 fs.writeFileSync(outPath, JSON.stringify(out, null, 1) + "\n");
 console.log(`${out.pieces.length} pieces, ${out.trains.length} train cases (${JSON.stringify(Object.fromEntries(trainCases))}) -> ${outPath}`);

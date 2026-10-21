@@ -295,3 +295,37 @@ export function placeTrain(path, u0, n, joint = 4, connection = 3) {
 	}
 	return out;
 }
+
+/**
+ * The timing model between two train samples (docs/v3/RAIL-GEOMETRY.md 8): the rail distance tau ticks after the first
+ * sample, and its rate, for samples T ticks and L rail distance apart with speeds va and vb (tiles a tick). From rest
+ * (va = 0) when uniform acceleration to vb covers L in less than T, the train stands until then; to rest (vb = 0) when
+ * uniform braking from va covers L in less than T, it stops early and stands; otherwise a cubic Hermite in time with the
+ * speeds as end slopes, held within [0, L] (rate 0 where held). Returns [u, rate].
+ */
+export function timingU(L, T, va, vb, tau) {
+	if (!(T > 0)) {
+		return [L, 0];
+	}
+	const t = Math.max(0, Math.min(T, tau));
+	if (L > 0) {
+		if (va <= 0 && vb > 0 && 2 * L < vb * T) {
+			const tm = (2 * L) / vb;
+			const s = t - (T - tm);
+			return s <= 0 ? [0, 0] : [(vb * s * s) / (2 * tm), (vb * s) / tm];
+		}
+		if (vb <= 0 && va > 0 && 2 * L < va * T) {
+			const tm = (2 * L) / va;
+			const s = Math.min(t, tm);
+			return [va * s - (va * s * s) / (2 * tm), va - (va * s) / tm];
+		}
+	}
+	const f = t / T;
+	const f2 = f * f;
+	const f3 = f2 * f;
+	const u = (f3 - 2 * f2 + f) * T * va + (3 * f2 - 2 * f3) * L + (f3 - f2) * T * vb;
+	const rate = (3 * f2 - 4 * f + 1) * va + ((6 * f - 6 * f2) * L) / T + (3 * f2 - 2 * f) * vb;
+	const lo = Math.min(0, L);
+	const hi = Math.max(0, L);
+	return u < lo || u > hi ? [Math.max(lo, Math.min(hi, u)), 0] : [u, rate];
+}

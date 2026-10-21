@@ -170,6 +170,8 @@ orientation along the chord. U0 and the path fix every carriage; U0 advances by 
 
 ## 5. Consequences for train samples
 
+(What the capture and viewer now do with these findings is section 8.)
+
 - **Heading.** The capture's sample heading `h` (second carriage towards the first) lags the
   rail tangent on curves by up to 18 degrees on 2.0 curves and 22 on legacy curves (p50 12.5
   and 15.9 on curves), so a pose built from `h` does not describe the curve. The leading
@@ -229,3 +231,138 @@ The game's own polynomial fits (0.01) and its 1/256 grid (0.004) account for the
   sample differently), 1e-6 for the ends, 0.02 tile and 0.25 degrees for carriages against the
   game. `bench/railbench/railgeom.test.mjs` is the reference check
   (`node --test bench/railbench/railgeom.test.mjs`).
+- `timing`: the timing model of section 8.3 at chosen points.
+
+## 8. Train paths between samples
+
+The v3 capture and viewer describe a train by its rail path and the timing along it
+(`capture/lua/core.lua`, `capture/lua/movers.lua`; `web/src/movers/railpath.ts`,
+`web/src/movers/track.ts`; protocol fields `v`, `rp`, `ru` in [PROTOCOL.md](PROTOCOL.md) 3.1,
+storage in [FORMAT.md](FORMAT.md) 7.4). A curve costs no samples: its pieces travel with the
+next sample, and only the timing needs samples.
+
+### 8.1 The pieces a train runs over
+
+- The capture notes at every read the rail under the leading carriage's front joint: that
+  is `LuaTrain.front_end` (`back_end` while the train leads with its back), the rail of the
+  front stock's open joint (`src/Train/TrainRollingStocks.cpp:150-161`,
+  `src/Script/LuaTrain.cpp:683-706`), and `LuaRailEnd.direction` is the end of that rail the
+  train runs towards. Reads are at most 4 tiles of travel apart (the wait rounded down; sooner
+  while accelerating: the next read is where `v w + a w^2 / 2 = 4` with the acceleration
+  since the last read; at most 30 ticks), less than the shortest curved piece (5.08), so no
+  curved piece passes between two reads. (Rounded up, a train at 1.33 tiles a tick was read
+  every 4 ticks, 5.3 tiles, and passed a curved-rail-a unseen on the Aron map.)
+- Only curved pieces and ramps are recorded (`rp` kinds 1 to 4). Between two of them the
+  rails are straight. The rail is read while the leading carriage turns (its orientation
+  differs from the last read's: on a straight it stays exactly the same until its front
+  joint is on a curve, and the next read comes at most 4 tiles later, still on that piece),
+  while the last rail read was a curved piece or ramp, and otherwise every third read. A
+  ramp shows no turn, and three reads are at most 12 tiles apart, less than its 16. (A
+  chain without its ramps is right in plan, but its rail distance is 0.76 tile short per
+  ramp, 4.8%, and every carriage behind a ramp is drawn that far off: carriage p99 0.74
+  tile on the benchmark map when only turns were read, 0.14 with every third read.) A
+  piece's ends are whole-tile points (every end the game reported in section 7's vectors
+  is): for the piece built facing north, front end then back end, as offset and outward
+  direction,
+
+  | Kind | Front end | Back end |
+  |---|---|---|
+  | curved-rail-a | (0, 2), 8 | (-1, -3), 15 |
+  | curved-rail-b | (1, 2), 7 | (-2, -2), 14 |
+  | legacy-curved-rail | (1, 4), 8 | (-2, -3), 14 |
+  | rail-ramp | (0, 8), 8 | (0, -8), 0 |
+
+  and the other directions by section 2.1's placement, which turns an end direction d by
+  mirroring (16 - d), a quarter turn (d + 4) and a half turn (d + 8); a ramp turns a quarter
+  per 4 of its direction.
+- A piece continues the path when its entry end faces the path's exit end (directions 8
+  apart) and lies on the exit end's ray: equal, or joined by straight rails. With the
+  direction's integer step (dx, dy) (even directions the compass steps, odd ones the 1:2
+  half-diagonals (1, -2), (2, -1), ...), that is `(px * dy - py * dx) = 0` and
+  `px * dx + py * dy >= 0` for the offset (px, py) from the exit to the entry. A piece that
+  does not continue the path means one was missed (a read came late: the capture reads at
+  most 32 trains a tick). The capture then walks back from the rail under the leading joint
+  over the rails under the train (`LuaRailEnd.flip_direction`, then `move_natural` up to 64
+  rails: the natural rail behind each connection is the one a train last took,
+  `src/Script/LuaRailEnd.cpp:176-187`, which is this train) to the last recorded rail and
+  records the curved pieces it passed. Only when that fails does it send the read before
+  and the current one, which begins a new path (`ru`).
+- Where a new path begins (first sight, end switch, surface change, a missed piece, a
+  resync) the sample lists the curved pieces and ramps under the whole train instead,
+  rear first: `LuaTrain.get_rails()` lists the rails under the train from its front end to
+  its back end (`src/Script/LuaTrain.cpp:627-638`, `src/Train/RailsUnderTrainIterator.cpp`).
+
+### 8.2 The chain
+
+The path of a run of samples (from one with `ru` to the sample before the next one) is one
+chain parametrised by rail distance u:
+
+- a lead-in line ending at the first piece's entry (u = 0 there), running back without end;
+- the pieces, each run front to back or back to front (the way that connects), with straight
+  lines between them;
+- a lead-out line from the last piece's exit, running on without end.
+
+The first piece's way round is the one that connects to the second; a lone piece is run so
+that its exit faces the run's first sample's direction of travel. A chain without pieces is
+the line through the first sample's leading joint along its heading. Each piece is placed
+exactly by section 2's formulas, so the chain is the rail centre line; rolling stock follows
+section 3: the carriage whose front joint is at u has its centre midway between the points
+at u and u - 4, and its orientation along their chord.
+
+Each sample of the run lies on the chain at the rail distance of its leading joint, its
+centre plus 2 tiles along `h` (half the joint chord: 1.9992 on a radius-13 curve), projected
+onto the chain. Samples are projected in order, each no further than 1.5 times its faster
+end speed over the ticks since the previous one plus 4 tiles ahead of it, and of points
+within 0.1 tile of the nearest the one nearest the rail distance the speeds predict (their
+mean over the ticks). A train that comes back past a place (a loop, a balloon, a straight
+used both ways) must not be put on another pass: the run's first sample lies no earlier than
+the start of the last piece it lists and no further than a train length past it (with `ru`;
+a heartbeat's run without), and at u <= 0 when it lists none (it is the anchor, before the
+first piece appended later). A sample whose leading joint lies more than 0.35
+tiles from the chain has no rail distance, and the segments touching it are drawn without
+the rail path. A piece that a sample lists but the chain already holds, and that does not
+continue the chain, is a resend (after a resync) and is skipped.
+
+When a new run begins and the previous sample's leading joint lies on the new chain behind
+the run's first sample (a first sight after a resync, a missed piece whose new path reaches
+back), the segment between them runs on the new chain.
+
+### 8.3 Timing
+
+Between two samples of a run, T ticks and L rail distance apart, with speeds va and vb
+(tiles a tick, `v`), the leading joint is u(tau) ahead of the first sample tau ticks after it:
+
+- from rest (va = 0, vb > 0) when uniform acceleration to vb covers L in less than T
+  (2 L < vb T): it stands until T - tm, tm = 2 L / vb, then u = vb s^2 / (2 tm) with
+  s = tau - (T - tm). A start is found by the next scan, up to 30 ticks late;
+- to rest (vb = 0, va > 0) when uniform braking from va covers L in less than T: it stops at
+  tm = 2 L / va, u = va s - va s^2 / (2 tm) with s = min(tau, tm), and stands. A stop is read
+  at the next read, up to 30 ticks late;
+- otherwise the cubic Hermite in time with the speeds as end slopes, f = tau / T:
+  u = (f^3 - 2 f^2 + f) T va + (3 f^2 - 2 f^3) L + (f^3 - f^2) T vb, held within [0, L].
+
+Uniform acceleration is exact in all three. A stop sample links to the next sample however
+long the train stood (a parked train is not sampled).
+
+### 8.4 What the capture checks
+
+Each read keeps an odometer: the chord between consecutive reads' leading joints, lengthened
+by `(1 + turn^2 / 24)` for the turn of the leading carriage between them (a chord of 4 on a
+radius-13 arc is 0.016 short of it). A read is sent when a read since the last sample lies
+more than 0.1 tile of rail distance from where the timing model from that sample to the
+current read puts it (the previous read is then sent as a vertex: it fitted when it was
+read), at least every 120 ticks (60 below game speed 0.5; 2 s of real time at speed 1, 5 s at
+speed 0.2, so a live viewer's next sample is that late at worst; a read is scheduled for
+when that wait ends), on the 600-tick heartbeat, on first sight, stop, start, end switch,
+surface change and a missed piece that the walk back did not find, and when 32 pieces wait.
+The reads kept for the check are at most 16; a full buffer keeps every other one. `car` goes
+with first sight, a changed train, a surface change and resyncs only: the path places every
+carriage, and `car` only tells the viewer the carriages' pitches.
+
+### 8.5 Test vectors
+
+The vectors' `timing` section lists `[L, T, va, vb, tau, u, rate]` from the reference
+implementation (`bench/railbench/railgeom.mjs` `timingU`); `rate` is du/dtau (0 where
+held). The `trains` vectors check a chain built from a path's curved pieces and ramps alone
+(`web/src/movers/railpath.test.ts`), and the Lua tests check the end table and the
+connection rule on the same paths (`capture/test/unit/core_test.lua`).
