@@ -410,11 +410,13 @@ export function railRuns(tr: Track): RailRuns {
       const [ux, uy] = orientationVector(x.o);
       chain = new RailChain(x.x + (JOINT / 2) * ux, x.y + (JOINT / 2) * uy, ux, uy, x.rp ?? []);
       // with `ru` the pieces were under the train: its leading joint is at most a train length
-      // past the last; else they were entered since the sample before: at most as far past them
-      // as it went since (a piece that did not continue the run), or a heartbeat at its speed
-      // without that sample (the first in view: a keyframe's, or the live payload's)
+      // past the last; else they were entered since the sample before (a stop sample's also lie
+      // under the train): at most as far past them as it went since, or a train length (a piece
+      // that did not continue the run), or a heartbeat at its speed without that sample (the
+      // first in view: a keyframe's, or the live payload's)
       const len = (JOINT + CONNECTION) * Math.max(1, x.meta.n ?? 1);
-      const since = prev && isRail(prev) && x.tick! > prev.tick! ? 1.5 * Math.max(prev.v, x.v) * (x.tick! - prev.tick!) + 4 : len + x.v * 600;
+      const since = prev && isRail(prev) && x.tick! > prev.tick!
+        ? Math.max(len, 1.5 * Math.max(prev.v, x.v) * (x.tick! - prev.tick!) + 4) : len + x.v * 600;
       // (without pieces the sample is the anchor: before the first piece appended later, u <= 0)
       firstTo = !x.rp || x.rp.length === 0 ? 0 : x.ru ? chain.end + len : chain.end + since;
       firstFrom = !x.rp || x.rp.length === 0 ? -Infinity : chain.end - pieceLength(x.rp[x.rp.length - 1].kind);

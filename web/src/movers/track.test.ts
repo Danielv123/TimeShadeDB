@@ -583,9 +583,13 @@ test("a known data gap: hidden when the mover is elsewhere afterwards, held when
   assert.ok(head.visible, "a parked train stays drawn across the gap");
 });
 
-test("rail runs: a run's first sample lies on the first pass of its rails, not on a later lap", async () => {
+/**
+ * A square loop of real rail pieces: four right quarter turns (curved-rail-a, b, b, a) joined by
+ * 40-tile straights, from (0, 1) east; ref runs it twice from 20 tiles before the start, and at(u)
+ * is the leading carriage's centre and orientation with its joint at u of ref (on a straight).
+ */
+async function squareLoop() {
   const P = await import("./railpath.ts");
-  // a square loop: four right quarter turns (curved-rail-a, b, b, a) joined by 40-tile straights, from (0, 1) east
   const pieces: { x: number; y: number; dir: number; kind: number }[] = [];
   let x = 0;
   let y = 1;
@@ -627,6 +631,11 @@ test("rail runs: a run's first sample lies on the first pass of its rails, not o
     // the leading carriage's centre, 2 tiles behind its joint on a straight
     return [pt[0] - 2 * pt[2], pt[1] - 2 * pt[3], H.vectorOrientation(pt[2], pt[3])];
   };
+  return { P, pieces, turns, ref, lap, at };
+}
+
+test("rail runs: a run's first sample lies on the first pass of its rails, not on a later lap", async () => {
+  const { P, turns, ref, lap, at } = await squareLoop();
   const m = { ...meta, id: "loop", n: 1, o: "L" };
   const tr = new T.Track("loop", m);
   // the first sample's heading is a little off the rails, so the turn's pieces do not continue its anchor line and the
@@ -656,5 +665,37 @@ test("rail runs: a run's first sample lies on the first pass of its rails, not o
   assert.ok(Math.abs(rr.u[5] - u1 - lap) < 0.01, `the second lap is a lap on (${u1}, ${rr.u[5]}, lap ${lap})`);
   for (let k = 2; k <= 8; k++) {
     assert.ok(rr.u[k] > rr.u[k - 1], `rail distances increase: ${k}`);
+  }
+});
+
+test("rail runs: a stop sample listing the pieces under a long train places it from a trail's first row on", async () => {
+  // the live payload's trail can begin after the train's earlier pieces: its stop sample's pieces then begin a run
+  const { P, turns, ref, at } = await squareLoop();
+  const n = 30;
+  const m = { ...meta, id: "long", n, o: "L" + "C".repeat(n - 1) };
+  const exit = (q: number): number => {
+    const last = turns[q][3];
+    const e = P.pieceEnds(last.kind, last.dir);
+    return Math.max(ref.project(last.x + e[0], last.y + e[1], 0, 250), ref.project(last.x + e[3], last.y + e[4], 0, 250));
+  };
+  // the trail's first row 3 tiles before the stop, braking; the stop 38 tiles past the last curved piece
+  const uh = exit(2) + 38;
+  const u0 = uh - 3;
+  const tr = new T.Track("long", m);
+  const [x0, y0, o0] = at(u0);
+  tr.insert(T.makeSample(m, 1000, x0, y0, o0, T.F_RAIL, null, 100, 0.3));
+  const [xh, yh, oh] = at(uh);
+  // a stop sample lists the pieces under the whole train, rear first (here all of turns 1 to 3)
+  const under = [...turns[0], ...turns[1], ...turns[2]];
+  const stopTick = 120;
+  tr.insert(T.makeSample(m, 1000 + (stopTick - 100) * (1000 / 60), xh, yh, oh, T.F_RAIL | T.F_STOP, null, stopTick, 0, under));
+  const rr = T.railRuns(tr);
+  assert.ok(Number.isFinite(rr.u[1]), `the stop sample lies on its run (${rr.u[1]})`);
+  const head = T.headAt(tr, 1000 + (stopTick - 100) * (1000 / 60) + 5000, Infinity, T.newHead());
+  const cars = T.placeRailCarriages(head, m.o, T.railGaps(tr, 1, []), []);
+  const c = [0, 0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    ref.carriage(uh - i * 7, c);
+    assert.ok(Math.hypot(cars[i].x - c[0], cars[i].y - c[1]) < 0.05, `carriage ${i}: ${cars[i].x}, ${cars[i].y} against ${c[0]}, ${c[1]}`);
   }
 });
