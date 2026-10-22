@@ -288,7 +288,9 @@ written. A day index lists only windows and keyframes that exist.
 Live samples (the open windows) are kept in a log per window, `open/<start>.wal` (decimal
 window start in ms): CRC-framed batches of `'M'` (meta) and `'S'` (sample) records,
 documented in `internal/v3/movers/wal.go`, with meta numbers local to the file. A batch is
-written to the logs of the windows it touches before the store accepts it. The rows are
+written to the logs of the windows it touches before the store accepts it, one write per
+log: a crash between those writes can leave a batch that was never acknowledged in some of
+its logs only (the sender retries it; the repeats are removed at commit). The rows are
 also kept in memory while they fit the store's byte budget (the server's
 `--mem-budget`/8, counted per row: about 150 bytes, more with carriages and rail pieces);
 beyond it whole windows, oldest first, are evicted and read back from their logs by the

@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math/bits"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -46,7 +48,10 @@ func killOps(seed int64) func() killOp {
 // the time, commits that read evicted windows back) and kills it at random moments: in an
 // Append, an eviction, a commit or between them. After each kill the store must open, and
 // after a final commit it must equal memstore fed exactly the batches whose Append
-// returned (or one more, written when the kill came): no accepted sample is lost.
+// returned, plus, of the batch in flight when the kill came, the rows of some of the
+// windows it touches: a batch is written to one log per window, so a kill between those
+// writes leaves part of a batch that was never acknowledged (its sender retries it). No
+// accepted sample is lost.
 func TestKillDuringIngest(t *testing.T) {
 	if os.Getenv("MOVERS_KILL_CHILD") != "" {
 		moversKillChild()
@@ -87,26 +92,61 @@ func TestKillDuringIngest(t *testing.T) {
 		if applied < 0 {
 			t.Fatalf("round %d: child applied nothing", round)
 		}
+		// The batch in flight: every subset of the window logs it touches, from none
+		// (the first candidate) to all.
+		var logs []walKey
+		for _, s := range killBatch(seed, applied) {
+			k := walKey{s.Surface, core.WindowStart(s.T, core.MoverWindowLen)}
+			if !slices.Contains(logs, k) {
+				logs = append(logs, k)
+			}
+		}
 		var mismatch error
 		matched := -1
-		for _, extra := range []int{0, 1} {
-			if mismatch = compareKilled(dir, seed, applied+extra); mismatch == nil {
-				matched = applied + extra
+		for mask := 0; mask < 1<<len(logs); mask++ {
+			in := map[walKey]bool{}
+			for i, k := range logs {
+				in[k] = mask&(1<<i) != 0
+			}
+			if mismatch = compareKilled(dir, seed, applied, in); mismatch == nil {
+				matched = mask
 				break
 			}
 		}
 		if matched < 0 {
-			t.Fatalf("round %d: reopened store matches no oracle prefix (applied %d batches): %v", round, applied, mismatch)
+			t.Fatalf("round %d: reopened store matches no oracle (applied %d batches, the next touching %d logs): %v", round, applied, len(logs), mismatch)
 		}
-		t.Logf("round %d: killed after %d batches, recovered %d", round, applied, matched)
+		t.Logf("round %d: killed after %d batches, recovered them and %d of the %d logs of the next", round, applied, bits.OnesCount(uint(matched)), len(logs))
+	}
+}
+
+// walKey names a window log: a surface and a window start.
+type walKey struct {
+	sfc   core.SurfaceKey
+	start core.TimeMs
+}
+
+// killBatch returns batch i (0-based) of the workload.
+func killBatch(seed int64, i int) []core.MoverSample {
+	next := killOps(seed)
+	for done := 0; ; {
+		op := next()
+		if op.batch == nil {
+			continue
+		}
+		if done == i {
+			return op.batch
+		}
+		done++
 	}
 }
 
 // compareKilled opens a copy of the killed store, commits everything and compares it
-// with memstore fed the first batches of the workload.
-func compareKilled(dir string, seed int64, batches int) error {
+// with memstore fed the first batches of the workload and the samples of the next batch
+// that fall in the window logs marked in partial.
+func compareKilled(dir string, seed int64, batches int, partial map[walKey]bool) error {
 	ctx := context.Background()
-	cp := dir + fmt.Sprintf(".check%d", batches)
+	cp := dir + ".check"
 	if err := os.CopyFS(cp, os.DirFS(dir)); err != nil {
 		return err
 	}
@@ -119,14 +159,25 @@ func compareKilled(dir string, seed int64, batches int) error {
 	want := memstore.NewMovers()
 	next := killOps(seed)
 	var last core.TimeMs
-	for done := 0; done < batches; {
+	for done := 0; done <= batches; {
 		op := next()
 		if op.batch == nil {
-			want.Commit(ctx, op.commit)
+			if done < batches {
+				want.Commit(ctx, op.commit)
+			}
 			continue
 		}
-		want.Append(ctx, op.batch)
-		for _, s := range op.batch {
+		batch := op.batch
+		if done == batches {
+			batch = nil
+			for _, s := range op.batch {
+				if partial[walKey{s.Surface, core.WindowStart(s.T, core.MoverWindowLen)}] {
+					batch = append(batch, s)
+				}
+			}
+		}
+		want.Append(ctx, batch)
+		for _, s := range batch {
 			last = max(last, s.T)
 		}
 		done++

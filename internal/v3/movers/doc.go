@@ -38,7 +38,11 @@
 // arrives (TestTraceHandoffsStreaming).
 //
 // Append validates the whole batch and writes it to the window logs before it changes
-// memory: a failed write applies nothing (the logs written are cut back). A Commit
+// memory: a failed write applies nothing (the logs written are cut back). A batch that
+// touches several windows is one write per window log, so a crash between them can leave
+// it in some of the logs only; such a batch never returned, its sender sends it again,
+// and the repeated rows are removed at commit (for equal journey and time the last
+// arrival wins). A Commit
 // builds the new live state on copies and installs it with the horizon only after
 // meta.json is written, so a failed Commit changes nothing in memory and can be retried.
 // A crash after meta.json leaves logs of closed windows, which Open deletes. Outside
