@@ -758,8 +758,9 @@ type batch struct {
 }
 
 // lineState is the envelope being applied: its header, clock anchor, the bound its
-// message times are clamped to (now) and the newest message time queued since the last
-// flush (maxT, valid when hasT).
+// message times are clamped to (now) and the newest time of a chunk update or mover
+// sample (the data with a horizon) queued since the last flush (maxT, valid when hasT;
+// held once the line registered its map with Sources).
 type lineState struct {
 	ok     bool
 	env    *envHeader
@@ -767,6 +768,7 @@ type lineState struct {
 	now    core.TimeMs
 	maxT   core.TimeMs
 	hasT   bool
+	held   bool
 }
 
 // jop is one journey operation for the applier.
@@ -943,14 +945,25 @@ func (b *batch) beginLine(l *parsedLine) {
 		now = max(in.opt.DataClock.Seen(), min(env.RecvMs, wall+max(in.opt.MaxAhead, 0)))
 	}
 	anchor := in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed)
-	// The envelope's own time counts as a message time (for Sources), clamped like one.
-	t := anchor.T(env.Tick)
-	if ahead := in.opt.MaxAhead; ahead > 0 && t > now+ahead {
-		t = now
-	}
-	b.cur = lineState{ok: true, env: env, anchor: anchor, now: now, maxT: t, hasT: true}
+	b.cur = lineState{ok: true, env: env, anchor: anchor, now: now}
 	if srcs != nil {
-		srcs.Seen(env.Src, env.Map, t)
+		srcs.Heard(env.Src)
+	}
+}
+
+// holds records the time of a chunk update or mover sample of the current envelope: the
+// data the source holds its map's horizon for (Sources). The first one of a line
+// registers the map, so a source's first data holds it before it is applied.
+func (b *batch) holds(t core.TimeMs) {
+	c := &b.cur
+	if !c.hasT || t > c.maxT {
+		c.maxT, c.hasT = t, true
+	}
+	if !c.held {
+		c.held = true
+		if srcs := b.in.opt.Sources; srcs != nil {
+			srcs.Seen(c.env.Src, c.env.Map, t)
+		}
 	}
 }
 
@@ -966,9 +979,6 @@ func (b *batch) timeOf(tick *int64) core.TimeMs {
 	if ahead := b.in.opt.MaxAhead; ahead > 0 && t > c.now+ahead {
 		b.in.stats.clamped.Add(1)
 		t = c.now
-	}
-	if !c.hasT || t > c.maxT {
-		c.maxT, c.hasT = t, true
 	}
 	return t
 }
@@ -1002,7 +1012,9 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 			b.jops = append(b.jops, jop{kind: jopBegin, mapKey: env.Map, src: env.Src})
 		}
 	case core.MsgResynced:
-		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: b.timeOf(nil)})
+		t := b.timeOf(nil)
+		b.holds(t)
+		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: t})
 		in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
 	case core.MsgTrace:
 		in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
@@ -1055,6 +1067,7 @@ func (b *batch) chunk(env *envHeader, m *wireMsg) error {
 		return fmt.Errorf("bad chunk coordinates %v,%v", cx, cy)
 	}
 	u := core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: int32(cx), Y: int32(cy)}, T: b.timeOf(m.Tick)}
+	b.holds(u.T)
 	if d, ok := m.chart(); !ok {
 		u.Deleted = true
 	} else {
@@ -1096,6 +1109,7 @@ func (b *batch) move(env *envHeader, m *wireMsg) error {
 			tick = *e.Tick
 		}
 		s := core.MoverSample{Surface: sfc, T: b.timeOf(e.Tick), Tick: tick}
+		b.holds(s.T)
 		s.Meta.ID = e.J
 		if e.Gone {
 			s.Flags = core.FlagGone

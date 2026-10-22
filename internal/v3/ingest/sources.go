@@ -111,10 +111,21 @@ func (s *Sources) get(src string) *source {
 	return e
 }
 
-// Seen records an envelope of src for mapKey: the source is heard from now. A map the
-// source has not fed before starts held at t (the envelope's own time), so the commit
-// loop cannot close its windows past the source's first data before that data is
-// applied.
+// Heard records an envelope of src: the source is heard from now.
+func (s *Sources) Heard(src string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.get(src)
+	e.SeenMs = s.wall().UnixMilli()
+	e.Ended = false
+	s.dirty = true
+}
+
+// Seen records data of src for mapKey (a chunk update or mover sample, or a caught_up
+// envelope): the source is heard from now. A map the source has not fed before starts
+// held at t, so the commit loop cannot close its windows past the source's first data
+// before that data is applied. Other messages (overlays, map info, traces) have no
+// horizon and hold nothing.
 func (s *Sources) Seen(src, mapKey string, t core.TimeMs) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

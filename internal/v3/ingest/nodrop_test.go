@@ -238,6 +238,20 @@ func TestSourcesHold(t *testing.T) {
 // TestNewSourceHoldsAtOnce: a source's first envelope holds its map from the moment it is
 // read, before its batch is applied, so a commit meanwhile cannot pass its backlog.
 func TestNewSourceHoldsAtOnce(t *testing.T) {
+	// A source of map messages only (the Clusterio controller) holds nothing.
+	ctl, _ := OpenSources("", time.Hour, nil)
+	maps0, _ := OpenMaps(t.TempDir())
+	in0 := New(Stores{Terrain: memstore.NewTerrain(), Movers: memstore.NewMovers(), Overlays: memstore.NewOverlays(), Maps: maps0},
+		Options{Sources: ctl, Clock: func() core.TimeMs { return base + core.Hour }})
+	mapMsg := line(t, env{V: 1, Tick: 60, Src: "clusterio:controller", Map: "m", RecvMs: int64(base), Seq: seq(1),
+		Msgs: []any{map[string]any{"type": "map", "info": map[string]any{"key": "m", "title": "M"}}}})
+	if _, err := in0.Ingest(context.Background(), strings.NewReader(mapMsg)); err != nil {
+		t.Fatal(err)
+	}
+	if h := ctl.Holds(); len(h) != 0 {
+		t.Fatalf("map messages hold %v", h)
+	}
+
 	srcs, _ := OpenSources("", time.Hour, nil)
 	maps, _ := OpenMaps(t.TempDir())
 	var held core.TimeMs

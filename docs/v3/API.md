@@ -253,7 +253,8 @@ The commit loop closes windows `--terrain-grace` and `--mover-grace` behind the 
 and data older than a datastore's or surface's horizon is late (FORMAT.md 4). So that a
 backlog is not late, each map's horizon is also held behind the data of the sources that
 feed it (`ingest.Sources`, FORMAT.md 5.8): per source (`src`) and map the server keeps the
-newest message time it applied, and closes no window of the map past the lowest of those,
+newest time of a chunk update or mover sample it applied (the data with a horizon; overlay,
+map and trace messages hold nothing), and closes no window of the map past the lowest of those,
 minus the grace, over the sources heard from within `--source-hold` (default 1 hour). A
 source's first envelope holds its map at once. A live source's newest time trails the
 clock by a few seconds, so live data is committed as before. A source that is behind
