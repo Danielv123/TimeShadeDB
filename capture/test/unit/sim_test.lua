@@ -601,6 +601,39 @@ t.test("trains: with the file transport's limits (core.limits) a long train list
 	end
 end)
 
+t.test("trains: with the Clusterio module's limits a 1,000-carriage train fits a line; a longer one's car is capped",
+	function()
+		local capture, world, log = boot()
+		local core = capture.core
+		local saved = { line = core.LIMIT, car = core.CAR_MAX, kinds = core.KINDS_MAX, rp_start = core.RP_START_MAX }
+		core.limits{ line = 65536, car = 1000, kinds = 1000, rp_start = 1000 }
+		local ok, err = pcall(function()
+			local s = world.surfaces.nauvis
+			local long = fake.train(s, "L" .. string.rep("C", 999), fake.path_lc(20000, 12), 9000)
+			local longer = fake.train(s, "L" .. string.rep("c", 1099), fake.path_lc(20000, 12), 18000)
+			run(capture, 1, 200, function()
+				for _, tr in ipairs({ long, longer }) do
+					tr.speed = 1
+					fake.place(tr, tr.pos + 1)
+				end
+			end)
+			local got = entries(log, storage.timeshade.by_train[long.id])
+			t.expect_eq(#got[1].car, 1000, "every carriage")
+			t.expect_eq(#got[1].o, 1000, "every kind")
+			got = entries(log, storage.timeshade.by_train[longer.id])
+			t.expect_eq(got[1].n, 1100)
+			t.expect_eq(#got[1].car, 1000, "car capped")
+			for _, line in ipairs(log.lines) do
+				t.expect_true(#line < 65536, "line of " .. #line)
+			end
+			t.expect_eq(capture.outbox.oversize(), 0, "nothing dropped")
+		end)
+		core.limits(saved)
+		if not ok then
+			error(err, 0)
+		end
+	end)
+
 t.test("vehicles and players: dead reckoning, vehicles with heading and kind, players by name", function()
 	local capture, world, log = boot()
 	local s = world.surfaces.nauvis

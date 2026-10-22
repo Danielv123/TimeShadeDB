@@ -44,15 +44,15 @@ core.SEEN_MAX = 12 -- rails a turning train's read walks back over a straight to
 core.LIVE_GAP = 120 -- ticks at game speed 1 a moving train goes without a sample at most, so live viewers stay ~2 s behind
 core.CAR_MAX = 100 -- carriages listed in `car`; with 200 kinds and a 200-byte name a sample stays under a line
 
--- Transport. The defaults fit Clusterio's IPC lines; a host whose lines can be longer (the standalone mod's files)
--- raises them with core.limits, so long trains are not cut short.
-core.LIMIT = 3500 -- bytes a printed line stays under (Clusterio IPC)
+-- Transport. The defaults keep lines short; each host raises them with core.limits (the Clusterio module to 64 KiB
+-- lines, the standalone mod's files to 200,000 bytes), so long trains are not cut short.
+core.LIMIT = 3500 -- bytes a printed line stays under
 core.MOVE_MAX = 3 -- samples without `car` a move message carries
 core.SURFACES_MAX = 13 -- surfaces a surfaces message carries
 core.KINDS_MAX = 200 -- carriage kinds sent
 
---- Raise the line limit and what it bounds (fields line, car, kinds, rp_start; each optional) for a transport without
---- Clusterio's line limit. Every peer must use the same values: they decide what mover records hold.
+--- Set the line limit and what it bounds (fields line, car, kinds, rp_start; each optional) for a host's transport.
+--- Every peer must use the same values: they decide what mover records hold.
 function core.limits(t)
 	core.LIMIT = t.line or core.LIMIT
 	core.CAR_MAX = t.car or core.CAR_MAX

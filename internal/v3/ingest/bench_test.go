@@ -13,7 +13,7 @@ import (
 
 // BenchmarkIngestTerrain measures POST-body ingest into the file-backed terrain store
 // (WAL with group commit, the server's defaults): bodies of 4,096 chunk updates in
-// envelopes of 8 messages (Clusterio IPC lines are under 3,500 bytes). Charts look like
+// envelopes of 8 messages (the capture's short default lines, under 3,500 bytes). Charts look like
 // game charts: runs of a few colours with noise.
 func BenchmarkIngestTerrain(b *testing.B) {
 	ter, err := terrain.Open(b.TempDir(), terrain.SplitBudget(128<<20))

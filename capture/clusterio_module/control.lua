@@ -11,9 +11,13 @@ local clusterio_api = require("modules/clusterio/api")
 local capture = require("modules/timeshade/capture")
 
 -- Clusterio's frame, as clusterio/packages/host/modules/clusterio/api.lua prints it ("\f$ipc:" .. channel .. "?j" ..
--- data). send_json is not used: it re-encodes, and a line of 4,000 bytes or more takes its file path and bumps a saved
--- counter, which can desync a client. The outbox keeps every line under core.LIMIT (3,500) bytes instead.
+-- data). send_json is not used: it re-encodes, and sends 4,000 bytes or more through a file the host reads later, so
+-- such a payload can arrive after lines printed after it. Printed lines of any length reach the host in order (its
+-- LineSplitter has no line limit), so the outbox keeps lines under 64 KiB: a 1,000-carriage train fits a sample, and
+-- the plugin's 1 MiB link events and the server's 256 KiB messages take every line.
 local FRAME = "\f$ipc:timeshade:out?j"
+
+capture.core.limits{ line = 65536, car = 1000, kinds = 1000, rp_start = 1000 }
 
 capture.setup{
 	sink = function(line)

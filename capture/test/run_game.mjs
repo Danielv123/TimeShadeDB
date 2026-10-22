@@ -558,7 +558,7 @@ async function runClusterio() {
 	note(`clusterio: ${raw.length} IPC lines on stdout, ${envelopes.length} valid envelopes, ${bad} bad, longest payload `
 		+ `${maxLen} bytes`);
 	check(raw.length > 0, "clusterio: IPC lines printed");
-	check(maxLen < 3500, `clusterio: every line under 3,500 bytes (longest ${maxLen})`);
+	check(maxLen < 65536, `clusterio: every line under 64 KiB (longest ${maxLen})`);
 	const outDir = path.join(box.write, "script-output");
 	const resultsPath = path.join(outDir, "timeshade-test", "results.json");
 	if (!check(fs.existsSync(resultsPath), "clusterio: the driver wrote results.json")) {
