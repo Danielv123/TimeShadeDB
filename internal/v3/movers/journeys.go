@@ -28,8 +28,11 @@ import (
 //     journey moved to (Stats.Quarantined). The same source can resume the journey
 //     after that window, or at once once another source has owned it.
 //   - Gones carry no meta on the wire (PROTOCOL.md 5); Journeys fills in the journey's
-//     last meta and surface. Gones of journeys it does not know are dropped (as illisis
-//     drops gones of journeys without an owner).
+//     last meta and surface. For a journey it does not know (forgotten by the bound, or
+//     the server restarted since its last sample) it asks Lookup, the store's last row of
+//     the journey on the gone's surface (Stats.ResolvedGones); a gone of a journey that
+//     neither knows, or that already ended, is dropped (as illisis drops gones of
+//     journeys without an owner).
 //   - A sample on another surface than the journey's last one first emits a gone on
 //     the old surface at the sample's time (the mover left that surface).
 //   - Train carriage count, kinds and colour are carried forward from the previous
@@ -45,6 +48,10 @@ import (
 // applies a batch's journey rules, then stores the samples, and undoes the rules when
 // the store refused the batch, so a retried batch meets the journeys as the first try did.
 type Journeys struct {
+	// Lookup, if set, returns the meta of journey id's last row on surface sfc when the
+	// journey is live there (the store's state), for gones of journeys Journeys forgot.
+	Lookup func(sfc core.SurfaceKey, id string) (core.MoverMeta, bool)
+
 	max   int
 	byID  map[string]*list.Element
 	lru   *list.List // front = most recently seen
@@ -127,8 +134,11 @@ func (js *Journeys) changeSeen(src string) {
 type JourneyStats struct {
 	// OwnerDrops are samples and gones dropped by the owner rule.
 	OwnerDrops int64
-	// UnknownGones are gones of journeys that were not tracked.
+	// UnknownGones are gones of journeys that were not tracked and that Lookup did not
+	// know either (or that had ended already).
 	UnknownGones int64
+	// ResolvedGones are gones of journeys that were not tracked, completed from Lookup.
+	ResolvedGones int64
 	// SurfaceChanges are journeys that moved to another surface (a gone was emitted on
 	// the old one).
 	SurfaceChanges int64
@@ -202,6 +212,16 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			continue
 		}
 		if s.Flags&core.FlagGone != 0 {
+			if (j == nil || !j.known) && js.Lookup != nil {
+				if meta, ok := js.Lookup(s.Surface, s.Meta.ID); ok {
+					if j == nil {
+						j = js.add(s.Meta.ID)
+					}
+					js.change(j)
+					j.owner, j.sfc, j.meta, j.known = src, s.Surface, meta, true
+					js.stats.ResolvedGones++
+				}
+			}
 			if j == nil || j.owner == "" || !j.known {
 				js.stats.UnknownGones++
 				continue

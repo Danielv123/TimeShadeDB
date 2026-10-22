@@ -325,7 +325,10 @@ What the exporter writes (`internal/v3/publish/README.md` has the details and si
   (`store` is `terrain` or `movers`), `tsdb_mover_store_rejected_total{reason}` (`ahead`,
   `behind`: before 2016, `duplicate`: rows a commit removed for an equal (journey, t),
   `corrupt`, `wal_skipped`), `tsdb_ingest_caught_up_total`, `tsdb_horizon_held_maps`,
-  `tsdb_horizon_hold_lag_ms`, `tsdb_overlay_open_intervals`,
+  `tsdb_horizon_hold_lag_ms`, `tsdb_ingest_resolved_gones_total` (gones of journeys the
+  journey rules had forgotten, after a restart, completed from the mover store's last row),
+  `tsdb_mover_live_evicted_total` (live journeys forgotten past the store's live-journey
+  bound), `tsdb_overlay_open_intervals`,
   `tsdb_overlay_torn_bytes_total` and the Go runtime gauges `go_memstats_heap_inuse_bytes`,
   `go_memstats_heap_alloc_bytes`, `go_memstats_sys_bytes` and `go_goroutines`.
 - `GET /healthz`: `200 ok` when the stores are open.

@@ -151,6 +151,8 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 		val(core.MetricIngestRejected, `reason="one_recv"`, st.OneRecv)
 		typ(core.MetricIngestCaughtUp, "counter")
 		val(core.MetricIngestCaughtUp, "", st.CaughtUp)
+		typ("tsdb_ingest_resolved_gones_total", "counter")
+		val("tsdb_ingest_resolved_gones_total", "", st.ResolvedGones)
 		for _, x := range []struct {
 			name string
 			r    core.ApplyResult
@@ -218,6 +220,8 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 		val("tsdb_mover_store_rejected_total", `reason="ahead"`, st.Ahead)
 		val("tsdb_mover_store_rejected_total", `reason="behind"`, st.Behind)
 		val("tsdb_mover_store_rejected_total", `reason="duplicate"`, st.Duplicates)
+		typ("tsdb_mover_live_evicted_total", "counter")
+		val("tsdb_mover_live_evicted_total", "", st.Evicted)
 		val("tsdb_mover_store_rejected_total", `reason="corrupt"`, st.Corrupt)
 		val("tsdb_mover_store_rejected_total", `reason="wal_skipped"`, st.WALSkipped)
 	}

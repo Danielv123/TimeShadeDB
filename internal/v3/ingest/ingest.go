@@ -100,6 +100,9 @@ type Stats struct {
 	Overloaded                  int64
 	OwnerDrops, UnknownGones    int64
 	SurfaceChanges, Quarantined int64
+	// ResolvedGones are gones of journeys the journey rules had forgotten (a server
+	// restart), completed from the mover store's state.
+	ResolvedGones int64
 	// Duplicates are envelopes skipped because their source's retry repeated them
 	// (Sources.Duplicate); CaughtUp are caught_up envelopes; OneRecv are envelopes that
 	// carried the receive time of their source's previous envelope although their tick
@@ -215,6 +218,7 @@ func (in *Ingester) Stats() Stats {
 		s.UnknownGones += js.UnknownGones
 		s.SurfaceChanges += js.SurfaceChanges
 		s.Quarantined += js.Quarantined
+		s.ResolvedGones += js.ResolvedGones
 	}
 	in.jmu.Unlock()
 	return s
@@ -1050,6 +1054,11 @@ func (in *Ingester) journeysOf(mapKey string) *movers.Journeys {
 		delete(in.journeys, oldK)
 	}
 	mj := &mapJourneys{js: movers.NewJourneys(in.opt.MaxJourneys), used: in.jtick}
+	if lm, ok := in.st.Movers.(interface {
+		LastMeta(core.SurfaceKey, string) (core.MoverMeta, bool)
+	}); ok {
+		mj.js.Lookup = lm.LastMeta
+	}
 	in.journeys[mapKey] = mj
 	return mj.js
 }

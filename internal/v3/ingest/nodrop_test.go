@@ -10,6 +10,7 @@ import (
 
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/memstore"
+	"timeshadedb/internal/v3/movers"
 )
 
 // These tests cover what keeps valid data from being dropped: retries that are
@@ -343,5 +344,53 @@ func TestEndedReleases(t *testing.T) {
 	}
 	if _, ok := srcs.Holds()["m"]; !ok {
 		t.Fatal("not held after new data")
+	}
+}
+
+// TestGoneAfterRestart: the journey rules live in memory, so after a server restart the
+// first gone of a journey is one they do not know. It is completed from the mover store's
+// last row of the journey (open or closed) instead of being dropped, so the train does
+// not stay live for ever; a gone of a journey that already ended stays dropped.
+func TestGoneAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	mov, err := movers.Open(dir, movers.Options{SyncInterval: -1, MaxAhead: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mov.Close()
+	maps, _ := OpenMaps(t.TempDir())
+	newIn := func() *Ingester {
+		return New(Stores{Terrain: memstore.NewTerrain(), Movers: mov, Overlays: memstore.NewOverlays(), Maps: maps},
+			Options{Clock: func() core.TimeMs { return base + core.Hour }})
+	}
+	body := line(t, env{V: 1, Tick: 60, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{moveMsg(trainEntry("1.1.1", 1), trainEntry("1.1.2", 1))}}) +
+		line(t, env{V: 1, Tick: 120, Src: "s", Map: "m", RecvMs: int64(base + 1000), Msgs: []any{moveMsg(map[string]any{"j": "1.1.2", "gone": true})}})
+	if _, err := newIn().Ingest(ctx, strings.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	// 1.1.1 in a closed window, then a "restart" (fresh journey rules).
+	if err := mov.Commit(ctx, base+core.MoverWindowLen*2); err != nil {
+		t.Fatal(err)
+	}
+	in := newIn()
+	gones := line(t, env{V: 1, Tick: 60 * 600, Src: "s", Map: "m", RecvMs: int64(base + 600_000),
+		Msgs: []any{moveMsg(map[string]any{"j": "1.1.1", "gone": true}, map[string]any{"j": "1.1.2", "gone": true})}})
+	resp, err := in.Ingest(ctx, strings.NewReader(gones))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := in.Stats(); resp.Samples.Accepted != 1 || st.ResolvedGones != 1 || st.UnknownGones != 1 {
+		t.Fatalf("gones after restart: %+v, stats %+v", resp.Samples, st)
+	}
+	if err := mov.Commit(ctx, base+core.Hour); err != nil {
+		t.Fatal(err)
+	}
+	live, err := mov.Live(ctx, core.SurfaceKey{Map: "m", Surface: "nauvis"}, base+core.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live.Rows) != 0 {
+		t.Fatalf("live after the gones: %+v", live.Rows)
 	}
 }

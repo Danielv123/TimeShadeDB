@@ -557,6 +557,7 @@ func (m *Store) replayRow(s *surface, w *openWin, r row, redo map[*surface]map[s
 	r.seq = m.seq
 	s.openBody(&r, redo)
 	s.observe(r.t)
+	s.noteOpen(&r)
 	m.addRow(w, r)
 }
 

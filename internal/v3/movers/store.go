@@ -187,6 +187,9 @@ type surface struct {
 	rails, orails rails
 	// metas interns MoverMeta values.
 	metas map[core.MoverMeta]*core.MoverMeta
+	// lastOpen is, per journey with open rows, the meta of its newest open row (nil when
+	// that row is a gone) and that row's time (LastMeta).
+	lastOpen map[string]lastMeta
 	// days caches day indexes touched in this process (without Final); dayList is the
 	// sorted set of days that have an index on disk.
 	days    map[string]*core.DayIndex
@@ -286,16 +289,57 @@ func (m *Store) syncLoop() {
 func (m *Store) newSurface(key core.SurfaceKey) *surface {
 	id := key.ID()
 	return &surface{
-		key:    key,
-		id:     id,
-		dir:    filepath.Join(m.dir, id),
-		open:   map[core.TimeMs]*openWin{},
-		live:   map[string]*row{},
-		rails:  rails{},
-		orails: rails{},
-		metas:  map[core.MoverMeta]*core.MoverMeta{},
-		days:   map[string]*core.DayIndex{},
+		key:      key,
+		id:       id,
+		dir:      filepath.Join(m.dir, id),
+		open:     map[core.TimeMs]*openWin{},
+		lastOpen: map[string]lastMeta{},
+		live:     map[string]*row{},
+		rails:    rails{},
+		orails:   rails{},
+		metas:    map[core.MoverMeta]*core.MoverMeta{},
+		days:     map[string]*core.DayIndex{},
 	}
+}
+
+// lastMeta is a journey's newest open row: its meta (nil for a gone) and time.
+type lastMeta struct {
+	meta *core.MoverMeta
+	t    core.TimeMs
+}
+
+// noteOpen records r, a row joining the open windows, in lastOpen.
+func (s *surface) noteOpen(r *row) {
+	if cur, ok := s.lastOpen[r.meta.ID]; ok && cur.t > r.t {
+		return
+	}
+	lm := lastMeta{meta: r.meta, t: r.t}
+	if r.gone() {
+		lm.meta = nil
+	}
+	s.lastOpen[r.meta.ID] = lm
+}
+
+// LastMeta returns the meta of journey id's newest row on surface sfc when the journey
+// is live there (its newest row, open or closed, is not a gone). Ingest's journey rules
+// use it to complete gones of journeys they forgot (movers.Journeys.Lookup).
+func (m *Store) LastMeta(sfc core.SurfaceKey, id string) (core.MoverMeta, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	s := m.sfc[sfc]
+	if s == nil {
+		return core.MoverMeta{}, false
+	}
+	if lm, ok := s.lastOpen[id]; ok {
+		if lm.meta == nil {
+			return core.MoverMeta{}, false
+		}
+		return *lm.meta, true
+	}
+	if r := s.live[id]; r != nil {
+		return *r.meta, true
+	}
+	return core.MoverMeta{}, false
 }
 
 func (s *surface) intern(meta *core.MoverMeta) *core.MoverMeta {
@@ -460,6 +504,7 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 		p.r.meta = p.s.intern(p.r.meta)
 		p.s.openBody(&p.r, redo)
 		p.s.observe(p.r.t)
+		p.s.noteOpen(&p.r)
 		m.addRow(p.w, p.r)
 	}
 	for s, ids := range redo {
@@ -778,6 +823,15 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) error {
 	for _, ws := range starts {
 		m.dropWin(s, s.open[ws])
 	}
+	s.lastOpen = map[string]lastMeta{}
+	for _, w := range s.open {
+		for i := range w.rows {
+			s.noteOpen(&w.rows[i])
+		}
+		for _, r := range w.last {
+			s.noteOpen(r)
+		}
+	}
 	// The rows that stay open get their bodies again, from the new state at the horizon.
 	// A journey with rows in an evicted window keeps its RailBody, which followed those
 	// rows already (in arrival order), unless this commit wrote a keyframe, which begins
@@ -1022,6 +1076,11 @@ func (s *surface) reintern() {
 		}
 		for _, r := range w.last {
 			keep(r.meta)
+		}
+	}
+	for _, lm := range s.lastOpen {
+		if lm.meta != nil {
+			keep(lm.meta)
 		}
 	}
 	for _, r := range s.trail {
