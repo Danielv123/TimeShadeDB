@@ -120,7 +120,7 @@ type Options struct {
 	// Workers is the number of tiles a commit encodes in parallel (default GOMAXPROCS).
 	Workers int
 	// MinTime, if positive, is the earliest update time accepted: earlier ones are
-	// impossible (a broken clock) and Invalid. serve-v3 sets DefaultMinTime.
+	// impossible (a broken clock) and Invalid. serve sets DefaultMinTime.
 	MinTime core.TimeMs
 	// Logf receives recovery notes (default: discard).
 	Logf func(format string, args ...any)

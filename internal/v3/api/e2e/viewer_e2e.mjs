@@ -1,4 +1,4 @@
-// End-to-end check of serve-v3 with the embedded viewer in headless Chromium (WP6
+// End-to-end check of serve with the embedded viewer in headless Chromium (WP6
 // acceptance): open the viewer on a running server, wait until the terrain view is fully
 // painted and the mover layer draws movers, and report what the browser fetched.
 //

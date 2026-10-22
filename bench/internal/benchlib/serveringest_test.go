@@ -14,7 +14,7 @@ import (
 	"timeshadedb/internal/v3/terrain"
 )
 
-// serverIngest is the ingest side of serve-v3 (stores sized from a 256 MiB budget as
+// serverIngest is the ingest side of serve (stores sized from a 256 MiB budget as
 // cmd/timeshadedb does, data clock, commit loop every second) without HTTP, for
 // profiling the server's share of the synthetic ingest benchmark.
 type serverIngest struct {

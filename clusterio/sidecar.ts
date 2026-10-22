@@ -1,4 +1,4 @@
-// The map server as a child process of the controller (PLAN.md §4.10): `timeshadedb serve-v3 --listen 127.0.0.1:0`,
+// The map server as a child process of the controller (PLAN.md §4.10): `timeshadedb serve --listen 127.0.0.1:0`,
 // whose first stdout line names the port it got. It is restarted with backoff when it exits, and stops when the
 // controller does: stop() closes its stdin (--exit-on-stdin-close), and so does the controller dying.
 import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";

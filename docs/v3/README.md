@@ -45,7 +45,7 @@ incomplete, the WP makes the smallest additive change and lists it in its report
 | WP3 pyramid and tile encoding | `internal/v3/pyramid/`, `internal/v3/tileenc/` | Implements `core.TileSource` for z <= 0 on top of a `TerrainStore` and a `SeriesStore`; TSV3/TSD3 encoding and the encoded-response cache. |
 | WP4 movers, overlays, rails | `internal/v3/movers/`, `internal/v3/overlays/` | Implements `core.MoverStore`, `core.OverlayStore`. |
 | WP5 illisis importer | `internal/import/minimap/`, `cmd/timeshadedb/cmd_import_minimap.go` | Produces `core.ChunkUpdate`, `core.MoverSample`, `core.OverlayEvent`. |
-| WP6 HTTP API, ingest, auth | `internal/v3/api/`, `internal/v3/ingest/`, `cmd/timeshadedb/cmd_serve_v3.go`, `cmd/timeshadedb/cmd_tail.go` | Implements API.md and PROTOCOL.md decoding. |
+| WP6 HTTP API, ingest, auth | `internal/v3/api/`, `internal/v3/ingest/`, `cmd/timeshadedb/cmd_serve.go`, `cmd/timeshadedb/cmd_tail.go` | Implements API.md and PROTOCOL.md decoding. |
 | WP7 viewer terrain engine | `web/src/map/*` except `layer.ts`, `web/src/App.tsx`, `web/src/main.tsx`, `web/src/styles.css` | Renderer, camera, scheduler, workers, caches, server and static `DataSource`s. Only WP7 touches `App.tsx`. |
 | WP8 viewer movers and overlays | `web/src/movers/`, `web/src/overlays/`, `web/src/layers/index.ts` | Only WP8 touches the layer list. |
 | WP9 capture | `capture/` (`lua/`, `mod/timeshade_capture/`, `clusterio_module/`, `test/`, `build.mjs`, `README.md`, the Blue Oak licence text), `timeshadedb_exporter/README.md` (deprecation note) | Writes PROTOCOL.md envelopes. `node capture/build.mjs` assembles the mod and the Clusterio module into `capture/dist/` (WP10 copies the module). |
@@ -53,7 +53,7 @@ incomplete, the WP makes the smallest additive change and lists it in its report
 | WP11 benchmarks and acceptance | `bench/` (`bench/cmd/{ingestbench,soak,tilebench,attack}/`, `bench/web/`, `bench/trains/`, `bench/run_acceptance.{ps1,sh}`; it writes `bench/REPORT.md`, not committed) | Reads `window.__tsdbPerf` and `/metrics`. |
 | WP12 static export and S3 | `internal/v3/publish/`, `cmd/timeshadedb/cmd_publish.go` | Writes the API.md static subset. |
 
-`cmd/timeshadedb/v3stores.go` (the file-backed v3 stores, pyramid build and icon copy
+`cmd/timeshadedb/stores.go` (the file-backed v3 stores, pyramid build and icon copy
 used by `import-minimap` and the command tests) is shared wiring, changed at integration.
 
 `web/package.json` and `web/package-lock.json` are shared: WP7 and WP8 may add
@@ -76,7 +76,7 @@ func init() {
 
 | Command | File | WP |
 |---|---|---|
-| `serve-v3` (becomes `serve` when v2 is removed) | `cmd_serve_v3.go` | WP6 |
+| `serve` (becomes `serve` when v2 is removed) | `cmd_serve.go` | WP6 |
 | `tail` | `cmd_tail.go` | WP6 |
 | `import-minimap` | `cmd_import_minimap.go` | WP5 |
 | `migrate-v3` | `cmd_migrate.go` | WP1 |
@@ -133,7 +133,7 @@ and `s` (CSS pixels per tile); `ds` wins over `map`/`surface`/`force` and `s` ov
 
 The bundle is built with relative asset URLs (Vite `base: "./"`), so it works at `/`,
 under a sub-path and from a static export prefix. Its state lives in the query string
-only: open it at its directory (`/`, `/prefix/`), not at a deeper path. `serve-v3`
+only: open it at its directory (`/`, `/prefix/`), not at a deeper path. `serve`
 answers every missing path with 404 (`internal/v3/api/web.go`). The legacy `serve`
 (`newSPAFileServer` in `cmd/timeshadedb/serve.go`) still answers missing routes with
 `index.html`, but answers missing paths under `assets/` or with a file extension with 404,

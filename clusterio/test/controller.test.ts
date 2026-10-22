@@ -19,12 +19,12 @@ async function start(fields: Record<string, unknown> = {}) {
 	return { c, plugin, url, received };
 }
 
-test("the sidecar runs serve-v3 on a random loopback port with random tokens, the database under the controller's", async () => {
+test("the sidecar runs serve on a random loopback port with random tokens, the database under the controller's", async () => {
 	const { c, plugin, received } = await start();
 	try {
 		const { args } = await received();
 		const arg = (name: string) => args[args.indexOf(name) + 1];
-		assert.equal(args[0], "serve-v3");
+		assert.equal(args[0], "serve");
 		assert.equal(arg("--listen"), "127.0.0.1:0");
 		assert.equal(arg("--db"), path.resolve(c.dir, "timeshade"));
 		assert.equal(arg("--mem-budget"), String(64 << 20));

@@ -348,7 +348,7 @@ What the exporter writes (`internal/v3/publish/README.md` has the details and si
 
 ## 8. Running the server
 
-`timeshadedb serve-v3 --db <dir>` opens (or creates) the database and serves this API, the
+`timeshadedb serve --db <dir>` opens (or creates) the database and serves this API, the
 live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It prints
 `listening on <addr>` as its first stdout line. Flags beyond the shared ones (README.md):
 

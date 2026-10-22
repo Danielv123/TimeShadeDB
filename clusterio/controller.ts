@@ -27,10 +27,10 @@ const MAPS_RESEND_MS = 10 * 60_000;
 const RESTART_FIELDS = new Set(["timeshade.binary_path", "timeshade.database_directory", "timeshade.mem_budget_mb"]);
 
 export type ControllerOptions = {
-	/** Run this instead of the timeshadedb binary (tests): the command and the arguments before "serve-v3". */
+	/** Run this instead of the timeshadedb binary (tests): the command and the arguments before "serve". */
 	command?: string;
 	commandArgs?: string[];
-	/** More serve-v3 flags (tests: --clock data and short graces). */
+	/** More serve flags (tests: --clock data and short graces). */
 	extraArgs?: string[];
 	sidecar?: Partial<SidecarOptions>;
 	queue?: Partial<IngestQueueOptions>;
@@ -69,7 +69,7 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 		return {
 			command,
 			args: [
-				...prefix, "serve-v3", "--db", dbDir(), "--listen", "127.0.0.1:0", "--ingest-token", ingestToken,
+				...prefix, "serve", "--db", dbDir(), "--listen", "127.0.0.1:0", "--ingest-token", ingestToken,
 				"--read-token", readToken, "--mem-budget", String(mem), "--exit-on-stdin-close", ...(options.extraArgs ?? []),
 			],
 		};

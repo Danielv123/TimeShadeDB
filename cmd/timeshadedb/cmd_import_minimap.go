@@ -29,7 +29,7 @@ func init() {
 }
 
 // importStores are the stores import-minimap writes into: the file-backed v3 stores
-// under --db (v3stores.go), or the in-memory reference stores without it.
+// under --db (stores.go), or the in-memory reference stores without it.
 type importStores struct {
 	Terrain  core.TerrainStore
 	Movers   core.MoverStore
@@ -64,7 +64,7 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	reportPath := fs.String("report", "", "write the full JSON report to this file")
 	mapsOut := fs.String("maps-out", "", "write the catalog map metadata (core.MapInfo list) to this JSON file")
 	allowErrors := fs.Bool("allow-errors", false, "exit 0 even when some files fail to read or decode (a best-effort import)")
-	dbDir := fs.String("db", "", "v3 database root to import into (default: in-memory reference stores, nothing is written)")
+	dbDir := fs.String("db", "", "database root to import into (default: in-memory reference stores, nothing is written)")
 	noPyramid := fs.Bool("no-pyramid", false, "with --db, skip building the coarse levels after the import")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -94,7 +94,7 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	var stores importStores
 	var ter *terrain.Store
 	if *dbDir != "" {
-		stores, ter, err = openV3ImportStores(*dbDir)
+		stores, ter, err = openImportStores(*dbDir)
 		if err != nil {
 			return err
 		}
@@ -135,7 +135,7 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 	if ter != nil && opt.Terrain != nil && !*noPyramid {
 		opt.AfterTerrain = func(ctx context.Context) error {
 			t0 := time.Now()
-			st, err := buildV3Pyramid(ctx, ter)
+			st, err := buildPyramid(ctx, ter)
 			if err != nil {
 				return fmt.Errorf("pyramid: %w", err)
 			}
@@ -211,10 +211,10 @@ func runImportMinimap(ctx context.Context, stdout io.Writer, args []string) erro
 		}
 	}
 	if *dbDir != "" {
-		if err := writeV3Maps(*dbDir, rep.Maps); err != nil {
+		if err := writeMaps(*dbDir, rep.Maps); err != nil {
 			return err
 		}
-		if err := copyV3Icons(*dbDir, d.Root, rep.Icons); err != nil {
+		if err := copyIcons(*dbDir, d.Root, rep.Icons); err != nil {
 			return err
 		}
 		t0 := time.Now()

@@ -66,11 +66,11 @@ The catalog icons of the export are copied into `v3db/icons`.
 
 ## Serving a v3 database
 
-`timeshadedb serve-v3` serves the v3 HTTP API (`docs/v3/API.md`), live events, ingest
+`timeshadedb serve` serves the v3 HTTP API (`docs/v3/API.md`), live events, ingest
 and the embedded viewer (build it first with `npm --prefix web run build`):
 
 ```powershell
-timeshadedb serve-v3 --db v3db --listen 127.0.0.1:8080
+timeshadedb serve --db v3db --listen 127.0.0.1:8080
 ```
 
 It listens on loopback by default; any other address needs `--ingest-token`. A standalone

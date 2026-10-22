@@ -62,7 +62,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: raildisk -db <v3 db> [-out disk.json]")
 		os.Exit(2)
 	}
-	// The serve-v3 store writes with Options.LightEncoder: zstd's better level, 4 MiB window.
+	// The server's store writes with Options.LightEncoder: zstd's better level, 4 MiB window.
 	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression), zstd.WithEncoderConcurrency(1),
 		zstd.WithLowerEncoderMem(true), zstd.WithWindowSize(1<<22))
 	check(err)

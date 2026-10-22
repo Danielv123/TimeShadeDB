@@ -21,7 +21,7 @@ import (
 	"timeshadedb/internal/v3/core"
 )
 
-func TestServeV3Flags(t *testing.T) {
+func TestServeFlags(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
 		want string
@@ -32,28 +32,28 @@ func TestServeV3Flags(t *testing.T) {
 		{[]string{"--db", "x", "--mem-budget", "1000"}, "--mem-budget"},
 		{[]string{"--db", "x", "extra"}, "unexpected arguments"},
 	} {
-		_, err := parseServeV3(io.Discard, tc.args)
+		_, err := parseServe(io.Discard, tc.args)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%v: err %v, want %q", tc.args, err, tc.want)
 		}
 	}
-	if o, err := parseServeV3(io.Discard, []string{"--db", "x", "--listen", "0.0.0.0:0", "--ingest-token", "t"}); err != nil || o.ingestToken != "t" {
+	if o, err := parseServe(io.Discard, []string{"--db", "x", "--listen", "0.0.0.0:0", "--ingest-token", "t"}); err != nil || o.ingestToken != "t" {
 		t.Fatalf("token on a public address: %v", err)
 	}
-	if o, err := parseServeV3(io.Discard, []string{"--db", "x", "--listen", "[::1]:0"}); err != nil || o == nil {
+	if o, err := parseServe(io.Discard, []string{"--db", "x", "--listen", "[::1]:0"}); err != nil || o == nil {
 		t.Fatalf("loopback v6: %v", err)
 	}
 }
 
-// startServeV3 runs serve-v3 on a free port and returns its base URL and a stop function
+// startServe runs serve on a free port and returns its base URL and a stop function
 // that waits for a clean shutdown.
-func startServeV3(t *testing.T, args ...string) (string, func()) {
+func startServe(t *testing.T, args ...string) (string, func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		done <- runServeV3(ctx, pw, io.Discard, append([]string{"--listen", "127.0.0.1:0", "--no-viewer", "--quiet"}, args...))
+		done <- runServe(ctx, pw, io.Discard, append([]string{"--listen", "127.0.0.1:0", "--no-viewer", "--quiet"}, args...))
 		pw.Close()
 	}()
 	sc := bufio.NewScanner(pr)
@@ -74,10 +74,10 @@ func startServeV3(t *testing.T, args ...string) (string, func()) {
 			select {
 			case err := <-done:
 				if err != nil {
-					t.Errorf("serve-v3: %v", err)
+					t.Errorf("serve: %v", err)
 				}
 			case <-time.After(30 * time.Second):
-				t.Error("serve-v3 did not stop")
+				t.Error("serve did not stop")
 			}
 		})
 	}
@@ -112,13 +112,13 @@ func getStatus(t *testing.T, url string) int {
 	return res.StatusCode
 }
 
-// TestServeV3ImportedDB imports the synthetic illisis export, serves it and reads the
+// TestServeImportedDB imports the synthetic illisis export, serves it and reads the
 // catalog, a view, its tiles, a coarse tile and the movers, then stops the server.
-func TestServeV3ImportedDB(t *testing.T) {
+func TestServeImportedDB(t *testing.T) {
 	exp := minimaptest.Write(t, t.TempDir())
 	db := filepath.Join(t.TempDir(), "db")
 	importIntoDB(t, exp.Root, db)
-	base, stop := startServeV3(t, "--db", db)
+	base, stop := startServe(t, "--db", db)
 	if s := getStatus(t, base+"/healthz"); s != 200 {
 		t.Fatalf("healthz %d", s)
 	}
@@ -168,19 +168,19 @@ func TestServeV3ImportedDB(t *testing.T) {
 	}
 	stop()
 	// The stores were closed cleanly: a second server opens the same database.
-	base, _ = startServeV3(t, "--db", db)
+	base, _ = startServe(t, "--db", db)
 	getJSON(t, base+"/api/v3/catalog", &cat)
 }
 
-// TestTailIntoServeV3 forwards the capture fixture (raw Lua output) with `tail` into a
-// fresh serve-v3 and checks what was stored.
-func TestTailIntoServeV3(t *testing.T) {
+// TestTailIntoServe forwards the capture fixture (raw Lua output) with `tail` into a
+// fresh serve and checks what was stored.
+func TestTailIntoServe(t *testing.T) {
 	fixture, err := os.ReadFile(filepath.Join("..", "..", "capture", "test", "fixtures", "game_envelopes.ndjson"))
 	if err != nil {
 		t.Skip("capture fixture missing:", err)
 	}
 	db := filepath.Join(t.TempDir(), "db")
-	base, _ := startServeV3(t, "--db", db, "--ingest-token", "secret")
+	base, _ := startServe(t, "--db", db, "--ingest-token", "secret")
 	dir := t.TempDir()
 	lines := strings.SplitAfter(strings.TrimSpace(string(fixture)), "\n")
 	half := len(lines) / 2
@@ -512,13 +512,13 @@ func TestIconsCopiedAndServed(t *testing.T) {
 	os.WriteFile(filepath.Join(root, "icons", "sheet.abc.png"), []byte("\x89PNG fake"), 0o644)
 	os.WriteFile(filepath.Join(root, "icons", "meta.abc.json"), []byte(`{"item":[]}`), 0o644)
 	db := filepath.Join(t.TempDir(), "db")
-	if err := copyV3Icons(db, root, &core.CatalogIcons{PNG: "icons/sheet.abc.png", JSON: "icons/meta.abc.json"}); err != nil {
+	if err := copyIcons(db, root, &core.CatalogIcons{PNG: "icons/sheet.abc.png", JSON: "icons/meta.abc.json"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := copyV3Icons(db, root, &core.CatalogIcons{PNG: "icons/../x y.png", JSON: "icons/meta.abc.json"}); err == nil {
+	if err := copyIcons(db, root, &core.CatalogIcons{PNG: "icons/../x y.png", JSON: "icons/meta.abc.json"}); err == nil {
 		t.Fatal("bad icon name accepted")
 	}
-	base, _ := startServeV3(t, "--db", db)
+	base, _ := startServe(t, "--db", db)
 	var cat core.Catalog
 	getJSON(t, base+"/api/v3/catalog", &cat)
 	if cat.Icons == nil || cat.Icons.PNG != "icons/sheet.abc.png" || cat.Icons.JSON != "icons/meta.abc.json" {
@@ -540,9 +540,9 @@ func TestIconsCopiedAndServed(t *testing.T) {
 	}
 }
 
-// TestServeV3ShutdownWithLiveClient: an open live stream does not delay shutdown.
-func TestServeV3ShutdownWithLiveClient(t *testing.T) {
-	base, stop := startServeV3(t, "--db", filepath.Join(t.TempDir(), "db"))
+// TestServeShutdownWithLiveClient: an open live stream does not delay shutdown.
+func TestServeShutdownWithLiveClient(t *testing.T) {
+	base, stop := startServe(t, "--db", filepath.Join(t.TempDir(), "db"))
 	res, err := http.Get(base + "/api/v3/live")
 	if err != nil {
 		t.Fatal(err)
@@ -558,12 +558,12 @@ func TestServeV3ShutdownWithLiveClient(t *testing.T) {
 	}
 }
 
-// TestServeV3DataClockMoversFirst: on the data clock a fresh database's first body may
+// TestServeDataClockMoversFirst: on the data clock a fresh database's first body may
 // be mover samples recorded long ago, spanning more than the commit grace; none of them
 // is late or "ahead" of the clock.
-func TestServeV3DataClockMoversFirst(t *testing.T) {
+func TestServeDataClockMoversFirst(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "db")
-	base, stop := startServeV3(t, "--db", db, "--clock", "data", "--commit-every", "20ms")
+	base, stop := startServe(t, "--db", db, "--clock", "data", "--commit-every", "20ms")
 	defer stop()
 	start := time.Now().Add(-30 * 24 * time.Hour).UnixMilli()
 	var body strings.Builder

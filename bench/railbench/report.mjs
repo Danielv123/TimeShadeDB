@@ -47,7 +47,7 @@ for (const d of data) {
 		+ `${f(s.moving_train_hours, 3)} | ${f(s.train_km, 1)} | ${f(d.run.wallMs / 1000, 0)} (${f(d.run.msPerTick, 2)}) |`);
 }
 P();
-P("### Samples stored (today's capture, read back from serve-v3)");
+P("### Samples stored (today's capture, read back from serve)");
 P();
 P("| Run | Samples | per train-hour | per train-km | `car` rows per train-hour | unmatched |");
 P("|---|---:|---:|---:|---:|---:|");

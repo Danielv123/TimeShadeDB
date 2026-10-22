@@ -15,19 +15,19 @@ import (
 	"timeshadedb/internal/v3/terrain"
 )
 
-// openV3BulkTerrain opens the terrain store under a database root for an offline bulk
+// openBulkTerrain opens the terrain store under a database root for an offline bulk
 // write (import or migration): no fsync and no WAL, because an interrupted run is redone
 // from its source, and no open-window budget, because the writer commits on its own
 // schedule and has nothing to retry with. The writer must Commit past its last window
 // before Close, since windows still open at Close are lost without a WAL.
-func openV3BulkTerrain(dir string) (*terrain.Store, error) {
+func openBulkTerrain(dir string) (*terrain.Store, error) {
 	return terrain.Open(dir, terrain.Options{NoSync: true, NoWAL: true, OpenWindowBytes: -1})
 }
 
-// openV3ImportStores opens every file-backed store under dir for a bulk import. The
+// openImportStores opens every file-backed store under dir for a bulk import. The
 // terrain store is returned too, so the caller can build the pyramid after the import.
-func openV3ImportStores(dir string) (importStores, *terrain.Store, error) {
-	ter, err := openV3BulkTerrain(dir)
+func openImportStores(dir string) (importStores, *terrain.Store, error) {
+	ter, err := openBulkTerrain(dir)
 	if err != nil {
 		return importStores{}, nil, err
 	}
@@ -46,11 +46,11 @@ func openV3ImportStores(dir string) (importStores, *terrain.Store, error) {
 	}}, ter, nil
 }
 
-// buildV3Pyramid builds the coarse levels of every datastore after an offline write:
+// buildPyramid builds the coarse levels of every datastore after an offline write:
 // Rebuild replays the whole z0 history for a datastore without coarse records, and a
 // datastore that already has some (an import into an existing database) gets a Flush at
 // the horizon instead.
-func buildV3Pyramid(ctx context.Context, ter *terrain.Store) (pyramid.BuildStats, error) {
+func buildPyramid(ctx context.Context, ter *terrain.Store) (pyramid.BuildStats, error) {
 	var total pyramid.BuildStats
 	p, err := pyramid.New(ctx, ter, ter.SeriesStore(), pyramid.Options{})
 	if err != nil {
@@ -94,21 +94,21 @@ func addBuildStats(t *pyramid.BuildStats, s pyramid.BuildStats) {
 	t.SnapshotBytes += s.SnapshotBytes
 }
 
-// writeV3Maps stores the map metadata of an import in <db>/maps.json (docs/v3/FORMAT.md
+// writeMaps stores the map metadata of an import in <db>/maps.json (docs/v3/FORMAT.md
 // "On-disk layout"), as the core.MapInfo list the catalog serves.
-func writeV3Maps(dir string, maps []core.MapInfo) error {
+func writeMaps(dir string, maps []core.MapInfo) error {
 	if maps == nil {
 		maps = []core.MapInfo{}
 	}
 	return writeJSONFile(filepath.Join(dir, "maps.json"), maps)
 }
 
-// copyV3Icons copies the catalog icon spritesheet and its metadata of an import (paths
+// copyIcons copies the catalog icon spritesheet and its metadata of an import (paths
 // relative to the export root) into <db>/icons and names them in <db>/icons/icons.json
-// with paths relative to the API base ("icons/<file>"), which serve-v3 reads for the
+// with paths relative to the API base ("icons/<file>"), which serve reads for the
 // catalog and serves under /api/v3/icons/ (docs/v3/FORMAT.md 5, API.md 2). Nothing
 // happens when the export has no icons.
-func copyV3Icons(db, root string, icons *core.CatalogIcons) error {
+func copyIcons(db, root string, icons *core.CatalogIcons) error {
 	if icons == nil {
 		return nil
 	}
@@ -141,7 +141,7 @@ func copyV3Icons(db, root string, icons *core.CatalogIcons) error {
 	return writeJSONFile(filepath.Join(dir, api.IconsFile), out)
 }
 
-// validIconFile accepts the names serve-v3 serves: [A-Za-z0-9._-], no leading dot.
+// validIconFile accepts the names serve serves: [A-Za-z0-9._-], no leading dot.
 func validIconFile(name string) bool {
 	if name == "" || len(name) > 200 || name[0] == '.' || name == api.IconsFile {
 		return false

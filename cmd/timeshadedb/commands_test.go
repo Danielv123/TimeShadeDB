@@ -8,7 +8,7 @@ import (
 )
 
 func TestCommandRegistry(t *testing.T) {
-	for _, name := range []string{"serve-v3", "tail", "import-minimap", "publish", "publish-serve"} {
+	for _, name := range []string{"serve", "tail", "import-minimap", "publish", "publish-serve"} {
 		if _, ok := lookupCommand(name); !ok {
 			t.Fatalf("command %q is not registered", name)
 		}
@@ -36,7 +36,7 @@ func TestRegisterRejectsBadCommands(t *testing.T) {
 	for _, c := range []Command{
 		{Name: "Bad_Name", Run: noop},
 		{Name: "no-run"},
-		{Name: "serve-v3", Run: noop},
+		{Name: "serve", Run: noop},
 	} {
 		func() {
 			defer func() {

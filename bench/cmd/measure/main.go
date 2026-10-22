@@ -21,7 +21,7 @@
 //	measure replicate -db <v3 db> -out <new db> [-n 10]
 //	    a database of n copies of a v3 database under suffixed map keys (the 10x database)
 //	measure startup -server-bin <timeshadedb> -db <v3 db> [-restarts 3]
-//	    median time from process start until serve-v3 answers (startup.ms)
+//	    median time from process start until serve answers (startup.ms)
 package main
 
 import (

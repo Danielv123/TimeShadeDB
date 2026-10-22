@@ -12,7 +12,7 @@ are stored again only when their bytes change.
 # From a database that no server has open (the stores are opened in this process):
 timeshadedb publish --db v3db --dir C:\www\map
 
-# From a running server (serve-v3, or the Clusterio sidecar), once or every minute:
+# From a running server (serve, or the Clusterio sidecar), once or every minute:
 timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --dir C:\www\map
 timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m `
     --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-bucket map --state C:\tsdb\publish-state
@@ -21,7 +21,7 @@ timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m `
 timeshadedb publish-serve --dir C:\www\map --listen 127.0.0.1:8090
 ```
 
-- Source: `--db <dir>` opens the stores like `serve-v3` does and reads the API in process.
+- Source: `--db <dir>` opens the stores like `serve` does and reads the API in process.
   Two processes must not open one database (there is no lock file), so use `--from <API base
   URL>` (with `--read-token` if the server has one) while a server runs. `--every` needs
   `--from`.
@@ -186,7 +186,7 @@ resumed after a failing endpoint and after a cancelled round; auth and refused o
 indexes deferred while an object is missing; the keyframe policy; the directory target and
 `publish-serve`; a torn state log; and, in `cmd/timeshadedb`, an imported database exported
 to a directory (every version a timeline names is there), to a fake S3 endpoint, and from a
-running `serve-v3`.
+running `serve`.
 
 Browser check (needs a built viewer, Chromium and `playwright-core`):
 

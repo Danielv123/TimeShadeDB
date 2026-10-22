@@ -7,7 +7,7 @@ vehicles, players, chart tags, machine recipes and optional rails, live and thro
 | Part | What it does |
 |---|---|
 | Instances (`instance.ts`, `forward.ts`) | The save-patch module `timeshade` (the capture Lua, [capture/](../capture/README.md)) prints envelopes on the IPC channel `timeshade:out`. The plugin stamps each one with `recv_ms` and `seq`, splits it by map, and sends what arrived to the controller about once a second. At every start, on a `gridworld.tile` change, on a capture setting change and on a new controller session it runs `/sc ts_rt.config(...) ts_rt.resync(...)` over RCON. |
-| Controller (`controller.ts`) | Runs `timeshadedb serve-v3 --listen 127.0.0.1:0` as a sidecar (`sidecar.ts`). It forwards envelopes to the sidecar's `POST /api/v3/ingest` (`ingest.ts`), and publishes the cluster's maps as `map` messages: titles, gridworld instance bounds and Universal Edges lines. |
+| Controller (`controller.ts`) | Runs `timeshadedb serve --listen 127.0.0.1:0` as a sidecar (`sidecar.ts`). It forwards envelopes to the sidecar's `POST /api/v3/ingest` (`ingest.ts`), and publishes the cluster's maps as `map` messages: titles, gridworld instance bounds and Universal Edges lines. |
 | Proxy (`http.ts`) | `/api/timeshade/*` on the controller's web server goes to the sidecar. Viewer files are open. The API (`/api/timeshade/api/v3/*`) needs a Clusterio token of a user with `timeshade.view`. |
 | Web UI (`web/`) | A **Map** page at `/timeshade` that shows the TimeShadeDB viewer in a frame. |
 
@@ -47,7 +47,7 @@ viewer config sets `base: "./"`). Otherwise the viewer cannot load its scripts u
 |---|---|---|
 | `timeshade.binary_path` | unset | The timeshadedb executable. Unset: `TIMESHADEDB_BINARY`, then the platform package, then `bin/` |
 | `timeshade.database_directory` | `<controller database>/timeshade` | Where the map is stored |
-| `timeshade.mem_budget_mb` | 256 | `serve-v3 --mem-budget` |
+| `timeshade.mem_budget_mb` | 256 | `serve --mem-budget` |
 | `timeshade.queue_mb` | 64 | Capture data kept in memory while the sidecar is down or slow; past it the queue continues on disk |
 | `timeshade.queue_disk_mb` | 4096 | Capture data kept on disk past the memory queue (`timeshade-queue/` in the controller's database directory), also across controller restarts; past it the oldest is dropped |
 

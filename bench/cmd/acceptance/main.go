@@ -400,7 +400,7 @@ func (r *runner) candidate() {
 	r.step("web", func() error {
 		// The same view as the illisis run: gridworld nauvis, z0, centred on (0, 0).
 		srv, err := benchlib.StartServer(benchlib.ServerSpec{Binary: bin,
-			Args: []string{"serve-v3", "--db", "{db}", "--listen", "{listen}"}, DB: imported,
+			Args: []string{"serve", "--db", "{db}", "--listen", "{listen}"}, DB: imported,
 			Log: logFile(filepath.Join(c.work, "logs", "web-server.log"))})
 		if err != nil {
 			return err

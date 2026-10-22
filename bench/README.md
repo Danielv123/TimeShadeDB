@@ -48,10 +48,10 @@ error (`benchlib.Fatal` stops every server first) or is interrupted. Each child 
 tied to the process that started it (a kill-on-close Job Object on Windows, `Pdeathsig`
 on Linux), so a crashed or killed tool, or acceptance runner, leaves nothing running.
 v3 servers are started as
-`serve-v3 --db {db} --listen {listen}` and must print `listening on <addr>` first;
+`serve --db {db} --listen {listen}` and must print `listening on <addr>` first;
 v2 as `serve --db {db} --addr {addr}`. The tools that replay recorded or synthetic data
 into v3 (`ingestbench`, `soak`) add `--clock data` (`-data-clock=false` turns it off): on
-the wall clock serve-v3 counts every replayed row as late, and on the data clock it never
+the wall clock serve counts every replayed row as late, and on the data clock it never
 moves past the wall clock plus 10 s, so replays must lie in the past. `soak` therefore
 places its data to end at the present, and the 10x database is built from replays
 shifted into the past, oldest first. `attack` adds `--pprof` on a free loopback port
@@ -103,7 +103,7 @@ never stands in for the imported one.
 
 ## Interfaces the v3 packages must provide
 
-- **WP6** `serve-v3`: `--db`, `--listen 127.0.0.1:0` printing `listening on <addr>`,
+- **WP6** `serve`: `--db`, `--listen 127.0.0.1:0` printing `listening on <addr>`,
   `/healthz`, the API.md routes, `--ingest-token` (the tools send `-token` as a bearer
   token).
 - **WP5** the import command (see `TSDB_IMPORT_ARGS`).

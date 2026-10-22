@@ -198,7 +198,7 @@ func cmdStartup(args []string) {
 	res.Set("startup.db_mib", float64(total)/(1<<20))
 	var ms []float64
 	for i := 0; i < *restarts; i++ {
-		s, err := benchlib.StartServer(benchlib.ServerSpec{Binary: *bin, Args: []string{"serve-v3", "--db", "{db}", "--listen", "{listen}"}, DB: *db, Timeout: 2 * time.Minute})
+		s, err := benchlib.StartServer(benchlib.ServerSpec{Binary: *bin, Args: []string{"serve", "--db", "{db}", "--listen", "{listen}"}, DB: *db, Timeout: 2 * time.Minute})
 		if err != nil {
 			benchlib.Fatal(err)
 		}

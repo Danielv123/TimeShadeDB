@@ -101,7 +101,7 @@ func (r *recorder) Write(b []byte) (int, error) {
 	return r.body.Write(b)
 }
 
-// HTTPSource reads from a running server (serve-v3, or the Clusterio proxy in front of
+// HTTPSource reads from a running server (serve, or the Clusterio proxy in front of
 // it), so a database in use is published without opening it twice.
 type HTTPSource struct {
 	// Base is the API base URL, for example http://127.0.0.1:8080/api/v3/.

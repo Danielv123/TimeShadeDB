@@ -10,7 +10,7 @@ function sidecar(env: Record<string, string> = {}, extra: Partial<SidecarOptions
 	const lines: Line[] = [];
 	const s = new Sidecar({
 		command: process.execPath,
-		args: [fake, "serve-v3", "--ingest-token", "i", "--read-token", "r"],
+		args: [fake, "serve", "--ingest-token", "i", "--read-token", "r"],
 		env: { ...process.env, ...env },
 		logger: fakeLogger(lines),
 		minBackoffMs: 50,
@@ -34,7 +34,7 @@ test("spawn: ready with the address of its first stdout line; later lines and st
 	assert.match(url, /^http:\/\/127\.0\.0\.1:\d+$/);
 	assert.equal(s.url, url);
 	assert.equal(s.state, "running");
-	assert.deepEqual((await received(url)).args.slice(0, 1), ["serve-v3"]);
+	assert.deepEqual((await received(url)).args.slice(0, 1), ["serve"]);
 	await until(() => lines.some(l => l.message === "timeshade sidecar: fake sidecar up")
 		&& lines.some(l => l.message === "timeshade sidecar: fake sidecar log line" && l.level === "info"));
 	await s.stop();
@@ -120,7 +120,7 @@ test("stop kills a process that ignores its closed stdin; restart applies a new 
 	await s.stop();
 	assert.ok(Date.now() - t0 >= 150, "waited for the stop timeout");
 	assert.equal(s.crashes, 0);
-	s.configure(process.execPath, [fake, "serve-v3"]);
+	s.configure(process.execPath, [fake, "serve"]);
 	await s.restart();
 	const url = await s.ready(10_000);
 	assert.notEqual(url, "http://127.0.0.1:1");
