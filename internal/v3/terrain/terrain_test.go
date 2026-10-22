@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -245,44 +246,100 @@ func TestNoAllocForUnknownTiles(t *testing.T) {
 	}
 }
 
-func TestOverBudget(t *testing.T) {
+// TestSpillInsteadOfRefusing: past the open-window budget Apply spills the oldest
+// windows to disk instead of refusing; live reads still see the spilled chunks, and the
+// commit closes the spilled windows and deletes their files.
+func TestSpillInsteadOfRefusing(t *testing.T) {
 	ctx := context.Background()
-	s := openTemp(t, Options{OpenWindowBytes: 10 * openChunkBytes})
+	dir := t.TempDir()
+	s, err := Open(dir, Options{NoSync: true, OpenWindowBytes: 10 * openChunkBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
+	want := memstore.NewTerrain()
 	ds := coretest.DS
+	// Three windows of 8 chunks each, then a second update of window 0 after it spilled.
 	var ups []core.ChunkUpdate
-	for i := 0; i < 12; i++ {
-		ups = append(ups, core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: int32(i)}, T: 10, Pixels: coretest.Fill(uint16(i + 1))})
+	for w := 0; w < 3; w++ {
+		for i := 0; i < 8; i++ {
+			ups = append(ups, core.ChunkUpdate{DS: ds, Chunk: core.ChunkCoord{X: int32(i)}, T: core.TimeMs(w)*core.Minute + 10, Pixels: coretest.Fill(uint16(w*8 + i + 1))})
+		}
 	}
-	if _, err := s.Apply(ctx, ups); err != nil {
+	for i := 0; i < len(ups); i += 4 {
+		if res, err := s.Apply(ctx, ups[i:i+4]); err != nil || res.Accepted != 4 {
+			t.Fatalf("apply %d = %+v, %v", i, res, err)
+		}
+		want.Apply(ctx, ups[i:i+4])
+	}
+	late := []core.ChunkUpdate{{DS: ds, Chunk: core.ChunkCoord{X: 1}, T: 20, Pixels: coretest.Fill(99)}, {DS: ds, Chunk: core.ChunkCoord{X: 2}, T: 5, Pixels: coretest.Fill(98)}}
+	if _, err := s.Apply(ctx, late); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Apply(ctx, ups[:1]); !errors.Is(err, ErrOverBudget) || !errors.Is(err, core.ErrOverloaded) {
-		t.Fatalf("err = %v, want ErrOverBudget wrapping core.ErrOverloaded", err)
+	want.Apply(ctx, late)
+	st := s.Stats()
+	if st.Spills == 0 || st.SpilledWindows == 0 || st.OpenWindowBytes > 10*openChunkBytes || st.Accepted != uint64(len(ups)+2) {
+		t.Fatalf("stats = %+v", st)
 	}
-	if err := s.Commit(ctx, core.Minute); err != nil {
-		t.Fatal(err)
+	tile := core.TileCoord{}
+	for _, at := range []core.TimeMs{3 * core.Minute, 30} {
+		a, sa, err := s.ReadTile(ctx, ds, tile, at, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, sb, _ := want.ReadTile(ctx, ds, tile, at, true)
+		if !a.Equal(b) || sa.Live != sb.Live {
+			t.Fatalf("live read at %d differs (live %v, oracle %v)", at, sa.Live, sb.Live)
+		}
 	}
-	if st := s.Stats(); st.OpenWindowBytes != 0 {
-		t.Fatalf("open bytes after commit %d", st.OpenWindowBytes)
+	far := 10 * core.Minute
+	ok := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := s.Apply(ctx, []core.ChunkUpdate{{DS: ds, Chunk: core.ChunkCoord{}, T: core.Minute + 1, Pixels: coretest.Fill(9)}}); err != nil {
-		t.Fatal(err)
+	ok(s.Commit(ctx, far))
+	want.Commit(ctx, far)
+	if st := s.Stats(); st.OpenWindowBytes != 0 || st.SpilledWindows != 0 {
+		t.Fatalf("after commit: %+v", st)
 	}
-	// A batch is counted at its worst case before it is applied: 1 chunk in use plus
-	// 10 new ones is over the budget of 10, so nothing of it is applied.
-	for i := range ups {
-		ups[i].T = core.Minute + 2
+	if files, _ := filepath.Glob(filepath.Join(dir, "datastores", "*", "open", "*.spill")); len(files) != 0 {
+		t.Fatalf("spill files left: %v", files)
 	}
-	if _, err := s.Apply(ctx, ups[:10]); !errors.Is(err, ErrOverBudget) {
-		t.Fatalf("err = %v, want ErrOverBudget", err)
+	for v := core.Version(0); v <= 3; v++ {
+		a, err := s.ReadVersion(ctx, ds, tile, v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := want.ReadVersion(ctx, ds, tile, v)
+		if !a.Equal(b) {
+			t.Fatalf("version %d differs", v)
+		}
 	}
-	if st := s.Stats(); st.OpenWindowBytes != openChunkBytes || st.Accepted != 13 {
-		t.Fatalf("rejected batch was applied: %+v", st)
+}
+
+// TestDifferentialSpilling is TestDifferential with an open-window budget so small that
+// almost every window is spilled before its commit.
+func TestDifferentialSpilling(t *testing.T) {
+	for _, seed := range []int64{1, 2} {
+		coretest.TerrainDifferential(t, func(t *testing.T) core.TerrainStore {
+			return openTemp(t, Options{OpenWindowBytes: 24 * openChunkBytes})
+		}, coretest.DiffOptions{Seed: seed, Updates: 4000, ExactVersions: true})
 	}
-	if _, err := s.Apply(ctx, ups[:9]); err != nil {
-		t.Fatal(err)
-	}
+}
+
+// TestDifferentialReopenSpilling reopens a spilling store every few calls: Open deletes
+// the spill files and the WAL replay spills again.
+func TestDifferentialReopenSpilling(t *testing.T) {
+	coretest.TerrainDifferential(t, func(t *testing.T) core.TerrainStore {
+		dir := t.TempDir()
+		opt := Options{NoSync: true, MaxChain: 4, OpenWindowBytes: 16 * openChunkBytes}
+		s, err := Open(dir, opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &reopening{Store: s, t: t, dir: dir, opt: opt, every: 41}
+	}, coretest.DiffOptions{Seed: 6, Updates: 3000, ExactVersions: true})
 }
 
 // TestConcurrentReadsDuringIngest runs readers against a store that is ingesting and

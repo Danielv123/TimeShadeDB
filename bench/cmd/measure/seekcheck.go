@@ -134,7 +134,7 @@ func seekcheck(db, surface string, every, grace core.TimeMs) (*seekCheck, error)
 		}
 	}
 	// the stored keyframes and the live payload from disk
-	st, err := movers.Open(db, movers.Options{NoWAL: true, SyncInterval: -1, MaxAhead: -1, MaxBehind: -1, Logf: func(string, ...any) {}})
+	st, err := movers.Open(db, movers.Options{NoWAL: true, SyncInterval: -1, MaxAhead: -1, MinTime: -1, Logf: func(string, ...any) {}})
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +216,7 @@ func seekcheck(db, surface string, every, grace core.TimeMs) (*seekCheck, error)
 		return nil, err
 	}
 	defer os.RemoveAll(tmp)
-	fresh, err := movers.Open(tmp, movers.Options{NoWAL: true, SyncInterval: -1, MaxAhead: -1, MaxBehind: -1})
+	fresh, err := movers.Open(tmp, movers.Options{NoWAL: true, SyncInterval: -1, MaxAhead: -1, MinTime: -1})
 	if err != nil {
 		return nil, err
 	}

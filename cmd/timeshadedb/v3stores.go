@@ -51,7 +51,7 @@ func openV3ImportStores(dir string) (importStores, *terrain.Store, error) {
 	}
 	// The importer loads one surface after another, so the reference-clock bounds must
 	// be off (movers.Options.MaxAhead/MaxBehind), and it commits at the end, so no WAL.
-	mov, err := movers.Open(dir, movers.Options{SyncInterval: -1, NoWAL: true, MaxAhead: -1, MaxBehind: -1})
+	mov, err := movers.Open(dir, movers.Options{SyncInterval: -1, NoWAL: true, MaxAhead: -1, MinTime: -1})
 	if err != nil {
 		return importStores{}, nil, errors.Join(err, ter.Close())
 	}

@@ -84,7 +84,7 @@ func TestRailBodies(t *testing.T) {
 			}
 			sort.Slice(all, func(i, j int) bool { return all[i].T < all[j].T })
 			dir := t.TempDir()
-			opts := Options{SyncInterval: -1, MaxAhead: -1, MaxBehind: -1}
+			opts := Options{SyncInterval: -1, MaxAhead: -1, MinTime: -1}
 			a, err := Open(dir, opts)
 			if err != nil {
 				t.Fatal(err)
@@ -190,7 +190,7 @@ func benchRail(b *testing.B, plain bool) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		m, err := Open(b.TempDir(), Options{SyncInterval: -1, NoWAL: true, MaxAhead: -1, MaxBehind: -1})
+		m, err := Open(b.TempDir(), Options{SyncInterval: -1, NoWAL: true, MaxAhead: -1, MinTime: -1})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -243,7 +243,7 @@ func TestRailBodiesReopenAtKeyframe(t *testing.T) {
 	}
 	sort.Slice(upTo, func(i, j int) bool { return upTo[i].T < upTo[j].T })
 	dir := t.TempDir()
-	opts := Options{SyncInterval: -1, MaxAhead: -1, MaxBehind: -1}
+	opts := Options{SyncInterval: -1, MaxAhead: -1, MinTime: -1}
 	a, err := Open(dir, opts)
 	if err != nil {
 		t.Fatal(err)

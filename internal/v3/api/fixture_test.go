@@ -48,7 +48,7 @@ type fixture struct {
 type fixtureOpt struct {
 	cfg        func(*Config)
 	openWindow int64
-	maxRows    int
+	moverBytes int64
 }
 
 func (f *fixture) clock() core.TimeMs { return core.TimeMs(f.now.Load()) }
@@ -84,7 +84,7 @@ func newFixture(t *testing.T, o fixtureOpt) *fixture {
 	if f.rend, err = tileenc.NewRenderer(f.pyr, f.ter, tileenc.Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if f.mov, err = movers.Open(f.dir, movers.Options{SyncInterval: -1, Clock: f.clock, MaxOpenRows: o.maxRows, MaxBehind: -1, Logf: func(string, ...any) {}}); err != nil {
+	if f.mov, err = movers.Open(f.dir, movers.Options{SyncInterval: -1, Clock: f.clock, OpenBytes: o.moverBytes, MinTime: -1, Logf: func(string, ...any) {}}); err != nil {
 		t.Fatal(err)
 	}
 	if f.ovl, err = overlays.Open(f.dir, overlays.Options{NoSync: true}); err != nil {

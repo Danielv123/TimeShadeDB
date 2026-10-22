@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -238,7 +239,7 @@ func TestDifferential(t *testing.T) {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
 			dir := t.TempDir()
-			opts := Options{SyncInterval: -1, MaxAhead: -1, MaxBehind: -1} // memstore has no clock bounds
+			opts := Options{SyncInterval: -1, MaxAhead: -1, MinTime: -1} // memstore has no clock bounds
 			a, err := Open(dir, opts)
 			if err != nil {
 				t.Fatal(err)
@@ -300,7 +301,7 @@ func TestWALReplay(t *testing.T) {
 	a.Append(ctx, batch[200:])
 	b.Append(ctx, batch[200:])
 	// Crash: the files stay as they are (fsynced per batch); nothing is closed.
-	a.wal.f.Close()
+	crash(a)
 	c, err := Open(dir, Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -331,17 +332,29 @@ func TestWALTornTail(t *testing.T) {
 			second := randomSamples(rng, coretest.T0, 4*core.Minute, 100)
 			a.Append(ctx, first)
 			b.Append(ctx, first)
-			path := filepath.Join(dir, "movers", "wal", "wal.log")
-			st, _ := os.Stat(path)
-			a.Append(ctx, second)
-			a.wal.f.Close()
-			raw, _ := os.ReadFile(path)
-			if mode == "truncate" {
-				raw = raw[:st.Size()+(int64(len(raw))-st.Size())/2]
-			} else {
-				raw[st.Size()+20] ^= 0xFF
+			// The window logs (one per surface: every sample is in one window) after the
+			// first batch; the second batch is then damaged in each.
+			paths, _ := filepath.Glob(filepath.Join(dir, "movers", "*", "open", "*.wal"))
+			if len(paths) != 2 {
+				t.Fatalf("window logs %v", paths)
 			}
-			os.WriteFile(path, raw, 0o644)
+			sizes := map[string]int64{}
+			for _, p := range paths {
+				st, _ := os.Stat(p)
+				sizes[p] = st.Size()
+			}
+			a.Append(ctx, second)
+			crash(a)
+			for _, path := range paths {
+				raw, _ := os.ReadFile(path)
+				size := sizes[path]
+				if mode == "truncate" {
+					raw = raw[:size+(int64(len(raw))-size)/2]
+				} else {
+					raw[size+20] ^= 0xFF
+				}
+				os.WriteFile(path, raw, 0o644)
+			}
 			c, err := Open(dir, Options{})
 			if err != nil {
 				t.Fatal(err)
@@ -350,8 +363,10 @@ func TestWALTornTail(t *testing.T) {
 			if got := c.Stats().OpenRows; got != len(first) {
 				t.Fatalf("open rows after recovery = %d, want %d", got, len(first))
 			}
-			if st2, _ := os.Stat(path); st2.Size() != st.Size() {
-				t.Fatalf("torn tail not truncated: %d, want %d", st2.Size(), st.Size())
+			for _, path := range paths {
+				if st2, _ := os.Stat(path); st2.Size() != sizes[path] {
+					t.Fatalf("torn tail not truncated: %d, want %d", st2.Size(), sizes[path])
+				}
 			}
 			// Appending after recovery and reopening again still works.
 			third := randomSamples(rng, coretest.T0, 4*core.Minute, 50)
@@ -377,25 +392,98 @@ func ok(t *testing.T, err error) {
 	}
 }
 
-func TestOverloaded(t *testing.T) {
+// TestEvictsInsteadOfRefusing: with open windows far over Options.OpenBytes, Append
+// accepts every row (evicting whole windows to their logs), memory stays near the budget,
+// and the committed result equals memstore's.
+func TestEvictsInsteadOfRefusing(t *testing.T) {
 	ctx := context.Background()
-	m, _ := openTemp(t, Options{SyncInterval: -1, MaxOpenRows: 100})
+	const budget = 64 << 10
+	m, dir := openTemp(t, Options{SyncInterval: -1, OpenBytes: budget})
 	defer m.Close()
+	b := memstore.NewMovers()
 	rng := rand.New(rand.NewSource(9))
-	batch := randomSamples(rng, coretest.T0, 4*core.Minute, 80)[:80]
-	if _, err := m.Append(ctx, batch); err != nil {
-		t.Fatal(err)
+	t0 := coretest.T0
+	total := 0
+	for i := 0; i < 40; i++ {
+		batch := inOrder(randomSamples(rng, t0+core.TimeMs(i)*3*core.Minute, 3*core.Minute, 400))
+		res, err := m.Append(ctx, batch)
+		if err != nil || res.Accepted != len(batch) {
+			t.Fatalf("append %d = %+v, %v", i, res, err)
+		}
+		b.Append(ctx, batch)
+		total += len(batch)
+		if st := m.Stats(); st.OpenBytes > budget+400*rowCost(&row{car: make([]carriage, 2)})+64<<10 {
+			t.Fatalf("append %d: open windows hold %d bytes, budget %d", i, st.OpenBytes, budget)
+		}
 	}
-	res, err := m.Append(ctx, batch[:30])
-	if !errors.Is(err, ErrOverloaded) || res != (core.ApplyResult{}) {
-		t.Fatalf("append over the limit = %+v, %v", res, err)
+	st := m.Stats()
+	if st.SpilledWindows == 0 || st.Evictions == 0 || st.OpenRows != total {
+		t.Fatalf("stats = %+v", st)
 	}
-	ok(t, m.Commit(ctx, coretest.T0+core.Hour))
-	if st := m.Stats(); st.OpenRows != 0 {
-		t.Fatalf("open rows after commit = %d", st.OpenRows)
+	// Live reads see the newest row of every journey, also of evicted windows.
+	end := t0 + 120*core.Minute
+	compareStores(t, ctx, m, b, t0, end)
+	ok(t, m.Commit(ctx, end+core.Hour))
+	ok(t, b.Commit(ctx, end+core.Hour))
+	compareStores(t, ctx, m, b, t0, end+core.Hour)
+	if st := m.Stats(); st.OpenRows != 0 || st.OpenBytes != 0 {
+		t.Fatalf("after commit: %+v", st)
 	}
-	if _, err := m.Append(ctx, batch[:30]); err != nil {
-		t.Fatalf("append after commit: %v", err)
+	if logs, _ := filepath.Glob(filepath.Join(dir, "movers", "*", "open", "*.wal")); len(logs) != 0 {
+		t.Fatalf("logs left after commit: %v", logs)
+	}
+}
+
+// TestDifferentialEvicting is TestDifferential with an open-window budget so small that
+// almost every window is evicted and read back from its log at commit.
+func TestDifferentialEvicting(t *testing.T) {
+	ctx := context.Background()
+	for seed := int64(1); seed <= 4; seed++ {
+		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+			rng := rand.New(rand.NewSource(seed))
+			dir := t.TempDir()
+			opts := Options{SyncInterval: -1, MaxAhead: -1, MinTime: -1, OpenBytes: 4 << 10}
+			a, err := Open(dir, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { a.Close() }()
+			b := memstore.NewMovers()
+			t0 := coretest.T0 - 23*core.Hour
+			now := t0
+			for step := 0; step < 30; step++ {
+				// In time order per journey: the live payload's train bodies of evicted
+				// windows follow arrival order (open.go).
+				batch := inOrder(randomSamples(rng, now, 25*core.Minute, 40+rng.Intn(120)))
+				ra, err := a.Append(ctx, batch)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rb, _ := b.Append(ctx, batch)
+				if ra != rb {
+					t.Fatalf("step %d append: got %+v want %+v", step, ra, rb)
+				}
+				now += 25*core.Minute + core.TimeMs(rng.Int63n(int64(20*core.Minute)))
+				if rng.Intn(3) > 0 {
+					upTo := now - core.TimeMs(rng.Int63n(int64(30*core.Minute)))
+					ok(t, a.Commit(ctx, upTo))
+					b.Commit(ctx, upTo)
+				}
+				switch rng.Intn(5) {
+				case 0:
+					ok(t, a.Close())
+					if a, err = Open(dir, opts); err != nil {
+						t.Fatal(err)
+					}
+				case 1:
+					crash(a)
+					if a, err = Open(dir, opts); err != nil {
+						t.Fatal(err)
+					}
+				}
+				compareStores(t, ctx, a, b, t0, now)
+			}
+		})
 	}
 }
 
@@ -592,4 +680,30 @@ func must[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+// inOrder sorts samples by time (stable), so every journey's samples arrive in order.
+func inOrder(samples []core.MoverSample) []core.MoverSample {
+	sort.SliceStable(samples, func(i, j int) bool { return samples[i].T < samples[j].T })
+	return samples
+}
+
+// crash drops m as a killed process would: the window log files are closed without an
+// fsync or cleanup (the OS keeps what was written). m must not be used again, except
+// that writes then fail (TestWALWriteFailure).
+func crash(m *Store) {
+	if m.stop != nil {
+		close(m.stop)
+		<-m.done
+		m.stop = nil
+	}
+	m.lmu.Lock()
+	defer m.lmu.Unlock()
+	for _, s := range m.sfc {
+		for _, w := range s.open {
+			if w.log != nil && w.log.f != nil {
+				w.log.f.Close()
+			}
+		}
+	}
 }

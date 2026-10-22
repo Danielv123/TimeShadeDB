@@ -2,7 +2,9 @@ package terrain
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 
@@ -61,7 +63,7 @@ type tileSnap struct {
 func (tl *tileState) snap() tileSnap {
 	tl.mu.Lock()
 	defer tl.mu.Unlock()
-	return tileSnap{versions: tl.versions, firstT: tl.firstT, lastT: tl.lastT, hasOpen: len(tl.open) > 0, liveSeq: tl.liveSeq}
+	return tileSnap{versions: tl.versions, firstT: tl.firstT, lastT: tl.lastT, hasOpen: len(tl.open) > 0 || tl.spilled > 0, liveSeq: tl.liveSeq}
 }
 
 // state computes the tile state at t.
@@ -212,15 +214,30 @@ func (s *Store) ReadTile(ctx context.Context, key core.DatastoreKey, tile core.T
 			return nil, st, err
 		}
 		im := base.Clone()
+		// Spilled windows of the tile (spill.go) are read first; their chunks count as
+		// older arrivals than any in memory.
+		spilled, gen, err := s.liveSpills(d, tl)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, st, err
+			}
+			continue // a commit closed a spilled window and deleted its file: retry
+		}
 		tl.mu.Lock()
-		if tl.versions != sn.versions {
+		if tl.versions != sn.versions || tl.spillGen != gen {
 			// A commit published a new version (and dropped the windows it closed)
 			// after the snapshot: the overlay would miss those windows. Retry; a tile
-			// is committed at most once per commit.
+			// is committed at most once per commit. Likewise a spill that moved
+			// windows out of memory after the spilled ones were read.
 			tl.mu.Unlock()
 			continue
 		}
 		var newest [core.TileBlocks]*openChunk
+		for b, oc := range spilled {
+			if oc != nil {
+				newest[b] = oc
+			}
+		}
 		for _, win := range tl.open {
 			for b, oc := range win.chunks {
 				if cur := newest[b]; cur == nil || oc.t > cur.t || (oc.t == cur.t && oc.arrival > cur.arrival) {

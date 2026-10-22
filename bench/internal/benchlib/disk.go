@@ -63,6 +63,8 @@ func MeasureV3Disk(db string) (V3Disk, error) {
 		case len(parts) >= 3 && parts[0] == "datastores":
 			id := parts[1]
 			switch parts[2] {
+			case "open": // spilled open windows, a cache of the WAL
+				d.WAL += n
 			case "tiles":
 				d.TerrainZ0 += n
 				d.ByDatastoreZ0[id] += n
@@ -77,7 +79,9 @@ func MeasureV3Disk(db string) (V3Disk, error) {
 				d.ByDatastoreTerrain[id] += n
 			}
 		case len(parts) >= 2 && parts[0] == "movers":
-			if len(parts) >= 3 && parts[2] == "wal" {
+			// movers/<surface>/open/: the open windows' logs; movers/wal/: the single
+			// log of older stores.
+			if parts[1] == "wal" || (len(parts) >= 3 && parts[2] == "open") {
 				d.WAL += n
 			} else {
 				d.Movers += n

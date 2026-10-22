@@ -6,7 +6,8 @@
 //     palette indices (FORMAT.md 5.3), and keyframes chosen by a byte rule;
 //   - an append-only palette per datastore;
 //   - open windows in memory (the newest update per chunk and window) backed by a
-//     write-ahead log, bounded by a byte budget;
+//     write-ahead log, bounded by a byte budget beyond which whole windows are spilled
+//     to disk (spill.go);
 //   - a decoded-tile LRU bounded by bytes, and an LRU of open series (indexes) bounded
 //     by count, so memory does not grow with history.
 //
@@ -23,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,10 +80,6 @@ const decoderMaxMemory = 64 << 20
 // openChunkBytes is the accounted size of one open-window chunk entry.
 const openChunkBytes = core.ChunkPixelCount*2 + 64
 
-// ErrOverBudget is returned by Apply when the open-window buffers would go over their
-// byte budget. Nothing from the batch was applied; the caller should retry later (HTTP
-// 503). It wraps core.ErrOverloaded.
-var ErrOverBudget = fmt.Errorf("terrain: open-window budget exceeded: %w", core.ErrOverloaded)
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -95,10 +93,11 @@ type Options struct {
 	DecodedCacheBytes int64
 	// OpenWindowBytes is the budget for open-window buffers (default 64 MiB; < 0 means
 	// unlimited). Apply counts every valid update of a batch as a new open chunk (the
-	// worst case) and returns ErrOverBudget, applying nothing, when that would go over
-	// the budget. A batch is always admitted when no window is open, so the budget can
-	// be exceeded by at most one batch; callers keep batches small (WP6: at most a few
-	// thousand updates).
+	// worst case) and, when that would go over the budget, first spills whole open
+	// windows to disk, oldest first, until it fits (spill.go). It never refuses a batch
+	// for memory; the budget can be exceeded by at most one batch (callers keep batches
+	// small, WP6: at most a few thousand updates) plus what cannot be spilled (windows a
+	// commit is closing).
 	OpenWindowBytes int64
 	// MaxOpenSeries bounds the idle series (indexes and file handles) kept open
 	// (default 256).
@@ -186,6 +185,7 @@ type Store struct {
 
 	openBytes atomic.Int64
 	reserved  atomic.Int64 // worst-case bytes of batches being applied
+	spillMu   sync.Mutex   // one spill at a time
 	stats     counters
 
 	stopSync chan struct{}
@@ -197,6 +197,7 @@ var _ core.TerrainStore = (*Store)(nil)
 type counters struct {
 	deltas, keyframes, recordBytes atomic.Uint64
 	commits, late, accepted        atomic.Uint64
+	spills, spilledBytes           atomic.Uint64
 }
 
 // dsState is one datastore.
@@ -220,6 +221,8 @@ type dsState struct {
 	hasData      bool
 	arrival      uint64
 	tiles        map[core.TileCoord]*tileState
+	// spills are the windows spilled to disk (spill.go), by start.
+	spills map[core.TimeMs]*spillWin
 
 	commitMu sync.Mutex
 	pal      *palette
@@ -242,6 +245,10 @@ type tileState struct {
 	// Open windows: window start -> chunks. nil when there are none.
 	open    map[core.TimeMs]*openWindow
 	liveSeq uint64
+	// spilled counts the spilled windows that hold chunks of this tile (spill.go);
+	// spillGen counts the spills that moved chunks of it out of memory.
+	spilled  int
+	spillGen uint64
 }
 
 type openWindow struct {
@@ -453,6 +460,7 @@ func newDS(key core.DatastoreKey, dir string, w core.TimeMs) *dsState {
 		applyHorizon: noHorizon,
 		horizon:      noHorizon,
 		tiles:        map[core.TileCoord]*tileState{},
+		spills:       map[core.TimeMs]*spillWin{},
 	}
 }
 
@@ -495,6 +503,9 @@ func (s *Store) loadDS(id string) (d *dsState, err error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
+	if err := clearSpills(dir); err != nil {
+		return nil, err
+	}
 	if d.pal, err = openPalette(filepath.Join(dir, "palette.bin"), s.opt.NoSync); err != nil {
 		return nil, err
 	}
@@ -528,7 +539,8 @@ func (s *Store) loadDS(id string) (d *dsState, err error) {
 		if d.wal, err = openWAL(filepath.Join(dir, "wal"), s.opt.NoSync); err != nil {
 			return nil, err
 		}
-		var palErr error
+		var palErr, spillErr error
+		lim := s.opt.OpenWindowBytes
 		err := d.wal.replay(s.dec, s.opt.Logf, func(ups []walUpdate) {
 			for i := range ups {
 				u := &ups[i]
@@ -542,9 +554,16 @@ func (s *Store) loadDS(id string) (d *dsState, err error) {
 				}
 				s.acceptLocked(d, tc, block, u.t, u.deleted, &u.px)
 			}
+			// The replay keeps the newest windows in memory and spills the oldest.
+			if lim > 0 && s.openBytes.Load() > lim && spillErr == nil {
+				spillErr = s.spill(lim*3/4, d)
+			}
 		})
 		if err == nil {
 			err = palErr
+		}
+		if err == nil {
+			err = spillErr
 		}
 		if err != nil {
 			return nil, fmt.Errorf("wal: %w", err)
@@ -710,13 +729,17 @@ func (s *Store) Apply(ctx context.Context, updates []core.ChunkUpdate) (core.App
 		return res, nil
 	}
 	// Budget: count every update as a new open chunk (the worst case) and reserve that
-	// until the batch is applied, so concurrent batches cannot overshoot together.
+	// until the batch is applied, so concurrent batches cannot overshoot together. Over
+	// the budget, spill the oldest open windows to disk first (to three quarters of it,
+	// so the next batches do not spill again at once).
 	if lim := s.opt.OpenWindowBytes; lim > 0 {
 		need := int64(len(valid)) * openChunkBytes
 		used := s.reserved.Add(need)
 		defer s.reserved.Add(-need)
-		if inUse := s.openBytes.Load() + used - need; inUse > 0 && inUse+need > lim {
-			return core.ApplyResult{}, ErrOverBudget
+		if s.openBytes.Load()+used > lim {
+			if err := s.spill(lim*3/4-used, nil); err != nil {
+				return core.ApplyResult{}, err
+			}
 		}
 	}
 	// Group by datastore, keeping their order.
@@ -900,11 +923,14 @@ func (s *Store) Commit(ctx context.Context, upTo core.TimeMs) error {
 	return first
 }
 
-// closingTile is one tile's windows to close in a commit.
+// closingTile is one tile's windows to close in a commit: per window start the
+// in-memory window (nil when it has none) and the spilled window (nil when it was not
+// spilled), merged by commitTile.
 type closingTile struct {
 	tl      *tileState
 	starts  []core.TimeMs
 	windows []*openWindow
+	spills  []*spillWin
 }
 
 func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) error {
@@ -920,6 +946,12 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 		d.applyHorizon = newH
 	}
 	var work []closingTile
+	var closedSpills []core.TimeMs
+	for ws := range d.spills {
+		if ws < newH {
+			closedSpills = append(closedSpills, ws)
+		}
+	}
 	for _, tl := range d.tiles {
 		tl.mu.Lock()
 		var ct closingTile
@@ -927,6 +959,22 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 			if ws < newH {
 				ct.starts = append(ct.starts, ws)
 				ct.windows = append(ct.windows, win)
+				ct.spills = append(ct.spills, nil)
+			}
+		}
+		if tl.spilled > 0 {
+			for _, ws := range closedSpills {
+				sp := d.spills[ws]
+				if len(sp.frames[tl.coord]) == 0 {
+					continue
+				}
+				if i := slices.Index(ct.starts, ws); i >= 0 {
+					ct.spills[i] = sp
+				} else {
+					ct.starts = append(ct.starts, ws)
+					ct.windows = append(ct.windows, nil)
+					ct.spills = append(ct.spills, sp)
+				}
 			}
 		}
 		tl.mu.Unlock()
@@ -973,6 +1021,17 @@ func (s *Store) commitDS(ctx context.Context, d *dsState, upTo core.TimeMs) erro
 		return err
 	}
 	s.stats.commits.Add(1)
+	if len(closedSpills) > 0 {
+		d.mu.Lock()
+		for _, ws := range closedSpills {
+			if err := os.Remove(d.spills[ws].path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				// A live read may still have it open (Windows); Open deletes it.
+				s.opt.Logf("terrain: removing spill %s: %v", d.spills[ws].path, err)
+			}
+			delete(d.spills, ws)
+		}
+		d.mu.Unlock()
+	}
 	if d.wal != nil {
 		if err := d.wal.rotate(newH); err != nil {
 			return err
@@ -1006,6 +1065,7 @@ func (b byStart) Less(i, j int) bool { return b.starts[i] < b.starts[j] }
 func (b byStart) Swap(i, j int) {
 	b.starts[i], b.starts[j] = b.starts[j], b.starts[i]
 	b.windows[i], b.windows[j] = b.windows[j], b.windows[i]
+	b.spills[i], b.spills[j] = b.spills[j], b.spills[i]
 }
 
 // commitTile writes one tile's closed windows and publishes the result. Only the
@@ -1047,8 +1107,13 @@ func (s *Store) commitTile(d *dsState, ct *closingTile) (err error) {
 		tl.sinceBase, tl.bytesSinceBase, tl.refLen = sinceBase, bytesSinceBase, refLen
 		removed := 0
 		for i := 0; i < written; i++ {
-			removed += len(ct.windows[i].chunks)
-			delete(tl.open, ct.starts[i])
+			if ct.windows[i] != nil {
+				removed += len(ct.windows[i].chunks)
+				delete(tl.open, ct.starts[i])
+			}
+			if ct.spills[i] != nil {
+				tl.spilled--
+			}
 		}
 		if len(tl.open) == 0 {
 			tl.open = nil
@@ -1068,6 +1133,11 @@ func (s *Store) commitTile(d *dsState, ct *closingTile) (err error) {
 			continue
 		}
 		win := ct.windows[wi]
+		if sp := ct.spills[wi]; sp != nil {
+			if win, err = s.mergedWindow(sp, tl.coord, win); err != nil {
+				return err
+			}
+		}
 		blocks := make([]int, 0, len(win.chunks))
 		for b := range win.chunks {
 			blocks = append(blocks, int(b))
@@ -1213,7 +1283,11 @@ type Stats struct {
 	Commits           uint64
 	Accepted, Late    uint64
 	WALBytes          int64
-	Series            series.Stats
+	// Spills counts open windows written to spill files, SpilledBytes their accounted
+	// memory; SpilledWindows is the open windows spilled now.
+	Spills, SpilledBytes uint64
+	SpilledWindows       int
+	Series               series.Stats
 }
 
 // Stats returns current counters.
@@ -1229,6 +1303,8 @@ func (s *Store) Stats() Stats {
 		Commits:           s.stats.commits.Load(),
 		Accepted:          s.stats.accepted.Load(),
 		Late:              s.stats.late.Load(),
+		Spills:            s.stats.spills.Load(),
+		SpilledBytes:      s.stats.spilledBytes.Load(),
 		Series:            s.series.Stats(),
 	}
 	s.mu.RLock()
@@ -1237,6 +1313,7 @@ func (s *Store) Stats() Stats {
 	for _, d := range s.ds {
 		d.mu.RLock()
 		st.Tiles += len(d.tiles)
+		st.SpilledWindows += len(d.spills)
 		d.mu.RUnlock()
 		if d.wal != nil {
 			st.WALBytes += d.wal.size()
