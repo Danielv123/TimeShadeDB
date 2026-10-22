@@ -45,9 +45,6 @@ type row struct {
 	body []core.RailPiece
 }
 
-// rowBytes is the approximate heap cost of one row without carriages, for budgets.
-const rowBytes = 120
-
 // railRow is what core.RailBody needs of r.
 func (r *row) railRow() core.RailRow {
 	return core.RailRow{T: r.t, X: float64(r.x) / core.PosUnits, Y: float64(r.y) / core.PosUnits,

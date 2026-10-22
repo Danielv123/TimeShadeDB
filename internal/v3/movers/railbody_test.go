@@ -221,3 +221,60 @@ func BenchmarkAppendRail(b *testing.B) { benchRail(b, false) }
 
 // BenchmarkAppendRailPlain: the same rows without the rail fields.
 func BenchmarkAppendRailPlain(b *testing.B) { benchRail(b, true) }
+
+// TestRailBodiesReopenAtKeyframe reopens the store just after it wrote a keyframe, so the
+// live trail reaches back before the keyframe it rebuilds from, and checks that the first
+// rows from before the keyframe still carry their bodies (and equal memstore's).
+func TestRailBodiesReopenAtKeyframe(t *testing.T) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(7))
+	t0 := coretest.T0 - 20*core.Minute
+	all, bodies := railJourneys(rng, t0, 600) // to T0 + 20 min
+	samples := map[string]map[core.TimeMs]core.MoverSample{}
+	var upTo []core.MoverSample
+	for _, s := range all {
+		if samples[s.Meta.ID] == nil {
+			samples[s.Meta.ID] = map[core.TimeMs]core.MoverSample{}
+		}
+		samples[s.Meta.ID][s.T] = s
+		if s.T <= coretest.T0+30*core.Second {
+			upTo = append(upTo, s)
+		}
+	}
+	sort.Slice(upTo, func(i, j int) bool { return upTo[i].T < upTo[j].T })
+	dir := t.TempDir()
+	opts := Options{SyncInterval: -1, MaxAhead: -1, MaxBehind: -1}
+	a, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := memstore.NewMovers()
+	if _, err := a.Append(ctx, upTo); err != nil {
+		t.Fatal(err)
+	}
+	b.Append(ctx, upTo)
+	if err := a.Commit(ctx, coretest.T0); err != nil {
+		t.Fatal(err)
+	}
+	b.Commit(ctx, coretest.T0)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = Open(dir, opts); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	with := 0
+	for now := coretest.T0 + 5*core.Second; now <= coretest.T0+30*core.Second; now += 5 * core.Second {
+		l, err := a.Live(ctx, coretest.SFC, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		with += checkBodies(t, fmt.Sprintf("live at %d", now), l, samples, bodies)
+		lb, _ := b.Live(ctx, coretest.SFC, now)
+		sameWindow(t, fmt.Sprintf("live at %d", now), l, lb)
+	}
+	if with == 0 {
+		t.Fatal("no live row with a body")
+	}
+}

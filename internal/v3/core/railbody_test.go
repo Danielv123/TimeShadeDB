@@ -164,3 +164,36 @@ func TestRailWithBody(t *testing.T) {
 		t.Fatal(fmt.Sprint(len(got), got[0], got[len(got)-1]))
 	}
 }
+
+// TestRailBodyRepeats: a row given again (a retried sample) repeats and gets the same body;
+// a row at the same time with anything RailBody reads changed does not repeat.
+func TestRailBodyRepeats(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	meta := coretest.Train
+	meta.Carriages = 20
+	tr := coretest.NewRailTrack(rng, 3000, 2)
+	run := tr.Run(rng, coretest.SFC, meta, coretest.T0, 160, 6, 100, 30)
+	var rb core.RailBody
+	if rb.Repeats(railRowOf(run.Samples[0])) {
+		t.Fatal("an empty RailBody repeats a row")
+	}
+	for i, s := range run.Samples {
+		r := railRowOf(s)
+		body := rb.Add(r)
+		if !rb.Repeats(r) {
+			t.Fatalf("sample %d does not repeat itself", i)
+		}
+		if again := rb.Add(r); !samePieces(again, body) {
+			t.Fatalf("sample %d again: body %v, first %v", i, again, body)
+		}
+		moved := r
+		moved.X += 0.5
+		extra := r
+		extra.Rail = append(append([]core.RailPiece(nil), r.Rail...), core.RailPiece{X: 1, Y: 2, Kind: core.RailKindRamp})
+		later := r
+		later.T++
+		if rb.Repeats(moved) || rb.Repeats(extra) || rb.Repeats(later) {
+			t.Fatalf("sample %d: a changed row repeats", i)
+		}
+	}
+}

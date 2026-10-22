@@ -1,6 +1,9 @@
 package core
 
-import "math"
+import (
+	"math"
+	"slices"
+)
 
 // Train bodies on the rail path (docs/v3/RAIL-GEOMETRY.md 8.2). A rail path row lists only the
 // curved pieces and ramps the leading joint entered since the row before, so a viewer that
@@ -32,8 +35,10 @@ const (
 // leading joint on a ramp's slope, pitches measured a little longer than 7, rounding.
 const railBodySlack = 4
 
-// railMaxKept bounds the pieces a RailBody keeps.
-const railMaxKept = 4096
+// railMaxKept bounds the pieces a RailBody keeps: enough for the longest body a row can
+// carry (MaxRailPieces with its own pieces) and the pieces under the train that capture
+// resends (at most 120, PROTOCOL.md), whatever the carriage count claims.
+const railMaxKept = MaxRailPieces + 128
 
 // railSym is the 8-fold placement of RAIL-GEOMETRY.md 2.1 applied to an offset.
 func railSym(i8 uint8, x, y int32) (int32, int32) {
@@ -181,11 +186,13 @@ type RailBody struct {
 	// the exit end of the last piece and the rail distance there
 	ex   railEnd
 	uEnd float64
-	// the previous row: its time, whether it was a stop sample, and its body
+	// the previous row: its time, whether it was a stop sample, its body, and the row itself
+	// (for Repeats)
 	has      bool
 	lastT    TimeMs
 	stopped  bool
 	lastBody []RailPiece
+	lastRow  RailRow
 }
 
 // Clone returns an independent copy of b (later calls on either do not affect the other).
@@ -209,7 +216,7 @@ func (b *RailBody) Add(r RailRow) []RailPiece {
 		return nil
 	}
 	body := b.add(r)
-	b.has, b.lastT, b.lastBody = true, r.T, body
+	b.has, b.lastT, b.lastBody, b.lastRow = true, r.T, body, r
 	b.stopped = r.Flags&(FlagRail|FlagStop|FlagGone) == FlagRail|FlagStop
 	return body
 }
@@ -224,8 +231,17 @@ func (b *RailBody) Seed(r RailRow) {
 	if r.Flags&FlagRail != 0 && r.Flags&FlagGone == 0 {
 		b.start(r)
 	}
-	b.has, b.lastT, b.lastBody = true, r.T, nil
+	b.has, b.lastT, b.lastBody, b.lastRow = true, r.T, nil, r
 	b.stopped = r.Flags&FlagStop != 0
+}
+
+// Repeats reports whether r is the row last given to Add or Seed again: the same time and
+// everything RailBody reads of it, so Add gives it the same body and changes nothing (a
+// retried sample). The row's Rail must not have been modified since.
+func (b *RailBody) Repeats(r RailRow) bool {
+	l := &b.lastRow
+	return b.has && r.T == b.lastT && r.X == l.X && r.Y == l.Y && r.Orientation == l.Orientation &&
+		r.Flags == l.Flags && r.RailStart == l.RailStart && r.Carriages == l.Carriages && slices.Equal(r.Rail, l.Rail)
 }
 
 func (b *RailBody) reset() {

@@ -430,21 +430,23 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 
 // openBody gives r, a row about to join s.open, its body from its journey's RailBody over
 // the open rows (orails). A row at or before the journey's previous open row arrived out of
-// time order: its journey is noted in redo for rebody, and its body waits for that.
+// time order: its journey is noted in redo for rebody, and its body waits for that. A
+// repeat of the previous row (a retried sample) needs no redo.
 func (s *surface) openBody(r *row, redo map[*surface]map[string]bool) {
 	r.body = nil
 	if r.meta.Kind != core.KindTrain || redo[s][r.meta.ID] {
 		return
 	}
 	b := s.orails.get(r.meta.ID, s.rails)
-	if t, ok := b.Last(); ok && r.t <= t {
+	rr := r.railRow()
+	if t, ok := b.Last(); ok && r.t <= t && !b.Repeats(rr) {
 		if redo[s] == nil {
 			redo[s] = map[string]bool{}
 		}
 		redo[s][r.meta.ID] = true
 		return
 	}
-	r.body = b.Add(r.railRow())
+	r.body = b.Add(rr)
 }
 
 // rebody gives the open rows of the journeys in ids their bodies again, from the state at
@@ -994,9 +996,19 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 		from = h
 		break
 	}
-	// Windows before the keyframe are read only for the trail.
+	// Windows before the keyframe are read only for the trail. Their rows take their bodies
+	// from the keyframe before them, as the store that wrote them gave them (only when the
+	// trail reaches back past the keyframe, just after one was written).
 	cut := s.horizon - core.LiveTrail
 	start := min(from, core.WindowStart(cut+1, core.MoverWindowLen))
+	pre := rails{}
+	if start < from {
+		pk := core.WindowStart(start, core.MoverKeyframeEvery)
+		if w, err := s.readWindow(s.keyframePath(pk)); err == nil {
+			pre = seedRails(w)
+		}
+		start = max(pk, core.WindowStart(s.first, core.MoverWindowLen))
+	}
 	for ws := start; ws < s.horizon; ws += core.MoverWindowLen {
 		if !s.hasWindow(ws) {
 			continue
@@ -1017,11 +1029,15 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 			r := rowFromCore(s.intern(&w.Movers[w.Rows[i].Mover]), &w.Rows[i])
 			rows[i] = &r
 		}
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].t < rows[j].t })
+		rs := pre
 		if ws >= from {
-			sort.SliceStable(rows, func(i, j int) bool { return rows[i].t < rows[j].t })
-			for _, r := range rows {
-				s.rails.add(r, nil)
-			}
+			rs = s.rails
+		}
+		for _, r := range rows {
+			rs.add(r, nil)
+		}
+		if ws >= from {
 			advance(s.live, rows)
 		}
 		for _, r := range rows {
