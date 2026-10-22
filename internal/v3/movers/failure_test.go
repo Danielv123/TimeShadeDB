@@ -2,6 +2,7 @@ package movers
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,44 +39,112 @@ func liveX(w *core.MoverWindow) map[string]float64 {
 	return out
 }
 
-// TestWALRewriteFailure: a failed rewrite must not change the meta numbering that later
-// appends use, or replay gives their samples to another journey.
-func TestWALRewriteFailure(t *testing.T) {
+// TestCrashAroundCommit: a crash after a commit wrote meta.json but before it deleted the
+// logs of the windows it closed, and a crash in a commit that failed before meta.json,
+// both reopen to the state of a store that never crashed.
+func TestCrashAroundCommit(t *testing.T) {
+	ctx := context.Background()
+	T0, W := coretest.T0, core.MoverWindowLen
+	for _, mode := range []string{"after-meta", "before-meta"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			m, err := Open(dir, Options{SyncInterval: -1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := memstore.NewMovers()
+			a, b := mover("a"), mover("b")
+			batch := []core.MoverSample{at(a, T0+1000, 1), at(b, T0+1500, 2), at(b, T0+W+1000, 2), at(a, T0+W+2000, 3)}
+			mustAppend(t, m, batch)
+			ref.Append(ctx, batch)
+			sfcDir := filepath.Join(dir, "movers", failSFC.ID())
+			log0 := filepath.Join(sfcDir, "open", timeName(T0)+".wal")
+			saved, err := os.ReadFile(log0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "before-meta" {
+				blocker := filepath.Join(sfcDir, "meta.json.tmp")
+				if err := os.MkdirAll(blocker, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.Commit(ctx, T0+W); err == nil {
+					t.Fatal("commit with an unwritable meta.json succeeded")
+				}
+				os.Remove(blocker)
+			} else {
+				ok(t, m.Commit(ctx, T0+W))
+				ref.Commit(ctx, T0+W)
+				// The crash came before the closed window's log was deleted.
+				if err := os.WriteFile(log0, saved, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			crash(m)
+			c, err := Open(dir, Options{SyncInterval: -1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if _, err := os.Stat(log0); mode == "after-meta" && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("log of a committed window kept: %v", err)
+			}
+			if mode == "before-meta" {
+				ref.Commit(ctx, T0+W)
+			}
+			ok(t, c.Commit(ctx, T0+W))
+			compareStores(t, ctx, c, ref, T0, T0+W)
+			ok(t, c.Commit(ctx, T0+3*W))
+			ref.Commit(ctx, T0+3*W)
+			compareStores(t, ctx, c, ref, T0, T0+3*W)
+		})
+	}
+}
+
+// TestMigrateSingleWAL: a database written by a store with the single-file WAL
+// (movers/wal/wal.log) opens with its open rows moved into the window logs.
+func TestMigrateSingleWAL(t *testing.T) {
 	ctx := context.Background()
 	T0, W := coretest.T0, core.MoverWindowLen
 	dir := t.TempDir()
+	rows := []core.MoverSample{at(mover("a"), T0+1000, 1), at(mover("b"), T0+W+1500, 2), at(mover("a"), T0+2*W+1000, 3)}
+	// The old log format: one frame with the rows of every open window.
+	entries := make([]walEntry, len(rows))
+	for i := range rows {
+		r, _ := makeRow(&rows[i], &rows[i].Meta, 0)
+		entries[i] = walEntry{sfc: failSFC, r: &r}
+	}
+	next := uint64(1)
+	buf, fs := encodeEntries(make([]byte, 8), 0, entries, map[walMetaKey]uint64{}, &next, nil)
+	frame(buf[fs:])
+	walDir := filepath.Join(dir, "movers", "wal")
+	if err := os.MkdirAll(walDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(walDir, "wal.log"), buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	m, err := Open(dir, Options{SyncInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, b := mover("a"), mover("b")
-	// In the log: a = 1, b = 2. Only b keeps an open row after the commit.
-	mustAppend(t, m, []core.MoverSample{at(a, T0+1000, 1), at(b, T0+1500, 2), at(b, T0+W+1000, 2)})
-	tmp := filepath.Join(dir, "movers", "wal", "wal.log.tmp")
-	if err := os.Mkdir(tmp, 0o755); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(walDir, "wal.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old WAL kept: %v", err)
 	}
-	if err := m.Commit(ctx, T0+W); err == nil {
-		t.Fatal("commit with an unwritable WAL rewrite succeeded")
+	if logs, _ := filepath.Glob(filepath.Join(dir, "movers", failSFC.ID(), "open", "*.wal")); len(logs) != 3 {
+		t.Fatalf("window logs = %v", logs)
 	}
-	// The old log is still in use: b's next sample must reference b's number in it.
-	if res, err := m.Append(ctx, []core.MoverSample{at(b, T0+W+2000, 3)}); err != nil || res.Accepted != 1 {
-		t.Fatalf("append after a failed rewrite = %+v, %v", res, err)
-	}
-	m.wal.f.Close() // crash: no Close
-	os.Remove(tmp)
+	crash(m)
 	c, err := Open(dir, Options{SyncInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	w, err := c.Live(ctx, failSFC, T0+W+3000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := liveX(w); got["b"] != 3 || got["a"] != 1 {
-		t.Fatalf("live after replay = %v, want a at 1 and b at 3", got)
-	}
+	ref := memstore.NewMovers()
+	ref.Append(ctx, rows)
+	ok(t, c.Commit(ctx, T0+3*W))
+	ref.Commit(ctx, T0+3*W)
+	compareStores(t, ctx, c, ref, T0, T0+3*W)
 }
 
 // TestWALWriteFailure: when the WAL write fails nothing is applied, and later appends
@@ -85,7 +154,7 @@ func TestWALWriteFailure(t *testing.T) {
 	m, _ := openTemp(t, Options{SyncInterval: -1})
 	defer m.Close()
 	mustAppend(t, m, []core.MoverSample{at(mover("a"), coretest.T0+1000, 1)})
-	m.wal.f.Close() // every later write fails
+	crash(m) // every later write to the window's log fails
 	for i := 0; i < 2; i++ {
 		res, err := m.Append(ctx, []core.MoverSample{at(mover("b"), coretest.T0+2000, 2)})
 		if err == nil || res != (core.ApplyResult{}) {
@@ -226,8 +295,9 @@ func TestDamagedFiles(t *testing.T) {
 	}
 }
 
-// TestClockBounds: samples far ahead of the clock are Invalid, samples far behind it on
-// a surface without a horizon are Late, and rows accepted before there was a clock are
+// TestClockBounds: samples far ahead of the clock are Invalid, samples before MinTime are
+// Invalid, any time in between is accepted (however old: a backlog after a long
+// downtime), and windows accepted before there was a clock that start far ahead of it are
 // dropped by the first Commit.
 func TestClockBounds(t *testing.T) {
 	ctx := context.Background()
@@ -235,7 +305,7 @@ func TestClockBounds(t *testing.T) {
 	const century = 100 * 365 * core.Day
 
 	t.Run("AfterCommit", func(t *testing.T) {
-		m, _ := openTemp(t, Options{SyncInterval: -1, MaxOpenRows: 10})
+		m, _ := openTemp(t, Options{SyncInterval: -1})
 		defer m.Close()
 		ok(t, m.Commit(ctx, T0))
 		future := make([]core.MoverSample, 10)
@@ -253,12 +323,27 @@ func TestClockBounds(t *testing.T) {
 		if res, err := m.Append(ctx, normal); err != nil || res.Accepted != 10 {
 			t.Fatalf("append after future samples = %+v, %v", res, err)
 		}
-		// A new surface cannot start far behind the clock.
+		ok(t, m.Commit(ctx, T0+W))
+		// A new surface can start far behind the clock (a backlog), but not before MinTime.
 		old := at(mover("o"), T0-90*core.Day, 1)
 		old.Surface = core.SurfaceKey{Map: "gw-b.1", Surface: "nauvis"}
+		ancient := old
+		ancient.T = DefaultMinTime - 1
+		if res, err := m.Append(ctx, []core.MoverSample{old, ancient}); err != nil || res.Accepted != 1 || res.Invalid != 1 || m.Stats().Behind != 1 {
+			t.Fatalf("old samples on a new surface = %+v, %v", res, err)
+		}
+		// Its first commit writes at most MaxKeyframesPerCommit keyframes; the horizon
+		// catches up over the next commits.
 		ok(t, m.Commit(ctx, T0+W))
-		if res, err := m.Append(ctx, []core.MoverSample{old}); err != nil || res.Late != 1 || m.Stats().Behind != 1 {
-			t.Fatalf("old sample on a new surface = %+v, %v", res, err)
+		info, _ := m.Surfaces(ctx)
+		var h core.TimeMs
+		for _, si := range info {
+			if si.Key == old.Surface {
+				h = si.Horizon
+			}
+		}
+		if want := core.WindowStart(old.T, core.Hour) + MaxKeyframesPerCommit*core.Hour; h != want {
+			t.Fatalf("horizon after the first commit = %d, want %d", h, want)
 		}
 	})
 
@@ -266,7 +351,7 @@ func TestClockBounds(t *testing.T) {
 		m, _ := openTemp(t, Options{SyncInterval: -1})
 		defer m.Close()
 		res, err := m.Append(ctx, []core.MoverSample{at(mover("f"), T0+century, 1), at(mover("o"), 1000, 1), at(mover("n"), T0+1000, 1)})
-		if err != nil || res.Accepted != 3 {
+		if err != nil || res.Accepted != 2 || res.Invalid != 1 {
 			t.Fatalf("append = %+v, %v", res, err)
 		}
 		ok(t, m.Commit(ctx, T0+W))
@@ -284,7 +369,7 @@ func TestClockBounds(t *testing.T) {
 		m, _ := openTemp(t, Options{SyncInterval: -1, Clock: func() core.TimeMs { return T0 }})
 		defer m.Close()
 		res, err := m.Append(ctx, []core.MoverSample{at(mover("f"), T0+2*core.Hour, 1), at(mover("o"), T0-2*core.Day, 1), at(mover("n"), T0+1000, 1)})
-		if err != nil || res.Accepted != 1 || res.Invalid != 1 || res.Late != 1 {
+		if err != nil || res.Accepted != 2 || res.Invalid != 1 || res.Late != 0 {
 			t.Fatalf("append with a clock = %+v, %v", res, err)
 		}
 	})

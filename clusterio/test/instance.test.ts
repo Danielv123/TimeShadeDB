@@ -1,6 +1,9 @@
 import { mock, test } from "node:test";
 import assert from "node:assert/strict";
-import loadInstancePlugin, { BATCH_MS, MAX_EVENT_BYTES } from "../instance.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import loadInstancePlugin, { BATCH_MS, HEARTBEAT_MS, MAX_EVENT_BYTES, MAX_PENDING_BYTES } from "../instance.js";
 import { fakeInstanceContext } from "./fakes.js";
 
 const tile = { world: "w1", x: 1, y: -2, size: 512, surface: "a\"b\\c'd\ne" };
@@ -94,12 +97,31 @@ test("a gridworld.tile change, a rails change and a new controller session recon
 		assert.equal(f.sent[0].envelopes[0].map, "gw-w1");
 	}));
 
-test("the exit sends what waits; a big backlog leaves in events of about 1 MiB; a failed send is retried", () => withTimers(async () => {
+test("idle: a caught_up envelope per map every HEARTBEAT_MS; none before the first envelope", () => withTimers(async () => {
+	const f = fakeInstanceContext(7, { "gridworld.tile": tile });
+	await loadInstancePlugin(f.context);
+	mock.timers.tick(3 * HEARTBEAT_MS);
+	assert.equal(f.sent.length, 0, "nothing before Lua sent anything");
+	await f.ipc({ v: 1, tick: 40, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: 0, y: 0, d: "eJzt" }] });
+	mock.timers.tick(BATCH_MS);
+	assert.equal(f.sent.length, 1);
+	mock.timers.tick(HEARTBEAT_MS - BATCH_MS);
+	assert.equal(f.sent.length, 1, "not before HEARTBEAT_MS without sending");
+	mock.timers.tick(BATCH_MS);
+	assert.equal(f.sent.length, 2);
+	assert.deepEqual(f.sent[1].envelopes.map((e: any) => [e.map, e.tick, e.caught_up, e.ended, e.msgs.length]),
+		[["gw-w1", 40, true, undefined, 0], ["i-7", 40, true, undefined, 0]]);
+	mock.timers.tick(HEARTBEAT_MS);
+	assert.equal(f.sent.length, 3, "again while idle");
+}));
+
+test("the exit sends what waits, then ended envelopes; a big backlog leaves in events of about 1 MiB; a failed send is retried", () => withTimers(async () => {
 	const f = fakeInstanceContext(5);
 	await loadInstancePlugin(f.context);
 	await f.ipc({ v: 1, tick: 1, msgs: [{ type: "adopt", j: "a", trace: "b" }] });
 	await f.call("exit");
 	assert.equal(f.sent.length, 1);
+	assert.deepEqual(f.sent[0].envelopes.map((e: any) => [e.map, e.caught_up, e.ended]), [["i-5", undefined, undefined], ["i-5", true, true]]);
 
 	const g = fakeInstanceContext(6);
 	let fail = true;
@@ -125,4 +147,34 @@ test("the exit sends what waits; a big backlog leaves in events of about 1 MiB; 
 		assert.ok(JSON.stringify(event.envelopes).length <= MAX_EVENT_BYTES + 4096);
 	}
 	assert.deepEqual(g.sent.flatMap((e: any) => e.envelopes.map((x: any) => x.tick)), [...Array(1000).keys()], "in order");
+}));
+
+test("a long controller outage: envelopes past MAX_PENDING_BYTES wait on disk, survive a host restart and go in order", () => withTimers(async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tsp-"));
+	const g = fakeInstanceContext(8);
+	g.instance.sendTo = () => {
+		throw new Error("not connected");
+	};
+	await loadInstancePlugin(g.context, { spoolDir: dir });
+	const d = "x".repeat(200_000);
+	const n = Math.ceil(MAX_PENDING_BYTES / 200_000) + 40;
+	for (let i = 0; i < n; i++) {
+		await g.ipc({ v: 1, tick: i, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: i, y: 0, d }] });
+	}
+	mock.timers.tick(BATCH_MS);
+	assert.ok(!g.lines.some(l => l.message === "timeshade.forward dropped"), "nothing dropped");
+	await g.call("exit"); // the host stops while the controller is still away
+	// The next start sends everything in order, then goes on.
+	const h = fakeInstanceContext(8);
+	await loadInstancePlugin(h.context, { spoolDir: dir });
+	await h.ipc({ v: 1, tick: n, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: n, y: 0, d: "eJzt" }] });
+	for (let i = 0; i < 20; i++) {
+		mock.timers.tick(BATCH_MS);
+	}
+	const ticks = h.sent.flatMap((e: any) => e.envelopes.filter((x: any) => x.msgs.length > 0).map((x: any) => x.tick));
+	assert.deepEqual(ticks, [...Array(n + 1).keys()]);
+	const ended = h.sent.flatMap((e: any) => e.envelopes).filter((x: any) => x.ended);
+	assert.equal(ended.length, 1, "the first run's ended envelope, after its data");
+	assert.deepEqual(fs.readdirSync(dir), [], "sent segments are deleted");
+	fs.rmSync(dir, { recursive: true, force: true });
 }));

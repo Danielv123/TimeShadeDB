@@ -86,10 +86,14 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 		sidecar.start();
 	};
 
+	// Past timeshade.queue_mb the queue continues on disk next to the controller's database, and what it holds when the
+	// controller stops is sent after the next start.
 	const queue = new IngestQueue({
 		target: () => (sidecar.url ? { url: sidecar.url, token: ingestToken } : undefined),
 		logger,
 		maxQueueBytes: controller.config.get("timeshade.queue_mb") * 1024 * 1024,
+		spoolDir: path.resolve(controller.config.get("controller.database_directory"), "timeshade-queue"),
+		maxDiskBytes: controller.config.get("timeshade.queue_disk_mb") * 1024 * 1024,
 		...options.queue,
 	});
 
@@ -205,8 +209,8 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 			queue.setMaxQueueBytes(controller.config.get("timeshade.queue_mb") * 1024 * 1024);
 		}
 	});
-	// Clusterio waits up to 15 s for this hook: up to 3 s to hand over what is queued, then the sidecar stops (its
-	// stdin closes; it is killed after 10 s).
+	// Clusterio waits up to 15 s for this hook: up to 3 s to hand over what is queued (the rest stays on disk for the
+	// next start), then the sidecar stops (its stdin closes; it is killed after 10 s).
 	controller.hooks.shutdown.attach(plugin.name, async () => {
 		clearInterval(mapsTimer);
 		await queue.drain(3000);

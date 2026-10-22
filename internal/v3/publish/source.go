@@ -155,11 +155,15 @@ func (h *HTTPSource) Get(ctx context.Context, path string) (Resource, error) {
 			last = err
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
+		body, err := io.ReadAll(io.LimitReader(res.Body, maxRawResponse+1))
 		res.Body.Close()
 		if err != nil {
 			last = err
 			continue
+		}
+		if len(body) > maxRawResponse {
+			// Never store a truncated object: the item fails (and is tried again next round).
+			return Resource{}, fmt.Errorf("get %s: response over %d bytes", path, maxRawResponse)
 		}
 		if res.StatusCode >= 500 {
 			last = fmt.Errorf("get %s: status %d", path, res.StatusCode)
@@ -193,7 +197,14 @@ func response(path string, status int, h http.Header, body []byte) (Resource, er
 	return Resource{Body: raw, ContentType: ct}, nil
 }
 
-var zdec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0), zstd.WithDecoderMaxMemory(256<<20))
+// maxRawResponse and maxDecoded bound one response as sent and once its Content-Encoding is removed. A response past
+// them fails its item; it is never stored truncated.
+const (
+	maxRawResponse = 64 << 20
+	maxDecoded     = 256 << 20
+)
+
+var zdec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0), zstd.WithDecoderMaxMemory(maxDecoded))
 
 // decode removes a Content-Encoding.
 func decode(enc string, b []byte) ([]byte, error) {
@@ -205,7 +216,11 @@ func decode(enc string, b []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return io.ReadAll(io.LimitReader(r, 256<<20))
+		out, err := io.ReadAll(io.LimitReader(r, maxDecoded+1))
+		if err == nil && len(out) > maxDecoded {
+			err = fmt.Errorf("body over %d bytes decoded", maxDecoded)
+		}
+		return out, err
 	case "zstd":
 		return zdec.DecodeAll(b, nil)
 	}

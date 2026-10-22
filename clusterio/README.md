@@ -48,7 +48,8 @@ viewer config sets `base: "./"`). Otherwise the viewer cannot load its scripts u
 | `timeshade.binary_path` | unset | The timeshadedb executable. Unset: `TIMESHADEDB_BINARY`, then the platform package, then `bin/` |
 | `timeshade.database_directory` | `<controller database>/timeshade` | Where the map is stored |
 | `timeshade.mem_budget_mb` | 256 | `serve-v3 --mem-budget` |
-| `timeshade.queue_mb` | 64 | Capture data kept while the sidecar is down or slow; past it the oldest is dropped |
+| `timeshade.queue_mb` | 64 | Capture data kept in memory while the sidecar is down or slow; past it the queue continues on disk |
+| `timeshade.queue_disk_mb` | 4096 | Capture data kept on disk past the memory queue (`timeshade-queue/` in the controller's database directory), also across controller restarts; past it the oldest is dropped |
 
 Changing any of the first three restarts the sidecar.
 
@@ -71,13 +72,21 @@ for every API request through the proxy.
   stdout line names the port. If it exits unasked, it is restarted after 1 s, and the delay
   doubles up to 60 s. A run of a minute or more resets the delay. A process that does not
   print its address within 30 s is killed. On controller shutdown, queued data gets up to 3 s
-  to go out, then the sidecar's stdin closes (`--exit-on-stdin-close`). It is killed after 10 s.
+  to go out (what is left stays on disk and goes out after the next start), then the sidecar's
+  stdin closes (`--exit-on-stdin-close`). It is killed after 10 s.
   If the controller dies, the sidecar exits on its own when its stdin closes.
 - **Forwarding.** Bodies are gzip NDJSON of up to 1 MiB, one request at a time, in order.
   Network errors, 5xx and 429 are retried with backoff and `Retry-After`; ingest is idempotent.
   A 400 or 413 splits the batch, and a single refused line is dropped. Lines the sidecar
   counts as bad are logged (rate-limited). While the sidecar is down the queue holds up to
-  `timeshade.queue_mb`. Instances keep up to 32 MiB while the controller link is down.
+  `timeshade.queue_mb` in memory and the rest on disk, up to `timeshade.queue_disk_mb`.
+  Instances keep up to 32 MiB in memory while the controller link is down, and the rest on
+  disk (`timeshade-pending/` in the instance directory, up to 4 GiB, also across host
+  restarts). Each line keeps the time it arrived at the instance, so a backlog lands where it
+  belongs (docs/v3/API.md 5, "Horizon").
+- **Caught up.** While an instance has nothing waiting it sends a `caught_up` envelope per map
+  every 5 s, and `ended` ones when it stops, so the map server holds a map's horizon back only
+  for an instance that still has data to send (docs/v3/PROTOCOL.md 1).
 - **Auth.**
   - Tokens are accepted as `X-Access-Token`, `Authorization: Bearer` or `?token=` (the
     viewer's live events use `?token=`).

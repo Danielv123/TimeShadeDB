@@ -29,14 +29,15 @@ const (
 
 // Size caps after decompression. The largest files in the test data are a 1.4 MB
 // change file, 0.5 MB snapshots, a 230 KB window file, a 100 KB recipes file and a
-// 27 KB area index (it grows with the history). The caps leave a wide margin while
-// bounding what a hostile file can make the importer allocate: window and keyframe
-// JSON is decoded into generic values (about 10x its size) on up to GOMAXPROCS
-// workers at once, so its cap is the smallest.
+// 27 KB area index (it grows with the history). The caps leave a margin of 30 to 2,000
+// times that for larger exports while bounding what a hostile file (a zip bomb) can make
+// the importer allocate: window and keyframe JSON is decoded into generic values (about
+// 10x its size) on up to GOMAXPROCS workers at once, so its cap is the smallest. A file
+// over its cap fails loudly (ErrTooLarge; the import stops unless --allow-errors).
 const (
-	maxChangeBytes = 16 << 20
-	maxJSONBytes   = 8 << 20
-	maxWindowBytes = 2 << 20
+	maxChangeBytes = 256 << 20
+	maxJSONBytes   = 64 << 20
+	maxWindowBytes = 8 << 20
 )
 
 var (

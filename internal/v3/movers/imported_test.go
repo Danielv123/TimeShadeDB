@@ -271,7 +271,7 @@ func TestImportedMoverSize(t *testing.T) {
 			}
 			load := time.Since(t0)
 			db := t.TempDir()
-			m, err := Open(db, Options{SyncInterval: -1, NoWAL: true, MaxAhead: -1, MaxBehind: -1}) // a bulk import: no clock bounds
+			m, err := Open(db, Options{SyncInterval: -1, NoWAL: true, MaxAhead: -1, MinTime: -1}) // a bulk import: no clock bounds
 			if err != nil {
 				t.Fatal(err)
 			}

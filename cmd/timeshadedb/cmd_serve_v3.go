@@ -49,6 +49,7 @@ type v3ServerOptions struct {
 	db, listen, ingestToken, readToken, pprof, webDir, clock string
 	memBudget                                                int64
 	window, commitEvery, terrainGrace, moverGrace, slowLog   time.Duration
+	sourceHold                                               time.Duration
 	noViewer, stdinExit, salvageOverlays, quiet              bool
 }
 
@@ -67,6 +68,7 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	fs.DurationVar(&o.moverGrace, "mover-grace", 15*time.Second, "how far behind the clock mover windows close (at least 10s)")
 	fs.DurationVar(&o.slowLog, "slow-log", 0, "log requests slower than this (0: off)")
 	fs.StringVar(&o.clock, "clock", "wall", "map clock: wall (live capture) or data (the newest ingested recv_ms, for replaying recorded captures)")
+	fs.DurationVar(&o.sourceHold, "source-hold", time.Hour, "how long a source that went quiet (or every source, after a restart) holds the horizon of its maps at its newest data, so its backlog is not late (0: the horizon follows the clock alone)")
 	fs.StringVar(&o.pprof, "pprof", "", "serve net/http/pprof on this separate address")
 	fs.StringVar(&o.webDir, "web-dir", "", "serve the viewer from this directory instead of the embedded bundle")
 	fs.BoolVar(&o.noViewer, "no-viewer", false, "do not serve the viewer")
@@ -93,6 +95,9 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	}
 	if o.memBudget < 32<<20 {
 		return nil, errors.New("serve-v3: --mem-budget must be at least 32 MiB")
+	}
+	if o.sourceHold < 0 {
+		return nil, fmt.Errorf("serve-v3: bad --source-hold %v", o.sourceHold)
 	}
 	if o.clock != "wall" && o.clock != "data" {
 		return nil, fmt.Errorf("serve-v3: bad --clock %q (wall or data)", o.clock)
@@ -166,17 +171,22 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v := &v3Server{}
 	fail := func(err error) (*v3Server, error) { return nil, errors.Join(err, v.Close()) }
 	clock := ingest.WallClock
-	// refClock is the movers' MaxAhead/MaxBehind reference: on the data clock the newest
-	// data read, which runs ahead of the commit clock until those rows are applied.
-	refClock := clock
+	// refClock is the movers' MaxAhead reference: the wall clock, also for a replay on
+	// the data clock (whose data lies in the past; ingest clamps message times to the
+	// wall clock plus 10 s), so a gap in replayed data is not taken for a broken clock.
+	refClock := ingest.WallClock
 	var dataClock *ingest.DataClock
 	if o.clock == "data" {
 		dataClock = &ingest.DataClock{}
 		clock = dataClock.Now
-		refClock = dataClock.Seen
+	}
+	sources, err := ingest.OpenSources(o.db, o.sourceHold, nil)
+	if err != nil {
+		logf("%v", err)
 	}
 
-	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64}
+	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64,
+		MinTime: terrain.DefaultMinTime}
 	topt.Window = core.TimeMs(o.window.Milliseconds())
 	// Each commit worker holds decoded tiles and an encoder; bound them for memory.
 	topt.Workers = min(runtime.GOMAXPROCS(0), 8)
@@ -208,10 +218,9 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v.rend = rend
 	v.closers = append(v.closers, rend.Close)
 
-	// About 72 bytes per open mover row (WP4); an eighth of the budget. A row without
-	// carriages now takes about 120 bytes (movers.row), so this undercounts.
-	maxRows := int(o.memBudget / 8 / 72)
-	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: refClock, Logf: logf,
+	// An eighth of the budget for the open mover windows, counted per row (about 150 bytes
+	// a row, more with carriages); beyond it whole windows wait in their logs on disk.
+	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, OpenBytes: o.memBudget / 8, Clock: refClock, Logf: logf,
 		LightEncoder: true})
 	if err != nil {
 		return fail(fmt.Errorf("movers: %w", err))
@@ -229,19 +238,18 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v.ovl = ovl
 	v.closers = append(v.closers, ovl.Close)
 
+	// The newest data per map: the data clock starts from it, and maps no source on record
+	// feeds are held at it until a source shows up (ingest.Sources.HoldUnknown).
+	newest, err := ingest.NewestData(ctx, ter, mov)
+	if err != nil {
+		return fail(err)
+	}
 	if dataClock != nil {
-		// Start from the newest data in the database.
-		if infos, err := ter.Datastores(ctx); err == nil {
-			for _, info := range infos {
-				dataClock.Observe(info.LastT)
-			}
-		}
-		if sfcs, err := mov.Surfaces(ctx); err == nil {
-			for _, si := range sfcs {
-				dataClock.Observe(si.LastT)
-			}
+		for _, t := range newest {
+			dataClock.Observe(t)
 		}
 	}
+	sources.HoldUnknown(newest)
 	maps, err := ingest.OpenMaps(o.db)
 	if err != nil {
 		return fail(err)
@@ -271,6 +279,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		CommitEvery:  o.commitEvery,
 		TerrainGrace: core.TimeMs(o.terrainGrace.Milliseconds()),
 		MoverGrace:   core.TimeMs(o.moverGrace.Milliseconds()),
+		Sources:      sources,
 		MemBudget:    o.memBudget,
 		SlowLog:      o.slowLog,
 		Logf:         logf,
@@ -281,6 +290,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	in := ingest.New(ingest.Stores{Terrain: ter, Movers: mov, Overlays: ovl, Maps: maps}, ingest.Options{
 		Clock:     clock,
 		DataClock: dataClock,
+		Sources:   sources,
 		Notifier:  srv.Notifier(),
 		Logf:      logf,
 	})
@@ -318,8 +328,9 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 	// buffers and the collector's headroom. The soft limit holds the runtime's mapped
 	// memory near it under load; on Windows the committed private bytes measured about
 	// 30 MiB above that (runtime metadata, the executable's writable pages) and the
-	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB.
-	// GOMEMLIMIT overrides.
+	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB. About
+	// 50 MiB (codecs, ingest buffers) does not scale with the budget, so below 256 MiB a
+	// full-speed ingest goes past that bound (docs/v3/API.md 8). GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(o.memBudget)
 	}

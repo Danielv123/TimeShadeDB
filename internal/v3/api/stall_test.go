@@ -104,7 +104,7 @@ func TestLiveMethodsAndClose(t *testing.T) {
 // open rows, the commit loop steps at once instead of waiting for its period, so a
 // fast replay is committed before the store refuses batches.
 func TestIngestKicksCommitUnderPressure(t *testing.T) {
-	f := newFixture(t, fixtureOpt{maxRows: 4000, cfg: func(c *Config) { c.CommitEvery = time.Hour }})
+	f := newFixture(t, fixtureOpt{moverBytes: 600_000, cfg: func(c *Config) { c.CommitEvery = time.Hour }})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go f.srv.Run(ctx)

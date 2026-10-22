@@ -6,6 +6,7 @@ package movers
 
 import (
 	"container/list"
+	"maps"
 	"strings"
 
 	"timeshadedb/internal/v3/core"
@@ -27,8 +28,11 @@ import (
 //     journey moved to (Stats.Quarantined). The same source can resume the journey
 //     after that window, or at once once another source has owned it.
 //   - Gones carry no meta on the wire (PROTOCOL.md 5); Journeys fills in the journey's
-//     last meta and surface. Gones of journeys it does not know are dropped (as illisis
-//     drops gones of journeys without an owner).
+//     last meta and surface. For a journey it does not know (forgotten by the bound, or
+//     the server restarted since its last sample) it asks Lookup, the store's last row of
+//     the journey on the gone's surface (Stats.ResolvedGones); a gone of a journey that
+//     neither knows, or that already ended, is dropped (as illisis drops gones of
+//     journeys without an owner).
 //   - A sample on another surface than the journey's last one first emits a gone on
 //     the old surface at the sample's time (the mover left that surface).
 //   - Train carriage count, kinds and colour are carried forward from the previous
@@ -39,20 +43,102 @@ import (
 //
 // Memory is bounded: at most max journeys are tracked; the least recently seen is
 // forgotten first (its next sample starts a new owner).
+//
+// Mark starts recording the changes, which Rollback undoes and Commit keeps: ingest
+// applies a batch's journey rules, then stores the samples, and undoes the rules when
+// the store refused the batch, so a retried batch meets the journeys as the first try did.
 type Journeys struct {
+	// Lookup, if set, returns the meta of journey id's last row on surface sfc when the
+	// journey is live there (the store's state), for gones of journeys Journeys forgot.
+	Lookup func(sfc core.SurfaceKey, id string) (core.MoverMeta, bool)
+
 	max   int
 	byID  map[string]*list.Element
 	lru   *list.List // front = most recently seen
 	seen  map[string]map[string]bool
 	stats JourneyStats
+	undo  *journeyUndo
+}
+
+// journeyUndo records what a batch changed since Mark.
+type journeyUndo struct {
+	before  map[*journey]journey       // journeys changed: their state at Mark
+	added   []*journey                 // journeys added since Mark
+	evicted []*journey                 // journeys forgotten since Mark (re-added at the back)
+	seen    map[string]map[string]bool // resync sets at Mark (nil: had none)
+	stats   JourneyStats
+}
+
+// Mark starts recording changes for Rollback (or Commit).
+func (js *Journeys) Mark() {
+	js.undo = &journeyUndo{before: map[*journey]journey{}, seen: map[string]map[string]bool{}, stats: js.stats}
+}
+
+// Commit keeps the changes since Mark and stops recording.
+func (js *Journeys) Commit() { js.undo = nil }
+
+// Rollback undoes every change since Mark and stops recording.
+func (js *Journeys) Rollback() {
+	u := js.undo
+	if u == nil {
+		return
+	}
+	js.undo = nil
+	for _, j := range u.added {
+		if e := js.byID[j.id]; e != nil && e.Value.(*journey) == j {
+			js.lru.Remove(e)
+			delete(js.byID, j.id)
+		}
+	}
+	for _, j := range u.evicted {
+		if js.byID[j.id] == nil {
+			js.byID[j.id] = js.lru.PushBack(j)
+		}
+	}
+	for j, b := range u.before {
+		*j = b
+	}
+	for src, set := range u.seen {
+		if set == nil {
+			delete(js.seen, src)
+		} else {
+			js.seen[src] = set
+		}
+	}
+	js.stats = u.stats
+}
+
+// change records j's state before a change (once per Mark).
+func (js *Journeys) change(j *journey) {
+	if u := js.undo; u != nil {
+		if _, ok := u.before[j]; !ok {
+			u.before[j] = *j
+		}
+	}
+}
+
+// changeSeen records src's resync set before a change (once per Mark).
+func (js *Journeys) changeSeen(src string) {
+	if u := js.undo; u != nil {
+		if _, ok := u.seen[src]; !ok {
+			if cur := js.seen[src]; cur != nil {
+				u.seen[src] = maps.Clone(cur)
+			} else {
+				u.seen[src] = nil
+			}
+		}
+	}
 }
 
 // JourneyStats counts what Journeys did.
 type JourneyStats struct {
 	// OwnerDrops are samples and gones dropped by the owner rule.
 	OwnerDrops int64
-	// UnknownGones are gones of journeys that were not tracked.
+	// UnknownGones are gones of journeys that were not tracked and that Lookup did not
+	// know either (or that had ended already).
 	UnknownGones int64
+	// ResolvedGones are gones of journeys that were not tracked, completed from Lookup.
+	ResolvedGones int64
 	// SurfaceChanges are journeys that moved to another surface (a gone was emitted on
 	// the old one).
 	SurfaceChanges int64
@@ -95,11 +181,18 @@ func (js *Journeys) get(id string) *journey {
 func (js *Journeys) add(id string) *journey {
 	j := &journey{id: id}
 	js.byID[id] = js.lru.PushFront(j)
+	if js.undo != nil {
+		js.undo.added = append(js.undo.added, j)
+	}
 	for js.lru.Len() > js.max {
 		e := js.lru.Back()
 		js.lru.Remove(e)
-		delete(js.byID, e.Value.(*journey).id)
+		old := e.Value.(*journey)
+		delete(js.byID, old.id)
 		js.stats.Evicted++
+		if js.undo != nil {
+			js.undo.evicted = append(js.undo.evicted, old)
+		}
 	}
 	return j
 }
@@ -119,10 +212,21 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			continue
 		}
 		if s.Flags&core.FlagGone != 0 {
+			if (j == nil || !j.known) && js.Lookup != nil {
+				if meta, ok := js.Lookup(s.Surface, s.Meta.ID); ok {
+					if j == nil {
+						j = js.add(s.Meta.ID)
+					}
+					js.change(j)
+					j.owner, j.sfc, j.meta, j.known = src, s.Surface, meta, true
+					js.stats.ResolvedGones++
+				}
+			}
 			if j == nil || j.owner == "" || !j.known {
 				js.stats.UnknownGones++
 				continue
 			}
+			js.change(j)
 			out = append(out, goneOf(j, s.T, s.Tick, s.Flags))
 			// The owner's gone clears the owner; meta and surface are kept so a resumed
 			// journey carries forward its train details.
@@ -137,6 +241,7 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 		if j == nil {
 			j = js.add(s.Meta.ID)
 		}
+		js.change(j)
 		if j.known && j.sfc != s.Surface {
 			if j.owner != "" { // still live on the old surface
 				out = append(out, goneOf(j, s.T, s.Tick, s.Flags))
@@ -157,7 +262,8 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 		j.owner, j.sfc, j.meta, j.known, j.lastT = src, s.Surface, s.Meta, true, s.T
 		j.goneBy = ""
 		if seen := js.seen[src]; seen != nil {
-			seen[s.Meta.ID] = true
+			js.changeSeen(src)
+			js.seen[src][s.Meta.ID] = true
 		}
 		out = append(out, s)
 	}
@@ -171,6 +277,7 @@ func (js *Journeys) Adopt(src, id string) string {
 	if j == nil {
 		j = js.add(id)
 	}
+	js.change(j)
 	prev := j.owner
 	j.owner, j.goneBy = src, ""
 	return prev
@@ -186,6 +293,7 @@ func (js *Journeys) Owner(id string) string {
 
 // Begin starts a resync of src: Resynced will end the journeys it does not re-send.
 func (js *Journeys) Begin(src string) {
+	js.changeSeen(src)
 	js.seen[src] = map[string]bool{}
 }
 
@@ -196,6 +304,7 @@ func (js *Journeys) Resynced(src string, t core.TimeMs, out []core.MoverSample) 
 	if seen == nil {
 		return out
 	}
+	js.changeSeen(src)
 	delete(js.seen, src)
 	return js.endOwned(src, t, out, func(j *journey) bool { return !seen[j.id] })
 }
@@ -203,6 +312,7 @@ func (js *Journeys) Resynced(src string, t core.TimeMs, out []core.MoverSample) 
 // Stopped handles a stopped source at t: its players are gone; its trains and vehicles
 // stay parked (illisis §7.3).
 func (js *Journeys) Stopped(src string, t core.TimeMs, out []core.MoverSample) []core.MoverSample {
+	js.changeSeen(src)
 	delete(js.seen, src)
 	return js.endOwned(src, t, out, func(j *journey) bool { return strings.HasPrefix(j.id, "p:") })
 }
@@ -216,6 +326,7 @@ func (js *Journeys) endOwned(src string, t core.TimeMs, out []core.MoverSample, 
 		}
 	}
 	for _, j := range ended {
+		js.change(j)
 		out = append(out, goneOf(j, t, 0, core.FlagNoTick))
 		j.owner = ""
 		j.lastT = t

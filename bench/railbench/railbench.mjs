@@ -121,7 +121,8 @@ async function survey() {
  * a free port with its own database under the run, posts every envelope of write/script-output/timeshade in name order
  * as `timeshadedb tail` does (gzip NDJSON with src, map, recv_ms, seq), except that recv_ms is the game time of the
  * envelope's tick plus a fixed lag (the benchmark ran faster than real time), then posts one trace envelope 7 minutes
- * later so every mover window closes, waits for the commit and stops the server.
+ * later, which moves the data clock past every mover window, and an ended envelope (the game stopped, so the server
+ * does not hold the map for the source), waits for the commit and stops the server.
  */
 async function feed() {
 	const name = option("--name");
@@ -135,11 +136,10 @@ async function feed() {
 	const bin = option("--bin", path.join(work, "bin", "timeshadedb.exe"));
 	const token = "railbench";
 	const { spawn } = await import("node:child_process");
+	const budget = option("--mem-budget", null);
 	const srv = spawn(bin, ["serve-v3", "--db", db, "--listen", "127.0.0.1:0", "--clock", "data", "--ingest-token", token,
-		"--no-viewer", "--quiet", "--exit-on-stdin-close",
-		// the capture's load resync sends every charted chunk in its first minute; the default 256 MiB budget refuses
-		// that burst on a large map (503 overloaded) because the replay's data clock cannot move on meanwhile
-		"--mem-budget", String(Number(option("--mem-budget", 2 ** 31)))], { stdio: ["pipe", "pipe", "pipe"] });
+		"--no-viewer", "--quiet", "--exit-on-stdin-close", ...(budget ? ["--mem-budget", String(Number(budget))] : [])],
+	{ stdio: ["pipe", "pipe", "pipe"] });
 	const logPath = path.join(dir, "serve-v3.log");
 	const log = fs.createWriteStream(logPath);
 	srv.stderr.on("data", (d) => log.write(d));
@@ -243,7 +243,9 @@ async function feed() {
 	}
 	const endRecv = lastRecv + 7 * 60 * 1000;
 	await post([`{"src":"standalone:railbench","map":"railbench","recv_ms":${endRecv},"seq":${seq + 1},"v":1,"tick":${0},`
-		+ `"msgs":[{"type":"trace","op":"railbench.end","phase":"end"}]}`]);
+		+ `"msgs":[{"type":"trace","op":"railbench.end","phase":"end"}]}`,
+	`{"src":"standalone:railbench","map":"railbench","recv_ms":${endRecv},"seq":${seq + 2},"v":1,"tick":${0},`
+		+ `"caught_up":true,"ended":true,"msgs":[]}`]);
 	// wait until the closed windows cover the last envelope: meta.json's horizon passes it
 	const want = lastRecv;
 	const t0 = Date.now();

@@ -86,6 +86,11 @@ type Config struct {
 	CommitEvery  time.Duration
 	TerrainGrace core.TimeMs
 	MoverGrace   core.TimeMs
+	// Sources, if set, holds the horizon of a map back while one of its sources still
+	// sends older data (ingest.Sources: a backlog after a downtime): the loop commits each
+	// map at most up to the lowest newest time of the sources holding it, minus the grace.
+	// It is saved after every step.
+	Sources SourceHolds
 	// SlowLog, if positive, logs requests that take longer (Logf).
 	SlowLog time.Duration
 	// IdleRelease: after this long without requests the commit loop returns freed memory
@@ -121,6 +126,9 @@ type Server struct {
 	// memory was returned after it.
 	lastReq  atomic.Int64
 	released atomic.Bool
+	// held are the maps whose commits a source holds back (noteHolds).
+	holdMu sync.Mutex
+	held   map[string]bool
 
 	catMu    sync.Mutex
 	catBody  []byte

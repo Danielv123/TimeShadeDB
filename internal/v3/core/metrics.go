@@ -28,4 +28,9 @@ const (
 	MetricMemBudgetBytes       = "tsdb_mem_budget_bytes"             // gauge
 	MetricPublishQueue         = "tsdb_publish_queue"                // gauge (WP12)
 	MetricPublishUploadedBytes = "tsdb_publish_uploaded_bytes_total" // counter (WP12)
+	MetricIngestCaughtUp       = "tsdb_ingest_caught_up_total"       // counter: caught_up envelopes
+	MetricHeldMaps             = "tsdb_horizon_held_maps"            // gauge: maps whose commits a source holds back over a minute
+	MetricHoldLag              = "tsdb_horizon_hold_lag_ms"          // gauge: the largest such hold behind the clock
+	MetricSpilledWindows       = "tsdb_spilled_windows"              // gauge {store=terrain|movers}: open windows on disk only
+	MetricSpills               = "tsdb_spills_total"                 // counter {store}: open windows moved out of memory
 )

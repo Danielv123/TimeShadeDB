@@ -19,10 +19,31 @@ the forwarder adds the second group before posting.
 | `src` | forwarder | string | clock source id, unique per running game: `clusterio:<instance id>` or `standalone:<name>` |
 | `map` | forwarder | string | map key (`gw-<world>` for gridworld, `i-<instance id>` otherwise, the `--map` flag standalone) |
 | `instance` | forwarder | int, optional | Clusterio instance id (overlay keys, instance bounds) |
-| `recv_ms` | forwarder | int | wall-clock ms when the forwarder read the line |
-| `seq` | forwarder | int, optional | increasing per `src`; echoed by ingest for acknowledgements |
+| `recv_ms` | forwarder | int | wall-clock ms when the line was written or first read (below) |
+| `seq` | forwarder | int, optional | increasing per `src`; echoed by ingest for acknowledgements; ingest skips an envelope whose `seq` and `recv_ms` are both at or below the last applied envelope of its `src` (a retried body) |
+| `caught_up` | forwarder | bool, optional | the forwarder has no older line of this `src` pending: everything it read was sent. Such an envelope may have no messages (`"msgs":[]`); then ingest only notes that the source has caught up to `recv_ms` (API.md 5, "Horizon") and does not use it for the clock anchor or the data clock |
+| `ended` | forwarder | bool, optional | with `caught_up`: the source stopped (its game exited), so ingest need not wait for more of it until it sends again |
 
 Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not fatal).
+
+`recv_ms` must keep the time the line came into being, also when the line is posted late:
+the clock anchor (section 4) places every envelope by it. A forwarder that stamps a
+backlog with the time it posts it collapses the backlog to that moment (ingest counts
+such envelopes as `one_recv`, API.md 5). The Clusterio instance stamps each line as it
+arrives over IPC and keeps that stamp while it queues the line. `timeshadedb tail` stamps
+lines it reads from a file the game wrote earlier by the file: the file's modification
+time for its last line, and for each line before it that time minus the ticks to the last
+line at 60 x `speed` ticks a second (never earlier than an earlier line's stamp, and
+strictly increasing per line). A game that ran slower than that, or paused, gives stamps
+later than the truth, which the anchor allows.
+
+Forwarders send `caught_up` envelopes while they have nothing to send: `timeshadedb tail`
+every few seconds once it has posted everything in the directory, and when it stops
+(`ended` when the newest file has not changed for 10 s, so the game is not running); the
+Clusterio instance every few seconds while its queue is empty, and `ended` when the
+instance stops. A forwarder that stops without one (killed, or its host lost) leaves its
+source holding its maps for the server's `--source-hold`, so the lines it still has are
+not late when it comes back.
 
 ## 2. Transports
 
@@ -87,7 +108,7 @@ Gone: `{j, gone: true, tick?}`.
 | `tick` | the game tick of the read, when it is not the envelope's: a train's chord vertex is sent one read late |
 | `stop` | at rest. A parked train is not read again until it moves: after its stop sample it sends only resync samples. A rail path stop sample's `rp` describes the whole train (see `rp`), so a keyframe or the live payload, which hold only a parked train's last sample, place every carriage |
 | `es` | the leading end switched at this sample (also when a stopped train starts off the other way); the sample before it is the old leading end's last read |
-| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages, so a sample fits a line); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage (older captures also sent it on stop, start and end switch). The viewer places rail path samples' carriages by vanilla rolling stock's joint (4) and connection (3) distances, measured pitches from `car` aside (RAIL-GEOMETRY.md 3, 8.2) |
+| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 100 carriages through Clusterio, so a sample fits an IPC line, and 4,000 in the standalone mod's files); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage (older captures also sent it on stop, start and end switch). The viewer places rail path samples' carriages by vanilla rolling stock's joint (4) and connection (3) distances, measured pitches from `car` aside (RAIL-GEOMETRY.md 3, 8.2) |
 | `v` | trains: the speed in tiles a tick (4 decimals, never negative). Its presence makes the sample a rail path sample (RAIL-GEOMETRY.md 8) |
 | `rp` | rail path samples: the curved rail pieces and rail ramps the leading carriage's front joint entered since the previous sample, in order, as `[x, y, direction, kind]`: the entity's position (whole tiles), its `defines.direction` and its kind, 1 `curved-rail-a`, 2 `curved-rail-b`, 3 `legacy-curved-rail`, 4 `rail-ramp` (the `elevated-` pieces share their ground piece's kind). Rails between them are straight, so the pieces are the exact path the leading joint ran along. Absent: none. With `ru`: the pieces under the whole train, rear first (at most 120, and with `car` as many as fit beside it in a line, at least 8). With `stop`, and on the sample where a stopped train starts (no `ru`): the pieces entered since the previous sample, with the pieces under the train that came before them in front (rear first, at most 120 of those) and any under the train's leading end after them, so that sample alone describes the whole train (a keyframe or the live payload may begin with it); a reader that holds the samples before it already has those pieces and skips them (a piece already on the path that does not continue it is a resend) |
 | `ru` | a new rail path begins at this sample (first sight, a changed train (join, split), end switch, surface change, a resync, or a piece that does not continue the recorded path: a missed piece); the path since the previous sample is not given |
@@ -127,7 +148,9 @@ At exactly 60 UPS this is the minimum of `obs = recv_ms - tick * 1000 / tps` ove
 - If an envelope's distance above the line changes by more than 5 s from the previous
   envelope's (save reloaded, game paused, host clock stepped), if it is more than 30 s off
   the line, or if the tick goes backwards, the window resets and the line re-fits from the
-  new observations.
+  new observations. A tick that goes backwards with a `recv_ms` no newer than the newest
+  seen is a replay (a forwarder posting envelopes again after a failed request): it changes
+  nothing and is timed on the current line.
 - If the slope over the last 60 s differs from the 3-minute slope by more than 1%, the UPS
   changed: envelopes older than 60 s are dropped. If every envelope of the last 5 s (at
   least 3) is more than 500 ms above the line, the server slowed down faster than that:

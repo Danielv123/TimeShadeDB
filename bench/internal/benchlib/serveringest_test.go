@@ -52,7 +52,7 @@ func newServerIngest(tb testing.TB) *serverIngest {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	mov, err := movers.Open(db, movers.Options{SyncInterval: time.Second, MaxOpenRows: budget / 8 / 72, Clock: dc.Seen})
+	mov, err := movers.Open(db, movers.Options{SyncInterval: time.Second, OpenBytes: budget / 8, Clock: dc.Seen})
 	if err != nil {
 		tb.Fatal(err)
 	}

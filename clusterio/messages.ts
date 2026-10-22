@@ -13,6 +13,9 @@ export const Envelope = Type.Object({
 	map: Type.String({ minLength: 1, maxLength: 200 }),
 	recv_ms: Type.Integer(),
 	seq: Type.Integer(),
+	/** Nothing older of this instance waits to be sent (docs/v3/PROTOCOL.md 1); `ended`: the instance stopped. */
+	caught_up: Type.Optional(Type.Boolean()),
+	ended: Type.Optional(Type.Boolean()),
 });
 export type Envelope = Static<typeof Envelope>;
 

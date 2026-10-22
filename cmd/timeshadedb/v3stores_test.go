@@ -70,7 +70,7 @@ func checkReopenedDB(t *testing.T, db string) int {
 	}
 
 	t0 = time.Now()
-	mov, err := movers.Open(db, movers.Options{MaxAhead: -1, MaxBehind: -1})
+	mov, err := movers.Open(db, movers.Options{MaxAhead: -1, MinTime: -1})
 	if err != nil {
 		t.Fatal(err)
 	}

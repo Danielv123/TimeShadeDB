@@ -76,6 +76,15 @@ timeshadedb serve-v3 --db v3db --listen 127.0.0.1:8080
 It listens on loopback by default; any other address needs `--ingest-token`. A standalone
 game with the `timeshade_capture` mod is forwarded with
 `timeshadedb tail --dir <factorio>/script-output/timeshade --map <key> --url http://127.0.0.1:8080`.
+Ingest is not throttled by memory: open windows past their share of `--mem-budget` are
+spilled to disk. A backlog (a recorded capture posted with `tail --once`, or the lines a
+forwarder kept while it, the network or the server was down) keeps the times it was
+captured at and is stored in full, as long as each source sends its data in time order:
+the server holds a map's horizon behind the data of a source that is still catching up
+(docs/v3/API.md section 5). A forwarder may stay away for up to `--source-hold` (default
+1 hour) while the server keeps running; past that its source no longer holds the map and
+the rest of its backlog is late. A server that is down holds nothing back, so the length
+of its downtime is not limited.
 
 ## Publishing a static map
 

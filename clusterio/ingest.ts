@@ -1,11 +1,14 @@
 // Forwards envelopes to the sidecar's POST /api/v3/ingest (docs/v3/API.md 5) in order, one request at a time:
 // gzip NDJSON bodies of about 1 MiB, retried on network errors, 5xx and 429 with backoff (honouring Retry-After),
 // split on 400 and 413, and a single refused line dropped. Ingest is idempotent, so a retried body is harmless. While
-// the sidecar is down the queue holds up to maxQueueBytes; past it the oldest lines are dropped.
+// the sidecar is down the queue holds up to maxQueueBytes in memory; past it the queue continues on disk in spoolDir
+// (spool.ts), up to maxDiskBytes, and close() keeps what it holds there for the next start. Without a spoolDir the
+// oldest lines are dropped instead.
 import { promisify } from "node:util";
 import * as zlib from "node:zlib";
 import type * as lib from "@clusterio/lib";
 import { lifecycle, rateLimited } from "./runtime.js";
+import { DiskTail } from "./spool.js";
 
 const gzip = promisify(zlib.gzip);
 
@@ -23,6 +26,10 @@ export type IngestQueueOptions = {
 	idleMs?: number;
 	requestTimeoutMs?: number;
 	fetch?: typeof globalThis.fetch;
+	/** Where the queue continues past maxQueueBytes, and what it holds is kept across restarts (none: drop the oldest). */
+	spoolDir?: string;
+	/** The disk part's bound; past it its oldest lines are dropped. */
+	maxDiskBytes?: number;
 };
 
 /** The counts of core.IngestResponse the queue reads. */
@@ -31,6 +38,9 @@ type IngestResponse = { bad_lines?: number; bad_messages?: number; errors?: stri
 export type QueueStats = {
 	queuedLines: number;
 	queuedBytes: number;
+	/** Of the queued lines, those on disk (spoolDir), and their bytes. */
+	diskLines: number;
+	diskBytes: number;
 	sentLines: number;
 	droppedLines: number;
 	refusedLines: number;
@@ -48,16 +58,29 @@ export class IngestQueue {
 	private wakeUp: (() => void) | undefined;
 	private sleepTimer: NodeJS.Timeout | undefined;
 	private drained: (() => void)[] = [];
-	private readonly opts: Required<IngestQueueOptions>;
+	private readonly opts: Required<Omit<IngestQueueOptions, "spoolDir" | "maxDiskBytes">> & Pick<IngestQueueOptions, "spoolDir" | "maxDiskBytes">;
 	private readonly warn: ReturnType<typeof rateLimited>;
 	private failures = 0;
 	/** Bytes of the lines being posted (taken off the queue while their request runs). */
 	private inflightBytes = 0;
 	/** Lines the next request may carry at most (halved by a 400 or 413). */
 	private splitTo = Infinity;
+	/** The lines being posted (kept when the queue closes mid-request). */
+	private inflight: string[] = [];
+	/**
+	 * The disk part (spoolDir). The memory lines are either all pushed directly, or all from the segment fromSeg taken
+	 * from the disk, of which fromSegLeft are not acknowledged yet; new lines go to the disk while it holds any or while
+	 * such a segment is out, so the order stays memory, then disk.
+	 */
+	private readonly disk: DiskTail | undefined;
+	private fromSeg: number | undefined;
+	private fromSegLeft = 0;
+	private diskBuf: string[] = [];
+	private diskBufBytes = 0;
+	private diskTimer: NodeJS.Immediate | undefined;
 	readonly stats: QueueStats = {
-		queuedLines: 0, queuedBytes: 0, sentLines: 0, droppedLines: 0, refusedLines: 0, retries: 0, badLines: 0,
-		badMessages: 0,
+		queuedLines: 0, queuedBytes: 0, diskLines: 0, diskBytes: 0, sentLines: 0, droppedLines: 0, refusedLines: 0,
+		retries: 0, badLines: 0, badMessages: 0,
 	};
 
 	constructor(opts: IngestQueueOptions) {
@@ -72,9 +95,22 @@ export class IngestQueue {
 			...opts,
 		};
 		this.warn = rateLimited(opts.logger);
+		if (opts.spoolDir) {
+			this.disk = new DiskTail(opts.spoolDir, opts.maxDiskBytes);
+			if (!this.disk.empty) {
+				lifecycle(opts.logger, "timeshade.ingest", "spool_loaded", { lines: this.disk.lines, bytes: this.disk.bytes });
+				this.compact();
+				this.pump();
+			}
+		}
 	}
 
+	/** Lines waiting: in memory, buffered for the disk and on it. */
 	get length(): number {
+		return this.memLength + this.diskBuf.length + (this.disk?.lines ?? 0);
+	}
+
+	private get memLength(): number {
 		return this.lines.length - this.head;
 	}
 
@@ -88,10 +124,79 @@ export class IngestQueue {
 		if (this.closed) {
 			return;
 		}
+		const disk = this.disk;
+		if (disk && (!disk.empty || this.diskBuf.length > 0 || this.fromSeg !== undefined ||
+			this.bytes + this.inflightBytes + line.length + 1 > this.opts.maxQueueBytes)) {
+			this.diskBuf.push(line);
+			this.diskBufBytes += line.length + 1;
+			if (this.diskBufBytes >= 1 << 20) {
+				this.flushDisk();
+			} else {
+				this.diskTimer ??= setImmediate(() => this.flushDisk());
+			}
+			this.compact();
+			this.pump();
+			return;
+		}
 		this.lines.push(line);
 		this.bytes += line.length + 1;
 		this.trim();
 		this.pump();
+	}
+
+	/** Writes the lines buffered for the disk. */
+	private flushDisk(): void {
+		if (this.diskTimer) {
+			clearImmediate(this.diskTimer);
+			this.diskTimer = undefined;
+		}
+		if (!this.disk || this.diskBuf.length === 0) {
+			return;
+		}
+		const before = this.disk.dropped;
+		this.disk.append(this.diskBuf);
+		this.diskBuf = [];
+		this.diskBufBytes = 0;
+		if (this.disk.dropped > before) {
+			this.stats.droppedLines += this.disk.dropped - before;
+			this.warn("dropped", "timeshade.ingest disk queue full, oldest dropped", {
+				op: "timeshade.ingest", phase: "dropped", lines: this.disk.dropped - before, diskBytes: this.disk.bytes,
+			});
+		}
+		this.compact();
+	}
+
+	/** With the memory part sent, the oldest segment of the disk part becomes the memory part. */
+	private refill(): void {
+		if (!this.disk || this.memLength > 0 || this.fromSeg !== undefined) {
+			return;
+		}
+		this.flushDisk();
+		const t = this.disk.take();
+		if (!t) {
+			return;
+		}
+		this.lines = t.lines;
+		this.head = 0;
+		this.bytes = t.lines.reduce((n, l) => n + l.length + 1, 0);
+		this.fromSeg = t.seg;
+		this.fromSegLeft = t.lines.length;
+		if (t.lines.length === 0) {
+			this.ack(0);
+		}
+	}
+
+	/** n lines of the memory part were acknowledged (or refused for good). */
+	private ack(n: number): void {
+		if (this.fromSeg === undefined) {
+			return;
+		}
+		this.fromSegLeft -= n;
+		if (this.fromSegLeft <= 0) {
+			this.disk!.done(this.fromSeg);
+			this.fromSeg = undefined;
+			this.fromSegLeft = 0;
+		}
 	}
 
 	/** Try now (the sidecar became ready). */
@@ -121,13 +226,31 @@ export class IngestQueue {
 		});
 	}
 
-	/** Stops sending; what is queued is lost. */
+	/**
+	 * Stops sending. With a spoolDir what is queued (also a request in flight) stays on disk for the next start;
+	 * without one it is lost.
+	 */
 	close(): void {
 		this.closed = true;
+		if (this.disk) {
+			this.flushDisk();
+			if (this.fromSeg === undefined) {
+				// Memory lines pushed directly: before everything on disk. (Lines from a taken segment are still in its
+				// file, which the next start reads again; the acknowledged ones are skipped by the map server.)
+				this.disk.putBack(this.inflight.concat(this.lines.slice(this.head)));
+			}
+			this.disk.close();
+			this.lines = [];
+			this.head = 0;
+			this.bytes = 0;
+		}
 		this.wake();
 	}
 
 	private trim() {
+		if (this.disk) {
+			return; // past maxQueueBytes lines go to the disk (push)
+		}
 		let dropped = 0;
 		while (this.bytes + this.inflightBytes > this.opts.maxQueueBytes && this.length > 1) {
 			this.bytes -= this.lines[this.head].length + 1;
@@ -149,7 +272,9 @@ export class IngestQueue {
 			this.head = 0;
 		}
 		this.stats.queuedLines = this.length;
-		this.stats.queuedBytes = this.bytes;
+		this.stats.diskLines = (this.disk?.lines ?? 0) + this.diskBuf.length;
+		this.stats.diskBytes = (this.disk?.bytes ?? 0) + this.diskBufBytes;
+		this.stats.queuedBytes = this.bytes + this.stats.diskBytes;
 	}
 
 	private sleep(ms: number): Promise<void> {
@@ -193,6 +318,12 @@ export class IngestQueue {
 				await this.sleep(this.opts.idleMs);
 				continue;
 			}
+			this.refill();
+			if (this.memLength === 0) {
+				// The lines are still buffered for the disk: write them, then take them.
+				this.flushDisk();
+				continue;
+			}
 			// The batch leaves the queue while it is posted, so trim() never drops a line that is in flight.
 			const n = this.batchSize();
 			const lines = this.lines.slice(this.head, this.head + n);
@@ -203,12 +334,14 @@ export class IngestQueue {
 			this.head += n;
 			this.bytes -= size;
 			this.inflightBytes = size;
+			this.inflight = lines;
 			this.compact();
 			let status: "ok" | "drop" | "retry";
 			try {
 				status = await this.post(target, lines);
 			} finally {
 				this.inflightBytes = 0;
+				this.inflight = [];
 			}
 			if (status === "retry") {
 				if (this.closed) {
@@ -222,8 +355,10 @@ export class IngestQueue {
 				this.failures = 0;
 				this.splitTo = Infinity;
 				this.stats.sentLines += n;
+				this.ack(n);
 			} else {
 				this.stats.refusedLines += n;
+				this.ack(n);
 			}
 		}
 		this.compact();
@@ -239,7 +374,7 @@ export class IngestQueue {
 	private batchSize(): number {
 		let n = 0;
 		let bytes = 0;
-		const max = Math.min(this.length, this.splitTo);
+		const max = Math.min(this.memLength, this.splitTo);
 		while (n < max && (n === 0 || bytes + this.lines[this.head + n].length + 1 <= this.opts.maxBatchBytes)) {
 			bytes += this.lines[this.head + n].length + 1;
 			n += 1;

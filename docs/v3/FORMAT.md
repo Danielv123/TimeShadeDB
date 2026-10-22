@@ -128,12 +128,15 @@ the database is served.
     tiles/<x>_<y>.blk, .idx              z0 terrain series, one per tile (5.1, 5.3)
     pyramid/<z>/<x>_<y>.blk, .idx        coarse snapshots, z = -1, -2, ... (5.4, WP3)
     wal/                                 write-ahead log of open windows (WP2, tunable)
+    open/<start>.spill                   open windows spilled out of memory, a cache of wal/ (5.7)
   movers/<surface id>/
     meta.json                            {"key":{...},"format_version":1}
     windows/<YYYY-MM-DD>/<start>.mvw     closed 5-minute windows (5.5)
     keyframes/<YYYY-MM-DD>/<t>.mvw       hourly keyframes (5.5)
     days/<YYYY-MM-DD>.json               day index, core.DayIndex as JSON
-    wal/                                 open-window samples (WP4, tunable)
+    open/<start>.wal                     samples of one open window (5.5)
+  movers/wal/wal.log                     open-window samples of older stores (5.5)
+  sources.json                           per-source ingest state: horizon holds and retry dedupe (5.8)
   overlays/<datastore id>/               interval log and per-tile index (WP4, 5.6)
   icons/                                 catalog icon spritesheet and metadata (optional)
     icons.json                           core.CatalogIcons: {"png":"icons/<file>","json":"icons/<file>"}
@@ -282,8 +285,21 @@ have kind 1, keyframes kind 2. Because the file is already a zstd frame of the w
 the server can send it unchanged with `Content-Encoding: zstd`. Windows with no rows are not
 written. A day index lists only windows and keyframes that exist.
 
-Live samples (the open window) are kept in memory with a WAL (tunable) and are bounded per
-surface by count.
+Live samples (the open windows) are kept in a log per window, `open/<start>.wal` (decimal
+window start in ms): CRC-framed batches of `'M'` (meta) and `'S'` (sample) records,
+documented in `internal/v3/movers/wal.go`, with meta numbers local to the file. A batch is
+written to the logs of the windows it touches before the store accepts it, one write per
+log: a crash between those writes can leave a batch that was never acknowledged in some of
+its logs only (the sender retries it; the repeats are removed at commit). The rows are
+also kept in memory while they fit the store's byte budget (the server's
+`--mem-budget`/8, counted per row: about 150 bytes, more with carriages and rail pieces);
+beyond it whole windows, oldest first, are evicted and read back from their logs by the
+commit that closes them, so the budget never makes ingest refuse samples. A log is deleted
+after the commit that closed its window wrote `meta.json`; on open, logs of windows below
+the horizon are deleted (a crash between the two) and the others replayed (a torn tail is
+truncated). Stores before these logs kept every open sample in one file,
+`movers/wal/wal.log` (the same records), rewritten at every commit; opening such a
+database moves its rows into the window logs and deletes it.
 
 ### 5.6 Overlays on disk (WP4, recommended)
 
@@ -330,6 +346,39 @@ recorded the new horizon, the replay brings those windows back; a tile skips eve
 that ends at or before its last record's `t_end`, so nothing is written twice. Open then
 finishes that commit (to `committing`) before it accepts any update, so an update for one
 of those windows is late for every tile, as it was while the commit ran.
+
+`open/<start>.spill` holds open windows moved out of memory when the open windows would
+exceed the store's budget (the server's `--mem-budget`/8): whole windows, oldest first,
+instead of refusing the batch. It is a sequence of frames in the WAL frame layout above,
+one per tile and spill (a window spilled twice has two frames for a tile); decompressed:
+`varint` tile x, `varint` tile y, `uvarint n`, then n chunks of `u8 block`, `varint T`,
+`u8 flags` (bit 0 deleted) and, unless deleted, 1,024 RGB565 pixels (u16 LE). Updates
+for a spilled window that arrive later are kept in memory; the commit merges them per
+chunk (greatest T wins, on equal T the later frame, and the in-memory update over the
+spilled one), and live reads of a tile read its frames. Spill files are a cache of the
+WAL, which keeps every update of an open window: open deletes them and the replay spills
+again as it fills the budget, so a crash during a spill or a commit loses nothing.
+
+### 5.8 Sources (`sources.json`)
+
+The live server keeps, per forwarder source (envelope `src`), what it needs to hold
+commits back for a source that is still sending older data and to recognise retried
+envelopes (API.md 5, "Horizon"). Written as tmp + rename about once a commit step;
+missing or unreadable means no sources known.
+
+```json
+{"version": 1, "sources": [{"src": "...", "seq": 123, "recv_ms": 1791630000000,
+  "seen_ms": 1791630005000, "maps": {"<map key>": 1791629999000},
+  "map_seen_ms": {"<map key>": 1791630005000}}]}
+```
+
+`maps` is, per map the source fed, the newest message time applied (or the newest
+`caught_up` time); `seq` and `recv_ms` are the last applied envelope's (absent without a
+`seq`); `seen_ms` is the server's wall clock when the source was last heard from, and
+`map_seen_ms` per map when it last had data or `caught_up` for it (optional; `seen_ms`
+for a map without an entry). Entries not heard from for 7 days are dropped. Maps with data
+but no source here are held from the server's start (API.md 5, "Horizon"); that hold is
+not saved.
 
 ## 6. Version and compatibility rules
 

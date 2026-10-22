@@ -66,7 +66,9 @@ func crashOpsWith(seed int64, spread, commitEvery int) func() crashOp {
 // TestKillDuringIngest runs the workload in a child process (real fsyncs, WAL group
 // commit every 20 ms) and kills it at random moments. After each kill the database must
 // reopen, and after a final commit it must equal the oracle fed exactly the updates
-// whose Apply reached the WAL: every version, its effective time and its content.
+// whose Apply reached the WAL: every version, its effective time and its content. Odd
+// rounds run with an open-window budget of a few chunks, so the kill also lands in
+// spills and in commits of spilled windows, and the reopen runs with that budget too.
 func TestKillDuringIngest(t *testing.T) {
 	if os.Getenv("TERRAIN_KILL_CHILD") != "" {
 		terrainKillChild()
@@ -84,7 +86,12 @@ func TestKillDuringIngest(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "db")
 		seed := int64(100 + round)
 		cmd := exec.Command(exe, "-test.run", "^TestKillDuringIngest$")
-		cmd.Env = append(os.Environ(), "TERRAIN_KILL_CHILD="+dir, "TERRAIN_KILL_SEED="+strconv.FormatInt(seed, 10))
+		budget := int64(0)
+		if round%2 == 1 {
+			budget = 12 * openChunkBytes
+		}
+		cmd.Env = append(os.Environ(), "TERRAIN_KILL_CHILD="+dir, "TERRAIN_KILL_SEED="+strconv.FormatInt(seed, 10),
+			"TERRAIN_KILL_BUDGET="+strconv.FormatInt(budget, 10))
 		out, _ := cmd.StdoutPipe()
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
@@ -108,7 +115,7 @@ func TestKillDuringIngest(t *testing.T) {
 			t.Fatalf("round %d: child applied nothing", round)
 		}
 
-		s, err := Open(dir, Options{})
+		s, err := Open(dir, Options{OpenWindowBytes: budget})
 		if err != nil {
 			t.Fatalf("round %d: reopen: %v", round, err)
 		}
@@ -153,7 +160,8 @@ func compareWithOracle(s *Store, seed int64, batches int, far core.TimeMs) error
 func terrainKillChild() {
 	dir := os.Getenv("TERRAIN_KILL_CHILD")
 	seed, _ := strconv.ParseInt(os.Getenv("TERRAIN_KILL_SEED"), 10, 64)
-	s, err := Open(dir, Options{SyncInterval: 20 * time.Millisecond, MaxChain: 6})
+	budget, _ := strconv.ParseInt(os.Getenv("TERRAIN_KILL_BUDGET"), 10, 64)
+	s, err := Open(dir, Options{SyncInterval: 20 * time.Millisecond, MaxChain: 6, OpenWindowBytes: budget})
 	if err != nil {
 		fmt.Println("open:", err)
 		os.Exit(2)

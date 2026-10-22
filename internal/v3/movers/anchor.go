@@ -35,7 +35,10 @@ import (
 // when an envelope's distance above the line changes by more than AnchorJump from the
 // previous envelope's (save reload, pause, host clock step), when it is more than
 // AnchorLost off the line, or when the tick goes backwards (TestAnchorSlowServer,
-// TestAnchorRateChange measure the errors).
+// TestAnchorRateChange measure the errors). A tick that goes backwards with a receive time
+// that is not newer than the newest one seen is a replay (a forwarder posting envelopes
+// again after a failed request), not a new game: it changes nothing and is timed on the
+// current line.
 
 // Anchor tuning (PROTOCOL.md 4).
 const (
@@ -90,6 +93,9 @@ type Anchor struct {
 	pts       []anchorPt // x increasing, one point per tick (the lowest y)
 	picks     []anchorPt // scratch for fit
 	resets    int
+	// newest is the newest receive time observed; lastRecv the last envelope's.
+	newest, lastRecv float64
+	replays          int
 }
 
 func tpsOf(speed float64) float64 {
@@ -104,6 +110,13 @@ func tpsOf(speed float64) float64 {
 func (a *Anchor) Observe(recv core.TimeMs, tick int64, speed float64) {
 	tps := tpsOf(speed)
 	y := float64(recv)
+	if a.started && tick < a.lastTick && y <= a.newest && tps == a.tps {
+		// A replay of envelopes already observed: keep the line.
+		a.replays++
+		return
+	}
+	a.newest = math.Max(a.newest, y)
+	a.lastRecv = y
 	switch {
 	case !a.started:
 		a.started, a.tps, a.base = true, tps, 0
@@ -293,6 +306,15 @@ func (a *Anchor) UPS() float64 {
 // Resets counts how often the anchor re-fitted after a jump, a backwards tick or a speed
 // change.
 func (a *Anchor) Resets() int { return a.resets }
+
+// Replays counts envelopes observed again (a backwards tick, no newer receive time).
+func (a *Anchor) Replays() int { return a.replays }
+
+// Last returns the tick and receive time of the last envelope observed (not a replay),
+// and whether there was one.
+func (a *Anchor) Last() (tick int64, recv core.TimeMs, ok bool) {
+	return a.lastTick, core.TimeMs(a.lastRecv), a.started
+}
 
 // Anchors keeps one Anchor per source id (envelope "src"), bounded: beyond max sources
 // the least recently used is forgotten (it re-fits from its next envelope).

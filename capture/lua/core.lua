@@ -14,7 +14,7 @@ local core = {}
 core.PROTOCOL = 1 -- the envelope's v
 
 -- Terrain.
-core.CAP = 20000 -- chart reads waiting; event pushes past this are dropped and counted; resync pushes are exempt
+core.CAP = 20000 -- chart reads the event queue's ring holds before it grows (it doubles; every charted chunk waits once)
 core.CHARTS = 1 -- chart reads a tick (60 a second; the UPS benchmark's heaviest cost, see capture/README.md)
 core.DEBOUNCE = 600 -- ticks from one read of a chunk to the next (a chunk charted again sooner waits)
 core.CACHE = 16384 -- last sent charts kept (deflated); a miss only re-sends an unchanged chart
@@ -44,11 +44,21 @@ core.SEEN_MAX = 12 -- rails a turning train's read walks back over a straight to
 core.LIVE_GAP = 120 -- ticks at game speed 1 a moving train goes without a sample at most, so live viewers stay ~2 s behind
 core.CAR_MAX = 100 -- carriages listed in `car`; with 200 kinds and a 200-byte name a sample stays under a line
 
--- Transport.
+-- Transport. The defaults fit Clusterio's IPC lines; a host whose lines can be longer (the standalone mod's files)
+-- raises them with core.limits, so long trains are not cut short.
 core.LIMIT = 3500 -- bytes a printed line stays under (Clusterio IPC)
 core.MOVE_MAX = 3 -- samples without `car` a move message carries
 core.SURFACES_MAX = 13 -- surfaces a surfaces message carries
 core.KINDS_MAX = 200 -- carriage kinds sent
+
+--- Raise the line limit and what it bounds (fields line, car, kinds, rp_start; each optional) for a transport without
+--- Clusterio's line limit. Every peer must use the same values: they decide what mover records hold.
+function core.limits(t)
+	core.LIMIT = t.line or core.LIMIT
+	core.CAR_MAX = t.car or core.CAR_MAX
+	core.KINDS_MAX = t.kinds or core.KINDS_MAX
+	core.RP_START_MAX = t.rp_start or core.RP_START_MAX
+end
 
 local atan2 = math.atan2 or math.atan
 
@@ -127,7 +137,7 @@ end
 
 --- A FIFO: items at [head, tail]. With cap, a ring of cap slots instead: its indices stay in 1..cap, so a queue that
 --- never empties (a saturated chart queue) keeps its items in the table's array part instead of a hash part that grows
---- with every push, and push refuses an item once cap wait.
+--- with every push; a full ring doubles (its items moved to the start of a ring twice the size).
 function core.queue(cap)
 	if cap then
 		return { head = 1, n = 0, cap = cap }
@@ -142,13 +152,24 @@ function core.size(q)
 	return q.tail - q.head + 1
 end
 
---- Append item. With cap (a plain FIFO), refuse it (false) once cap items wait.
+--- Append item. With cap (a plain FIFO), refuse it (false) once cap items wait. A ring grows instead.
 function core.push(q, item, cap)
 	local rc = q.cap
 	if rc then
 		local n = q.n
 		if n >= rc then
-			return false
+			local items = {}
+			for i = 1, n do
+				items[i] = q[(q.head + i - 2) % rc + 1]
+			end
+			for i = 1, rc do
+				q[i] = nil
+			end
+			for i = 1, n do
+				q[i] = items[i]
+			end
+			rc = 2 * rc
+			q.head, q.cap = 1, rc
 		end
 		q[(q.head + n - 1) % rc + 1] = item
 		q.n = n + 1
@@ -245,13 +266,14 @@ end
 
 -- Chart debounce. A queued read is the chunk's key alone (a number in the game; core.unkey gives the surface, force and
 -- position back), so a busy map's queue of 20,000 reads holds no table per read for the garbage collector to walk.
--- Event reads wait in d.queue, a ring of core.CAP slots; pushes past it are dropped and counted. Forced reads (a
--- resync's walk and its sentinel, a deletion) wait in d.forced, which takes no cap, is read first and paces the walk, so a
--- full event queue never stalls a resync. The resync's sentinel is the one table item, { resynced = walk number }.
+-- Event reads wait in d.queue, a ring of core.CAP slots that doubles when full: a charted chunk waits once (pending), so
+-- it holds at most every charted chunk of the map, and a read is only delayed, never dropped. Forced reads (a resync's
+-- walk and its sentinel, a deletion) wait in d.forced, which is read first and paces the walk, so a long event queue
+-- never stalls a resync. The resync's sentinel is the one table item, { resynced = walk number }.
 -- A chunk read at tick t cools down until t + core.DEBOUNCE. A chunk charted while waiting in the queue is not queued
 -- twice; one charted while cooling is marked dirty and queued when its cool-down ends. The cool-down list is a FIFO
 -- (keys in d.due, their end ticks in d.due_t), because every read adds now + DEBOUNCE with now never decreasing, so the
--- state holds at most the chunks read in the last DEBOUNCE ticks plus the queue (bounded by core.CAP).
+-- state holds at most the chunks read in the last DEBOUNCE ticks plus the queue (at most the map's charted chunks).
 --
 -- raw[key] keeps the raw chart of an event read while its chunk cools down, so the re-read at the end of the cool-down
 -- can skip helpers.encode_string when nothing changed (deflating 2 KiB is most of a read's cost). It is dropped when a
@@ -266,8 +288,7 @@ function core.debounce()
 end
 
 --- An on_chunk_charted for chunk key (any value but nil and false; a table is the resync's sentinel, forced only).
---- forced pushes (resync, deletion) skip the cool-down and the cap. Returns "queued", "dirty", "waiting" (already
---- queued) or "dropped".
+--- forced pushes (resync, deletion) skip the cool-down. Returns "queued", "dirty" or "waiting" (already queued).
 function core.charted(d, key, forced)
 	if forced then
 		core.push(d.forced, key)
@@ -284,12 +305,9 @@ function core.charted(d, key, forced)
 		d.dirty[key] = true
 		return "dirty"
 	end
-	if core.push(d.queue, key) then
-		d.pending[key] = true
-		return "queued"
-	end
-	d.drops = d.drops + 1
-	return "dropped"
+	core.push(d.queue, key)
+	d.pending[key] = true
+	return "queued"
 end
 
 --- The next key to read at tick now and whether it is forced, or nil: from d.forced first, or only from "forced" or
@@ -712,7 +730,7 @@ function core.rp_start(ncar)
 	if not ncar then
 		return core.RP_START_MAX
 	end
-	local fit = math.floor((2600 - 26 * math.min(ncar, core.CAR_MAX)) / 18)
+	local fit = math.floor((core.LIMIT - 900 - 26 * math.min(ncar, core.CAR_MAX)) / 18)
 	return math.max(8, math.min(core.RP_START_MAX, fit))
 end
 

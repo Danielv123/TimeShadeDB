@@ -154,6 +154,7 @@ export async function fakeControllerContext(fields: Record<string, unknown> = {}
 		"timeshade.database_directory": null,
 		"timeshade.mem_budget_mb": 64,
 		"timeshade.queue_mb": 64,
+		"timeshade.queue_disk_mb": 4096,
 		...fields,
 	});
 	const handlers = new Map<any, Hook>();
