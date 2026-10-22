@@ -7,6 +7,7 @@ declare module "@clusterio/lib" {
 		"timeshade.database_directory": string | null;
 		"timeshade.mem_budget_mb": number;
 		"timeshade.queue_mb": number;
+		"timeshade.queue_disk_mb": number;
 	}
 	export interface InstanceConfigFields {
 		"timeshade.capture_rails": boolean;
@@ -55,12 +56,25 @@ export const plugin: lib.PluginDeclaration = {
 		},
 		"timeshade.queue_mb": {
 			title: "Forwarding queue (MiB)",
-			description: "Capture data kept while the map server is down or slow; past it the oldest is dropped.",
+			description: "Capture data kept in memory while the map server is down or slow; past it the queue continues " +
+				"on disk (timeshade-queue/ in the controller's database directory).",
 			type: "number",
 			initialValue: 64,
 			validator: (value: number) => {
 				if (!(value >= 1)) {
 					throw new Error("timeshade.queue_mb must be at least 1");
+				}
+			},
+		},
+		"timeshade.queue_disk_mb": {
+			title: "Forwarding queue on disk (MiB)",
+			description: "Capture data kept on disk past the memory queue, also across controller restarts; past it the " +
+				"oldest is dropped.",
+			type: "number",
+			initialValue: 4096,
+			validator: (value: number) => {
+				if (!(value >= 1)) {
+					throw new Error("timeshade.queue_disk_mb must be at least 1");
 				}
 			},
 		},

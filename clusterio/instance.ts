@@ -3,6 +3,8 @@
 //
 // The instance side (PLAN.md §4.10): Lua's capture module prints envelopes on the IPC channel timeshade:out; this
 // stamps each with its arrival time, splits it by map, and sends what arrived to the controller about once a second.
+// While nothing waits it sends caught_up envelopes every few seconds, and ended ones when the instance stops, so the map
+// server holds a map's horizon back only for an instance that still has data to send (docs/v3/API.md 5, "Horizon").
 // It configures the capture over RCON at every start, on a gridworld.tile change and on a new controller session.
 import * as lib from "@clusterio/lib";
 import type { InstancePluginContext } from "@clusterio/host";
@@ -10,19 +12,29 @@ import { envelopeError, Splitter, type LuaEnvelope, type TraceMsg } from "./forw
 import { tileOf } from "./integrations.js";
 import { EnvelopesEvent, type Envelope } from "./messages.js";
 import { lifecycle, newId, rateLimited, type Level } from "./runtime.js";
+import { DiskTail } from "./spool.js";
 
 /** Envelopes go to the controller once a second. */
 export const BATCH_MS = 1000;
 /** One link event carries at most about this many bytes of envelopes. */
 export const MAX_EVENT_BYTES = 1 << 20;
-/** Envelopes waiting for the next send; past it the oldest are dropped (the controller link is down for long). */
+/**
+ * Envelopes waiting for the next send in memory; past it they wait on disk (timeshade-pending/ in the instance
+ * directory, kept across host restarts) while the controller link is down, up to MAX_PENDING_DISK_BYTES, past which
+ * the oldest are dropped. Without a directory (tests) the oldest are dropped past MAX_PENDING_BYTES.
+ */
 export const MAX_PENDING_BYTES = 32 << 20;
+export const MAX_PENDING_DISK_BYTES = 4 * 1024 ** 3;
+/** While nothing waits, a caught_up envelope per map this often. */
+export const HEARTBEAT_MS = 5000;
 
 export type InstanceOptions = {
 	/** The wall clock stamped as recv_ms (tests). */
 	now?: () => number;
 	/** How often envelopes are sent (tests); BATCH_MS by default. */
 	batchMs?: number;
+	/** Where envelopes past MAX_PENDING_BYTES wait (default timeshade-pending/ in the instance directory). */
+	spoolDir?: string;
 };
 
 const LEVELS = new Set(["info", "verbose", "warn", "error"]);
@@ -44,6 +56,16 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	const nextSeq = () => ++seq;
 	let pending: { env: Envelope; bytes: number }[] = [];
 	let pendingBytes = 0;
+	// The disk part of the pending envelopes (spool.ts): newer than the memory part, which is either all received
+	// directly or all from the segment fromSeg (deleted once that is sent).
+	const instPath = (instance as unknown as { path?: (...parts: string[]) => string }).path;
+	const spoolDir = options.spoolDir ?? (typeof instPath === "function" ? instPath.call(instance, "timeshade-pending") : undefined);
+	const disk = spoolDir ? new DiskTail(spoolDir, MAX_PENDING_DISK_BYTES) : undefined;
+	let fromSeg: number | undefined;
+	let diskDropped = 0;
+	/** The newest tick Lua sent (-1: none yet), and when envelopes last left. */
+	let lastTick = -1;
+	let lastSent = now();
 
 	/** A trace line from Lua, logged; reserved keys and the fields the cluster logger stamps never come from Lua. */
 	function log(msg: TraceMsg) {
@@ -59,6 +81,7 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 			warn(`envelope:${error}`, "timeshade.ipc invalid", { op: "timeshade.ipc", phase: "invalid", error });
 			return;
 		}
+		lastTick = Math.max(lastTick, (data as LuaEnvelope).tick);
 		const split = splitter.split(data as LuaEnvelope, now(), nextSeq);
 		if (split.invalid > 0) {
 			warn("message", "timeshade.ipc invalid", { op: "timeshade.ipc", phase: "invalid", error: "bad message", messages: split.invalid });
@@ -69,13 +92,28 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 		for (const r of split.resynced) {
 			lifecycle(logger, "timeshade.resync", "done", { trace: r.trace, counts: r.counts }, "verbose");
 		}
-		for (const env of split.envelopes) {
-			const bytes = JSON.stringify(env).length;
-			pending.push({ env, bytes });
-			pendingBytes += bytes;
+		enqueue(split.envelopes);
+	}
+
+	/** Queues envelopes after everything pending: in memory, or on disk once the memory part is full. */
+	function enqueue(envs: Envelope[]) {
+		const toDisk: string[] = [];
+		for (const env of envs) {
+			const json = JSON.stringify(env);
+			if (disk && (toDisk.length > 0 || !disk.empty || fromSeg !== undefined || pendingBytes + json.length > MAX_PENDING_BYTES)) {
+				toDisk.push(json);
+				continue;
+			}
+			pending.push({ env, bytes: json.length });
+			pendingBytes += json.length;
 		}
 		let dropped = 0;
-		while (pendingBytes > MAX_PENDING_BYTES && pending.length > 1) {
+		if (disk) {
+			disk.append(toDisk);
+			dropped = disk.dropped - diskDropped;
+			diskDropped = disk.dropped;
+		}
+		while (!disk && pendingBytes > MAX_PENDING_BYTES && pending.length > 1) {
 			pendingBytes -= pending.shift()!.bytes;
 			dropped += 1;
 		}
@@ -84,7 +122,48 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 		}
 	}
 
+	/** With the memory part sent, the oldest disk segment becomes the memory part. */
+	function refill() {
+		if (!disk || pending.length > 0 || fromSeg !== undefined) {
+			return;
+		}
+		const t = disk.take();
+		if (!t) {
+			return;
+		}
+		fromSeg = t.seg;
+		for (const line of t.lines) {
+			try {
+				pending.push({ env: JSON.parse(line) as Envelope, bytes: line.length });
+				pendingBytes += line.length;
+			} catch {
+				// a torn last line of a segment written when the host died
+			}
+		}
+		if (pending.length === 0) {
+			disk.done(t.seg);
+			fromSeg = undefined;
+		}
+	}
+
+	/** caught_up envelopes for every map of the instance: nothing older waits (ended: the instance stopped). */
+	function caughtUp(ended: boolean) {
+		const envs: Envelope[] = [];
+		for (const map of splitter.maps()) {
+			const env: Envelope = { v: 1, tick: Math.max(lastTick, 0), msgs: [], map, recv_ms: now(), seq: nextSeq(), caught_up: true };
+			if (ended) {
+				env.ended = true;
+			}
+			envs.push(env);
+		}
+		enqueue(envs);
+	}
+
 	function flush() {
+		refill();
+		if (pending.length === 0 && (!disk || disk.empty) && lastTick >= 0 && now() - lastSent >= HEARTBEAT_MS) {
+			caughtUp(false);
+		}
 		while (pending.length > 0) {
 			const batch: Envelope[] = [];
 			let bytes = 0;
@@ -97,12 +176,18 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 			try {
 				instance.sendTo("controller", new EnvelopesEvent(batch));
 			} catch (err: any) {
-				// Not connected: keep them for the next try (bounded by MAX_PENDING_BYTES).
+				// Not connected: keep them for the next try (in memory, then on disk).
 				warn("send", "timeshade.forward send failed", { op: "timeshade.forward", phase: "send_failed", error: err?.message });
 				return;
 			}
 			pending = pending.slice(n);
 			pendingBytes -= bytes;
+			lastSent = now();
+			if (pending.length === 0 && fromSeg !== undefined) {
+				disk!.done(fromSeg);
+				fromSeg = undefined;
+				refill();
+			}
 		}
 	}
 
@@ -110,9 +195,22 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	// so lines are handled in arrival order.
 	instance.server.handle("timeshade:out", async (data: unknown) => receive(data));
 	const timer = setInterval(flush, options.batchMs ?? BATCH_MS);
+	if (disk && !disk.empty) {
+		lifecycle(logger, "timeshade.forward", "spool_loaded", { envelopes: disk.lines, bytes: disk.bytes });
+	}
 	instance.hooks.exit.attach(plugin.name, () => {
 		clearInterval(timer);
+		if (lastTick >= 0) {
+			caughtUp(true);
+		}
 		flush();
+		if (disk) {
+			// What could not be sent waits on disk for the next start (lines of a taken segment are still in its file).
+			if (fromSeg === undefined) {
+				disk.putBack(pending.map(p => JSON.stringify(p.env)));
+			}
+			disk.close();
+		}
 	});
 
 	/** An instance config field, or `fallback` when the controller does not know it (an older plugin version). */

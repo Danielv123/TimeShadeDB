@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as zlib from "node:zlib";
 import { IngestQueue } from "../ingest.js";
 import { fakeLogger, listen, until, type Line } from "./fakes.js";
@@ -146,4 +149,56 @@ test("lines in flight are not dropped by the queue bound", async () => {
 	assert.equal(await q.drain(5000), true);
 	assert.deepEqual(got.slice(1).flat(), ["first-1", "c-33", "d-44"], "the in-flight line survives; the oldest queued go");
 	await srv.close();
+});
+
+test("with a spool directory, lines past maxQueueBytes wait on disk: none is dropped and the order holds", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tsq-"));
+	const ep = await endpoint(ok);
+	let target: { url: string; token: string } | undefined;
+	const q = new IngestQueue({ target: () => target, logger: fakeLogger(), maxQueueBytes: 30, maxBatchBytes: 40, idleMs: 60_000, spoolDir: dir });
+	const lines = Array.from({ length: 50 }, (_, i) => `line-${String(i).padStart(2, "0")}`);
+	for (const l of lines) {
+		q.push(l);
+	}
+	await new Promise(r => setImmediate(r));
+	assert.equal(q.length, 50);
+	assert.equal(q.stats.droppedLines, 0);
+	assert.ok(q.stats.diskLines > 40, `${q.stats.diskLines} lines on disk`);
+	target = { url: ep.url, token: "t" };
+	q.wake();
+	assert.equal(await q.drain(5000), true);
+	assert.deepEqual(ep.got.flatMap(g => g.lines), lines);
+	assert.deepEqual(fs.readdirSync(dir), [], "the segments are deleted once sent");
+	await ep.close();
+	fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("close keeps the queue on disk (also a request in flight and a partly sent segment); the next queue sends it first", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tsq-"));
+	// The sidecar is down: everything waits; close keeps it.
+	const q = new IngestQueue({ target: () => undefined, logger: fakeLogger(), maxQueueBytes: 30, idleMs: 60_000, spoolDir: dir });
+	const first = Array.from({ length: 12 }, (_, i) => `a-${String(i).padStart(2, "0")}`);
+	for (const l of first) {
+		q.push(l);
+	}
+	q.close();
+	// The next start: it sends what was kept, then new lines; it is closed while a segment is half sent.
+	let answers = 0;
+	const ep = await endpoint(() => (++answers <= 2 ? ok() : { status: 503, retryAfter: "60" }));
+	const q2 = new IngestQueue({ target: () => ({ url: ep.url, token: "t" }), logger: fakeLogger(), maxQueueBytes: 30, maxBatchBytes: 20, spoolDir: dir });
+	q2.push("b-00");
+	await until(() => ep.got.length >= 3, 5000, "the third request");
+	q2.close();
+	const sent = ep.got.slice(0, 2).flatMap(g => g.lines);
+	assert.deepEqual(sent, first.slice(0, sent.length), "the kept lines go first, in order");
+	// A third start sends the rest: the unacknowledged part again (the map server skips what it applied) and b-00 last.
+	const ep3 = await endpoint(ok);
+	const q3 = new IngestQueue({ target: () => ({ url: ep3.url, token: "t" }), logger: fakeLogger(), maxQueueBytes: 30, spoolDir: dir });
+	assert.equal(await q3.drain(5000), true);
+	const all = sent.concat(ep3.got.flatMap(g => g.lines));
+	assert.deepEqual([...new Set(all)], [...first, "b-00"], "every line, in order (some twice)");
+	assert.deepEqual(fs.readdirSync(dir), []);
+	await ep.close();
+	await ep3.close();
+	fs.rmSync(dir, { recursive: true, force: true });
 });
