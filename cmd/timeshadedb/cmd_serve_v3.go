@@ -35,7 +35,6 @@ func init() {
 	register(Command{
 		Name:    "serve-v3",
 		Summary: "serve a v3 database: HTTP API, ingest, live events and the viewer",
-		Group:   GroupV3,
 		Run:     cmdServeV3,
 	})
 }

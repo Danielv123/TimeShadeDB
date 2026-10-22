@@ -24,7 +24,6 @@ func init() {
 	register(Command{
 		Name:    "import-minimap",
 		Summary: "import an illisis/minimap export (terrain, movers, overlays) and verify it",
-		Group:   GroupV3,
 		Run:     cmdImportMinimap,
 	})
 }

@@ -28,7 +28,6 @@ func init() {
 	register(Command{
 		Name:    "tail",
 		Summary: "forward a standalone game's capture files (script-output/timeshade) to POST /api/v3/ingest",
-		Group:   GroupV3,
 		Run:     cmdTail,
 	})
 }

@@ -28,13 +28,11 @@ func init() {
 	register(Command{
 		Name:    "publish",
 		Summary: "export the v3 database as static files to a directory or an S3/R2 bucket",
-		Group:   GroupV3,
 		Run:     cmdPublish,
 	})
 	register(Command{
 		Name:    "publish-serve",
 		Summary: "serve a directory written by publish --dir (for testing an export)",
-		Group:   GroupV3,
 		Run:     cmdPublishServe,
 	})
 }

@@ -15,24 +15,6 @@ import (
 	"timeshadedb/internal/v3/terrain"
 )
 
-// This file wires the file-backed v3 stores (terrain and series from WP2, the pyramid
-// from WP3, movers and overlays from WP4) into the offline commands: import-minimap
-// --db and migrate-v3 --db. The server (WP6) opens the same stores with its own options.
-
-func init() {
-	v3TerrainStoreOpener = func(ctx context.Context, dir string) (core.TerrainStore, error) {
-		return openV3BulkTerrain(dir)
-	}
-	v3TerrainFinisher = func(ctx context.Context, store core.TerrainStore) (any, error) {
-		ter, ok := store.(*terrain.Store)
-		if !ok {
-			return nil, nil
-		}
-		st, err := buildV3Pyramid(ctx, ter)
-		return st, err
-	}
-}
-
 // openV3BulkTerrain opens the terrain store under a database root for an offline bulk
 // write (import or migration): no fsync and no WAL, because an interrupted run is redone
 // from its source, and no open-window budget, because the writer commits on its own
