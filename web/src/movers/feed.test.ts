@@ -177,6 +177,13 @@ const settle = async (n = 20) => {
   }
 };
 
+// Waits for cond instead of a fixed time, so a delayed fake answer is not raced by slow or fast timers.
+const until = async (cond: () => boolean, ms = 2000) => {
+  for (const end = Date.now() + ms; !cond() && Date.now() < end;) {
+    await new Promise(r => setTimeout(r, 2));
+  }
+};
+
 test("history: a seek that supersedes one with its day index in flight still loads", async () => {
   const { src, calls } = fakeSource({ dayDelay: 50 });
   const view = new MoverView();
@@ -189,6 +196,7 @@ test("history: a seek that supersedes one with its day index in flight still loa
     feed.ensure(); // every frame while the day index loads
     await tick();
   }
+  await until(() => view.size === 3);
   await settle();
   assert.equal(calls.filter(c => c === "day 2026-10-10").length, 1, "the in-flight index is shared");
   assert.equal(calls.filter(c => c === "window 0").length, 1, "frames during the seek do not restart it");
@@ -204,6 +212,7 @@ test("history: stop aborts day index fetches without caching them as missing", a
   feed.setTime(T0 + 3000, false);
   feed.stop();
   feed.setTime(T0 + 3000, false);
+  await until(() => view.size === 3);
   await settle();
   assert.equal(calls.filter(c => c === "day 2026-10-10").length, 2, calls.join("; "));
   assert.equal(view.size, 3);
