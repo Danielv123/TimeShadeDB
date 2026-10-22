@@ -307,3 +307,27 @@ func TestDataClockGap(t *testing.T) {
 		}
 	}
 }
+
+// TestEndedReleases: an ended envelope (the game exited) releases the source's maps once
+// the data before it is applied; data from the source holds them again.
+func TestEndedReleases(t *testing.T) {
+	srcs, _ := OpenSources("", time.Hour, nil)
+	maps, _ := OpenMaps(t.TempDir())
+	in := New(Stores{Terrain: memstore.NewTerrain(), Movers: memstore.NewMovers(), Overlays: memstore.NewOverlays(), Maps: maps},
+		Options{Sources: srcs, Clock: func() core.TimeMs { return base + core.Hour }})
+	data := line(t, env{V: 1, Tick: 60, Src: "s", Map: "m", RecvMs: int64(base), Seq: seq(1), Msgs: []any{moveMsg(trainEntry("1.1.1", 1))}})
+	ended := `{"v":1,"tick":60,"src":"s","map":"m","recv_ms":` + fmt.Sprint(int64(base+1000)) + `,"seq":2,"caught_up":true,"ended":true,"msgs":[]}` + "\n"
+	if _, err := in.Ingest(context.Background(), strings.NewReader(data+ended)); err != nil {
+		t.Fatal(err)
+	}
+	if h, ok := srcs.Holds()["m"]; ok {
+		t.Fatalf("held at base%+d after ended", h-base)
+	}
+	more := line(t, env{V: 1, Tick: 120, Src: "s", Map: "m", RecvMs: int64(base + 5000), Seq: seq(3), Msgs: []any{moveMsg(trainEntry("1.1.1", 2))}})
+	if _, err := in.Ingest(context.Background(), strings.NewReader(more)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := srcs.Holds()["m"]; !ok {
+		t.Fatal("not held after new data")
+	}
+}

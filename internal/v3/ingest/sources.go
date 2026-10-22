@@ -25,7 +25,8 @@ import (
 //   - seen: when the server last heard from it (wall clock). A source is held until Hold
 //     after that. Every source loaded from disk counts as seen at start, so after a
 //     server restart the horizon waits up to Hold for each source's backlog; a source
-//     that stopped for good releases its maps after Hold.
+//     that stopped for good releases its maps after Hold, or at once when its forwarder
+//     said it ended (an ended envelope: the game exited), until it sends again.
 //   - the last applied envelope's (seq, recv_ms): envelopes of a retried body up to it
 //     are skipped as duplicates, so a retry neither runs the journey rules again nor
 //     re-anchors the clock (Duplicate).
@@ -48,6 +49,7 @@ type source struct {
 	Recv   core.TimeMs            `json:"recv_ms,omitempty"`
 	SeenMs int64                  `json:"seen_ms"`
 	Maps   map[string]core.TimeMs `json:"maps"`
+	Ended  bool                   `json:"ended,omitempty"`
 }
 
 type sourcesFile struct {
@@ -118,6 +120,7 @@ func (s *Sources) Seen(src, mapKey string, t core.TimeMs) {
 	defer s.mu.Unlock()
 	e := s.get(src)
 	e.SeenMs = s.wall().UnixMilli()
+	e.Ended = false
 	if _, ok := e.Maps[mapKey]; !ok {
 		e.Maps[mapKey] = t
 	}
@@ -168,8 +171,19 @@ func (s *Sources) Applied(w map[srcMap]core.TimeMs, marks map[string]seqMark) {
 	s.dirty = true
 }
 
+// End records that src stopped (an ended envelope, applied): it holds nothing until it
+// sends again.
+func (s *Sources) End(src string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e := s.m[src]; e != nil {
+		e.Ended = true
+		s.dirty = true
+	}
+}
+
 // Holds returns, per map key, the lowest W of the sources holding it: the sources heard
-// from within Hold. The commit loop closes no window of the map past it minus its grace.
+// from within Hold that did not end. The commit loop closes no window of the map past it minus its grace.
 // Maps no source holds are absent. With Hold 0 it is empty.
 func (s *Sources) Holds() map[string]core.TimeMs {
 	if s.hold <= 0 {
@@ -180,7 +194,7 @@ func (s *Sources) Holds() map[string]core.TimeMs {
 	now := s.wall().UnixMilli()
 	out := map[string]core.TimeMs{}
 	for _, e := range s.m {
-		if now-e.SeenMs > s.hold.Milliseconds() {
+		if e.Ended || now-e.SeenMs > s.hold.Milliseconds() {
 			continue
 		}
 		for mk, t := range e.Maps {
@@ -199,7 +213,7 @@ func (s *Sources) HeldBy() map[string]map[string]core.TimeMs {
 	now := s.wall().UnixMilli()
 	out := map[string]map[string]core.TimeMs{}
 	for _, e := range s.m {
-		if s.hold <= 0 || now-e.SeenMs > s.hold.Milliseconds() {
+		if s.hold <= 0 || e.Ended || now-e.SeenMs > s.hold.Milliseconds() {
 			continue
 		}
 		for mk, t := range e.Maps {

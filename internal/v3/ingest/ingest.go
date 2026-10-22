@@ -485,6 +485,7 @@ type envHeader struct {
 	RecvMs   core.TimeMs `json:"recv_ms,omitempty"`
 	Seq      *int64      `json:"seq,omitempty"`
 	CaughtUp bool        `json:"caught_up,omitempty"`
+	Ended    bool        `json:"ended,omitempty"`
 }
 
 func (s *segment) next() []byte {
@@ -742,9 +743,11 @@ type batch struct {
 	jops   []jop
 	events []core.OverlayEvent
 	// w and marks are, since the last flush, the newest message time per (source, map)
-	// and the last finished envelope per source (Sources.Applied once applied).
+	// and the last finished envelope per source, ended the sources that ended
+	// (Sources.Applied once applied).
 	w     map[srcMap]core.TimeMs
 	marks map[string]seqMark
+	ended map[string]bool
 	// slab holds the pixels of the queued chunk updates (FlushChunks entries; nslab used).
 	slab  *[]core.ChunkPixels
 	nslab int
@@ -877,8 +880,8 @@ func (b *batch) badMessage(env *envHeader, i int, err error) {
 
 // beginLine starts applying one parsed line: it counts bad lines, and for an envelope
 // skips it as a duplicate (a retry of an envelope already applied), or updates the data
-// clock and the source's clock anchor. A caught_up envelope without messages only
-// records that its source has nothing older pending.
+// clock and the source's clock anchor. A caught_up (or ended) envelope without messages
+// only records that its source has nothing older pending (and that it stopped).
 func (b *batch) beginLine(l *parsedLine) {
 	b.finishLine()
 	b.cur = lineState{}
@@ -906,10 +909,16 @@ func (b *batch) beginLine(l *parsedLine) {
 		b.resp.Duplicates++
 		return
 	}
-	if env.CaughtUp && l.it.empty() {
+	if (env.CaughtUp || env.Ended) && l.it.empty() {
 		in.stats.caughtUp.Add(1)
 		if srcs != nil {
 			srcs.Seen(env.Src, env.Map, env.RecvMs)
+		}
+		if env.Ended {
+			if b.ended == nil {
+				b.ended = map[string]bool{}
+			}
+			b.ended[env.Src] = true
 		}
 		b.cur = lineState{ok: true, env: env, maxT: env.RecvMs, hasT: true}
 		return
@@ -1215,7 +1224,8 @@ func (b *batch) flush() error {
 	b.foldTime()
 	job.w, b.w = b.w, nil
 	job.marks, b.marks = b.marks, nil
-	if len(job.updates)+len(job.jops)+len(job.events)+len(job.w)+len(job.marks) == 0 {
+	job.ended, b.ended = b.ended, nil
+	if len(job.updates)+len(job.jops)+len(job.events)+len(job.w)+len(job.marks)+len(job.ended) == 0 {
 		return nil
 	}
 	if dc := b.in.opt.DataClock; dc != nil {
@@ -1233,9 +1243,10 @@ type applyJob struct {
 	raw     []core.MoverSample
 	jops    []jop
 	events  []core.OverlayEvent
-	// w and marks go to Sources.Applied once the batch is applied.
+	// w, marks and ended go to Sources.Applied once the batch is applied.
 	w     map[srcMap]core.TimeMs
 	marks map[string]seqMark
+	ended map[string]bool
 	// clock is the data clock's seen value when the batch was handed over, published
 	// once the batch is applied.
 	clock core.TimeMs
@@ -1273,6 +1284,9 @@ func (in *Ingester) startApplier(ctx context.Context) *applier {
 				}
 				if in.opt.Sources != nil {
 					in.opt.Sources.Applied(job.w, job.marks)
+					for src := range job.ended {
+						in.opt.Sources.End(src)
+					}
 				}
 			}
 			if job.slab != nil {

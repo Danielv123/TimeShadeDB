@@ -438,7 +438,7 @@ func TestTailStampsFromFile(t *testing.T) {
 	if n, err := tl.pass(context.Background()); err != nil || n != 4 {
 		t.Fatalf("pass: %d %v", n, err)
 	}
-	if err := tl.caughtUp(context.Background()); err != nil {
+	if err := tl.finish(); err != nil {
 		t.Fatal(err)
 	}
 	w := written.UnixMilli()
@@ -449,8 +449,57 @@ func TestTailStampsFromFile(t *testing.T) {
 		}
 	}
 	cu := fi.envs[4]
-	if cu["caught_up"] != true || int64(cu["recv_ms"].(float64)) != now.UnixMilli() || cu["tick"].(float64) != 1200 || len(cu["msgs"].([]any)) != 0 {
-		t.Fatalf("caught_up envelope %v", cu)
+	if cu["caught_up"] != true || cu["ended"] != true || int64(cu["recv_ms"].(float64)) != now.UnixMilli() || cu["tick"].(float64) != 1200 || len(cu["msgs"].([]any)) != 0 {
+		t.Fatalf("caught_up envelope %v (the file is an hour old: the game stopped)", cu)
+	}
+	// A game still writing: the final caught_up does not say it ended.
+	now = written.Add(5 * time.Second)
+	if err := tl.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if cu := fi.envs[len(fi.envs)-1]; cu["caught_up"] != true || cu["ended"] != nil {
+		t.Fatalf("caught_up of a running game %v", cu)
+	}
+}
+
+// TestTailStampsCopiedFiles: files that all got the same modification time (copied
+// without it) are laid out back from the newest one by their ticks, so a backlog of them
+// does not overlap in time; a pause between files (an earlier modification time) stays.
+func TestTailStampsCopiedFiles(t *testing.T) {
+	fi := &fakeIngest{}
+	ts := httptest.NewServer(fi)
+	defer ts.Close()
+	dir := t.TempDir()
+	copied := time.UnixMilli(1_791_000_000_000)
+	tl := &tailer{dir: dir, url: ts.URL, src: "standalone:x", mapKey: "m", batchBytes: 1 << 20,
+		client: ts.Client(), logf: func(string, ...any) {}, now: func() time.Time { return copied.Add(time.Minute) },
+		sleep: func(context.Context, time.Duration) error { return nil }, offsets: map[string]*tailFile{}}
+	env := func(tick int) string { return `{"v":1,"tick":` + itoa(int32(tick)) + `,"msgs":[]}` + "\n" }
+	write := func(name string, mtime time.Time, ticks ...int) {
+		var b strings.Builder
+		for _, tk := range ticks {
+			b.WriteString(env(tk))
+		}
+		p := filepath.Join(dir, name)
+		os.WriteFile(p, []byte(b.String()), 0o644)
+		os.Chtimes(p, mtime, mtime)
+	}
+	// 1 and 2 copied at once (one minute of ticks each); 3 written after a pause, later.
+	write("1.ndjson", copied, 0, 1800, 3600)
+	write("2.ndjson", copied, 3720, 5400, 7200)
+	write("3.ndjson", copied.Add(30*time.Second), 9000)
+	tl.now = func() time.Time { return copied.Add(30 * time.Second) }
+	if n, err := tl.pass(context.Background()); err != nil || n != 7 {
+		t.Fatalf("pass: %d %v", n, err)
+	}
+	c := copied.UnixMilli()
+	// 3 ends at its own time; 2 at its own time (where 3.s ticks put it too);
+	// 1 is laid back from 2 by the 3,600 ticks between their last lines.
+	want := []int64{c - 60000 - 60000, c - 60000 - 30000, c - 60000, c - 58000, c - 30000, c, c + 30000}
+	for i, e := range fi.envs {
+		if got := int64(e["recv_ms"].(float64)); got != want[i] {
+			t.Fatalf("line %d stamped %d, want %d", i, got-c, want[i]-c)
+		}
 	}
 }
 

@@ -22,6 +22,7 @@ the forwarder adds the second group before posting.
 | `recv_ms` | forwarder | int | wall-clock ms when the line was written or first read (below) |
 | `seq` | forwarder | int, optional | increasing per `src`; echoed by ingest for acknowledgements; ingest skips an envelope whose `seq` and `recv_ms` are both at or below the last applied envelope of its `src` (a retried body) |
 | `caught_up` | forwarder | bool, optional | the forwarder has no older line of this `src` pending: everything it read was sent. Such an envelope may have no messages (`"msgs":[]`); then ingest only notes that the source has caught up to `recv_ms` (API.md 5, "Horizon") and does not use it for the clock anchor or the data clock |
+| `ended` | forwarder | bool, optional | with `caught_up`: the source stopped (its game exited), so ingest need not wait for more of it until it sends again |
 
 Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not fatal).
 
@@ -37,10 +38,12 @@ strictly increasing per line). A game that ran slower than that, or paused, give
 later than the truth, which the anchor allows.
 
 Forwarders send `caught_up` envelopes while they have nothing to send: `timeshadedb tail`
-every few seconds once it has posted everything in the directory, and at the end of
-`--once`; the Clusterio instance every few seconds while its queue is empty, and when the
-instance stops. Without them a source that goes quiet holds its maps for the server's
-`--source-hold`.
+every few seconds once it has posted everything in the directory, and when it stops
+(`ended` when the newest file has not changed for 10 s, so the game is not running); the
+Clusterio instance every few seconds while its queue is empty, and `ended` when the
+instance stops. A forwarder that stops without one (killed, or its host lost) leaves its
+source holding its maps for the server's `--source-hold`, so the lines it still has are
+not late when it comes back.
 
 ## 2. Transports
 

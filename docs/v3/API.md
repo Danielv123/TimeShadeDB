@@ -259,9 +259,10 @@ source's first envelope holds its map at once. A live source's newest time trail
 clock by a few seconds, so live data is committed as before. A source that is behind
 (a forwarder catching up after it, the network or the server was down) holds the map at
 its own data, which it sends in time order, so none of it is late. A `caught_up` envelope
-(PROTOCOL.md 1) raises the source's time to its `recv_ms`, which releases the map. A
-source that goes quiet without one holds its maps until `--source-hold` after it was last
-heard from; every source in `sources.json` counts as heard from when the server starts,
+(PROTOCOL.md 1) raises the source's time to its `recv_ms` (a forwarder that is idle sends
+one every few seconds, so its source holds nothing back), and one marked `ended` (the game
+stopped) releases the source's maps until it sends again. A source that goes quiet
+without one holds its maps until `--source-hold` after it was last heard from; every source in `sources.json` counts as heard from when the server starts,
 so after a restart each map waits up to `--source-hold` for its sources' backlogs. Data a
 source sends later than that, or out of order by more than the grace, can still be late
 (counted as `late`). Closed windows are never rewritten. While a map is held, its windows
@@ -390,7 +391,9 @@ the file's modification time for its last line, counted back by ticks for the li
 before it), so a backlog (a tailer that was stopped, a server that was down, a recorded
 capture posted with `--once`) keeps its times and is posted as fast as the server takes
 it. Once it has posted everything it sends a `caught_up` envelope, and again every
-`--heartbeat` (5 s) while nothing new arrives, and at the end of `--once`. Network
+`--heartbeat` (5 s) while nothing new arrives, and one when it stops (at the end of
+`--once`, or on interrupt), marked `ended` when the newest file has not changed for 10 s
+(the game is not running). Network
 errors, 5xx, 429 and 408 are retried with backoff (honouring `Retry-After`); a 400 or 413
 splits the batch, and a single line that is still refused is skipped and logged; any other
 status (401, 403, 404, 415) stops the tailer with an error. The acknowledged offsets are

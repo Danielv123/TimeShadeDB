@@ -150,10 +150,11 @@ func (t *tailer) pass(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	ends := t.fileEnds(names)
 	total := 0
 	for i, name := range names {
 		newest := i == len(names)-1
-		n, err := t.forward(ctx, name, newest)
+		n, err := t.forward(ctx, name, newest, ends[i])
 		total += n
 		if err != nil {
 			return total, err
@@ -205,7 +206,7 @@ func (t *tailer) list() ([]string, error) {
 
 // forward posts the complete lines of a file from its offset. A file that is not the
 // newest is complete: a trailing partial line (the game stopped mid-write) is dropped.
-func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, error) {
+func (t *tailer) forward(ctx context.Context, name string, newest bool, wrote time.Time) (int, error) {
 	path := filepath.Join(t.dir, name)
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -254,7 +255,10 @@ func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, er
 		t.logf("%s: dropping %d bytes of an incomplete last line", name, len(data)-end)
 	}
 	data = data[:end]
-	lines := t.lineStamps(data, fi.ModTime())
+	if wrote.IsZero() {
+		wrote = fi.ModTime()
+	}
+	lines := t.lineStamps(data, wrote)
 	total := 0
 	for len(lines) > 0 {
 		// Cut a batch at a line boundary.
@@ -285,6 +289,110 @@ func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, er
 	return total, nil
 }
 
+// fileEnds returns, per file (in name order), when the game wrote its last line: its
+// modification time, but no later than the clock and, going back from the newest file,
+// no later than the next file's last line minus the ticks between their last lines (at
+// the next file's speed), or than the next file's first line when the ticks do not
+// continue. So files whose modification times are later than their ticks allow (copied
+// without them, all at once) are laid out back from the newest by their ticks and do not
+// overlap, while a pause between files (an earlier modification time) is kept. A file
+// whose ticks cannot be read keeps its modification time (zero: forward stats it).
+func (t *tailer) fileEnds(names []string) []time.Time {
+	type span struct {
+		first, last int64
+		speed       float64
+		mtime       time.Time
+		ok          bool
+	}
+	spans := make([]span, len(names))
+	for i, name := range names {
+		f, err := os.Open(filepath.Join(t.dir, name))
+		if err != nil {
+			continue
+		}
+		fi, err := f.Stat()
+		if err == nil {
+			head := make([]byte, min(fi.Size(), 512))
+			tailBytes := make([]byte, min(fi.Size(), 16<<10))
+			_, err1 := f.ReadAt(head, 0)
+			_, err2 := f.ReadAt(tailBytes, fi.Size()-int64(len(tailBytes)))
+			if (err1 == nil || errors.Is(err1, io.EOF)) && (err2 == nil || errors.Is(err2, io.EOF)) {
+				first, _ := lineTick(head)
+				// the last complete line
+				end := bytes.LastIndexByte(tailBytes, '\n')
+				if end > 0 {
+					start := bytes.LastIndexByte(tailBytes[:end], '\n') + 1
+					last, speed := lineTick(tailBytes[start:end])
+					spans[i] = span{first, last, speed, fi.ModTime(), first >= 0 && last >= first}
+				}
+			}
+			if !spans[i].ok {
+				spans[i].mtime = fi.ModTime()
+			}
+		}
+		f.Close()
+	}
+	ends := make([]time.Time, len(names))
+	now := t.now()
+	for i := len(names) - 1; i >= 0; i-- {
+		s := spans[i]
+		if s.mtime.IsZero() {
+			continue
+		}
+		e := s.mtime
+		if e.After(now) {
+			e = now
+		}
+		if i+1 < len(names) && s.ok && spans[i+1].ok && !ends[i+1].IsZero() {
+			n := spans[i+1]
+			var bound time.Time
+			if n.first >= s.last {
+				bound = ends[i+1].Add(-time.Duration(float64(n.last-s.last) * float64(time.Second) / (60 * n.speed)))
+			} else {
+				bound = ends[i+1].Add(-time.Duration(float64(n.last-n.first) * float64(time.Second) / (60 * n.speed)))
+			}
+			if bound.Before(e) {
+				e = bound
+			}
+		}
+		ends[i] = e
+	}
+	return ends
+}
+
+// gameIdle is how long the newest capture file must be unchanged before the tailer takes
+// the game for stopped (it appends every 2 s while it runs, PROTOCOL.md 2).
+const gameIdle = 10 * time.Second
+
+// gameStopped reports whether the game looks stopped: no capture file, or the newest one
+// unchanged for gameIdle.
+func (t *tailer) gameStopped() bool {
+	names, err := t.list()
+	if err != nil {
+		return false
+	}
+	if len(names) == 0 {
+		return true
+	}
+	fi, err := os.Stat(filepath.Join(t.dir, names[len(names)-1]))
+	return err == nil && t.now().Sub(fi.ModTime()) >= gameIdle
+}
+
+// finish sends the last caught_up envelope when the tailer stops: ended when the game
+// looks stopped, so the server does not wait for more of this source.
+func (t *tailer) finish() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ended := t.gameStopped()
+	if err := t.caughtUp(ctx, ended); err != nil {
+		return err
+	}
+	if ended {
+		t.logf("the game looks stopped: told the server this source ended")
+	}
+	return t.saveState()
+}
+
 // tline is one line to post (with its newline) and the recv_ms it is stamped with.
 type tline struct {
 	b    []byte
@@ -293,8 +401,9 @@ type tline struct {
 
 // lineStamps splits data (complete lines, the rest of a file from its acknowledged
 // offset) and stamps each line with when the game wrote it (docs/v3/PROTOCOL.md 1): the
-// last line with the file's modification time (no later than now), each line before it
-// that time minus the ticks to the next line at 60 x speed ticks a second (a tick that
+// last line with the file's end time (fileEnds: its modification time, no later than now
+// or than its successor allows), each line before it that time minus the ticks to the next
+// line at 60 x speed ticks a second (a tick that
 // goes back, a reloaded save, counts as no time). When they would start at or before the
 // newest stamp of an earlier line, all of them move up by the difference, as far as the
 // clock allows; within the lines they increase strictly. A game that ran slower than its
@@ -302,7 +411,7 @@ type tline struct {
 // allows (stamps earlier than the truth would make it place the data too early). Files
 // whose modification times do not match their ticks (copied without them, say) give
 // stamps that go back at file boundaries; the anchor then starts over there.
-func (t *tailer) lineStamps(data []byte, mtime time.Time) []tline {
+func (t *tailer) lineStamps(data []byte, end time.Time) []tline {
 	var lines []tline
 	for len(data) > 0 {
 		i := bytes.IndexByte(data, '\n') + 1
@@ -313,7 +422,7 @@ func (t *tailer) lineStamps(data []byte, mtime time.Time) []tline {
 		return nil
 	}
 	now := core.FromTime(t.now())
-	last := min(core.FromTime(mtime), now)
+	last := min(core.FromTime(end), now)
 	ticks := make([]int64, len(lines))
 	speeds := make([]float64, len(lines))
 	for i, l := range lines {
@@ -371,14 +480,19 @@ func lineTick(line []byte) (int64, float64) {
 }
 
 // caughtUp posts a caught_up envelope: everything the tailer read was posted
-// (docs/v3/PROTOCOL.md 1), so the server can stop holding the map for this source.
-func (t *tailer) caughtUp(ctx context.Context) error {
+// (docs/v3/PROTOCOL.md 1), so the server need not hold the map for this source beyond
+// now. With ended it says the game stopped, and the server stops holding the map for the
+// source at all until it sends again.
+func (t *tailer) caughtUp(ctx context.Context, ended bool) error {
 	recv := max(int64(core.FromTime(t.now())), t.lastRecv+1)
 	t.seq++
 	var line bytes.Buffer
 	fmt.Fprintf(&line, `{"src":%s,"map":%s,"recv_ms":%d,"seq":%d`, jsonString(t.src), jsonString(t.mapKey), recv, t.seq)
 	if t.instance != 0 {
 		fmt.Fprintf(&line, `,"instance":%d`, t.instance)
+	}
+	if ended {
+		line.WriteString(`,"ended":true`)
 	}
 	fmt.Fprintf(&line, `,"v":1,"tick":%d,"caught_up":true,"msgs":[]}`+"\n", max(t.lastTick, 0))
 	var body bytes.Buffer
@@ -553,7 +667,7 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	poll := fs.Duration("poll", time.Second, "how often to look for new lines")
 	batch := fs.Int("batch-bytes", 1<<20, "largest request body before compression")
 	once := fs.Bool("once", false, "forward what is there now and exit")
-	heartbeat := fs.Duration("heartbeat", 5*time.Second, "while there is nothing new to post, send a caught_up envelope this often, so the server does not hold the map for this source (0: never; --once always sends one at the end)")
+	heartbeat := fs.Duration("heartbeat", 5*time.Second, "while there is nothing new to post, send a caught_up envelope this often, so the server does not hold the map for this source (0: never; one is always sent when tail stops, marked ended when the game looks stopped)")
 	state := fs.String("state", "", "file that keeps the acknowledged offsets across restarts (default <dir>/timeshadedb-tail.state.json; - for none)")
 	quiet := fs.Bool("quiet", false, "log only errors")
 	if err := fs.Parse(args); err != nil {
@@ -604,21 +718,34 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	stopped := func() error {
+		if err := t.finish(); err != nil {
+			logf("ingest: final caught_up not sent: %v", err)
+		}
+		return nil
+	}
 	for {
 		n, err := t.pass(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return stopped()
 			}
 			return fmt.Errorf("tail: %w", err)
 		}
 		if n > 0 && !*quiet {
 			logf("posted %d envelopes (%d total)", n, t.posted)
 		}
-		if *once || (n == 0 && *heartbeat > 0 && t.now().Sub(t.lastSent) >= *heartbeat) {
-			if err := t.caughtUp(ctx); err != nil {
+		if *once {
+			if err := t.finish(); err != nil {
+				return fmt.Errorf("tail: %w", err)
+			}
+			fmt.Fprintf(stdout, "posted %d envelopes\n", t.posted)
+			return nil
+		}
+		if n == 0 && *heartbeat > 0 && t.now().Sub(t.lastSent) >= *heartbeat {
+			if err := t.caughtUp(ctx, false); err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return stopped()
 				}
 				return fmt.Errorf("tail: %w", err)
 			}
@@ -626,12 +753,8 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 				return fmt.Errorf("tail: state: %w", err)
 			}
 		}
-		if *once {
-			fmt.Fprintf(stdout, "posted %d envelopes\n", t.posted)
-			return nil
-		}
 		if err := sleepCtx(ctx, *poll); err != nil {
-			return nil
+			return stopped()
 		}
 	}
 }
