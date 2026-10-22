@@ -129,10 +129,6 @@ function terrain.on_chunk_charted(st, e, forced)
 		if deb.pending[key] or deb.dirty[key] then
 			return
 		end
-		if not deb.cool[key] and deb.queue.n >= deb.queue.cap then
-			deb.drops = deb.drops + 1
-			return
-		end
 	end
 	core.charted(deb, key, forced)
 end

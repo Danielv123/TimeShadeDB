@@ -76,27 +76,31 @@ t.test("the FIFO: order kept; the cap refuses event pushes; a push without a cap
 	t.expect_same(q, { head = 1, tail = 0 }, "an empty queue resets its indexes")
 end)
 
-t.test("the ring: order kept across the wrap; full at cap; its slots stay within 1..cap", function()
+t.test("the ring: order kept across the wrap and when a full ring doubles; its slots stay within 1..cap", function()
 	local q = core.queue(3)
 	t.expect_eq(core.pop(q), nil, "empty")
 	t.expect_eq(core.peek(q), nil, "nothing to peek")
 	local want, next_in = {}, 1
 	for round = 1, 10 do
-		while core.push(q, next_in) do
+		for _ = 1, 3 do
+			t.expect_true(core.push(q, next_in), "a ring takes every item")
 			want[#want + 1] = next_in
 			next_in = next_in + 1
 		end
-		t.expect_eq(core.size(q), 3, "full at cap (round " .. round .. ")")
+		t.expect_eq(core.size(q), #want, "round " .. round)
 		for _ = 1, round % 3 + 1 do
 			t.expect_eq(core.peek(q), want[1])
 			t.expect_eq(core.pop(q), table.remove(want, 1))
 		end
 	end
+	t.expect_true(q.cap > 3, "it grew: cap " .. q.cap)
 	for k in pairs(q) do
-		t.expect_true(type(k) == "string" or (k >= 1 and k <= 3), "slot " .. tostring(k))
+		t.expect_true(type(k) == "string" or (k >= 1 and k <= q.cap), "slot " .. tostring(k))
 	end
-	while core.pop(q) do
+	while #want > 0 do
+		t.expect_eq(core.pop(q), table.remove(want, 1))
 	end
+	t.expect_eq(core.pop(q), nil)
 	t.expect_eq(core.size(q), 0)
 end)
 
@@ -154,16 +158,16 @@ t.test("debounce: a chunk is read at most once per DEBOUNCE ticks; one charted w
 		t.expect_eq(core.charted(d, key), "queued", "a quiet chunk is queued at once")
 	end)
 
-t.test("debounce: forced pushes skip the cool-down and the cap; the cap drops and counts event pushes", function()
+t.test("debounce: forced pushes skip the cool-down; the event queue grows past its ring instead of dropping", function()
 	local cap = core.CAP
 	core.CAP = 2
 	local d = core.debounce()
 	core.CAP = cap
 	t.expect_eq(core.charted(d, "a"), "queued")
 	t.expect_eq(core.charted(d, "b"), "queued")
-	t.expect_eq(core.charted(d, "c"), "dropped")
-	t.expect_eq(d.drops, 1)
-	t.expect_eq(core.charted(d, "c", true), "queued", "forced past the cap")
+	t.expect_eq(core.charted(d, "x"), "queued", "past the ring's first size")
+	t.expect_eq(d.drops, 0)
+	t.expect_eq(core.charted(d, "c", true), "queued", "forced")
 	local key, forced = core.take(d, 0)
 	t.expect_eq(key, "c", "forced reads first")
 	t.expect_eq(forced, true)

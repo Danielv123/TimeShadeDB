@@ -17,7 +17,7 @@ It replaces `timeshadedb_exporter/`, which does not run on Factorio 2.0.
 | Path | Contents |
 |---|---|
 | `lua/core.lua` | Pure rules: clip, chunk keys, queues, chart debounce, sent-chart cache, train emission, dead reckoning, journeys, the line cut, storage migrations |
-| `lua/outbox.lua` | Per-tick message queue, flushed as envelope lines under 3,500 bytes |
+| `lua/outbox.lua` | Per-tick message queue, flushed as envelope lines under `core.LIMIT` bytes (3,500 for Clusterio's IPC; the standalone mod's files take 200,000, `core.limits`) |
 | `lua/json.lua` | The JSON encoder (cheaper than `helpers.table_to_json`) |
 | `lua/terrain.lua` | `on_chunk_charted` through the debounce, chart reads and compare, surfaces, the resync walk |
 | `lua/movers.lua` | Scan, read wheel, train/vehicle/player samples, joins and splits, Universal Edges hand-off |
@@ -172,7 +172,8 @@ saves. Headless Factorio never charts, so a synthetic chart seam stands in for
 What the game tests check, on the standalone mod and on the Clusterio module (loaded as a
 patched save loads it, with a stub Clusterio API):
 
-- every line is a valid envelope under 3,500 bytes; every chart inflates to the 2,048 bytes
+- every line is a valid envelope under its host's limit (3,500 bytes for the Clusterio module,
+  200,000 for the standalone mod's files); every chart inflates to the 2,048 bytes
   the seam produced at that tick;
 - the debounce bound; a resync sends all 400 charted chunks and ends with `resynced`;
 - two trains, one on a straight track (east, stop, back west), one round a loop built with
@@ -270,7 +271,7 @@ string: slower), so it is a slow tick every 2 s and 11 µs/tick on average. Char
 real terrain deflate to fewer bytes than the generated ones but take longer to deflate.
 
 What changed since the 0.330 ms/tick recorded here before: a queued chart read
-is now the chunk's key alone, in a ring of 20,000 slots (it was a table per read in a table
+is now the chunk's key alone, in a ring of 20,000 slots that doubles when full (it was a table per read in a table
 whose indexes drifted into its hash part), which halves the capture's Lua heap in this bench
 (19.8 to 9.4 MiB); chunk messages and move messages are encoded
 without escaping the base64 or building a string per sample; the chord test avoids square

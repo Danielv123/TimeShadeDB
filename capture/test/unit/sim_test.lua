@@ -574,6 +574,33 @@ t.test("trains: a train destroyed sends gone; a long train's car is capped and e
 		t.expect_eq(storage.timeshade.movers[j], nil, "forgotten")
 	end)
 
+t.test("trains: with the file transport's limits (core.limits) a long train lists every carriage and kind", function()
+	local capture, world, log = boot()
+	local core = capture.core
+	local saved = { line = core.LIMIT, car = core.CAR_MAX, kinds = core.KINDS_MAX, rp_start = core.RP_START_MAX }
+	core.limits{ line = 200000, car = 4000, kinds = 4000, rp_start = 1000 }
+	local ok, err = pcall(function()
+		local s = world.surfaces.nauvis
+		local tr = fake.train(s, "L" .. string.rep("C", 249), fake.path_lc(5000, 12), 2000)
+		run(capture, 1, 200, function()
+			tr.speed = 1
+			fake.place(tr, tr.pos + 1)
+		end)
+		local got = entries(log, storage.timeshade.by_train[tr.id])
+		t.expect_eq(got[1].n, 250)
+		t.expect_eq(#got[1].car, 250, "every carriage")
+		t.expect_eq(#got[1].o, 250, "every kind")
+		for _, line in ipairs(log.lines) do
+			t.expect_true(#line < 200000, "line of " .. #line)
+		end
+		t.expect_eq(capture.outbox.oversize(), 0, "nothing dropped")
+	end)
+	core.limits(saved)
+	if not ok then
+		error(err, 0)
+	end
+end)
+
 t.test("vehicles and players: dead reckoning, vehicles with heading and kind, players by name", function()
 	local capture, world, log = boot()
 	local s = world.surfaces.nauvis
@@ -733,9 +760,9 @@ t.test("terrain: total Lua memory stays bounded at the default chart rate with 2
 	collectgarbage("collect")
 	local peak = collectgarbage("count") - before
 	local d = capture.terrain.state().debounce
-	t.expect_eq(core.size(d.queue) + capture.terrain.state().reads + d.drops, 200000, "every event queued, read or dropped")
-	t.expect_true(core.size(d.queue) <= core.CAP, "queue " .. core.size(d.queue))
-	local drops = d.drops
+	t.expect_eq(core.size(d.queue) + capture.terrain.state().reads, 200000, "every event queued or read")
+	t.expect_eq(d.drops, 0, "nothing dropped")
+	local drops, queued = d.drops, core.size(d.queue)
 	-- read the queue empty, then let the last cool-downs end
 	local tick = 100
 	while core.size(capture.terrain.state().debounce.queue) > 0 do
@@ -754,11 +781,11 @@ t.test("terrain: total Lua memory stays bounded at the default chart rate with 2
 	t.expect_true(core.cache_count(st.cache) <= core.CACHE, "cache entries " .. core.cache_count(st.cache))
 	t.expect_eq(next(st.debounce.raw), nil, "no raw chart left")
 	t.expect_eq(next(st.debounce.pending), nil, "nothing pending")
-	-- unbounded, the queue alone would hold 200,000 items and the cache 200,000 charts (over 60 MiB)
+	-- the queue holds every charted chunk once (keys only); unbounded, the cache would hold 200,000 charts (over 60 MiB)
 	t.expect_true(peak < 12 * 1024, string.format("Lua memory +%.1f MiB with the queue full", peak / 1024))
 	t.expect_true(final < 12 * 1024, string.format("Lua memory +%.1f MiB once read", final / 1024))
 	print(string.format("    default rate: Lua memory +%.1f MiB with the queue full (%d queued, %d dropped), +%.1f MiB "
-		.. "once read (%d cached); Lua 5.4 in wasm", peak / 1024, core.CAP, drops, final / 1024,
+		.. "once read (%d cached); Lua 5.4 in wasm", peak / 1024, queued, drops, final / 1024,
 		core.cache_count(st.cache)))
 end)
 

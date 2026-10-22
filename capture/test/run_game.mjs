@@ -477,7 +477,8 @@ async function runTest() {
 	const { envelopes, msgs, bad, maxLen } = validateLines(lines, "test");
 	note(`test: ${files.length} files, ${lines.length} lines, ${envelopes.length} valid envelopes, ${bad} bad, longest line `
 		+ `${maxLen} bytes, ${msgs.length} messages`);
-	check(maxLen < 3500, `test: every line under 3,500 bytes (longest ${maxLen})`);
+	// the standalone mod's files take lines up to 200,000 bytes (core.limits in its control.lua)
+	check(maxLen < 200000, `test: every line under 200,000 bytes (longest ${maxLen})`);
 	const resultsPath = path.join(outDir, "timeshade-test", "results.json");
 	if (!check(fs.existsSync(resultsPath), "test: the driver wrote results.json")) {
 		return;

@@ -9,6 +9,10 @@
 -- load only decide what is written.
 local capture = require("lua.capture")
 
+-- Files have no line limit like Clusterio's IPC (the server takes 256 KiB a message): list every carriage of a long
+-- train and every rail piece under it (the server keeps up to 1,024 a sample).
+capture.core.limits{ line = 200000, car = 4000, kinds = 4000, rp_start = 1000 }
+
 local ROTATE_TICKS = 3600 -- a new file every 60 s of game time
 local MAX_BYTES = 4 * 1024 * 1024 -- or once a file holds 4 MiB
 
