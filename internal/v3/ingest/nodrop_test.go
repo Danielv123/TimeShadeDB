@@ -394,3 +394,67 @@ func TestGoneAfterRestart(t *testing.T) {
 		t.Fatalf("live after the gones: %+v", live.Rows)
 	}
 }
+
+// TestUnknownHolds: maps no source on record feeds are held at their newest data from
+// the start; caught_up, an ended source of the map or the hold's end release them, and a
+// source's own data takes over the hold. A map a known source feeds gets no unknown hold.
+func TestUnknownHolds(t *testing.T) {
+	dir := t.TempDir()
+	wall := time.UnixMilli(int64(base + 2*core.Hour))
+	clock := func() time.Time { return wall }
+	known, _ := OpenSources(dir, time.Hour, clock)
+	known.Seen("k", "known", base)
+	if err := known.Save(); err != nil {
+		t.Fatal(err)
+	}
+	srcs, err := OpenSources(dir, time.Hour, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcs.HoldUnknown(map[string]core.TimeMs{"known": base + 50, "a": base + 10, "b": base + 20, "c": base + 30})
+	h := srcs.Holds()
+	if h["known"] != base || h["a"] != base+10 || h["b"] != base+20 || h["c"] != base+30 {
+		t.Fatalf("holds at start %v", h)
+	}
+	srcs.Seen("s", "a", base+500) // data: s holds a from its first data on
+	srcs.Seen("t", "b", base+600) // the same for a caught_up envelope
+	srcs.Seen("u", "c", base+700)
+	srcs.End("u")
+	h = srcs.Holds()
+	if h["a"] != base+500 || h["b"] != base+600 {
+		t.Fatalf("holds after the sources sent %v", h)
+	}
+	if _, ok := h["c"]; ok {
+		t.Fatalf("c held after its source ended: %v", h)
+	}
+	if by := srcs.HeldBy(); by["a"][UnknownSource] != 0 || len(by["a"]) != 1 {
+		t.Fatalf("held by %v", by)
+	}
+
+	again, _ := OpenSources("", time.Hour, clock)
+	again.HoldUnknown(map[string]core.TimeMs{"x": base})
+	wall = wall.Add(61 * time.Minute)
+	if h := again.Holds(); len(h) != 0 {
+		t.Fatalf("unknown hold after the hold ended: %v", h)
+	}
+}
+
+// TestHoldPerMap: a source that stopped feeding one of its maps releases that map after
+// the hold, while it keeps holding the map it still feeds.
+func TestHoldPerMap(t *testing.T) {
+	wall := time.UnixMilli(int64(base + core.Hour))
+	clock := func() time.Time { return wall }
+	srcs, _ := OpenSources("", time.Hour, clock)
+	srcs.Seen("s", "m1", base)
+	srcs.Seen("s", "m2", base)
+	wall = wall.Add(40 * time.Minute)
+	srcs.Seen("s", "m2", base+40*core.Minute)
+	wall = wall.Add(30 * time.Minute)
+	h := srcs.Holds()
+	if _, ok := h["m1"]; ok {
+		t.Fatalf("m1 held 70 min after its last data: %v", h)
+	}
+	if _, ok := h["m2"]; !ok {
+		t.Fatalf("m2 released 30 min after its last data: %v", h)
+	}
+}

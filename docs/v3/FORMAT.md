@@ -368,13 +368,17 @@ missing or unreadable means no sources known.
 
 ```json
 {"version": 1, "sources": [{"src": "...", "seq": 123, "recv_ms": 1791630000000,
-  "seen_ms": 1791630005000, "maps": {"<map key>": 1791629999000}}]}
+  "seen_ms": 1791630005000, "maps": {"<map key>": 1791629999000},
+  "map_seen_ms": {"<map key>": 1791630005000}}]}
 ```
 
 `maps` is, per map the source fed, the newest message time applied (or the newest
 `caught_up` time); `seq` and `recv_ms` are the last applied envelope's (absent without a
-`seq`); `seen_ms` is the server's wall clock when the source was last heard from. Entries
-not heard from for 7 days are dropped.
+`seq`); `seen_ms` is the server's wall clock when the source was last heard from, and
+`map_seen_ms` per map when it last had data or `caught_up` for it (optional; `seen_ms`
+for a map without an entry). Entries not heard from for 7 days are dropped. Maps with data
+but no source here are held from the server's start (API.md 5, "Horizon"); that hold is
+not saved.
 
 ## 6. Version and compatibility rules
 

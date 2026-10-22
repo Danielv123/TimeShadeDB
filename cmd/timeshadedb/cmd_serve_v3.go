@@ -238,19 +238,18 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v.ovl = ovl
 	v.closers = append(v.closers, ovl.Close)
 
+	// The newest data per map: the data clock starts from it, and maps no source on record
+	// feeds are held at it until a source shows up (ingest.Sources.HoldUnknown).
+	newest, err := ingest.NewestData(ctx, ter, mov)
+	if err != nil {
+		return fail(err)
+	}
 	if dataClock != nil {
-		// Start from the newest data in the database.
-		if infos, err := ter.Datastores(ctx); err == nil {
-			for _, info := range infos {
-				dataClock.Observe(info.LastT)
-			}
-		}
-		if sfcs, err := mov.Surfaces(ctx); err == nil {
-			for _, si := range sfcs {
-				dataClock.Observe(si.LastT)
-			}
+		for _, t := range newest {
+			dataClock.Observe(t)
 		}
 	}
+	sources.HoldUnknown(newest)
 	maps, err := ingest.OpenMaps(o.db)
 	if err != nil {
 		return fail(err)

@@ -121,3 +121,57 @@ func surfaceInfo(t *testing.T, f *fixture, sfc core.SurfaceKey) core.SurfaceInfo
 	t.Fatalf("no surface %v", sfc)
 	return core.SurfaceInfo{}
 }
+
+// TestUnknownMapHeldAfterRestart: the first part of a backlog reached the stores before a
+// restart whose server has no record of the source (a database from before sources.json).
+// The loop runs a few commit steps before the forwarder reconnects with the rest. With
+// HoldUnknown the map waits at its newest data and nothing is late; without it (the
+// earlier behaviour) the horizon follows the clock and the rest is late.
+func TestUnknownMapHeldAfterRestart(t *testing.T) {
+	for _, unknown := range []bool{true, false} {
+		t.Run(fmt.Sprint(unknown), func(t *testing.T) {
+			srcs, err := ingest.OpenSources("", time.Hour, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := newFixture(t, fixtureOpt{sources: srcs})
+			ctx := context.Background()
+			start := f.clock() - core.Hour
+			// before the restart: an ingester without source records
+			pre := ingest.New(ingest.Stores{Terrain: f.ter, Movers: f.mov, Overlays: f.ovl, Maps: f.maps}, ingest.Options{Clock: f.clock})
+			if r, err := pre.Ingest(ctx, strings.NewReader(backlogBody(t, "standalone:back", start, 0, 200))); err != nil || r.Samples.Accepted != 200 {
+				t.Fatalf("first part: %+v, %v", r, err)
+			}
+			if unknown {
+				newest, err := ingest.NewestData(ctx, f.ter, f.mov)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if newest["gw-back.1"] != start+199*core.Second {
+					t.Fatalf("newest data %v, want start+199 s", newest)
+				}
+				srcs.HoldUnknown(newest)
+			}
+			for range 3 {
+				f.srv.Step(ctx)
+			}
+			second, err := f.in.Ingest(ctx, strings.NewReader(backlogBody(t, "standalone:back", start, 200, 400)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			late := second.Samples.Late + second.Chunks.Late
+			if !unknown {
+				if late == 0 {
+					t.Fatalf("without the unknown hold the rest was not late: %+v", second)
+				}
+				return
+			}
+			if late != 0 || second.Samples.Accepted != 400 || second.Chunks.Accepted != 400 {
+				t.Fatalf("rest of the backlog: %+v", second)
+			}
+			if _, ok := srcs.HeldBy()["gw-back.1"][ingest.UnknownSource]; ok {
+				t.Fatal("the unknown hold stayed after the source sent data")
+			}
+		})
+	}
+}

@@ -257,18 +257,28 @@ backlog is not late, each map's horizon is also held behind the data of the sour
 feed it (`ingest.Sources`, FORMAT.md 5.8): per source (`src`) and map the server keeps the
 newest time of a chunk update or mover sample it applied (the data with a horizon; overlay,
 map and trace messages hold nothing), and closes no window of the map past the lowest of those,
-minus the grace, over the sources heard from within `--source-hold` (default 1 hour). A
-source's first envelope holds its map at once. A live source's newest time trails the
-clock by a few seconds, so live data is committed as before. A source that is behind
+minus the grace, over the sources that had data (or a `caught_up` envelope) for the map
+within `--source-hold` (default 1 hour). A source's first envelope holds its map at once.
+A live source's newest time trails the clock by a few seconds, so live data is committed
+as before (the committed horizon trails it by those seconds more than with the clock
+alone; viewers see the open windows as live meanwhile). A source that is behind
 (a forwarder catching up after it, the network or the server was down) holds the map at
 its own data, which it sends in time order, so none of it is late. A `caught_up` envelope
 (PROTOCOL.md 1) raises the source's time to its `recv_ms` (a forwarder that is idle sends
 one every few seconds, so its source holds nothing back), and one marked `ended` (the game
 stopped) releases the source's maps until it sends again. A source that goes quiet
-without one holds its maps until `--source-hold` after it was last heard from; every source in `sources.json` counts as heard from when the server starts,
-so after a restart each map waits up to `--source-hold` for its sources' backlogs. Data a
-source sends later than that, or out of order by more than the grace, can still be late
-(counted as `late`). Closed windows are never rewritten. While a map is held, its windows
+without one holds its maps until `--source-hold` after it last had data for them; every
+source in `sources.json` counts as heard from when the server starts, so after a restart
+each map waits up to `--source-hold` for its sources' backlogs. A map with data that no
+source in `sources.json` feeds (a database from before that file, or one whose file was
+lost) is held at its newest data from the start in the same way, until a source sends data
+or `caught_up` for it (its own hold then takes over) or `--source-hold` passes, so a
+forwarder that reconnects some time after the restart still finds its backlog ahead of
+the horizon. Data a source sends later than that, or out of order by more than the grace,
+can still be late (counted as `late`): `--source-hold` is how long a forwarder may stay
+away while the server runs (a server that is down holds nothing back, so its downtime has
+no limit); a longer one costs only how late history closes for a source that stopped
+without saying so. Closed windows are never rewritten. While a map is held, its windows
 stay open (spilled to disk when memory runs short) and history in the held period is
 served as live; the server logs when it holds a map more than a minute behind the clock
 and when it releases it (`tsdb_horizon_held_maps`, `tsdb_horizon_hold_lag_ms`).
@@ -399,7 +409,9 @@ capture posted with `--once`) keeps its times and is posted as fast as the serve
 it. Once it has posted everything it sends a `caught_up` envelope, and again every
 `--heartbeat` (5 s) while nothing new arrives, and one when it stops (at the end of
 `--once`, or on interrupt), marked `ended` when the newest file has not changed for 10 s
-(the game is not running). Network
+(the game is not running). So `--once` on the files of a game that is still running
+leaves the map held at its last line for `--source-hold`: the next run (or a tailer that
+follows the game) continues from there without its lines being late. Network
 errors, 5xx, 429 and 408 are retried with backoff (honouring `Retry-After`); a 400 or 413
 splits the batch, and a single line that is still refused is skipped and logged; any other
 status (401, 403, 404, 415) stops the tailer with an error. The acknowledged offsets are

@@ -81,7 +81,10 @@ spilled to disk. A backlog (a recorded capture posted with `tail --once`, or the
 forwarder kept while it, the network or the server was down) keeps the times it was
 captured at and is stored in full, as long as each source sends its data in time order:
 the server holds a map's horizon behind the data of a source that is still catching up
-(`--source-hold`, docs/v3/API.md section 5).
+(docs/v3/API.md section 5). A forwarder may stay away for up to `--source-hold` (default
+1 hour) while the server keeps running; past that its source no longer holds the map and
+the rest of its backlog is late. A server that is down holds nothing back, so the length
+of its downtime is not limited.
 
 ## Publishing a static map
 
