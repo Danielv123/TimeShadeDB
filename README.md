@@ -102,29 +102,12 @@ durable upload queue.
 
 ## Factorio export
 
-The `timeshadedb_exporter` mod writes Factorio export files under
-`script-output/timeshadedb/`:
-
-```text
-chunk-charted.tsv
-entity-positions.tsv
-```
-
-Import entity movement into VictoriaMetrics with:
+The `timeshadedb_exporter` mod writes charted chunks to
+`script-output/timeshadedb/chunk-charted.tsv`. Send them to `serve` with:
 
 ```powershell
-timeshadedb tail-entity-tsv --input entity-positions.tsv --savefile SAVE_UUID --victoriametrics-url http://127.0.0.1:8428
+timeshadedb tail-chunk-tsv --input chunk-charted.tsv --savefile SAVE_UUID --base-url http://127.0.0.1:8080
 ```
-
-The chunk tailer can watch both files together:
-
-```powershell
-timeshadedb tail-chunk-tsv --input chunk-charted.tsv --entity-input entity-positions.tsv --savefile SAVE_UUID --base-url http://127.0.0.1:8080 --victoriametrics-url http://127.0.0.1:8428
-```
-
-Entity coordinates are stored as `timeshadedb_entity_x` and
-`timeshadedb_entity_y` series labelled by savefile, surface, force, entity type,
-entity id, and path segment. No tile label is written.
 
 ## Factorio mod deployment
 

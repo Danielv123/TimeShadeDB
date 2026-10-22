@@ -10,7 +10,7 @@ import (
 func TestCommandRegistryHasLegacyCommands(t *testing.T) {
 	for _, name := range []string{
 		"import-csv", "query-tile", "stats", "verify", "inspect-index", "export-tile", "compact",
-		"copy-chunks", "benchmark", "serve", "tail-chunk-tsv", "tail-entity-tsv",
+		"copy-chunks", "benchmark", "serve", "tail-chunk-tsv",
 	} {
 		c, ok := lookupCommand(name)
 		if !ok {

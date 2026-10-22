@@ -1,18 +1,8 @@
 local chunk_output_path = "timeshadedb/chunk-charted.tsv"
-local entity_output_path = "timeshadedb/entity-positions.tsv"
 local chunk_size = 32
-
-local tracked_types = {
-  car = true,
-  ["spider-vehicle"] = true,
-  locomotive = true
-}
 
 local function state()
   local s = storage.timeshadedb_exporter or {}
-  s.entities = s.entities or {}
-  s.entity_samples = s.entity_samples or {}
-  s.entity_segments = s.entity_segments or {}
   s.tile_queue = s.tile_queue or {}
   s.tile_queue_head = s.tile_queue_head or 1
   s.tile_queued = s.tile_queued or {}
@@ -25,200 +15,8 @@ local function setting(name)
   return settings.global[name].value
 end
 
-local function format_number(value)
-  return string.format("%.6f", value)
-end
-
-local function entity_key(kind, id)
-  return kind .. ":" .. tostring(id)
-end
-
 local function chunk_key(surface_index, force_name, chunk)
   return tostring(surface_index) .. ":" .. force_name .. ":" .. tostring(chunk.x) .. ":" .. tostring(chunk.y)
-end
-
-local function entity_force(entity)
-  if entity and entity.valid and entity.force then
-    return entity.force.name
-  end
-  return "neutral"
-end
-
-local function current_segment(kind, id)
-  local s = state()
-  local key = entity_key(kind, id)
-  local segment = s.entity_segments[key]
-  if not segment then
-    segment = 1
-    s.entity_segments[key] = segment
-  end
-  return segment
-end
-
-local function begin_next_segment(kind, id)
-  if not id then
-    return
-  end
-  local s = state()
-  local key = entity_key(kind, id)
-  s.entity_samples[key] = nil
-  s.entity_segments[key] = (s.entity_segments[key] or 1) + 1
-end
-
-local function emit_entity_sample(tick, surface_name, force_name, entity_type, entity_id, segment, position, orientation, speed)
-  local line = table.concat({
-    tostring(tick),
-    surface_name,
-    force_name,
-    entity_type,
-    tostring(entity_id),
-    tostring(segment),
-    format_number(position.x),
-    format_number(position.y),
-    format_number(orientation or 0),
-    format_number(speed or 0)
-  }, "\t") .. "\n"
-  game.write_file(entity_output_path, line, true)
-end
-
-local function should_emit_entity(previous, tick, position, orientation)
-  if not previous then
-    return true
-  end
-
-  local dt = tick - previous.tick
-  if dt <= 0 then
-    dt = 1
-  end
-
-  if dt >= setting("timeshadedb-entity-max-silent-ticks") then
-    return true
-  end
-
-  local predicted_x = previous.x + previous.vx * dt
-  local predicted_y = previous.y + previous.vy * dt
-  local dx = position.x - predicted_x
-  local dy = position.y - predicted_y
-  local position_error = math.sqrt(dx * dx + dy * dy)
-  if position_error >= setting("timeshadedb-entity-position-epsilon") then
-    return true
-  end
-
-  local orientation_delta = math.abs((orientation or 0) - (previous.orientation or 0))
-  orientation_delta = math.min(orientation_delta, 1 - orientation_delta)
-  if orientation_delta >= setting("timeshadedb-entity-orientation-epsilon") then
-    return true
-  end
-
-  local vx = (position.x - previous.x) / dt
-  local vy = (position.y - previous.y) / dt
-  local dvx = vx - previous.vx
-  local dvy = vy - previous.vy
-  return math.sqrt(dvx * dvx + dvy * dvy) >= setting("timeshadedb-entity-velocity-epsilon")
-end
-
-local function observe_entity(kind, id, surface_name, force_name, position, orientation)
-  if not id or not position then
-    return
-  end
-
-  local tick = game.tick
-  local s = state()
-  local key = entity_key(kind, id)
-  local previous = s.entity_samples[key]
-  if previous and (previous.surface ~= surface_name or previous.force ~= force_name) then
-    begin_next_segment(kind, id)
-    previous = nil
-  end
-  local segment = current_segment(kind, id)
-
-  if should_emit_entity(previous, tick, position, orientation) then
-    local speed = 0
-    local vx = 0
-    local vy = 0
-    if previous then
-      local dt = tick - previous.tick
-      if dt <= 0 then
-        dt = 1
-      end
-      vx = (position.x - previous.x) / dt
-      vy = (position.y - previous.y) / dt
-      speed = math.sqrt(vx * vx + vy * vy)
-    end
-    emit_entity_sample(tick, surface_name, force_name, kind, id, segment, position, orientation, speed)
-    s.entity_samples[key] = {
-      tick = tick,
-      surface = surface_name,
-      force = force_name,
-      x = position.x,
-      y = position.y,
-      vx = vx,
-      vy = vy,
-      orientation = orientation or 0
-    }
-  end
-end
-
-local function track_entity(entity)
-  if not entity or not entity.valid or not entity.unit_number or not tracked_types[entity.type] then
-    return
-  end
-  state().entities[entity.unit_number] = entity
-end
-
-local function untrack_entity(entity)
-  if entity and entity.unit_number then
-    state().entities[entity.unit_number] = nil
-    begin_next_segment(entity.type, entity.unit_number)
-  end
-end
-
-local function rescan_entities()
-  local s = state()
-  s.entities = {}
-  for _, surface in pairs(game.surfaces) do
-    for _, entity in pairs(surface.find_entities_filtered({ type = { "car", "spider-vehicle", "locomotive" } })) do
-      track_entity(entity)
-    end
-  end
-end
-
-local function observe_players()
-  local seen = {}
-  for _, player in pairs(game.connected_players) do
-    local target = player.vehicle or player.character
-    if target and target.valid then
-      seen[player.name] = true
-      observe_entity("player", player.name, target.surface.name, player.force.name, target.position, target.orientation)
-    end
-  end
-
-  local missing_players = {}
-  for key in pairs(state().entity_samples) do
-    local kind, id = string.match(key, "^([^:]+):(.+)$")
-    if kind == "player" and not seen[id] then
-      table.insert(missing_players, id)
-    end
-  end
-  for _, id in pairs(missing_players) do
-    begin_next_segment("player", id)
-  end
-end
-
-local function observe_tracked_entities()
-  local s = state()
-  for unit_number, entity in pairs(s.entities) do
-    if not entity.valid then
-      s.entities[unit_number] = nil
-    else
-      observe_entity(entity.type, unit_number, entity.surface.name, entity_force(entity), entity.position, entity.orientation)
-    end
-  end
-end
-
-local function sample_entities()
-  observe_players()
-  observe_tracked_entities()
 end
 
 local function queue_chunk(surface, force, chunk)
@@ -401,9 +199,6 @@ local function queue_tile_event_chunks(event)
 end
 
 local function on_tick(event)
-  if event.tick % setting("timeshadedb-entity-sample-interval") == 0 then
-    sample_entities()
-  end
   if event.tick % setting("timeshadedb-tile-rescan-interval") == 0 then
     enqueue_charted_chunks()
   end
@@ -416,7 +211,7 @@ local function initialize()
   s.tile_queue_head = 1
   s.tile_queued = {}
   s.tile_payloads = {}
-  rescan_entities()
+  s.entities, s.entity_samples, s.entity_segments = nil, nil, nil
   enqueue_charted_chunks()
 end
 
@@ -436,13 +231,6 @@ script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
   end
 end)
 
-script.on_event(defines.events.on_player_left_game, function(event)
-  local player = game.get_player(event.player_index)
-  if player then
-    begin_next_segment("player", player.name)
-  end
-end)
-
 if defines.events.on_chunk_charted then
   script.on_event(defines.events.on_chunk_charted, function(event)
     local surface = game.get_surface(event.surface_index)
@@ -452,27 +240,6 @@ if defines.events.on_chunk_charted then
     end
   end)
 end
-
-local build_events = {}
-append_event(build_events, defines.events.on_built_entity)
-append_event(build_events, defines.events.on_robot_built_entity)
-append_event(build_events, defines.events.script_raised_built)
-append_event(build_events, defines.events.script_raised_revive)
-append_event(build_events, defines.events.on_entity_cloned)
-
-script.on_event(build_events, function(event)
-  track_entity(event.entity or event.destination)
-end)
-
-local remove_events = {}
-append_event(remove_events, defines.events.on_player_mined_entity)
-append_event(remove_events, defines.events.on_robot_mined_entity)
-append_event(remove_events, defines.events.on_entity_died)
-append_event(remove_events, defines.events.script_raised_destroy)
-
-script.on_event(remove_events, function(event)
-  untrack_entity(event.entity)
-end)
 
 local tile_events = {}
 append_event(tile_events, defines.events.on_player_built_tile)
