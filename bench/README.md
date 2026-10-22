@@ -4,7 +4,8 @@ This directory holds the tools that check the numeric targets of the v3 plan
 (`research/PLAN.md` section 5) and the baselines measured on today's systems:
 TimeShadeDB `master` and the illisis/minimap viewer and export.
 
-One command runs everything and writes [REPORT.md](REPORT.md):
+One command runs everything and writes `bench/REPORT.md`. The report and the result
+files under `bench/results` and `bench/baselines` are local output, ignored by git:
 
 ```sh
 # v3 acceptance (needs WP2-WP8 landed): imports the test data, then measures it.
@@ -71,7 +72,7 @@ shifted into the past, oldest first. `attack` adds `--pprof` on a free loopback 
 Results are JSON files (`bench/internal/benchlib/result.go`): tool, label, target,
 scenario, machine (CPU, OS), parameters, metrics, notes. Local paths in parameters and
 notes are written relative to `$TSDB_TESTDATA`, `$TSDB_STREAM`, `$TSDB_WORK`, `$TMP` or
-`~`, or as their last element, because the baselines are committed.
+`~`, or as their last element, so result files can be shared between machines.
 
 `targets.json` maps each target to a metric, a tool and a scenario. `tool` may list
 alternatives, such as `"measure-v3disk|measure-illisis|ingestbench"`: the first listed

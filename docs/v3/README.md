@@ -50,7 +50,7 @@ incomplete, the WP makes the smallest additive change and lists it in its report
 | WP8 viewer movers and overlays | `web/src/movers/`, `web/src/overlays/`, `web/src/layers/index.ts` | Only WP8 touches the layer list. |
 | WP9 capture | `capture/` (`lua/`, `mod/timeshade_capture/`, `clusterio_module/`, `test/`, `build.mjs`, `README.md`, the Blue Oak licence text), `timeshadedb_exporter/README.md` (deprecation note) | Writes PROTOCOL.md envelopes. `node capture/build.mjs` assembles the mod and the Clusterio module into `capture/dist/` (WP10 copies the module). |
 | WP10 Clusterio plugin | `clusterio/` | Forwarder, sidecar, auth proxy, web page. |
-| WP11 benchmarks and acceptance | `bench/` (`bench/cmd/{ingestbench,soak,tilebench,attack}/`, `bench/web/`, `bench/trains/`, `bench/run_acceptance.{ps1,sh}`, `bench/REPORT.md`) | Reads `window.__tsdbPerf` and `/metrics`. |
+| WP11 benchmarks and acceptance | `bench/` (`bench/cmd/{ingestbench,soak,tilebench,attack}/`, `bench/web/`, `bench/trains/`, `bench/run_acceptance.{ps1,sh}`; it writes `bench/REPORT.md`, not committed) | Reads `window.__tsdbPerf` and `/metrics`. |
 | WP12 static export and S3 | `internal/v3/publish/`, `cmd/timeshadedb/cmd_publish.go` | Writes the API.md static subset. |
 
 `cmd/timeshadedb/v3stores.go` (the file-backed v3 stores, pyramid build and icon copy

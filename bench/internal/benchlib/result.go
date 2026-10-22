@@ -183,7 +183,7 @@ func DetectMachine() Machine {
 	return machine
 }
 
-// Result files are committed (bench/baselines), so local paths in them are shortened:
+// Result files get shared between machines (bench/baselines), so local paths in them are shortened:
 // a path under a known root becomes "$NAME/rest", any other absolute path keeps only its
 // last element.
 var pathRoots = []struct{ env, name string }{

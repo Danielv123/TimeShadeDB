@@ -13,3 +13,7 @@ web/node_modules/
 web/dist/*
 !web/dist/.keep
 /build/
+# Benchmark output stays local
+bench/REPORT.md
+bench/results/
+bench/baselines/
