@@ -340,7 +340,8 @@ func TestTailerFiles(t *testing.T) {
 		t.Fatalf("%d envelopes", len(fi.envs))
 	}
 	// recv_ms: the first read's last line at the clock (the file is newer than the fake
-	// clock), the line before it a tick earlier; then strictly increasing.
+	// clock), the line before it a tick earlier; then never decreasing (the stopped fake
+	// clock caps them).
 	var lastSeq, lastRecv float64
 	for i, e := range fi.envs {
 		if e["src"] != "standalone:x" || e["map"] != "m" || e["instance"].(float64) != 3 || e["v"].(float64) != 1 {
@@ -351,8 +352,8 @@ func TestTailerFiles(t *testing.T) {
 		} else {
 			lastSeq = s
 		}
-		if r := e["recv_ms"].(float64); r <= lastRecv {
-			t.Fatalf("recv_ms not increasing at %d: %v after %v", i, r, lastRecv)
+		if r := e["recv_ms"].(float64); r < lastRecv || r > 5000 {
+			t.Fatalf("recv_ms at %d: %v after %v", i, r, lastRecv)
 		} else {
 			lastRecv = r
 		}

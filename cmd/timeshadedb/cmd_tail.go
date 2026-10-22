@@ -295,11 +295,13 @@ type tline struct {
 // offset) and stamps each line with when the game wrote it (docs/v3/PROTOCOL.md 1): the
 // last line with the file's modification time (no later than now), each line before it
 // that time minus the ticks to the next line at 60 x speed ticks a second (a tick that
-// goes back, a reloaded save, counts as no time). The stamps then increase strictly from
-// the newest stamp of an earlier line: when they would start at or before it, all of them
-// move up by the difference. A game that ran slower than its speed, or paused, gives
-// stamps later than the truth, which the server's clock anchor allows; stamps earlier than
-// the truth would make it place the data too early.
+// goes back, a reloaded save, counts as no time). When they would start at or before the
+// newest stamp of an earlier line, all of them move up by the difference, as far as the
+// clock allows; within the lines they increase strictly. A game that ran slower than its
+// speed, or paused, gives stamps later than the truth, which the server's clock anchor
+// allows (stamps earlier than the truth would make it place the data too early). Files
+// whose modification times do not match their ticks (copied without them, say) give
+// stamps that go back at file boundaries; the anchor then starts over there.
 func (t *tailer) lineStamps(data []byte, mtime time.Time) []tline {
 	var lines []tline
 	for len(data) > 0 {
@@ -325,7 +327,7 @@ func (t *tailer) lineStamps(data []byte, mtime time.Time) []tline {
 		}
 		lines[i].recv = int64(ms)
 	}
-	if shift := t.lastRecv + 1 - lines[0].recv; shift > 0 {
+	if shift := min(t.lastRecv+1-lines[0].recv, int64(now)-lines[len(lines)-1].recv); shift > 0 {
 		for i := range lines {
 			lines[i].recv += shift
 		}
