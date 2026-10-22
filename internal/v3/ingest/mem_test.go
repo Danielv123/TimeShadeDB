@@ -154,7 +154,9 @@ func TestIngestMemoryBounded(t *testing.T) {
 			if c.want != nil && !c.want(st, ter.n.Load(), mov.n.Load(), ovl.n.Load()) {
 				t.Fatalf("unexpected counts: stats %+v", st)
 			}
-			if grew > 32<<20 {
+			// The sampled peak moves by several MB with GC timing (tags: 24 to 33 MB for the same
+			// body on Windows and Linux CI); the bound is for growth with the message count.
+			if grew > 48<<20 {
 				t.Fatalf("peak heap grew %.1f MB for a %d byte body", float64(grew)/(1<<20), len(body))
 			}
 		})
