@@ -11,12 +11,12 @@ import (
 	"time"
 
 	"timeshadedb/internal/import/minimap/minimaptest"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/coretest"
-	"timeshadedb/internal/v3/movers"
-	"timeshadedb/internal/v3/overlays"
-	"timeshadedb/internal/v3/pyramid"
-	"timeshadedb/internal/v3/terrain"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/coretest"
+	"timeshadedb/internal/movers"
+	"timeshadedb/internal/overlays"
+	"timeshadedb/internal/pyramid"
+	"timeshadedb/internal/terrain"
 )
 
 // importIntoDB runs import-minimap --db --verify and returns its output.

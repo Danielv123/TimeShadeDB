@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"timeshadedb/internal/import/minimap"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/memstore"
-	"timeshadedb/internal/v3/pyramid"
-	"timeshadedb/internal/v3/terrain"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/memstore"
+	"timeshadedb/internal/pyramid"
+	"timeshadedb/internal/terrain"
 )
 
 func init() {

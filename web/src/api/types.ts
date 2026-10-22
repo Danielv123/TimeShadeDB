@@ -1,6 +1,6 @@
-// TimeShadeDB v3 API contract for the viewer (WP0). Mirrors internal/v3/core/apitypes.go,
-// internal/v3/core/movers.go and overlays.go field for field; docs/v3/API.md and
-// docs/v3/FORMAT.md are the normative descriptions. Change Go and TypeScript together.
+// TimeShadeDB v3 API contract for the viewer (WP0). Mirrors internal/core/apitypes.go,
+// internal/core/movers.go and overlays.go field for field; docs/API.md and
+// docs/FORMAT.md are the normative descriptions. Change Go and TypeScript together.
 
 /** Unix milliseconds on the map clock. */
 export type TimeMs = number;
@@ -376,7 +376,7 @@ export interface DataSource {
 }
 
 // ---------------------------------------------------------------------------------------
-// Perf hooks (window.__tsdbPerf), read by the WP11 Playwright suite. See docs/v3/README.md.
+// Perf hooks (window.__tsdbPerf), read by the WP11 Playwright suite. See docs/README.md.
 
 export type PerfEventName =
   | "tile.request"

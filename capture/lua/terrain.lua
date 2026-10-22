@@ -1,7 +1,7 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/terrain.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- Terrain (docs/v3/PROTOCOL.md section 6): on_chunk_charted queues a chunk through the debounce; each tick reads
+-- Terrain (docs/PROTOCOL.md section 6): on_chunk_charted queues a chunk through the debounce; each tick reads
 -- core.CHARTS queued chunks with LuaForce.get_chunk_chart and sends those whose chart differs from the last one sent.
 -- The forces with players, the surfaces message and the resync's walk of charted chunks live here too.
 --

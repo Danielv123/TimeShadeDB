@@ -325,9 +325,9 @@ test("data clock never goes back", () => {
 });
 
 test("a parked train is placed from its stop sample alone (a keyframe, live.bin) when it lists the pieces under it", async () => {
-  // the real-game trains of the shared rail vectors (docs/v3/rail-geometry-vectors.json)
+  // the real-game trains of the shared rail vectors (docs/rail-geometry-vectors.json)
   const P = await import("./railpath.ts");
-  const vectors = JSON.parse(readFileSync(new URL("../../../docs/v3/rail-geometry-vectors.json", import.meta.url), "utf8"));
+  const vectors = JSON.parse(readFileSync(new URL("../../../docs/rail-geometry-vectors.json", import.meta.url), "utf8"));
   const kindOf = (type: string): number =>
     ({ "curved-rail-a": P.KIND_CURVE_A, "curved-rail-b": P.KIND_CURVE_B, "legacy-curved-rail": P.KIND_LEGACY_CURVE, "rail-ramp": P.KIND_RAMP })[
       type.replace(/^elevated-/, "")
@@ -375,7 +375,7 @@ test("a moving train's first row in view (a keyframe's, live.bin's) places its b
   // the server's body (core.RailBody, FORMAT.md 7.4): the same real-game trains as above, now moving and seen first at
   // a row that is neither a run start nor a stop
   const P = await import("./railpath.ts");
-  const vectors = JSON.parse(readFileSync(new URL("../../../docs/v3/rail-geometry-vectors.json", import.meta.url), "utf8"));
+  const vectors = JSON.parse(readFileSync(new URL("../../../docs/rail-geometry-vectors.json", import.meta.url), "utf8"));
   const kindOf = (type: string): number =>
     ({ "curved-rail-a": P.KIND_CURVE_A, "curved-rail-b": P.KIND_CURVE_B, "legacy-curved-rail": P.KIND_LEGACY_CURVE, "rail-ramp": P.KIND_RAMP })[
       type.replace(/^elevated-/, "")

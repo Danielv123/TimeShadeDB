@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"sync"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // areaIndexJSON is an area's index.json.gz (illisis keys.ts AreaIndex).

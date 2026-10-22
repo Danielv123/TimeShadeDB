@@ -19,7 +19,7 @@ const binary = process.env.TIMESHADEDB_BINARY ?? path.join(pluginDir, "bin", bin
 const fixture = path.resolve(pluginDir, "..", "capture", "test", "fixtures", "game_envelopes.ndjson");
 const skip = fs.existsSync(binary) ? false : `no timeshadedb binary at ${binary} (npm run build:binary)`;
 
-/** MVW3 (docs/v3/FORMAT.md 7.4), the parts this test reads. */
+/** MVW3 (docs/FORMAT.md 7.4), the parts this test reads. */
 function decodeMVW3(buf: Buffer) {
 	assert.equal(buf.toString("latin1", 0, 4), "MVW3");
 	const kind = buf[4];

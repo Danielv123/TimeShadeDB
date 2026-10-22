@@ -2,7 +2,7 @@
 
 The Lua that records a Factorio game for the TimeShadeDB v3 cluster map: the map chart,
 trains, vehicles, players, chart tags, machine recipes and (optionally) rail entities. It
-writes the capture envelopes of [docs/v3/PROTOCOL.md](../docs/v3/PROTOCOL.md). One library
+writes the capture envelopes of [docs/PROTOCOL.md](../docs/PROTOCOL.md). One library
 serves two hosts:
 
 | Host | Directory | Output | Forwarder |
@@ -89,7 +89,7 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   capped; while a resync runs one of its 4 reads a tick goes to chart events whenever any
   wait, so neither starves the other.
 - Trains are described by their rail path and the timing along it
-  ([RAIL-GEOMETRY.md](../docs/v3/RAIL-GEOMETRY.md) 8). Each read (every 5 tiles of travel,
+  ([RAIL-GEOMETRY.md](../docs/RAIL-GEOMETRY.md) 8). Each read (every 5 tiles of travel,
   sooner while accelerating, at most 30 ticks apart) notes the rail under the leading
   carriage's front joint while the carriage turns or the last rail read was a curved piece
   or ramp, and on a straight every third read (`LuaTrain.front_end`/`back_end`, three API

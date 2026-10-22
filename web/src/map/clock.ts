@@ -1,5 +1,5 @@
 // The data clock: map-clock milliseconds now, kept from catalog.now and X-TSDB-Now headers
-// (docs/v3/API.md 1) plus performance.now(), never Date.now() alone. Ported in spirit from
+// (docs/API.md 1) plus performance.now(), never Date.now() alone. Ported in spirit from
 // illisis-minimap web/view/movers.ts `Clock` (Blue Oak Model License 1.0.0).
 
 import type { TimeMs } from "../api/types";

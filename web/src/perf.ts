@@ -1,4 +1,4 @@
-// window.__tsdbPerf: the viewer's perf hooks (docs/v3/README.md "Perf hooks"). WP7 and
+// window.__tsdbPerf: the viewer's perf hooks (docs/README.md "Perf hooks"). WP7 and
 // WP8 record into it; the WP11 Playwright suite reads it. Recording is cheap (a ring
 // buffer push), so it stays on in production builds.
 

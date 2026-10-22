@@ -31,7 +31,7 @@ unselected for manual cleanup.
 ## Moving a v2 chunk database to v3
 
 `timeshadedb migrate-v3` copies every datastore of a v2 chunk database into a v3
-terrain store (see `docs/v3/`), then compares both pixel by pixel at random ticks:
+terrain store (see `docs/`), then compares both pixel by pixel at random ticks:
 
 ```powershell
 timeshadedb migrate-v3 --from factorio.tshd --db v3db
@@ -66,7 +66,7 @@ The catalog icons of the export are copied into `v3db/icons`.
 
 ## Serving a v3 database
 
-`timeshadedb serve` serves the v3 HTTP API (`docs/v3/API.md`), live events, ingest
+`timeshadedb serve` serves the v3 HTTP API (`docs/API.md`), live events, ingest
 and the embedded viewer (build it first with `npm --prefix web run build`):
 
 ```powershell
@@ -81,7 +81,7 @@ spilled to disk. A backlog (a recorded capture posted with `tail --once`, or the
 forwarder kept while it, the network or the server was down) keeps the times it was
 captured at and is stored in full, as long as each source sends its data in time order:
 the server holds a map's horizon behind the data of a source that is still catching up
-(docs/v3/API.md section 5). A forwarder may stay away for up to `--source-hold` (default
+(docs/API.md section 5). A forwarder may stay away for up to `--source-hold` (default
 1 hour) while the server keeps running; past that its source no longer holds the map and
 the rest of its backlog is late. A server that is down holds nothing back, so the length
 of its downtime is not limited.
@@ -89,7 +89,7 @@ of its downtime is not limited.
 ## Publishing a static map
 
 `timeshadedb publish` exports a v3 database as static files (the API subset of
-`docs/v3/API.md` section 6 plus the viewer) to a directory or an S3/R2 bucket, storing each
+`docs/API.md` section 6 plus the viewer) to a directory or an S3/R2 bucket, storing each
 immutable file once and mutable files only when they change:
 
 ```powershell
@@ -97,7 +97,7 @@ timeshadedb publish --db v3db --dir C:\www\map
 timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-bucket map --state publish-state
 ```
 
-See `internal/v3/publish/README.md` for the flags, the tile versions it exports and the
+See `internal/publish/README.md` for the flags, the tile versions it exports and the
 durable upload queue.
 
 ## Factorio export

@@ -1,4 +1,4 @@
-// Train paths on the rails (docs/v3/RAIL-GEOMETRY.md sections 2, 3 and 8). The capture sends,
+// Train paths on the rails (docs/RAIL-GEOMETRY.md sections 2, 3 and 8). The capture sends,
 // with each train sample, the curved rail pieces and ramps the leading joint entered since the
 // sample before (`rp`), and the train's speed (`v`). Rails are straight between those pieces,
 // so the pieces of a journey, joined end to end by straight lines, are the exact path its

@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // trainRows builds rows for one journey (the meta is set by fixJourney).

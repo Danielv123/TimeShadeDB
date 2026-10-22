@@ -13,9 +13,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"timeshadedb/bench/internal/benchlib"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/wire"
-	"timeshadedb/internal/v3/movers"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/wire"
+	"timeshadedb/internal/movers"
 )
 
 // seekCheck is what `measure seekcheck` writes: for each source of first rows (the stored

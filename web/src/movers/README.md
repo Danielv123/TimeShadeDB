@@ -2,13 +2,13 @@
 
 The movers layer draws every train, vehicle and player of the shown surface at the displayed
 time. It implements PLAN.md §4.8 (trains on the rails) on top of the WP0 contracts: MVW3
-windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers` events
-(`docs/v3/API.md` 5).
+windows, keyframes and live payloads (`docs/FORMAT.md` 7.4) and live `movers` events
+(`docs/API.md` 5).
 
 | File | Role |
 |---|---|
 | `track.ts` | Samples per journey; rail runs of rail path samples; segment rules (gaps, gones, handoffs, end switches); derived velocities; head position; body path; carriage placement |
-| `railpath.ts` | The rail path model (docs/v3/RAIL-GEOMETRY.md 8): piece shapes and ends, the chain of a run, projection, carriage placement, the timing model |
+| `railpath.ts` | The rail path model (docs/RAIL-GEOMETRY.md 8): piece shapes and ends, the chain of a run, projection, carriage placement, the timing model |
 | `segment.ts` | Geometry between two samples without a rail path: line+arc or arc+line where it fits, cubic Hermite otherwise; arc-length timing |
 | `hermite.ts` | Hermite basis, orientation helpers, arc-length polyline |
 | `view.ts` | `MoverView`: tracks fed from windows and events, per-frame evaluation, never-snap corrections, trimming |
@@ -23,7 +23,7 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
 ## How a train is drawn
 
 0. **Rail path samples.** A train sample with a speed (`F_RAIL`; PROTOCOL.md 3.1 `v`, `rp`,
-   `ru`) comes from the v3 capture's rail path model (docs/v3/RAIL-GEOMETRY.md 8). The track
+   `ru`) comes from the v3 capture's rail path model (docs/RAIL-GEOMETRY.md 8). The track
    groups such samples into runs (`railRuns`): a run begins at a sample with `ru`, after a
    sample of another kind, at an end switch, or where a listed piece does not continue the
    run's path; its chain (`railpath.ts`) is the curved pieces and ramps of its samples joined

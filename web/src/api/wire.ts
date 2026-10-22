@@ -1,5 +1,5 @@
-// Decoders for the v3 wire formats (docs/v3/FORMAT.md section 7): TSV3 tiles, TSD3 tile
-// deltas, TSP3 palettes and MVW3 mover windows. Reference: internal/v3/core/wire (Go).
+// Decoders for the v3 wire formats (docs/FORMAT.md section 7): TSV3 tiles, TSD3 tile
+// deltas, TSP3 palettes and MVW3 mover windows. Reference: internal/core/wire (Go).
 // Bodies arrive already decompressed (HTTP Content-Encoding). Safe to use in workers.
 // This file imports types only, so `node --test` can load it directly (wire.test.ts).
 

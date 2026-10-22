@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"testing"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // T0 is the base time of the synthetic data: a multiple of 300 s.

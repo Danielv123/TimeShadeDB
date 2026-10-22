@@ -1,4 +1,4 @@
-// Test datasets for the mock server: TSV3/TSD3/TSP3 encoders (docs/v3/FORMAT.md 7) and a
+// Test datasets for the mock server: TSV3/TSD3/TSP3 encoders (docs/FORMAT.md 7) and a
 // synthetic terrain history with coarse levels built by the FORMAT.md 3 average. Node-only
 // helpers (excluded from tsc); used by *.test.ts and the browser benchmark harness.
 

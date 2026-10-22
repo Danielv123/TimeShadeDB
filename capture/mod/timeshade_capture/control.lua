@@ -1,4 +1,4 @@
--- TimeShadeDB capture, standalone mod (docs/v3/PROTOCOL.md section 2, "Standalone").
+-- TimeShadeDB capture, standalone mod (docs/PROTOCOL.md section 2, "Standalone").
 --
 -- The shared capture library (capture/lua, copied into lua/ by capture/build.mjs) writes envelope lines here into
 -- script-output/timeshade/<seq>-<tick>.ndjson; `timeshadedb tail --dir <script-output>/timeshade` posts complete files

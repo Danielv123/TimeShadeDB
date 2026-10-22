@@ -107,7 +107,7 @@ never stands in for the imported one.
   `/healthz`, the API.md routes, `--ingest-token` (the tools send `-token` as a bearer
   token).
 - **WP5** the import command (see `TSDB_IMPORT_ARGS`).
-- **WP7** `window.__tsdbPerf` (docs/v3/README.md) and `window.__tsdbControl`
+- **WP7** `window.__tsdbPerf` (docs/README.md) and `window.__tsdbControl`
   (`TsdbControl` in `web/src/api/types.ts`); the query parameters `ds`, `x`, `y`, `z`, `t`.
   The client benchmark opens the v3 viewer at `ds=gw-bc41437d~2E1.nauvis.player`, x 0,
   y 0, z 0, the same view as the illisis run, and checks `view()` and `datastore()` before

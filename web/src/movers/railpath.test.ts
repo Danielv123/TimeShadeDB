@@ -1,5 +1,5 @@
-// The rail path model (railpath.ts) against the shared test vectors of docs/v3/RAIL-GEOMETRY.md
-// (docs/v3/rail-geometry-vectors.json): piece shapes and ends, carriages as the game placed them
+// The rail path model (railpath.ts) against the shared test vectors of docs/RAIL-GEOMETRY.md
+// (docs/rail-geometry-vectors.json): piece shapes and ends, carriages as the game placed them
 // on chains built from curved pieces and ramps alone, and the timing model. capture/test runs the
 // Lua implementation against the same file.
 import "./eval/ts-resolve.mjs";
@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 const P = await import("./railpath.ts");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const vectors = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "..", "docs", "v3", "rail-geometry-vectors.json"), "utf8"));
+const vectors = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "..", "docs", "rail-geometry-vectors.json"), "utf8"));
 
 /** The `rp` kind of a rail type, or 0 for a straight piece. */
 function kindOf(type: string): number {

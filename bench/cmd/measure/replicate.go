@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"timeshadedb/bench/internal/benchlib"
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // cmdReplicate writes a database holding n copies of a v3 database, copy k > 0 under map

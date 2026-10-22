@@ -22,8 +22,8 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/wire"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/wire"
 )
 
 type surfaceDisk struct {

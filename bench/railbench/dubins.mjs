@@ -1,5 +1,5 @@
 // Fixed-radius line/arc paths between two poses (Dubins CSC paths), the reconstruction railbench tests for train
-// samples: rails are straights joined by circular arcs of one radius (docs/v3/RAILS.md), so between two samples a
+// samples: rails are straights joined by circular arcs of one radius (docs/RAILS.md), so between two samples a
 // train follows arc-line-arc with that radius (either arc or the line may be empty).
 //
 // Coordinates are Factorio's (x east, y south); headings are Factorio orientations in radians (0 north, pi/2 east), so

@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // IngestOutcome is what the server reports it did with the rows of one body.

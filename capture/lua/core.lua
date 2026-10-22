@@ -1,9 +1,9 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/capture_core.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- Pure rules of the TimeShadeDB capture (docs/v3/PROTOCOL.md): constants, the gridworld clip, chunk keys, FIFO
+-- Pure rules of the TimeShadeDB capture (docs/PROTOCOL.md): constants, the gridworld clip, chunk keys, FIFO
 -- queues, the chart debounce, the bounded chart cache, train emission (the timing model along the rail path, rail piece
--- ends, docs/v3/RAIL-GEOMETRY.md), dead reckoning for
+-- ends, docs/RAIL-GEOMETRY.md), dead reckoning for
 -- vehicles and players, journeys, the byte-exact line cut, and the storage migrations. State comes in as arguments and
 -- no Factorio global is touched, so these run in plain Lua (capture/test/run_unit.mjs) as well as in the game.
 --
@@ -375,7 +375,7 @@ end
 
 --- Ticks until a train at `speed` (tiles a tick, not 0), accelerating by `accel` (tiles a tick per tick, or nil), is
 --- read again: before it has gone more than core.STEP tiles (rounded down, so a train at 1.3 tiles a tick is read every
---- 3 ticks, not 4), within [1, core.SLOW]. No curved piece may pass between two reads (docs/v3/RAIL-GEOMETRY.md 8). With
+--- 3 ticks, not 4), within [1, core.SLOW]. No curved piece may pass between two reads (docs/RAIL-GEOMETRY.md 8). With
 --- 5 tiles a train is read about as often as with the 2026-10 rule (4 tiles rounded up); 4 rounded down read 39% more on
 --- the benchmark map.
 function core.next_read(speed, accel)
@@ -446,7 +446,7 @@ function core.poll(m, x, y, si, tick, how)
 	return due
 end
 
--- Rail pieces (docs/v3/RAIL-GEOMETRY.md 2 and 8). The capture records the curved pieces and ramps a train's leading
+-- Rail pieces (docs/RAIL-GEOMETRY.md 2 and 8). The capture records the curved pieces and ramps a train's leading
 -- joint enters; between them rails are straight. Kinds as PROTOCOL.md 3.1 `rp`: elevated pieces share the ground ones'.
 core.RAIL_KINDS = { ["curved-rail-a"] = 1, ["elevated-curved-rail-a"] = 1, ["curved-rail-b"] = 2,
 	["elevated-curved-rail-b"] = 2, ["legacy-curved-rail"] = 3, ["rail-ramp"] = 4 }
@@ -523,7 +523,7 @@ function core.connects(ex, ey, ed, sx, sy, sd)
 	return math.abs(px * st[2] - py * st[1]) < 1e-6 and px * st[1] + py * st[2] > -1e-6
 end
 
---- The timing model between two samples (docs/v3/RAIL-GEOMETRY.md 8): the rail distance tau ticks after the first, for
+--- The timing model between two samples (docs/RAIL-GEOMETRY.md 8): the rail distance tau ticks after the first, for
 --- samples T ticks and L rail distance apart with speeds va and vb (tiles a tick). From rest, when uniform acceleration
 --- to vb covers L in less than T, it stands until then; to rest, when uniform braking from va covers L in less than T,
 --- it stops early and stands; otherwise a cubic Hermite in time, held within [0, L].

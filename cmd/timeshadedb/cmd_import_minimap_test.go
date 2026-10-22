@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"timeshadedb/internal/import/minimap/minimaptest"
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 func TestImportMinimapCommand(t *testing.T) {

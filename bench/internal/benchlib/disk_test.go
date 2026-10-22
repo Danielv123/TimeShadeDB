@@ -7,8 +7,8 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/wire"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/wire"
 )
 
 func writeMVW(t *testing.T, path string, w *core.MoverWindow) {

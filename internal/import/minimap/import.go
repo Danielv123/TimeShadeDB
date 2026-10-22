@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // Options configure an import. Nil stores are skipped.

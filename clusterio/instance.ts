@@ -4,7 +4,7 @@
 // The instance side (PLAN.md §4.10): Lua's capture module prints envelopes on the IPC channel timeshade:out; this
 // stamps each with its arrival time, splits it by map, and sends what arrived to the controller about once a second.
 // While nothing waits it sends caught_up envelopes every few seconds, and ended ones when the instance stops, so the map
-// server holds a map's horizon back only for an instance that still has data to send (docs/v3/API.md 5, "Horizon").
+// server holds a map's horizon back only for an instance that still has data to send (docs/API.md 5, "Horizon").
 // It configures the capture over RCON at every start, on a gridworld.tile change and on a new controller session.
 import * as lib from "@clusterio/lib";
 import type { InstancePluginContext } from "@clusterio/host";
@@ -51,7 +51,7 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	const warn = rateLimited(logger);
 	const splitter = new Splitter(instance.id);
 	splitter.setTile(tileOf(instance.config as unknown as { get(name: string): unknown }));
-	// Increasing per source (docs/v3/PROTOCOL.md 1), also across host restarts.
+	// Increasing per source (docs/PROTOCOL.md 1), also across host restarts.
 	let seq = now() * 1000;
 	const nextSeq = () => ++seq;
 	let pending: { env: Envelope; bytes: number }[] = [];

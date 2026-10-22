@@ -13,8 +13,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"timeshadedb/bench/internal/benchlib"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/wire"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/wire"
 )
 
 // moversExport is the file `measure movers` writes and the train evaluator reads with
@@ -279,7 +279,7 @@ func trainRows(windows []*core.MoverWindow) []trainRow {
 
 // trainBodies returns the body of every train row of a surface's closed windows as the
 // mover store gives it (core.RailBody over each journey's rows in time order, begun again at
-// each keyframe from the keyframe's row, internal/v3/movers): keyed by journey and time.
+// each keyframe from the keyframe's row, internal/movers): keyed by journey and time.
 func trainBodies(db, surface string) (map[string]map[core.TimeMs][]core.RailPiece, error) {
 	sdir := filepath.Join(db, "movers", surface)
 	windows, err := readMoverFiles(filepath.Join(sdir, "windows"))

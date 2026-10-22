@@ -1,5 +1,5 @@
 // DataSource implementations (web/src/api/types.ts): the live server under /api/v3/ and a
-// static export (docs/v3/API.md section 6). Both also expose request URLs so tile fetches can
+// static export (docs/API.md section 6). Both also expose request URLs so tile fetches can
 // run in workers (UrlSource). The static source maps calls to the export's file names.
 // Source abstraction modelled on illisis-minimap web/view/source.ts (Blue Oak Model License 1.0.0).
 

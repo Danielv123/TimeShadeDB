@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/ingest"
-	"timeshadedb/internal/v3/movers"
-	"timeshadedb/internal/v3/overlays"
-	"timeshadedb/internal/v3/terrain"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/ingest"
+	"timeshadedb/internal/movers"
+	"timeshadedb/internal/overlays"
+	"timeshadedb/internal/terrain"
 )
 
 // serverIngest is the ingest side of serve (stores sized from a 256 MiB budget as

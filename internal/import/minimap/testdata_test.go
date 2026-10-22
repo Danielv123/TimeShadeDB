@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"timeshadedb/internal/import/minimap"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/memstore"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/memstore"
 )
 
 // sourceCounts are the illisis export's mover counts as measured by the research scripts

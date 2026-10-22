@@ -13,7 +13,7 @@ vehicles, players, chart tags, machine recipes and optional rails, live and thro
 
 ## Maps
 
-Map keys follow [docs/v3/PROTOCOL.md](../docs/v3/PROTOCOL.md): `gw-<world>` for a gridworld
+Map keys follow [docs/PROTOCOL.md](../docs/PROTOCOL.md): `gw-<world>` for a gridworld
 world, `i-<instance id>` for everything else. A gridworld tile instance sends its tiled surfaces
 to its world's map: always its `tile.surface`, plus the surfaces the capture marks tiled. Its
 other surfaces, such as space platforms, go to its own map. Each envelope carries one map, so
@@ -83,10 +83,10 @@ for every API request through the proxy.
   Instances keep up to 32 MiB in memory while the controller link is down, and the rest on
   disk (`timeshade-pending/` in the instance directory, up to 4 GiB, also across host
   restarts). Each line keeps the time it arrived at the instance, so a backlog lands where it
-  belongs (docs/v3/API.md 5, "Horizon").
+  belongs (docs/API.md 5, "Horizon").
 - **Caught up.** While an instance has nothing waiting it sends a `caught_up` envelope per map
   every 5 s, and `ended` ones when it stops, so the map server holds a map's horizon back only
-  for an instance that still has data to send (docs/v3/PROTOCOL.md 1).
+  for an instance that still has data to send (docs/PROTOCOL.md 1).
 - **Auth.**
   - Tokens are accepted as `X-Access-Token`, `Authorization: Bearer` or `?token=` (the
     viewer's live events use `?token=`).

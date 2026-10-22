@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"sort"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // SynthConfig describes the synthetic workload modelled on the illisis test data

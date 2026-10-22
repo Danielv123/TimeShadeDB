@@ -21,14 +21,14 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"timeshadedb"
-	"timeshadedb/internal/v3/api"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/ingest"
-	"timeshadedb/internal/v3/movers"
-	"timeshadedb/internal/v3/overlays"
-	"timeshadedb/internal/v3/pyramid"
-	"timeshadedb/internal/v3/terrain"
-	"timeshadedb/internal/v3/tileenc"
+	"timeshadedb/internal/api"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/ingest"
+	"timeshadedb/internal/movers"
+	"timeshadedb/internal/overlays"
+	"timeshadedb/internal/pyramid"
+	"timeshadedb/internal/terrain"
+	"timeshadedb/internal/tileenc"
 )
 
 func init() {
@@ -329,7 +329,7 @@ func runServe(ctx context.Context, stdout, stderr io.Writer, args []string) erro
 	// 30 MiB above that (runtime metadata, the executable's writable pages) and the
 	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB. About
 	// 50 MiB (codecs, ingest buffers) does not scale with the budget, so below 256 MiB a
-	// full-speed ingest goes past that bound (docs/v3/API.md 8). GOMEMLIMIT overrides.
+	// full-speed ingest goes past that bound (docs/API.md 8). GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(o.memBudget)
 	}
@@ -346,7 +346,7 @@ func runServe(ctx context.Context, stdout, stderr io.Writer, args []string) erro
 	if err != nil {
 		return err
 	}
-	// The first stdout line names the address (docs/v3/README.md).
+	// The first stdout line names the address (docs/README.md).
 	fmt.Fprintf(stdout, "listening on %s\n", ln.Addr())
 	quietf("opened %s in %v (viewer: %v)", o.db, v.opened.Round(time.Millisecond), !o.noViewer && (o.webDir != "" || timeshadedb.WebBundleBuilt()))
 

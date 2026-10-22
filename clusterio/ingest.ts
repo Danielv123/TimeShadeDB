@@ -1,4 +1,4 @@
-// Forwards envelopes to the sidecar's POST /api/v3/ingest (docs/v3/API.md 5) in order, one request at a time:
+// Forwards envelopes to the sidecar's POST /api/v3/ingest (docs/API.md 5) in order, one request at a time:
 // gzip NDJSON bodies of about 1 MiB, retried on network errors, 5xx and 429 with backoff (honouring Retry-After),
 // split on 400 and 413, and a single refused line dropped. Ingest is idempotent, so a retried body is harmless. While
 // the sidecar is down the queue holds up to maxQueueBytes in memory; past it the queue continues on disk in spoolDir

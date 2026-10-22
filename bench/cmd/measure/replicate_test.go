@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 func TestReplicate(t *testing.T) {

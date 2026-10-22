@@ -126,7 +126,7 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 		});
 	};
 
-	// Map messages (docs/v3/PROTOCOL.md 3): sent when a map changed, and all of them every 10 minutes and after each
+	// Map messages (docs/PROTOCOL.md 3): sent when a map changed, and all of them every 10 minutes and after each
 	// sidecar start. The controller's envelopes count ticks at 60 a second from its start, so they anchor cleanly.
 	const clock = options.now ?? Date.now;
 	const startedMs = clock();

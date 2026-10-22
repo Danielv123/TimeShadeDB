@@ -3,7 +3,7 @@
 // newest one, straight bridges across instance handoffs), and a train's body built from
 // the head's spline history with carriages placed by arc length.
 //
-// Train samples of the rail path model (F_RAIL, docs/v3/RAIL-GEOMETRY.md 8) carry the
+// Train samples of the rail path model (F_RAIL, docs/RAIL-GEOMETRY.md 8) carry the
 // train's speed and the rail pieces since the sample before: their journey's rail path is
 // known exactly (railpath.ts), so between two of them the leading joint runs along it by
 // the timing model, and every carriage sits on it at its joint distances. Other samples

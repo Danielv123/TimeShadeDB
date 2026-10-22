@@ -1,11 +1,11 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/movers.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- Movers (docs/v3/PROTOCOL.md sections 3.1 and 6): a scan of what moves, a walk polling core.WALK movers a tick, a wheel
+-- Movers (docs/PROTOCOL.md sections 3.1 and 6): a scan of what moves, a walk polling core.WALK movers a tick, a wheel
 -- of due train reads, journeys minted by the scan and followed through joins, splits and Universal Edges crossings.
 --
 -- Trains are read every core.STEP tiles. Each read notes the rail under the leading joint: the curved pieces and ramps
--- it enters, joined by straight rails, are the train's exact path (docs/v3/RAIL-GEOMETRY.md 8), sent with the next
+-- it enters, joined by straight rails, are the train's exact path (docs/RAIL-GEOMETRY.md 8), sent with the next
 -- sample (`rp`). So only the timing needs samples (core.train_read): a sample carries the game tick of its read, the
 -- speed (`v`) and the leading carriage's own orientation (`h`), every carriage's position and orientation (`car`) on
 -- first sight, a changed train, a surface change and resync, `es` when the leading end switched, and `ru` with the pieces

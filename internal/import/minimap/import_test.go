@@ -9,8 +9,8 @@ import (
 
 	"timeshadedb/internal/import/minimap"
 	"timeshadedb/internal/import/minimap/minimaptest"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/memstore"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/memstore"
 )
 
 type stores struct {

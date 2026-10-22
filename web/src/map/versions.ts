@@ -1,4 +1,4 @@
-// Which version of each tile to show (docs/v3/API.md "view" and "timeline").
+// Which version of each tile to show (docs/API.md "view" and "timeline").
 //
 // - TimelineVersions: one timeline per (level, UTC day) answers every tile of that level for
 //   any time of the day, so scrubbing and timelapse need no request per step. Used for

@@ -1,4 +1,4 @@
-// What the instance does to Lua's envelopes before they leave (docs/v3/PROTOCOL.md 1 and 2): check their shape, take
+// What the instance does to Lua's envelopes before they leave (docs/PROTOCOL.md 1 and 2): check their shape, take
 // out trace lines, and split each one by map. An envelope carries one `map`, but one instance can feed two maps: a
 // gridworld tile's tiled surfaces belong to its world (`gw-<world>`), its other surfaces (space platforms, say) to the
 // instance itself (`i-<id>`). Which surfaces are tiled comes from Lua's surfaces messages, in order with the rest.

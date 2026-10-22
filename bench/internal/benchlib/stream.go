@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // TSVReader reads chunk rows from a TimeShadeDB chunk TSV file in the 5-field form

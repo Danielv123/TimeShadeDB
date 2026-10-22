@@ -2,7 +2,7 @@
 
 The map canvas of the v3 viewer: WebGL2 palette-index textures (Canvas2D fallback), a global
 request scheduler, version resolution from `view`/`timeline`, never-black fallbacks, versioned
-texture caching and tile deltas. Contracts: `docs/v3/API.md`, `docs/v3/FORMAT.md` 7,
+texture caching and tile deltas. Contracts: `docs/API.md`, `docs/FORMAT.md` 7,
 `web/src/api/types.ts` (`DataSource`, perf hooks) and `web/src/map/layer.ts` (`MapLayer`).
 
 ## Files

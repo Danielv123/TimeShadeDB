@@ -4,7 +4,7 @@ railbench runs a real save headless with the v3 capture and a test-only recorder
 game, feeds the capture's envelopes through `serve`, and compares what the v3 viewer
 (`web/src/movers`, run headless in Node) draws from the stored rows with where the game
 really put every carriage on every tick. It also checks the rail geometry model of
-[docs/v3/RAIL-GEOMETRY.md](../../docs/v3/RAIL-GEOMETRY.md) against the recording and replays
+[docs/RAIL-GEOMETRY.md](../../docs/RAIL-GEOMETRY.md) against the recording and replays
 sampling rules on it.
 
 Nothing here is part of the shipped capture. The recorder mod is for benchmarks only.
@@ -44,7 +44,7 @@ node $R/simulate.mjs --run <run> [--reads capture|accel|shipped] [--sed 1] [--ru
 node $R/geometry.mjs --run <run> [--run <run2>...] [--every 10] [--train-every 30] [--out <file>]
 node $R/railbench.mjs ups <save.zip> --name ups-<run> [--pairs 3] [--ticks 7200] [--affinity FF00] [--compare <capture dir>]
 node $R/compare.mjs --row "<label>=<run dir>[,eval=<file>]"... [--out <file.md>]  # before/after tables
-node $R/gen-vectors.mjs --run <run>... [--out docs/v3/rail-geometry-vectors.json]
+node $R/gen-vectors.mjs --run <run>... [--out docs/rail-geometry-vectors.json]
 node --test $R/railgeom.test.mjs
 ```
 
@@ -60,7 +60,7 @@ node --test $R/railgeom.test.mjs
 | `geometry` | `geometry.json` | Checks the rail model against the recording: joint residuals per rail type, the carriage centre's offset from the rail, the game's rail distance against speed, carriage placement from the leading joint and the rail path, headings. |
 | `ups` | `ups-<run>/ups.json` | The save with and without the capture mod (recorder off), interleaved pairs, Factorio's `--benchmark-verbose` timings; the capture's Lua cost (`scriptUpdate + luaGarbageIncremental`) and whole-tick cost after the load resync, and during it. `--compare <dir>` also runs the capture built from another `capture/` directory (an older checkout's, e.g. `git archive <rev> capture`) in each pair. |
 | `compare` | stdout or `--out` | Markdown tables of samples, storage, history and live accuracy for several runs (the before/after tables of a result report). |
-| `gen-vectors` | `docs/v3/rail-geometry-vectors.json` | Test vectors from the model and from recorded carriages. |
+| `gen-vectors` | `docs/rail-geometry-vectors.json` | Test vectors from the model and from recorded carriages. |
 
 ## Ground truth format
 

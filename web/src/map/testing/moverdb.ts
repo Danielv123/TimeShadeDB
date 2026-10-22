@@ -1,6 +1,6 @@
 // Serves the movers of a real v3 database (written by `timeshadedb import-minimap --db`) next
 // to the mock terrain, so the movers layer can be checked in a browser before the v3 server
-// (WP6) exists. Reads the WP4 on-disk layout (FORMAT.md 5.5, internal/v3/movers/doc.go):
+// (WP6) exists. Reads the WP4 on-disk layout (FORMAT.md 5.5, internal/movers/doc.go):
 //
 //   <db>/movers/<surface id>/meta.json, days/<day>.json, windows/<day>/<start>.mvw,
 //   keyframes/<day>/<t>.mvw (one zstd frame of an MVW3 body each)

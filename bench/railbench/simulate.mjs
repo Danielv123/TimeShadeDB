@@ -23,7 +23,7 @@
 //                switch, heartbeat and --rp-buf reads); described by the model (railgeom.mjs): the leading joint at the
 //                time-interpolated arc length, the leading carriage centre between it and the joint 4 behind
 //   railpath-v   railpath with each sample's speed: the arc length between samples is a cubic Hermite in time
-//   railpath-t   railpath-v with the timing model of docs/v3/RAIL-GEOMETRY.md 8.3 (stand-then-accelerate from a
+//   railpath-t   railpath-v with the timing model of docs/RAIL-GEOMETRY.md 8.3 (stand-then-accelerate from a
 //                stop, brake-then-stand into one), what the capture and viewer now use
 //   shape-v      railshape walked by the Hermite in time with the speeds, one tolerance (--eps) at the read's time
 //   matched     the samples of railpath, but the path between two samples is the shortest rail path through the
@@ -201,7 +201,7 @@ export function hermiteU(e, c, f) {
 }
 
 /**
- * The timing model of a sample pair (docs/v3/RAIL-GEOMETRY.md 8): arc length at fraction f between samples e and c with
+ * The timing model of a sample pair (docs/RAIL-GEOMETRY.md 8): arc length at fraction f between samples e and c with
  * speeds. A pair that starts at rest (e.v = 0) stands until uniform acceleration from rest reaches c with c's speed,
  * when that takes less than the pair's time; one that ends at rest decelerates uniformly from e's speed and stands.
  * Otherwise a cubic Hermite in time with both speeds.

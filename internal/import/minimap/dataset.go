@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // Dataset is an opened export: its catalog and the files discovered under its root.

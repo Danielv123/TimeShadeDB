@@ -1,4 +1,4 @@
-// Headless Factorio tests of the capture (docs/v3/PROTOCOL.md section 6). Needs a Factorio 2.x install; nothing else.
+// Headless Factorio tests of the capture (docs/PROTOCOL.md section 6). Needs a Factorio 2.x install; nothing else.
 //
 //   node run_game.mjs [--mode test|clusterio|bench|all] [--factorio <factorio.exe>] [--keep] [--ticks N]
 //   test options: [--write-fixture] (rewrite fixtures/game_envelopes.ndjson from this run)

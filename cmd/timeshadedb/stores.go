@@ -7,12 +7,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"timeshadedb/internal/v3/api"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/movers"
-	"timeshadedb/internal/v3/overlays"
-	"timeshadedb/internal/v3/pyramid"
-	"timeshadedb/internal/v3/terrain"
+	"timeshadedb/internal/api"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/movers"
+	"timeshadedb/internal/overlays"
+	"timeshadedb/internal/pyramid"
+	"timeshadedb/internal/terrain"
 )
 
 // openBulkTerrain opens the terrain store under a database root for an offline bulk
@@ -94,7 +94,7 @@ func addBuildStats(t *pyramid.BuildStats, s pyramid.BuildStats) {
 	t.SnapshotBytes += s.SnapshotBytes
 }
 
-// writeMaps stores the map metadata of an import in <db>/maps.json (docs/v3/FORMAT.md
+// writeMaps stores the map metadata of an import in <db>/maps.json (docs/FORMAT.md
 // "On-disk layout"), as the core.MapInfo list the catalog serves.
 func writeMaps(dir string, maps []core.MapInfo) error {
 	if maps == nil {
@@ -106,7 +106,7 @@ func writeMaps(dir string, maps []core.MapInfo) error {
 // copyIcons copies the catalog icon spritesheet and its metadata of an import (paths
 // relative to the export root) into <db>/icons and names them in <db>/icons/icons.json
 // with paths relative to the API base ("icons/<file>"), which serve reads for the
-// catalog and serves under /api/v3/icons/ (docs/v3/FORMAT.md 5, API.md 2). Nothing
+// catalog and serves under /api/v3/icons/ (docs/FORMAT.md 5, API.md 2). Nothing
 // happens when the export has no icons.
 func copyIcons(db, root string, icons *core.CatalogIcons) error {
 	if icons == nil {

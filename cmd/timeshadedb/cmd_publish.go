@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"timeshadedb"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/publish"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/publish"
 )
 
 func init() {
