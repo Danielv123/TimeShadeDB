@@ -99,7 +99,7 @@ func (o *Options) defaults() {
 	}
 }
 
-// Store is the on-disk core.MoverStore (PLAN.md §4.4, docs/FORMAT.md 5.5). It keeps
+// Store is the on-disk core.MoverStore (docs/FORMAT.md 5.5). It keeps
 // in memory only the open windows, the trail of the last core.LiveTrail and the last row
 // of every live journey; closed windows, keyframes and day indexes live on disk.
 type Store struct {

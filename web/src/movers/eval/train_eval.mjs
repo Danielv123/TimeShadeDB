@@ -1,4 +1,4 @@
-// Train rendering evaluator (PLAN.md §4.8, §5 "Trains"): leave-one-out interpolation error and
+// Train rendering evaluator: leave-one-out interpolation error and
 // rendered carriage distance to rails, v3 viewer against the illisis baseline.
 //
 // usage (from web/): node src/movers/eval/train_eval.mjs <trains.jsonl> <rail_mask.bin>

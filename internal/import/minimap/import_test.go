@@ -7,10 +7,10 @@ import (
 	"os"
 	"testing"
 
-	"timeshadedb/internal/import/minimap"
-	"timeshadedb/internal/import/minimap/minimaptest"
 	"timeshadedb/internal/core"
 	"timeshadedb/internal/core/memstore"
+	"timeshadedb/internal/import/minimap"
+	"timeshadedb/internal/import/minimap/minimaptest"
 )
 
 type stores struct {

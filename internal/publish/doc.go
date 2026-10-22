@@ -1,5 +1,5 @@
-// Package publish writes the static export of a v3 database (docs/API.md 6, PLAN.md
-// §4.6, WP12): the same relative paths as the HTTP API, written to a directory or
+// Package publish writes the static export of a v3 database (docs/API.md 6): the same
+// relative paths as the HTTP API, written to a directory or
 // uploaded to an S3-compatible bucket (AWS S3, Cloudflare R2, MinIO) behind a CDN, so
 // the viewer runs against the bucket with its static DataSource.
 //

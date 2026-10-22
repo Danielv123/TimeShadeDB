@@ -20,7 +20,7 @@ func (pngPool) Put(b *png.EncoderBuffer) { pngBuffers.Put(b) }
 
 var pngEncoder = png.Encoder{CompressionLevel: png.BestSpeed, BufferPool: pngPool{}}
 
-// EncodePNG encodes a tile as PNG for external use (PLAN.md §4.5: the viewer uses TSV3).
+// EncodePNG encodes a tile as PNG for external use (the viewer uses TSV3).
 // Uncharted pixels (0) are transparent. With a non-nil lut and at most 256 palette
 // entries in use the image is 8-bit paletted (palette = the datastore palette prefix the
 // tile needs, so the output depends only on content and palette order); otherwise it is

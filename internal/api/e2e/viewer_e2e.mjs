@@ -1,5 +1,5 @@
-// End-to-end check of serve with the embedded viewer in headless Chromium (WP6
-// acceptance): open the viewer on a running server, wait until the terrain view is fully
+// End-to-end check of serve with the embedded viewer in headless Chromium:
+// open the viewer on a running server, wait until the terrain view is fully
 // painted and the mover layer draws movers, and report what the browser fetched.
 //
 //   node internal/api/e2e/viewer_e2e.mjs --url http://127.0.0.1:PORT [--map gw-bc41437d.1]

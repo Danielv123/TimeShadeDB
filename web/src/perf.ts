@@ -1,6 +1,6 @@
-// window.__tsdbPerf: the viewer's perf hooks (docs/README.md "Perf hooks"). WP7 and
-// WP8 record into it; the WP11 Playwright suite reads it. Recording is cheap (a ring
-// buffer push), so it stays on in production builds.
+// window.__tsdbPerf: the viewer's perf hooks (docs/README.md "Viewer hooks"). The map
+// engine and the layers record into it; the client benchmark (bench/web) reads it.
+// Recording is cheap (a ring buffer push), so it stays on in production builds.
 
 import type { PerfCounters, PerfEvent, PerfEventName, TsdbPerf } from "./api/types";
 

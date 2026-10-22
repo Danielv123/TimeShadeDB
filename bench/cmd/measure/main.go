@@ -10,7 +10,7 @@
 //	    the chunk TSV stream (<map>.chunks.tsv) that ingestbench and soak replay
 //	measure capture -repo <repo> [-runs 3] [-affinity FF00] [-- extra run_game.mjs args]
 //	    the capture's UPS cost: runs `node capture/test/run_game.mjs --mode bench`
-//	    (headless Factorio, WP9) and records its steady-state deltas per tick
+//	    (headless Factorio) and records its steady-state deltas per tick
 //	measure movers -db <v3 db> [-surface gw-bc41437d~2E1.nauvis] -out journeys.json
 //	    the train journeys stored in a v3 database, for the train evaluator's
 //	    --journeys-json (the imported, re-timed rows instead of the illisis windows);
@@ -41,7 +41,7 @@ import (
 	"timeshadedb/bench/internal/benchlib"
 )
 
-// Test-data denominators (research/testdata.md, PLAN.md §4.2): 7,483 charted nauvis chunks
+// Test-data denominators (research/testdata.md): 7,483 charted nauvis chunks
 // over 169.1 h.
 const (
 	nauvisChunks = 7483

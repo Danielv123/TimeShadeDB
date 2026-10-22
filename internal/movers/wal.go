@@ -11,11 +11,10 @@ import (
 )
 
 // The write-ahead log keeps the samples of open windows across a crash
-// (docs/FORMAT.md 5.5: "Live samples are kept in memory with a WAL"). Each open window
-// has its own log, movers/<surface id>/open/<window start>.wal (open.go); stores before
-// that kept one file, movers/wal/wal.log, rewritten with the rows still open at every
-// commit, which Open moves into the window logs. Both are a sequence of frames, one per
-// Append batch:
+// (docs/FORMAT.md 5.5). Each open window has its own log,
+// movers/<surface id>/open/<window start>.wal (open.go). A single-file log,
+// movers/wal/wal.log, is moved into the window logs by Open. Both are a sequence of
+// frames, one per Append batch:
 //
 //	u32 payload length | u32 CRC-32C of the payload | payload
 //

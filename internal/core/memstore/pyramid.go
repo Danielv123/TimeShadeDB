@@ -13,7 +13,7 @@ import (
 // Oracle rule (schedule-free): a coarse tile gets a new version at every effective time
 // at which any of its z0 descendants got one, and its content is the recursive 2x2
 // average (core.Downsample) of its children's committed content at that time. The real
-// pyramid (WP3) snapshots coarse levels on a schedule, so it matches this oracle on the
+// pyramid (internal/pyramid) snapshots coarse levels on a schedule, so it matches this oracle on the
 // latest state and at the times it snapshots, not version for version.
 type Pyramid struct {
 	T *Terrain

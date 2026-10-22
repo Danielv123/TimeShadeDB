@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// TimeMs is the v3 primary time key: Unix milliseconds on the map clock (PLAN.md §4.1, D2).
+// TimeMs is the v3 primary time key: Unix milliseconds on the map clock.
 //
 // A gridworld map spans many instances with separate game ticks, so wall-clock time is
 // the only clock they share. Live capture derives TimeMs from the game tick through a
@@ -21,7 +21,7 @@ const (
 	Day    TimeMs = 24 * Hour
 )
 
-// Time window defaults (PLAN.md D3, §4.4).
+// Time window defaults.
 const (
 	// DefaultTerrainWindow is the terrain net-change window length.
 	DefaultTerrainWindow TimeMs = 60 * Second

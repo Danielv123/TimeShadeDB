@@ -1,4 +1,4 @@
-// The platforms the binary packages are built for (decision D5): npm's platform and arch, and Go's.
+// The platforms the binary packages are built for: npm's platform and arch, and Go's.
 export const targets = [
 	{ platform: "win32", arch: "x64", goos: "windows", goarch: "amd64" },
 	{ platform: "linux", arch: "x64", goos: "linux", goarch: "amd64" },

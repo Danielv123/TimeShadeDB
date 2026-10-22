@@ -1,4 +1,4 @@
-// Builds the per-platform binary packages (decision D5) into npm/<package>/: package.json (os, cpu) and bin/. Publish
+// Builds the per-platform binary packages into npm/<package>/: package.json (os, cpu) and bin/. Publish
 // each with npm publish, then the plugin, whose optionalDependencies name them at the same version; npm installs
 // only the one matching the machine. Build the viewer first (npm run build:binary -- --web, or web's own build with
 // --base ./): every binary embeds web/dist.

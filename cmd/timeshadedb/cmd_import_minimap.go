@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"timeshadedb/internal/import/minimap"
 	"timeshadedb/internal/core"
 	"timeshadedb/internal/core/memstore"
+	"timeshadedb/internal/import/minimap"
 	"timeshadedb/internal/pyramid"
 	"timeshadedb/internal/terrain"
 )

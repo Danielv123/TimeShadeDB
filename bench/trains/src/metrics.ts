@@ -1,4 +1,4 @@
-// The train metrics of PLAN.md section 5:
+// The train metrics (the Trains targets in bench/targets.json):
 // - leave-one-out (LOO): hide a sample, let the renderer draw the head at its time from
 //   the samples around it, measure the distance to the hidden sample;
 // - rail distance of every drawn carriage centre, sampled at `hz` over all train time,

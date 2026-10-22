@@ -1,4 +1,4 @@
-// Fetching tile bodies off the main thread (PLAN.md §4.7 "Loading"): a pool of 2-4 workers
+// Fetching tile bodies off the main thread: a pool of 2-4 workers
 // fetches (the browser decompresses through Content-Encoding) and transfers the ArrayBuffer
 // back. For the Canvas2D renderer the worker also decodes the tile and expands its pixels to
 // RGBA through the palette LUT; otherwise the header is validated on the main thread when the

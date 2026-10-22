@@ -1,4 +1,4 @@
-// Motion tests (PLAN.md §4.8): Hermite and rail segments, head placement, extrapolation
+// Motion tests: Hermite and rail segments, head placement, extrapolation
 // bounds, gones and handoffs, end switches, bodies and carriages. Run with `npm test`.
 import "./eval/ts-resolve.mjs";
 import assert from "node:assert/strict";

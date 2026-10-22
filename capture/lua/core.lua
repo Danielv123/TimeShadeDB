@@ -15,7 +15,7 @@ core.PROTOCOL = 1 -- the envelope's v
 
 -- Terrain.
 core.CAP = 20000 -- chart reads the event queue's ring holds before it grows (it doubles; every charted chunk waits once)
-core.CHARTS = 1 -- chart reads a tick (60 a second; the UPS benchmark's heaviest cost, see capture/README.md)
+core.CHARTS = 1 -- chart reads a tick (60 a second; the heaviest cost in the UPS benchmark)
 core.DEBOUNCE = 600 -- ticks from one read of a chunk to the next (a chunk charted again sooner waits)
 core.CACHE = 16384 -- last sent charts kept (deflated); a miss only re-sends an unchanged chart
 core.RESYNC_READS = 64 -- chunk positions the resync walk reads a tick

@@ -250,7 +250,7 @@ function T.tick(api, cfg, t)
 		g.car.speed = 0.2
 	end
 	-- train C: a schedule to a temporary stop on the rail at x = 251, then automatic mode; its path is read while it
-	-- drives (PLAN 4.8 item 6 needs LuaTrain.path for map matching; the capture itself does not read it)
+	-- drives (map matching needs LuaTrain.path; the capture itself does not read it)
 	if t == 100 and g.c.valid then
 		local rail = s_rail(251, 201)
 		local ok, err = pcall(function()

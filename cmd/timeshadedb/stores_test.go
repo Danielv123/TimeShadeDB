@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"timeshadedb/internal/import/minimap/minimaptest"
 	"timeshadedb/internal/core"
 	"timeshadedb/internal/core/coretest"
+	"timeshadedb/internal/import/minimap/minimaptest"
 	"timeshadedb/internal/movers"
 	"timeshadedb/internal/overlays"
 	"timeshadedb/internal/pyramid"

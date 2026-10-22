@@ -1,5 +1,5 @@
-// Package pyramid keeps the coarse zoom levels (z < 0) of the v3 terrain (PLAN.md §4.5,
-// docs/FORMAT.md 4 and 5.4, WP3) and serves every level through core.TileSource.
+// Package pyramid keeps the coarse zoom levels (z < 0) of the v3 terrain
+// (docs/FORMAT.md 4 and 5.4) and serves every level through core.TileSource.
 //
 // A pixel at level z-1 is the 2x2 average (core.Average4) of level z, so every coarse
 // tile is a pure function of the z0 content at some time. The pyramid stores, per
@@ -28,7 +28,7 @@
 // New versions are synced (core.Series.Sync) before readers can see them, so a version
 // served under an immutable URL survives a crash. The pyramid holds no series handles
 // between calls: reads and builds open the series they need and close them afterwards,
-// so the series store bounds open files and index memory (WP2's idle LRU). RAM holds
+// so the series store bounds open files and index memory (its idle LRU). RAM holds
 // about 200 bytes per coarse tile (map entry included, independent of history length)
 // plus a byte-bounded LRU of decoded images; version times stay in the series index.
 package pyramid
@@ -88,8 +88,8 @@ type Options struct {
 const imageCost = 2*core.TilePixelCount + 64
 
 // DefaultIntervals is the default per-level schedule (FORMAT.md 4): z-1 every 15 min,
-// z-2 every 60 min, z <= -3 every 8 h. The plan's 5/15/60 min schedule stored more bytes
-// than the disk target (PLAN.md §5) allows next to z0 (TestIllisisTuning); between
+// z-2 every 60 min, z <= -3 every 8 h. A 5/15/60 min schedule stored more bytes
+// than the disk target (bench/targets.json) allows next to z0 (TestIllisisTuning); between
 // versions the live latest (ReadTile) keeps every level current.
 var DefaultIntervals = []core.TimeMs{15 * core.Minute, 60 * core.Minute, 480 * core.Minute}
 
@@ -898,7 +898,7 @@ func (p *Pyramid) BuiltUpTo(key core.DatastoreKey) (t core.TimeMs, ok bool) {
 	return d.builtT, d.builtT != math.MinInt64
 }
 
-// CacheStats returns the decoded coarse image cache counters (exported by WP6 under
+// CacheStats returns the decoded coarse image cache counters (exported at GET /metrics under
 // core.MetricDecodedCacheBytes and core.MetricCacheHits{cache="decoded"}).
 func (p *Pyramid) CacheStats() tileenc.LRUStats { return p.cache.Stats() }
 

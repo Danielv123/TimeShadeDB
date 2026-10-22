@@ -1,5 +1,5 @@
-// Package overlays is the on-disk core.OverlayStore of TimeShadeDB v3 (PLAN.md §4.4,
-// docs/FORMAT.md 5.6): chart tags, machine recipes and rail entities as intervals
+// Package overlays is the on-disk core.OverlayStore of TimeShadeDB v3
+// (docs/FORMAT.md 5.6): chart tags, machine recipes and rail entities as intervals
 // [Start, End), stored per datastore in an append-only log with a per-tile index.
 //
 // Layout under <db>/overlays/<datastore id>/:
@@ -38,7 +38,7 @@
 // so close events for unknown keys or datastores leave no state behind. Every
 // datastore keeps its log open; the per-tile index (8 bytes per record) and the open
 // map (about 140 bytes per open interval, key included) are in memory and are not part
-// of a memory budget, and the log is never compacted (see the WP4 report follow-ups).
+// of a memory budget, and the log is never compacted.
 package overlays
 
 import (

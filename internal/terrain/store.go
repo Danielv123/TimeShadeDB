@@ -1,4 +1,4 @@
-// Package terrain is the z0 terrain store of TimeShadeDB v3 (PLAN.md §4.2, WP2). It
+// Package terrain is the z0 terrain store of TimeShadeDB v3. It
 // implements core.TerrainStore on top of the series package:
 //
 //   - one series per (datastore, z0 tile) under <db>/datastores/<id>/tiles/<x>_<y>;
@@ -95,7 +95,7 @@ type Options struct {
 	// worst case) and, when that would go over the budget, first spills whole open
 	// windows to disk, oldest first, until it fits (spill.go). It never refuses a batch
 	// for memory; the budget can be exceeded by at most one batch (callers keep batches
-	// small, WP6: at most a few thousand updates) plus what cannot be spilled (windows a
+	// small; ingest sends at most a few thousand updates) plus what cannot be spilled (windows a
 	// commit is closing).
 	OpenWindowBytes int64
 	// MaxOpenSeries bounds the idle series (indexes and file handles) kept open
@@ -315,7 +315,7 @@ func Open(dir string, opt Options) (*Store, error) {
 	}
 	// One encoder for records and one (fastest) for the WAL, each with a few concurrent
 	// slots and a 256 KiB window: the encoders' memory is bounded and small, unlike a
-	// pool of NumCPU full-size encoders (PLAN.md §4.3 G5).
+	// pool of NumCPU full-size encoders.
 	enc, err := zstd.NewWriter(nil,
 		zstd.WithEncoderLevel(opt.Level),
 		zstd.WithEncoderConcurrency(min(opt.Workers, maxEncoders)),
@@ -1343,5 +1343,5 @@ func (s *Store) Stats() Stats {
 func (s *Store) DropCaches() { s.cache.clear() }
 
 // SeriesStore returns the underlying series store (rooted at <db>/datastores), which
-// the pyramid (WP3) can share for its coarse series.
+// the pyramid (internal/pyramid) can share for its coarse series.
 func (s *Store) SeriesStore() *series.Store { return s.series }

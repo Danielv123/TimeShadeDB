@@ -10,10 +10,10 @@ import (
 	"io"
 )
 
-// Capture protocol types (docs/PROTOCOL.md). The capture Lua (WP9) writes
-// envelopes; forwarders (the Clusterio plugin, WP10, and `timeshadedb tail`, WP6) add
-// the source fields and POST them to /api/v3/ingest as NDJSON; the ingest decoder (WP6)
-// turns them into ChunkUpdate, MoverSample and OverlayEvent values.
+// Capture protocol types (docs/PROTOCOL.md). The capture Lua (capture/) writes
+// envelopes; forwarders (the Clusterio plugin and `timeshadedb tail`) add
+// the source fields and POST them to /api/v3/ingest as NDJSON; the ingest decoder
+// (internal/ingest) turns them into ChunkUpdate, MoverSample and OverlayEvent values.
 
 // ProtocolVersion is Envelope.V.
 const ProtocolVersion = 1

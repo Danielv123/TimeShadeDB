@@ -1,7 +1,8 @@
-// Browser benchmark of the viewer against the mock server (PLAN.md §5 client rows), driven
-// through Chrome DevTools Protocol with network emulation (40 ms RTT, 50 Mbit/s):
-// first full paint (cold and warm), zoom out to the whole surface, time scrub steps,
-// timelapse frame rate, long tasks and memory. Reads window.__tsdbPerf and window.__tsdbMap.
+// Browser benchmark of the viewer against the mock server (the Client targets in
+// bench/targets.json), driven through Chrome DevTools Protocol with network emulation
+// (40 ms RTT, 50 Mbit/s): first full paint (cold and warm), zoom out to the whole surface,
+// time scrub steps, timelapse frame rate, long tasks and memory. Reads window.__tsdbPerf
+// and window.__tsdbMap.
 //
 //   npm --prefix web run build
 //   npm i --no-save --prefix <dir> playwright-core
@@ -11,8 +12,8 @@
 //        [--h2] (HTTP/2 over TLS, self-signed via openssl) [--static] (static export paths)
 //        [--diag] (print one cold load's request timeline to stderr)
 //
-// Prints a JSON report. Node only. WP11's Playwright suite is the authoritative harness;
-// this one exists so WP7 could measure before WP6 landed.
+// Prints a JSON report. Node only. The Playwright suite in bench/web is the authoritative
+// harness; this one exists so the viewer could be measured before the v3 server existed.
 
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";

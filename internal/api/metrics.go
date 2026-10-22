@@ -92,7 +92,7 @@ type routeHist struct {
 }
 
 // metrics holds the request counters. Label sets are fixed, so memory is constant
-// whatever the requests (PLAN.md §4.3 G2, G10).
+// whatever the requests.
 type metrics struct {
 	requests [numRoutes][numCodes]atomic.Uint64
 	hist     [numRoutes]routeHist

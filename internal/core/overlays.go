@@ -11,7 +11,7 @@ const (
 	OverlayTag IntervalKind = "tag"
 	// OverlayRecipe is an assembling machine's or furnace's recipe and quality.
 	OverlayRecipe IntervalKind = "recipe"
-	// OverlayRail is a rail entity (optional, from WP9 capture), used for map-matching.
+	// OverlayRail is a rail entity (optional, from the capture), used for map-matching.
 	OverlayRail IntervalKind = "rail"
 )
 
@@ -85,7 +85,7 @@ type OverlayQuery struct {
 	T0, T1 TimeMs
 }
 
-// OverlayStore stores overlay intervals (WP4, internal/overlays; reference
+// OverlayStore stores overlay intervals (internal/overlays; reference
 // memstore.Overlays).
 //
 // Events for one key must arrive in T order; an event older than the start of the

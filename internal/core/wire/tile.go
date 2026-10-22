@@ -1,7 +1,7 @@
 // Package wire holds the reference encoders and decoders of the v3 wire formats
 // (docs/FORMAT.md, "Wire formats"): TSV3 tiles, TSD3 tile deltas, TSP3 palettes and
 // MVW3 mover windows. Bodies are uncompressed; HTTP Content-Encoding (zstd or gzip)
-// compresses them in transit. WP3 (tile encoding) and WP4 (movers) may use these
+// compresses them in transit. internal/tileenc and internal/movers may use these
 // directly or write faster versions, but their output must decode here and be
 // byte-identical for the same input. web/src/api/wire.ts decodes the same formats and
 // is tested against web/fixtures, which TestFixtures generates from this package.

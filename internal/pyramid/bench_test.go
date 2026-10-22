@@ -102,7 +102,7 @@ func (f *realFixture) largest(b testing.TB, z int8) (core.TileInfo, *core.TileIm
 }
 
 // BenchmarkRealEncode: TSV3 encode + compression of the worst-compressing latest nauvis
-// tile at z0 and z-1 (PLAN.md WP3: encoded tile <= 2 ms).
+// tile at z0 and z-1 (target: encoded tile <= 2 ms).
 func BenchmarkRealEncode(b *testing.B) {
 	f := loadReal(b)
 	ctx := context.Background()
@@ -146,8 +146,8 @@ func BenchmarkRealEncode(b *testing.B) {
 	}
 }
 
-// BenchmarkRealColdRead: latest coarse tile read with an empty decoded cache (PLAN.md
-// WP3: z=-5 tile from latest <= 20 ms cold), and a random historical version.
+// BenchmarkRealColdRead: latest coarse tile read with an empty decoded cache (target:
+// z=-5 tile from latest <= 20 ms cold), and a random historical version.
 func BenchmarkRealColdRead(b *testing.B) {
 	f := loadReal(b)
 	ctx := context.Background()
@@ -171,8 +171,8 @@ func BenchmarkRealColdRead(b *testing.B) {
 	})
 }
 
-// BenchmarkRealRenderer: encoded response through tileenc.Renderer, cache hit (PLAN.md
-// WP3: cache hit <= 50 us) and miss (cold pyramid read + encode + zstd), z-1.
+// BenchmarkRealRenderer: encoded response through tileenc.Renderer, cache hit (target:
+// <= 50 us) and miss (cold pyramid read + encode + zstd), z-1.
 func BenchmarkRealRenderer(b *testing.B) {
 	f := loadReal(b)
 	ctx := context.Background()
@@ -228,7 +228,7 @@ func itoa(z int8) string {
 
 // TestIllisisEncodeLatency times single TSV3 encode + compression calls on the
 // worst-compressing latest nauvis tiles at z0 and z-1 and reports per-call percentiles
-// (PLAN.md WP3: encoded tile <= 2 ms). It needs TSDB_TESTDATA and TSDB_TUNE=1.
+// (target: encoded tile <= 2 ms). It needs TSDB_TESTDATA and TSDB_TUNE=1.
 func TestIllisisEncodeLatency(t *testing.T) {
 	root := testdataRoot(t)
 	if os.Getenv("TSDB_TUNE") == "" {

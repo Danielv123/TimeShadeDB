@@ -822,7 +822,7 @@ function runBench() {
 	const deltaResync = result.with.resyncLua.mean - result.without.resyncLua.mean;
 	note(`bench: during a resync (400 ticks from tick ${resyncTick}): Lua ${fmt(result.with.resyncLua)} with, `
 		+ `${fmt(result.without.resyncLua)} without; capture costs ${deltaResync.toFixed(4)} ms/tick`);
-	// The budget (PLAN D9) is for the steady state; both measures of it must hold. A resync is a transient (start and
+	// The budget is for the steady state; both measures of it must hold. A resync is a transient (start and
 	// reconnect, about 3.5 min per 50,000 chunks): reported against the budget, not failed.
 	const BUDGET = 0.3;
 	check(delta <= BUDGET, `bench: capture Lua cost ${delta.toFixed(4)} ms/tick within the ${BUDGET} ms budget`);

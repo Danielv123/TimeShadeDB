@@ -8,8 +8,8 @@ import (
 	"timeshadedb/internal/core"
 )
 
-// SynthConfig describes the synthetic workload modelled on the illisis test data
-// (PLAN.md §5): a charted area of Chunks chunks, terrain updates where HotShare of the
+// SynthConfig describes the synthetic workload modelled on the illisis test data:
+// a charted area of Chunks chunks, terrain updates where HotShare of the
 // updates hit HotFraction of the chunks (Zipf inside the hot set, like biters and belts
 // flickering), and Trains trains moving on closed loops.
 type SynthConfig struct {

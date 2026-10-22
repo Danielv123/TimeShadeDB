@@ -1,4 +1,4 @@
-// Mover tracks and their motion (PLAN.md §4.8): samples per journey in time order, the
+// Mover tracks and their motion: samples per journey in time order, the
 // head position at time t (cubic Hermite between samples, bounded extrapolation past the
 // newest one, straight bridges across instance handoffs), and a train's body built from
 // the head's spline history with carriages placed by arc length.
@@ -31,7 +31,7 @@ export const F_NO_HEADING = 1 << 5;
 /** A rail path sample: o is the leading carriage's own orientation, v its speed, rp its new rail pieces. */
 export const F_RAIL = 1 << 7;
 
-/** A gone followed by a sample of the same journey within this is a handoff (PLAN §4.4). */
+/** A gone followed by a sample of the same journey within this is a handoff. */
 export const HANDOFF_MS = 10_000;
 /** Consecutive samples further apart than this are not interpolated (a data gap). */
 export const MAX_SEGMENT_MS = 60_000;
@@ -68,16 +68,16 @@ export interface MotionConfig {
   /**
    * Largest turn (radians) an extrapolation past the data horizon follows the newest
    * curvature for, then straight; 0 extrapolates straight. With the turn inside the horizon
-   * too, 15 degrees measured best on the test data (WP8 live snaps 22 straight, 15 at 15
+   * too, 15 degrees measured best on the test data (live snaps: 22 straight, 15 at 15
    * degrees, 16 at 22.5, 18 at 30: past a curve's exit a long turn runs off the other side).
    */
   extrapTurn: number;
   /**
    * Whether the extrapolation inside the data horizon follows the curve too (default false:
    * only the run past the horizon does). The capture emits on about 2 degrees of turn, so
-   * silence inside the horizon means a straight run. Turning there saved 7 of 22 WP8 live
+   * silence inside the horizon means a straight run. Turning there saved 7 of 22 live
    * snaps on the test data, but nearly doubled the carriages off the rails while moving at
-   * lookahead 0 in the WP11 evaluator (5.2% -> 9.9% on 10 journeys): trains turned on past a
+   * lookahead 0 in the train evaluator (5.2% -> 9.9% on 10 journeys): trains turned on past a
    * curve's exit.
    */
   extrapTurnInside: boolean;

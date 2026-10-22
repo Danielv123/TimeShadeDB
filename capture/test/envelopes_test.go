@@ -1,5 +1,5 @@
 // Package capturetest checks that what the capture Lua writes decodes into the Go
-// contract types (internal/core/protocol.go) the ingest decoder (WP6) uses.
+// contract types (internal/core/protocol.go) the ingest decoder (internal/ingest) uses.
 //
 // fixtures/game_envelopes.ndjson holds real lines from a headless Factorio run of the
 // standalone mod (capture/test/run_game.mjs --mode test --keep): chunks, trains with car,

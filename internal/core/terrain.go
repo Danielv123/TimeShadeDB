@@ -33,7 +33,7 @@ var (
 // way. A version is only meaningful together with its tile.
 type Version uint32
 
-// ChunkUpdate is one chart observation of one chunk (PLAN.md §4.2 write path).
+// ChunkUpdate is one chart observation of one chunk.
 type ChunkUpdate struct {
 	DS    DatastoreKey
 	Chunk ChunkCoord
@@ -138,9 +138,9 @@ type DatastoreInfo struct {
 }
 
 // TileSource reads versioned tiles at one or more levels. TerrainStore implements it
-// for z0 (other levels return ErrBadTile); the pyramid (WP3, internal/pyramid)
+// for z0 (other levels return ErrBadTile); the pyramid (internal/pyramid)
 // implements it for every level z <= 0, delegating z0 to a TerrainStore. The HTTP API
-// (WP6) and the static exporter (WP12) only use this interface for reads.
+// (internal/api) and the static exporter (internal/publish) only use this interface for reads.
 //
 // Versions effective before the datastore Horizon never change once served: new versions
 // become effective at or after the Horizon, except in offline builds (import, pyramid
@@ -164,7 +164,7 @@ type TileSource interface {
 	ListTiles(ctx context.Context, ds DatastoreKey, z int8) ([]TileInfo, error)
 }
 
-// TerrainStore is the z0 terrain store (WP2, internal/terrain; reference
+// TerrainStore is the z0 terrain store (internal/terrain; reference
 // memstore.Terrain).
 //
 // Semantics (normative; memstore.Terrain is the executable definition):
@@ -215,6 +215,6 @@ type TerrainStore interface {
 	// TSD3 tile delta.
 	ChangedChunks(ctx context.Context, ds DatastoreKey, tile TileCoord, from, to Version) ([]ChunkDelta, error)
 	// Close flushes nothing that is not already durable by the store's rules and
-	// releases resources. Open windows are kept in the WAL (WP2) or dropped (memstore).
+	// releases resources. Open windows are kept in the WAL (internal/terrain) or dropped (memstore).
 	Close() error
 }

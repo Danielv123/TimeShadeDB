@@ -1,5 +1,5 @@
 // Package minimap imports an illisis/minimap export (the controller's minimap database
-// directory or its S3 mirror) into TimeShadeDB v3 stores (PLAN.md §6 WP5).
+// directory or its S3 mirror) into TimeShadeDB v3 stores.
 //
 // Portions of this package (the MMC1/MMS1 codec, the key and area arithmetic, the
 // window, keyframe and version tuple shapes) are ported from illisis-minimap

@@ -1,6 +1,6 @@
 // Command attack sends random hostile tile requests (random levels and coordinates,
 // unknown datastores, missing versions) and measures how much server memory they leave
-// behind and how fast they are answered (PLAN.md §4.3 G2, §5 "Hostile tile requests":
+// behind and how fast they are answered (the Hostile requests targets in bench/targets.json:
 // 1 M random coordinates add < 2 MB, each answered in < 1 ms).
 //
 // Memory is read several times before and after (the median of -mem-readings, after

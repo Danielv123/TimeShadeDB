@@ -1,13 +1,13 @@
 package pyramid
 
-// Cross-checks against the illisis/minimap static export (PLAN.md §6 WP3 acceptance:
+// Cross-checks against the illisis/minimap static export (acceptance criterion:
 // "the average matches illisis z1-4 on imported data, bit-exact on the final state").
 //
 // Set TSDB_TESTDATA to the export root (the directory holding maps.json.gz). The data is
 // only read and decoded here; nothing in it is executed. The MMC1/MMS1 decoding below is
 // written from the format description in the research notes (testdata.md §1-3, after
 // illisis shared/codec.ts and shared/replay.ts); it is a test helper, not the importer
-// (WP5).
+// (internal/import/minimap).
 
 import (
 	"compress/gzip"

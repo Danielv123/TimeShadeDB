@@ -23,7 +23,7 @@ type Terrain interface {
 // Options configures a Renderer. Zero values pick the defaults.
 type Options struct {
 	// CacheBytes bounds the encoded-response LRU (default 64 MiB). It is the encoded
-	// share of --mem-budget (PLAN.md §4.3).
+	// share of --mem-budget (see openServer in cmd/timeshadedb/cmd_serve.go).
 	CacheBytes int64
 	// CacheShards is the number of LRU shards (default 16).
 	CacheShards int
@@ -146,7 +146,7 @@ func (r *Renderer) Compress(enc Encoding, raw []byte) (Body, error) {
 	return Body{Data: b, Encoding: enc}, err
 }
 
-// CacheStats returns the encoded-response cache counters (exported by WP6 as
+// CacheStats returns the encoded-response cache counters (exported at GET /metrics as
 // core.MetricEncodedCacheBytes and core.MetricCacheHits/Misses{cache="encoded"}).
 func (r *Renderer) CacheStats() LRUStats { return r.cache.Stats() }
 

@@ -193,7 +193,7 @@ func simulateAnchor(ups float64, period, dur core.TimeMs, seed int64) (worst flo
 }
 
 // TestAnchorSlowServer: a busy server runs below 60 UPS; the anchor fits the effective
-// rate instead of drifting (PLAN.md §4.1 "re-fits when the offset drifts").
+// rate instead of drifting.
 func TestAnchorSlowServer(t *testing.T) {
 	for _, ups := range []float64{60, 59.5, 59, 55, 50, 30, 10, 3} {
 		for _, period := range []core.TimeMs{core.Second, core.Second / 4} {

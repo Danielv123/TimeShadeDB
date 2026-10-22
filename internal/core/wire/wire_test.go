@@ -235,7 +235,7 @@ func TestMoverWindowRail(t *testing.T) {
 
 func TestMoverWindowSizeOnTrainTrack(t *testing.T) {
 	// A train sampled every ~300 ms at 40 tiles/s: compressed like a stored window, the
-	// columnar body must stay under the 6 B/sample target (PLAN.md §5).
+	// columnar body must stay under the 6 B/sample target.
 	w := &core.MoverWindow{Kind: core.WindowClosed, Start: 0, Len: core.MoverWindowLen,
 		Movers: []core.MoverMeta{{ID: "t", Kind: core.KindTrain, Force: "player", Name: "locomotive"}}}
 	r := rand.New(rand.NewSource(3))

@@ -1,4 +1,4 @@
-// Curve math for mover rendering (PLAN.md §4.8): cubic Hermite segments in time, the
+// Curve math for mover rendering: cubic Hermite segments in time, the
 // orientation helpers, and polyline arc-length lookup. Pure functions, no imports, so
 // node --test and workers can load it directly.
 

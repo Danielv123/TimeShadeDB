@@ -2,7 +2,7 @@
   "name": "timeshadedb-bench-web",
   "private": true,
   "type": "module",
-  "description": "Client benchmarks (PLAN.md section 5, Client rows): Playwright Chromium against the illisis viewer (baseline) and the v3 viewer.",
+  "description": "Client benchmarks (the Client targets in bench/targets.json): Playwright Chromium against the illisis viewer (baseline) and the v3 viewer.",
   "scripts": {
     "build": "node build.mjs",
     "bench": "node build.mjs && node run.mjs",

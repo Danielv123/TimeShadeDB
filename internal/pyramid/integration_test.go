@@ -1,4 +1,4 @@
-// Integration tests against WP2's file-backed stores (internal/terrain and
+// Integration tests against the file-backed stores (internal/terrain and
 // internal/series). TestWholeMapFileStores needs TSDB_TESTDATA.
 
 package pyramid
@@ -95,10 +95,10 @@ func dirSize(dir string, match func(string) bool) int64 {
 }
 
 // TestWholeMapFileStores replays the illisis test data (TSDB_TESTDATA) through the
-// file-backed terrain store the way WP2's replay benchmark does (a Commit before every
+// file-backed terrain store the way internal/terrain's replay benchmark does (a Commit before every
 // batch of 1024 updates), with Pyramid.Update after every Commit (live mode) and a
 // Flush at the end. It reports z0 and pyramid disk use per chunk-hour over the whole
-// map (PLAN.md §5: <= 5 B), Update timings and series memory, and checks the latest
+// map (target: <= 5 B), Update timings and series memory, and checks the latest
 // coarse state against the z0 average. TSDB_SYNC=1 enables fsync.
 func TestWholeMapFileStores(t *testing.T) {
 	root := os.Getenv("TSDB_TESTDATA")
@@ -226,7 +226,7 @@ func TestWholeMapFileStores(t *testing.T) {
 		pyrAll += pyr
 		chAll += ch
 	}
-	t.Logf("ALL: z0 %d B = %.3f B/chunk-hour, pyramid %d B = %.3f, total %.3f B/chunk-hour (PLAN.md §5 target <= 5)",
+	t.Logf("ALL: z0 %d B = %.3f B/chunk-hour, pyramid %d B = %.3f, total %.3f B/chunk-hour (target <= 5)",
 		z0All, float64(z0All)/chAll, pyrAll, float64(pyrAll)/chAll, float64(z0All+pyrAll)/chAll)
 
 	// Reopen: series memory with the pyramid loaded (its tiles hold no handles).

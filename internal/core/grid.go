@@ -31,7 +31,7 @@ const (
 	MinZ = -10
 	// MaxCoord bounds tile x and y at z0 (|x|, |y| <= MaxCoord). The Factorio map limit is
 	// +-1,000,000 tiles, about +-1954 z0 tiles. Requests outside are rejected without
-	// allocating anything (PLAN.md §4.3 G2).
+	// allocating anything.
 	MaxCoord = 2048
 )
 

@@ -2,7 +2,7 @@
 // The integrations wiring is ported from illisis/minimap controller.ts (Blue Oak Model License 1.0.0, see
 // LICENSE-BlueOak-1.0.0.md).
 //
-// The controller side (PLAN.md §4.10): it runs the map server as a sidecar, forwards the instances' envelopes to its
+// The controller side: it runs the map server as a sidecar, forwards the instances' envelopes to its
 // ingest, publishes the cluster's maps (titles, gridworld bounds, Universal Edges lines) as "map" messages, proxies
 // the map behind Clusterio's auth, and mints view tokens for the web page.
 import { randomBytes } from "node:crypto";

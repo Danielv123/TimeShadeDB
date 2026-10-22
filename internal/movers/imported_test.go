@@ -18,8 +18,8 @@ import (
 )
 
 // This file measures the store on the movers of the illisis/minimap test export
-// (PLAN.md §6 WP4: "<= 6 B/sample on the imported movers"). It reads the export's
-// window files (*.m.gz, gzip JSON) itself, so it does not depend on the WP5 importer,
+// (target: <= 6 B/sample on the imported movers). It reads the export's
+// window files (*.m.gz, gzip JSON) itself, so it does not depend on the importer,
 // and treats them as untrusted input: bounded sizes, every field checked. It runs only
 // when TSDB_TESTDATA points at the export root (the directory holding maps.json.gz).
 
@@ -80,7 +80,7 @@ func headingFromVelocity(vx, vy float64) float64 {
 }
 
 // loadIllisisMovers reads every surface's window files. With velHeading, vehicles and
-// players without a heading get one derived from their velocity (as WP5 does).
+// players without a heading get one derived from their velocity (as the importer does).
 func loadIllisisMovers(t *testing.T, root string, velHeading bool) []*illisisSurface {
 	var out []*illisisSurface
 	maps, err := os.ReadDir(root)
@@ -250,8 +250,8 @@ func TestImportedMoverSize(t *testing.T) {
 		t.Skip("TSDB_TESTDATA not set")
 	}
 	ctx := context.Background()
-	// The export has no ticks. Live data has them (PLAN.md §5 counts heading and tick
-	// in the 6 B/sample), so the last variant adds a synthetic tick per sample, as an
+	// The export has no ticks. Live data has them (the 6 B/sample target counts heading
+	// and tick), so the last variant adds a synthetic tick per sample, as an
 	// anchor at 60 UPS would give (tick = T * 60 / 1000), to track their cost.
 	for _, variant := range []struct {
 		name       string
@@ -280,7 +280,7 @@ func TestImportedMoverSize(t *testing.T) {
 			t1 := time.Now()
 			for _, s := range sfcs {
 				// Stream in time order, an Append per 10,000 rows and a Commit per batch,
-				// as a live server (or the WP5 importer) would.
+				// as a live server (or the importer) would.
 				for i := 0; i < len(s.rows); i += 10_000 {
 					j := min(i+10_000, len(s.rows))
 					res, err := m.Append(ctx, s.rows[i:j])
@@ -315,7 +315,7 @@ func TestImportedMoverSize(t *testing.T) {
 			switch {
 			case per <= 6:
 			case variant.ticks:
-				// Tracked, not enforced: see the WP4 report (the tick column is the
+				// Tracked, not enforced (the tick column is the
 				// remaining cost; a cheaper encoding needs a FORMAT.md 7.4 change).
 				t.Logf("WARNING: %.2f B/sample with ticks exceeds the 6 B/sample target", per)
 			default:

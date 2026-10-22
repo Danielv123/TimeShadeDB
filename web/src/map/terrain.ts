@@ -1,4 +1,4 @@
-// The terrain engine (PLAN.md §4.7), DOM-free: per frame it picks the level and visible
+// The terrain engine, DOM-free: per frame it picks the level and visible
 // tiles, resolves the version each tile should show, schedules loads through the global
 // scheduler, keeps textures in a GPU-byte LRU and returns the draw list. While a tile loads
 // it draws an older version of the same tile, its nearest loaded ancestor (scaled up) or its

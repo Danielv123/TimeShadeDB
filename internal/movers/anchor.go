@@ -7,7 +7,7 @@ import (
 	"timeshadedb/internal/core"
 )
 
-// Clock anchors (docs/PROTOCOL.md 4, PLAN.md §4.1) map a source's game ticks to the
+// Clock anchors (docs/PROTOCOL.md 4) map a source's game ticks to the
 // map clock. Mover samples are stamped through an anchor and keep the raw tick, so
 // velocity is exact even below 60 UPS, arrival jitter does not move samples, and two
 // samples of one journey never collide on the same millisecond unless their ticks do.

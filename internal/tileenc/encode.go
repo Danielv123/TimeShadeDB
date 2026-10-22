@@ -1,5 +1,5 @@
 // Package tileenc encodes v3 tiles for the wire and caches the encoded responses
-// (docs/FORMAT.md section 7, docs/API.md "Compression"; PLAN.md §4.5, WP3).
+// (docs/FORMAT.md section 7, docs/API.md "Compression").
 //
 // The encoders here produce bodies byte-identical to the reference codecs in
 // internal/core/wire, but avoid their intermediate buffers. Renderer ties a

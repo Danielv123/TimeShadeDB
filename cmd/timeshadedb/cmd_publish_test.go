@@ -17,8 +17,8 @@ import (
 	"sync"
 	"testing"
 
-	"timeshadedb/internal/import/minimap/minimaptest"
 	"timeshadedb/internal/core"
+	"timeshadedb/internal/import/minimap/minimaptest"
 )
 
 func TestPublishFlags(t *testing.T) {

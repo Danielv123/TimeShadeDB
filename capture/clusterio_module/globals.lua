@@ -1,7 +1,7 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/globals.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- The capture's RCON entry point, the one global this module defines. The instance plugin (WP10) calls, at every start,
+-- The capture's RCON entry point, the one global this module defines. The instance plugin (clusterio/instance.ts) calls, at every start,
 -- on a gridworld.tile change and on reconnect:
 --   /sc ts_rt.config('{"tile":{...},"rails":false}')  then  /sc ts_rt.resync("<trace>")
 -- Headless servers never chart, so the game tests and end-to-end tests stand charts in through ts_rt.seam.

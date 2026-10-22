@@ -1,4 +1,4 @@
-// Headless browser check of a static export (WP12): opens the exported viewer from a
+// Headless browser check of a static export: opens the exported viewer from a
 // static server, waits for the first full paint, checks that terrain was drawn, that no
 // request went to the live API (/api/v3/) and that no tile, delta, palette or timeline
 // request failed. Then it zooms to z0, scrubs to a time in the middle of the history (a

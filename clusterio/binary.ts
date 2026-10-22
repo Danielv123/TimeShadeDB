@@ -1,4 +1,4 @@
-// Where the timeshadedb executable comes from (decision D5): a configured path, else an environment variable, else
+// Where the timeshadedb executable comes from: a configured path, else an environment variable, else
 // the npm package built for this platform (an optional dependency, as esbuild ships its binaries), else bin/ in the
 // plugin directory (a development build: npm run build:binary).
 import * as fs from "node:fs";

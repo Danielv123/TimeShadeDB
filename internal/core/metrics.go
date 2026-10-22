@@ -1,7 +1,7 @@
 package core
 
-// Prometheus metric names exported at GET /metrics (WP6) and read by the benchmark
-// suite (WP11). Names are fixed here so both sides agree; docs/API.md lists them
+// Prometheus metric names exported at GET /metrics and read by the benchmark
+// suite (bench/). Names are fixed here so both sides agree; docs/API.md lists them
 // with their labels. Labels: ds = datastore id, sfc = surface id, route = API route
 // name (the first path segment after /api/v3/), code = HTTP status.
 const (
@@ -26,8 +26,8 @@ const (
 	MetricLiveDropped          = "tsdb_live_clients_dropped_total"   // counter
 	MetricClockAnchorOffset    = "tsdb_clock_anchor_offset_ms"       // gauge {src}
 	MetricMemBudgetBytes       = "tsdb_mem_budget_bytes"             // gauge
-	MetricPublishQueue         = "tsdb_publish_queue"                // gauge (WP12)
-	MetricPublishUploadedBytes = "tsdb_publish_uploaded_bytes_total" // counter (WP12)
+	MetricPublishQueue         = "tsdb_publish_queue"                // gauge (publish)
+	MetricPublishUploadedBytes = "tsdb_publish_uploaded_bytes_total" // counter (publish)
 	MetricIngestCaughtUp       = "tsdb_ingest_caught_up_total"       // counter: caught_up envelopes
 	MetricHeldMaps             = "tsdb_horizon_held_maps"            // gauge: maps whose commits a source holds back over a minute
 	MetricHoldLag              = "tsdb_horizon_hold_lag_ms"          // gauge: the largest such hold behind the clock

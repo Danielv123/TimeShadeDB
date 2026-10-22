@@ -1,4 +1,4 @@
-// The path between two consecutive samples (PLAN.md §4.8 step 2, refined). Rails are lines
+// The path between two consecutive samples. Rails are lines
 // and arcs, and a sample pair often spans a long straight that ends just inside a curve:
 // a cubic cannot be straight for 60 tiles and then turn, so with accurate end tangents it
 // bulges off the straight. Where the end points and tangents allow it, the segment is

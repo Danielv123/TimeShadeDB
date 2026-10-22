@@ -1,5 +1,5 @@
-// Package movers is the on-disk core.MoverStore of TimeShadeDB v3 (PLAN.md §4.4,
-// docs/FORMAT.md 5.5), plus the journey rules and clock anchors that ingest applies
+// Package movers is the on-disk core.MoverStore of TimeShadeDB v3
+// (docs/FORMAT.md 5.5), plus the journey rules and clock anchors that ingest applies
 // before samples reach it.
 //
 // # Layout
@@ -59,7 +59,7 @@
 // (Stats.Ahead, Stats.Behind). Any time between is accepted on a surface without a
 // horizon, however old: a backlog after a long downtime is stored. Bulk importers that
 // stream one surface after another, or whose batches jump ahead of their commits, must
-// pass MaxAhead: -1. WP6 should still clamp T to its own clock, and should commit once at
+// pass MaxAhead: -1. Ingest should still clamp T to its own clock, and should commit once at
 // start (or set Clock) so the reference exists before ingest resumes. After a long
 // downtime, or for a surface whose first sample is old, a Commit writes a keyframe for
 // every hour of the gap (FORMAT.md 5.5 has a keyframe at every hour; skipping empty ones
@@ -93,7 +93,7 @@
 // logged, counted (Stats.Corrupt) and skipped there, so one damaged file cannot stop
 // the store opening; Window and Keyframe return an error for it.
 //
-// MaxTrailRows and MaxLiveMovers are not derived from a global --mem-budget (WP6/WP11).
+// MaxTrailRows and MaxLiveMovers are not derived from the global --mem-budget.
 // Open loads each surface with the whole limits and trims them to their shares once all
 // surfaces are loaded, so the store briefly holds more while it opens. Open replays the
 // window logs oldest first and evicts as it goes, so the newest windows end up resident.
@@ -125,5 +125,5 @@
 // Journeys (journeys.go) applies the owner rule, adoption, resync, gone meta and
 // surface changes to decoded move messages; Anchors (anchor.go) maps game ticks to the
 // map clock per source (PROTOCOL.md 4). Both are bounded and meant for the ingest
-// decoder (WP6), which owns envelope decoding.
+// decoder (internal/ingest), which owns envelope decoding.
 package movers

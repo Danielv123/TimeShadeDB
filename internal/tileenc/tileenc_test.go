@@ -499,7 +499,7 @@ func TestRendererSingleFlight(t *testing.T) {
 }
 
 // TestRendererHostile: a million random out-of-grid, empty or unknown-datastore tile
-// requests leave no lasting allocations (PLAN.md §4.3 G2, §5 "hostile tile requests").
+// requests leave no lasting allocations (the Hostile requests targets in bench/targets.json).
 func TestRendererHostile(t *testing.T) {
 	ctx := context.Background()
 	ter, pyr := fixture(t)

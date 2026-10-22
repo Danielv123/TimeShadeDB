@@ -59,7 +59,7 @@ type Record struct {
 var ErrOutOfOrder = errors.New("record out of order")
 
 // Series is one append-only record log: a .blk payload file and a .idx index of fixed
-// 24-byte records (WP2, internal/series; reference memstore.Series). Terrain keeps
+// 24-byte records (internal/series; reference memstore.Series). Terrain keeps
 // one series per (datastore, z0 tile); the pyramid one per (datastore, coarse tile).
 //
 // Records are appended with non-decreasing TEnd. A Series is safe for one writer and

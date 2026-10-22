@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
 // Ported from illisis/minimap instance.ts (Blue Oak Model License 1.0.0, see LICENSE-BlueOak-1.0.0.md).
 //
-// The instance side (PLAN.md §4.10): Lua's capture module prints envelopes on the IPC channel timeshade:out; this
+// The instance side: Lua's capture module prints envelopes on the IPC channel timeshade:out; this
 // stamps each with its arrival time, splits it by map, and sends what arrived to the controller about once a second.
 // While nothing waits it sends caught_up envelopes every few seconds, and ended ones when the instance stops, so the map
 // server holds a map's horizon back only for an instance that still has data to send (docs/API.md 5, "Horizon").

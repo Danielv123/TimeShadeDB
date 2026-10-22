@@ -1,4 +1,4 @@
-// The v3 movers module as a train renderer for the WP11 train evaluator (bench/trains):
+// The v3 movers module as a train renderer for the train evaluator (bench/trains):
 // bench/trains/build.mjs resolves its "v3-movers" import to this file and calls
 // createTrainRenderer(). The types are bench/trains/src/types.ts, repeated here
 // structurally so the viewer does not import from bench/.

@@ -1,6 +1,6 @@
 // Package core holds the shared types and store interfaces of TimeShadeDB v3.
 //
-// It is the contract every v3 work package codes against (PLAN.md §6 WP0). The
+// It is the contract every other v3 package codes against. The
 // normative descriptions live in docs/FORMAT.md (on-disk and wire formats),
 // docs/API.md (HTTP API) and docs/PROTOCOL.md (capture envelopes); the doc
 // comments here repeat the parts that matter for callers.
@@ -25,6 +25,5 @@
 // and core/wire the reference codecs for the wire formats (and the web fixtures).
 //
 // Rules for changing this package: changes are additive (new fields, new methods on
-// new interfaces). A work package that needs a change makes the smallest additive one
-// and lists it in its report.
+// new interfaces). Make the smallest additive change that does the job.
 package core

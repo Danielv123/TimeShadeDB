@@ -1,6 +1,6 @@
-// The layers the viewer can draw above terrain, in menu order. Owned by WP8: movers
+// The layers the viewer can draw above terrain, in menu order: movers
 // (trains, vehicles, players), tags, recipes, UE edges, instance bounds and rails. Terrain
-// is drawn by the map engine (WP7) and is not a layer.
+// is drawn by the map engine (web/src/map/) and is not a layer.
 
 import type { LayerFactory, MapLayer } from "../map/layer";
 import { MoverLayer } from "../movers/layer";

@@ -181,7 +181,7 @@ func ReadAllTSV(paths []string, surface string) ([]ChunkRow, error) {
 
 // ChunkHours returns the number of distinct (map, surface, force, chunk) keys in rows
 // and the time span in hours, whose product is the "chunk-hour" denominator of the
-// terrain disk target (PLAN.md §4.2: charted chunks x hours covered).
+// terrain disk target (charted chunks x hours covered).
 func ChunkHours(rows []ChunkRow) (chunks int, hours float64) {
 	type key struct {
 		m, s, f string

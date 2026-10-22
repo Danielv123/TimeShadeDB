@@ -1,4 +1,4 @@
-// TimeShadeDB v3 API contract for the viewer (WP0). Mirrors internal/core/apitypes.go,
+// TimeShadeDB v3 API contract for the viewer. Mirrors internal/core/apitypes.go,
 // internal/core/movers.go and overlays.go field for field; docs/API.md and
 // docs/FORMAT.md are the normative descriptions. Change Go and TypeScript together.
 
@@ -346,7 +346,7 @@ export interface ErrorResponse {
 }
 
 // ---------------------------------------------------------------------------------------
-// Data sources (implemented by WP7 in web/src/map/; WP8 reads movers and overlays through it)
+// Data sources (implemented in web/src/map/; the mover and overlay layers read through it)
 
 /**
  * Where the viewer reads data from: the live server (`/api/v3/`) or a static export
@@ -376,7 +376,7 @@ export interface DataSource {
 }
 
 // ---------------------------------------------------------------------------------------
-// Perf hooks (window.__tsdbPerf), read by the WP11 Playwright suite. See docs/README.md.
+// Perf hooks (window.__tsdbPerf), read by the client benchmark (bench/web). See docs/README.md.
 
 export type PerfEventName =
   | "tile.request"
@@ -425,7 +425,7 @@ export interface TsdbPerf {
 }
 
 /**
- * Control surface the viewer exposes as window.__tsdbControl, so the WP11 Playwright suite
+ * Control surface the viewer exposes as window.__tsdbControl, so the Playwright benchmark
  * (bench/web/run.mjs) can drive zoom, scrub and timelapse the same way in every viewer.
  * Calls behave as the matching user action; each paint they cause is reported through
  * __tsdbPerf (view.fallback / view.full).

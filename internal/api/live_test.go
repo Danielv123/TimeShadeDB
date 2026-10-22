@@ -310,7 +310,7 @@ func (w *discardWriter) WriteHeader(s int)           { w.status = s }
 
 // TestHostileTileRequests sends random tile URLs (unknown and malformed datastores,
 // coordinates inside and outside the grid, versions that do not exist) and checks that
-// they leave less than 2 MB behind (PLAN.md §4.3 G2, §5 "Hostile tile requests") and
+// they leave less than 2 MB behind (the Hostile requests targets in bench/targets.json) and
 // answer quickly.
 // hostilePath returns a random request path: mostly invalid ids, levels, coordinates and
 // versions (valid false), or valid ids and levels with coordinates, versions and dates

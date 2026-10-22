@@ -1,5 +1,5 @@
 // Reference renderers that draw only the head: linear interpolation in time (a chord)
-// and cubic Hermite with tangents v*dt (PLAN.md section 4.8 step 2). They reproduce the
+// and cubic Hermite with tangents v*dt. They reproduce the
 // research numbers (research/illisis-viewer.md 2.3) and sanity-check the evaluator; the
 // head is held at the newest known sample (no extrapolation).
 

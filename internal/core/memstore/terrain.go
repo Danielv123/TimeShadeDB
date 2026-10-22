@@ -1,7 +1,7 @@
 // Package memstore holds in-memory reference implementations of the core store
 // interfaces. They keep everything in RAM and are written to be obviously correct,
-// not fast: they are the test oracles for the real stores (WP2 terrain, WP3 pyramid,
-// WP4 movers and overlays) and fixtures for API tests (WP6). Do not use them in
+// not fast: they are the test oracles for the real stores (terrain, pyramid, movers
+// and overlays) and fixtures for API tests. Do not use them in
 // production.
 package memstore
 

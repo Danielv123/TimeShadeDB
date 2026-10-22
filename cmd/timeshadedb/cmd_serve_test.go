@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"timeshadedb/internal/import/minimap/minimaptest"
 	"timeshadedb/internal/core"
+	"timeshadedb/internal/import/minimap/minimaptest"
 )
 
 func TestServeFlags(t *testing.T) {

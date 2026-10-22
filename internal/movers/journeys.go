@@ -12,8 +12,8 @@ import (
 	"timeshadedb/internal/core"
 )
 
-// Journeys applies the journey rules of PLAN.md §4.4 to decoded move messages before
-// they reach a MoverStore. Ingest (WP6) keeps one per map and feeds it every move
+// Journeys applies the journey rules below to decoded move messages before
+// they reach a MoverStore. Ingest keeps one per map and feeds it every move
 // message in envelope order; the store then assigns FlagHandoff at commit.
 //
 //   - Owner rule (illisis K28): a journey belongs to the first source that samples it.

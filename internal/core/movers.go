@@ -124,7 +124,7 @@ type MoverSample struct {
 	// from the second carriage towards the leading one.
 	Orientation float64
 	Flags       MoverFlags
-	// Carriages, when present, lists every carriage from the leading end (WP9 sends them
+	// Carriages, when present, lists every carriage from the leading end (the capture sends them
 	// on stop, on start, in keyframes and at end switches).
 	Carriages []Carriage
 	// Speed (tiles a tick), Rail and RailStart are set with FlagRail (see there).
@@ -274,7 +274,7 @@ type SurfaceInfo struct {
 	Days []string `json:"days"`
 }
 
-// MoverStore stores mover samples per surface (WP4, internal/movers; reference
+// MoverStore stores mover samples per surface (internal/movers; reference
 // memstore.Movers).
 //
 // Semantics (normative; memstore.Movers is the executable definition):

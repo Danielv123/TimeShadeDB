@@ -153,7 +153,7 @@ func (v *server) Close() error {
 }
 
 // openServer opens every store under o.db and builds the API server. The memory
-// budget is split (PLAN.md §4.3): to the terrain store 3/32 for decoded tiles, 1/8 for
+// budget is split: to the terrain store 3/32 for decoded tiles, 1/8 for
 // open windows (Apply refuses batches beyond it, counting every update of a batch as a
 // new open chunk: 1/16 was too little for the synthetic soak at 100x and 3/32 for the
 // test data's 60 s stream) and 3/64 for idle indexes; 1/8 to the encoded-response cache, 1/16 to decoded coarse images, 1/32 to overlay caches
@@ -327,7 +327,7 @@ func runServe(ctx context.Context, stdout, stderr io.Writer, args []string) erro
 	// buffers and the collector's headroom. The soft limit holds the runtime's mapped
 	// memory near it under load; on Windows the committed private bytes measured about
 	// 30 MiB above that (runtime metadata, the executable's writable pages) and the
-	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB. About
+	// working set up to there, so RSS stays within the mem-budget + 64 MiB target. About
 	// 50 MiB (codecs, ingest buffers) does not scale with the budget, so below 256 MiB a
 	// full-speed ingest goes past that bound (docs/API.md 8). GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {

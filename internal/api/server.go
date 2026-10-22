@@ -1,4 +1,4 @@
-// Package api is the v3 HTTP API (docs/API.md, PLAN.md §4.6, WP6): the read routes
+// Package api is the v3 HTTP API (docs/API.md): the read routes
 // under /api/v3/ over the terrain store, the pyramid, the tile renderer, the mover and
 // overlay stores; POST /api/v3/ingest over internal/ingest; live events over
 // Server-Sent Events; /metrics, /healthz and the embedded viewer. Run drives the commit

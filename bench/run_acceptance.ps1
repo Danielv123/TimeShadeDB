@@ -1,4 +1,4 @@
-# Runs the WP11 acceptance suite (or, with -mode baseline, the Wave 1 baselines) and
+# Runs the acceptance suite (or, with -mode baseline, the baselines) and
 # writes bench/REPORT.md. All options are flags of bench/cmd/acceptance; see
 # bench/README.md. Example:
 #   $env:TSDB_TESTDATA = "G:\data\minimap"

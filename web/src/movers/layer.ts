@@ -1,7 +1,7 @@
 // The movers layer (MapLayer, web/src/map/layer.ts): trains, vehicles and players of the
 // shown surface at the displayed time. In live mode the drawn time trails the data clock
 // by the adaptive delay (DelayEstimator), so the next sample is usually known and movers
-// interpolate instead of extrapolating (PLAN.md §4.8 step 1).
+// interpolate instead of extrapolating.
 
 import type { LayerContext, LayerHit, MapLayer, FrameState } from "../map/layer";
 import type { TimeMs } from "../api/types";

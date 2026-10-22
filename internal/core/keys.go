@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// DatastoreKey names one terrain datastore: a (map, surface, force) triple
-// (PLAN.md §4.2). The fields are raw names as the game or the forwarder gives them.
+// DatastoreKey names one terrain datastore: a (map, surface, force) triple. The fields
+// are raw names as the game or the forwarder gives them.
 //
 // Map is the map key. Clusterio gridworld maps use "gw-<world name>" (all tiles and
 // non-excluded planets stitched into one coordinate space), other Clusterio surfaces

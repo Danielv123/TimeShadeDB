@@ -1,11 +1,11 @@
 // Package replay turns the illisis/minimap static export (the v3 test data) into a
 // time-ordered stream of terrain chunk updates, for benchmarks and tests of the
-// terrain store (WP2 acceptance: "synthetic test-data replay").
+// terrain store.
 //
 // It reads only the z0 change files (MMC1, illisis codec.ts) listed by each area's
 // index.json.gz, merges all areas by time and keeps every chunk's full state, so each
 // change record becomes one core.ChunkUpdate with the full 32x32 chart, as live capture
-// would send it. It is a minimal reader for measurement; the importer (WP5) is the
+// would send it. It is a minimal reader for measurement; the importer (internal/import/minimap) is the
 // complete one. The data directory is untrusted input: it is only parsed, and every
 // length is checked.
 package replay

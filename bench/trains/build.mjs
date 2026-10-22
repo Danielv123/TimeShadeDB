@@ -2,7 +2,7 @@
 // - "illisis-movers" resolves to <ILLISIS_REPO>/web/view/movers.ts (env ILLISIS_REPO,
 //   default ../../../illisis-minimap next to the TimeShadeDB checkout). The illisis
 //   source is only read by the bundler; nothing from the test data is executed.
-// - "v3-movers" resolves to web/src/movers/bench.ts when it exists (WP8), else a stub.
+// - "v3-movers" resolves to web/src/movers/bench.ts when it exists, else a stub.
 import { build } from "esbuild";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
