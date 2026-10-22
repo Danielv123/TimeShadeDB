@@ -32,17 +32,74 @@ type row struct {
 	x, y  int32
 	o     uint16
 	flags core.MoverFlags
-	car   []carriage
-	// With core.FlagRail: speed in core.SpeedUnits, the rail pieces and the rail start.
-	speed  uint32
-	rail   []core.RailPiece
+	// With core.FlagRail: the rail start, speed in core.SpeedUnits and the rail pieces.
 	rstart bool
+	speed  uint32
+	car    []carriage
+	rail   []core.RailPiece
 	// seq is the arrival order; for equal (journey, t) the highest seq wins.
 	seq uint64
+	// body is the rail pieces under the train that earlier rows of the journey listed
+	// (core.RailBody), put in front of rail when the row is a keyframe's or the first of its
+	// journey in the live payload. Not stored with the row; shared, never modified.
+	body []core.RailPiece
 }
 
 // rowBytes is the approximate heap cost of one row without carriages, for budgets.
-const rowBytes = 72
+const rowBytes = 120
+
+// railRow is what core.RailBody needs of r.
+func (r *row) railRow() core.RailRow {
+	return core.RailRow{T: r.t, X: float64(r.x) / core.PosUnits, Y: float64(r.y) / core.PosUnits,
+		Orientation: float64(r.o) / core.OrientUnits, Flags: r.flags, Rail: r.rail, RailStart: r.rstart,
+		Carriages: r.meta.Carriages}
+}
+
+// withBody returns r as a keyframe or the live payload holds it: a copy with its body in
+// front of its rail pieces, or r itself when it has none.
+func (r *row) withBody() *row {
+	if len(r.body) == 0 {
+		return r
+	}
+	c := *r
+	c.rail = core.RailWithBody(r.body, r.rail)
+	c.body = nil
+	return &c
+}
+
+// rails maps journeys to their core.RailBody. A journey without one has none yet: a
+// fresh one, or a clone of base's (see get).
+type rails map[string]*core.RailBody
+
+// get returns id's RailBody, made from base's copy (or empty) when it has none.
+func (rs rails) get(id string, base rails) *core.RailBody {
+	if b := rs[id]; b != nil {
+		return b
+	}
+	b := new(core.RailBody)
+	if c := base[id]; c != nil {
+		b = c.Clone()
+	}
+	rs[id] = b
+	return b
+}
+
+// add gives train row r its body from its journey's RailBody (made from base's when missing).
+func (rs rails) add(r *row, base rails) {
+	r.body = nil
+	if r.meta.Kind == core.KindTrain {
+		r.body = rs.get(r.meta.ID, base).Add(r.railRow())
+	}
+}
+
+// clone returns a deep copy.
+func (rs rails) clone() rails {
+	c := make(rails, len(rs))
+	for id, b := range rs {
+		c[id] = b.Clone()
+	}
+	return c
+}
 
 func (r *row) gone() bool { return r.flags&core.FlagGone != 0 }
 

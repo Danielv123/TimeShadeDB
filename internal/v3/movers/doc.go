@@ -62,7 +62,15 @@
 // No history is held in memory. Per surface the store keeps the open rows (bounded
 // across surfaces by Options.MaxOpenRows; Append returns ErrOverloaded beyond it), the
 // closed rows of the last core.LiveTrail before the horizon and the last row of every
-// live journey, from which keyframes and Live are built. Options.MaxTrailRows and
+// live journey, from which keyframes and Live are built, and for every live train a
+// core.RailBody over its closed rows and one over its open rows (the rail pieces of about
+// a train length behind it), which give rows the body that keyframes and Live put in front
+// of a moving train's first row (FORMAT.md 7.4). A row keeps its body as a slice of its
+// RailBody's pieces. The open RailBody follows rows as they arrive; a row at or before its
+// journey's previous open row makes Append (or the WAL replay) give that journey's open
+// rows their bodies again in time order. A commit follows the closed rows in time order,
+// begins every RailBody again at each keyframe it writes, and redoes the open rows' bodies
+// from the new state. Options.MaxTrailRows and
 // Options.MaxLiveMovers bound those two summed over all surfaces: each commit trims the
 // surface it commits to what the other surfaces leave of the limit, or an equal share
 // if that is more (Store.share). Opening rebuilds these from the newest keyframe, the windows after it
@@ -87,7 +95,8 @@
 //
 // Window and Keyframe decode the files; Day reads the index; Live(now) is served from
 // memory when now is at or after the horizon, and otherwise rebuilt from the keyframe
-// before now - core.LiveTrail and the windows up to now (skipping damaged files).
+// before now - core.LiveTrail and the windows up to now (skipping damaged files), with the
+// bodies followed from that keyframe's rows (and again from each later keyframe passed).
 //
 // # Journeys and clock anchors
 //

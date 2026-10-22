@@ -447,6 +447,22 @@ Row flags (`core.MoverFlags`; bit 6 exists only on the wire):
 | 6 | carriages | the carriage column has a block for this row |
 | 7 | rail | a train's rail path sample (RAIL-GEOMETRY.md 8): the orientation is the leading carriage's own orientation (the rail tangent), and columns 9 and 10 have its speed, its rail pieces and whether a new rail path begins (PROTOCOL.md 3.1 `v`, `rp`, `ru`). Gone rows never have it |
 
+**Train bodies in keyframes and live payloads.** A rail row lists only the pieces its leading
+joint entered since the row before, so a viewer that starts from a keyframe or a live payload
+would know a moving train's head but not where its body lies. In a keyframe (kind 2), and in a
+live payload (kind 3) for each journey's first row, a rail row therefore carries its *body* in
+front of its own pieces: the pieces that the journey's earlier rows of the same rail path
+listed and that still lie under the train, rear first (`core.RailBody`: the viewer's chain of
+RAIL-GEOMETRY.md 8.2 followed over the rows, a piece kept while its exit end lies within the
+train length plus 4 tiles behind the leading joint; at most 1,024 pieces in all). This is the
+shape a stop sample already has (PROTOCOL.md 3.1 `rp`): a viewer that holds the rows before
+skips those pieces as resends. Rows that list the whole train themselves (with rail start, stop
+samples and the sample after a stop) get no body, nor do rows whose path was lost (a piece that
+neither continues the path nor is on it) until such a row. The body follows on from the newest
+keyframe at or before the row, whose row begins the path again, so it is the same whether or
+not the store restarted in between. Closed windows (kind 1) never carry bodies. Older data and
+older stores give keyframes without bodies, which read as before.
+
 Positions: a train's x, y is its leading carriage centre; carriages list every carriage from
 the leading end. Orientation is Factorio's (0 north, 0.25 east); a train's points from the
 second carriage to the first, except on rail rows (bit 7), where it is the leading carriage's
