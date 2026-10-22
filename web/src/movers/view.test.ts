@@ -371,6 +371,50 @@ test("a parked train is placed from its stop sample alone (a keyframe, live.bin)
   assert.ok(worstOld > 2, `without the pieces under it a parked train is drawn up to ${worstOld.toFixed(1)} tiles off`);
 });
 
+test("a moving train's first row in view (a keyframe's, live.bin's) places its body when the server put the pieces under it in front", async () => {
+  // the server's body (core.RailBody, FORMAT.md 7.4): the same real-game trains as above, now moving and seen first at
+  // a row that is neither a run start nor a stop
+  const P = await import("./railpath.ts");
+  const vectors = JSON.parse(readFileSync(new URL("../../../docs/v3/rail-geometry-vectors.json", import.meta.url), "utf8"));
+  const kindOf = (type: string): number =>
+    ({ "curved-rail-a": P.KIND_CURVE_A, "curved-rail-b": P.KIND_CURVE_B, "legacy-curved-rail": P.KIND_LEGACY_CURVE, "rail-ramp": P.KIND_RAMP })[
+      type.replace(/^elevated-/, "")
+    ] ?? 0;
+  let curved = 0;
+  let worstOld = 0;
+  for (const t of vectors.trains) {
+    const pieces = t.path.filter((r: { type: string }) => kindOf(r.type)).map((r: { type: string; x: number; y: number; dir: number }) =>
+      ({ x: r.x, y: r.y, dir: r.dir, kind: kindOf(r.type) }));
+    if (pieces.length < 2) {
+      continue;
+    }
+    curved++;
+    const [cx, cy, co] = t.game_carriages[0];
+    const [nx, ny] = t.game_carriages[1];
+    const a = 2 * Math.PI * co;
+    const ahead = Math.sin(a) * (cx - nx) - Math.cos(a) * (cy - ny) > 0;
+    const o = (co + (ahead ? 0 : 0.5)) % 1;
+    const m = { id: t.source, k: "t" as const, f: "player", name: "locomotive", n: t.game_carriages.length, o: "L" + "C".repeat(t.game_carriages.length - 1) };
+    const draw = (rp: typeof pieces) => {
+      const v = new MoverView();
+      v.add(m, T.makeSample(m, 1000, cx, cy, o, T.F_RAIL, null, 600, 0.5, rp));
+      const shown = v.frame(1000, Infinity, { bodies: true })[0];
+      assert.equal(shown.cars.length, t.game_carriages.length);
+      let worst = 0;
+      for (const [i, [x, y]] of t.game_carriages.entries()) {
+        worst = Math.max(worst, Math.hypot(shown.cars[i].x - x, shown.cars[i].y - y));
+      }
+      return worst;
+    };
+    const e = draw(pieces);
+    assert.ok(e < (t.category === "rail-ramp" ? 0.25 : 0.05), `${t.source}: a carriage ${e.toFixed(3)} tiles off`);
+    // only the piece the row itself lists (entered since the row before): the body behind it is not known
+    worstOld = Math.max(worstOld, draw(pieces.slice(-1)));
+  }
+  assert.ok(curved >= 15, `${curved} trains on two or more curved pieces or ramps`);
+  assert.ok(worstOld > 2, `without its body a moving train is drawn up to ${worstOld.toFixed(1)} tiles off`);
+});
+
 test("a changed train (a split at rest: a new rail path, fewer carriages) holds at its stop sample, then jumps", () => {
   const v = new MoverView();
   const m3 = { ...meta, id: "split", n: 3, o: "LCC" };
