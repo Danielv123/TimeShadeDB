@@ -379,7 +379,12 @@ caches get about half of the budget (terrain 3/32 decoded tiles, 1/8 open window
 windows another eighth, counted per row); the rest is working memory
 and the collector's headroom. Open windows past their share move to disk (FORMAT.md 5.5,
 5.7) and are read back by the commit that closes them, so memory stays within the budget
-however fast data arrives or however long a horizon is held.
+however fast data arrives or however long a horizon is held. About 50 MiB of working
+memory does not shrink with the budget (the zstd encoders and decoders, ingest's decode
+buffers), so the budget + 64 MiB bound holds from the default 256 MiB up; with a smaller
+budget, ingest at full speed takes more (measured with 12 copies of a 10-minute capture
+through `tail --once`: 156 MiB working set and 195 MiB private bytes at 64 MiB, 175 MiB
+and 218 MiB at 128 MiB, 257 MiB and 302 MiB at 256 MiB).
 After 10 s without requests the server returns freed memory to the operating system.
 
 Interrupt or SIGTERM shuts down cleanly: live streams are ended at once, requests in

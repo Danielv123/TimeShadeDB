@@ -328,8 +328,9 @@ func runServeV3(ctx context.Context, stdout, stderr io.Writer, args []string) er
 	// buffers and the collector's headroom. The soft limit holds the runtime's mapped
 	// memory near it under load; on Windows the committed private bytes measured about
 	// 30 MiB above that (runtime metadata, the executable's writable pages) and the
-	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB.
-	// GOMEMLIMIT overrides.
+	// working set up to there, so RSS stays within PLAN.md §5's mem-budget + 64 MiB. About
+	// 50 MiB (codecs, ingest buffers) does not scale with the budget, so below 256 MiB a
+	// full-speed ingest goes past that bound (docs/v3/API.md 8). GOMEMLIMIT overrides.
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(o.memBudget)
 	}
