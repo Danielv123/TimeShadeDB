@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -768,6 +769,9 @@ func TestLiveHeapHeldHour(t *testing.T) {
 	if st := m.Stats(); st.SpilledWindows < 11 || st.OpenBytes > budget {
 		t.Fatalf("stats %+v: want every window evicted within the budget", st)
 	}
+	// Collect often, so the peak is what the request holds rather than garbage the
+	// collector has not reached yet.
+	defer debug.SetGCPercent(debug.SetGCPercent(10))
 	var before runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
@@ -798,7 +802,9 @@ func TestLiveHeapHeldHour(t *testing.T) {
 		t.Fatalf("live: %d rows, want %d", len(w.Rows), 200*120)
 	}
 	// The trail is 24,000 rows (a few MiB); the hour is 1.44 million rows (over 200 MiB).
-	if grew := int64(peak.Load()) - int64(before.HeapInuse); grew > 2*budget {
+	grew := int64(peak.Load()) - int64(before.HeapInuse)
+	t.Logf("live grew the heap by %d MiB", grew>>20)
+	if grew > 2*budget {
 		t.Fatalf("live grew the heap by %d MiB, want at most %d MiB", grew>>20, 2*budget>>20)
 	}
 }
