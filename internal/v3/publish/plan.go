@@ -104,9 +104,6 @@ func utcDays(from, to core.TimeMs) []string {
 	return days
 }
 
-// maxDays bounds the days per datastore (a broken clock must not plan millions).
-const maxDays = 3700
-
 // plan returns the round's items, grouped by phase and ordered within each phase.
 func (p *planner) plan(ctx context.Context) ([]Item, error) {
 	catRes, err := p.src.Get(ctx, "catalog")
@@ -166,10 +163,9 @@ func (p *planner) planDatastore(ctx context.Context, d core.CatalogDatastore, to
 		return nil
 	}
 	last := d.Last + d.WindowMs
+	// The stores take no time before 2016 nor more than an hour ahead of the clock
+	// (terrain and movers MinTime, MaxAhead), so a datastore spans a bounded number of days.
 	days := utcDays(d.First, last)
-	if len(days) > maxDays {
-		return fmt.Errorf("datastore %s spans %d days (first %d, last %d); refusing", d.ID, len(days), d.First, d.Last)
-	}
 	if days[len(days)-1] < today {
 		// Start-up on a static export asks for today's timeline for "latest"
 		// (web/src/map/boot.ts), which answers for every time after the newest data.

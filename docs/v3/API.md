@@ -231,7 +231,9 @@ message 256 KiB and move message 4,096 entries (the message is counted as a bad 
   after decompression is handled by splitting.
 - 415 for a `Content-Encoding` other than identity, gzip or zstd.
 - A message time more than 10 s after the server clock (a broken game clock or anchor) is
-  clamped to the clock and counted (`tsdb_ingest_rejected_total{reason="clamped"}`). On
+  clamped to the clock and counted (`tsdb_ingest_rejected_total{reason="clamped"}`). A chunk
+  update or mover sample before 2016 is impossible and counted as invalid; any time between
+  is accepted while it is not behind its horizon, however old (a backlog). On
   `--clock data` the bound is the envelope's own `recv_ms` (at most the wall clock plus
   10 s), so a gap in replayed data does not move times.
 - Retries are safe: an envelope whose `seq` and `recv_ms` are both at or below the last

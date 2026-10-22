@@ -185,7 +185,8 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		logf("%v", err)
 	}
 
-	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64}
+	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64,
+		MinTime: terrain.DefaultMinTime}
 	topt.Window = core.TimeMs(o.window.Milliseconds())
 	// Each commit worker holds decoded tiles and an encoder; bound them for memory.
 	topt.Workers = min(runtime.GOMAXPROCS(0), 8)

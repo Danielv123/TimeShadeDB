@@ -119,9 +119,16 @@ type Options struct {
 	MaxChain int
 	// Workers is the number of tiles a commit encodes in parallel (default GOMAXPROCS).
 	Workers int
+	// MinTime, if positive, is the earliest update time accepted: earlier ones are
+	// impossible (a broken clock) and Invalid. serve-v3 sets DefaultMinTime.
+	MinTime core.TimeMs
 	// Logf receives recovery notes (default: discard).
 	Logf func(format string, args ...any)
 }
+
+// DefaultMinTime is the default Options.MinTime: 2016-01-01T00:00:00Z, before any
+// Factorio map that can feed this store existed.
+const DefaultMinTime core.TimeMs = 1_451_606_400_000
 
 // SplitBudget returns options with a total memory budget split between the decoded
 // cache (half), open windows (a quarter) and idle series indexes (an eighth). The rest
@@ -719,6 +726,10 @@ func (s *Store) Apply(ctx context.Context, updates []core.ChunkUpdate) (core.App
 			continue
 		}
 		if tc, _ := u.Chunk.Tile(); !tc.Valid() {
+			res.Invalid++
+			continue
+		}
+		if s.opt.MinTime > 0 && u.T < s.opt.MinTime {
 			res.Invalid++
 			continue
 		}
