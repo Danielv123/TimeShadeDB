@@ -154,3 +154,12 @@ func countArray(arr []byte, limit int) int {
 	}
 	return n
 }
+
+// empty reports whether the array has no more elements, without consuming any.
+func (it *arrayIter) empty() bool {
+	i := skipWS(it.b, it.i)
+	if i < len(it.b) && it.b[i] == ',' {
+		i = skipWS(it.b, i+1)
+	}
+	return i >= len(it.b) || it.b[i] == ']'
+}

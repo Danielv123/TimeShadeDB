@@ -403,7 +403,7 @@ func unknownKey(k []byte, fields []string) bool {
 	return !foldAny(k, fields)
 }
 
-var envFields = []string{"v", "tick", "speed", "src", "map", "instance", "recv_ms", "seq", "msgs"}
+var envFields = []string{"v", "tick", "speed", "src", "map", "instance", "recv_ms", "seq", "msgs", "caught_up"}
 
 // parseEnvelopeFast decodes the envelope header of line into env and validates the
 // whole line. It returns the msgs value (nil when absent) and ok=false when the line
@@ -438,6 +438,8 @@ func parseEnvelopeFast(line []byte, env *envHeader, in *interner) (msgs []byte, 
 			return true
 		case "seq":
 			return l.int64Ptr(&env.Seq)
+		case "caught_up":
+			return l.boolVal(&env.CaughtUp)
 		case "msgs":
 			v0 := l.i
 			if !l.skip(0) {

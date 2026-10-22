@@ -54,7 +54,7 @@ Status and body `{"error": "...", "code": "..."}` (`core.ErrorResponse`):
 | 405 | `bad_request` | wrong method for the route |
 | 408 | `timeout` | ingest body not received within the time limit |
 | 413 | `too_large` | ingest body over the cap |
-| 503 | `overloaded` | ingest backpressure (`core.ErrOverloaded`), ingest bodies in flight over their budget, too many live clients; `Retry-After` seconds given |
+| 503 | `overloaded` | ingest bodies in flight over their budget, too many live clients; `Retry-After` seconds given (the stores never refuse ingest for memory: they spill to disk, FORMAT.md 5.5, 5.7) |
 | 500 | `internal` | anything else |
 
 **Hostile requests** (PLAN.md §4.3 G2): parameter validation, the grid bound check and the
@@ -215,24 +215,60 @@ message 256 KiB and move message 4,096 entries (the message is counted as a bad 
   are applied. Unknown message types are ignored (forward compatibility).
 - 200 with `core.IngestResponse` (counts per kind, up to 10 error strings, highest `seq`).
 - The body is decoded as a stream and applied in batches (at most 2,048 chunk updates or
-  4 MiB of chart text, 16,384 mover samples and 16,384 overlay events each), in order.
+  4 MiB of chart text, 12,288 mover samples and 16,384 overlay events each), in order.
   Messages are decoded a window at a time (2,048 messages or 256 KiB), however many a
   line packs, so memory per request is bounded whatever the body size or shape.
 - The raw body is received in full before any of it is applied, under a time limit
   (60 s; 408 `timeout` after it) and a budget for the bodies being received at once
   (64 MiB; beyond it 503 `overloaded`), so a client that stalls mid-body never delays
   other ingest requests.
-- 503 `overloaded` with `Retry-After` when a store refused a batch for backpressure (the
-  terrain open-window budget, the mover open-row limit). That batch may be partly applied
-  (its chunk updates can be stored before the mover store refuses its samples), the rest
-  of the body was not, and earlier batches of the same body were. The forwarder retries
-  the same body, which is safe because ingest is idempotent (below). A 413 for a body
-  that exceeds the cap only after decompression is handled the same way.
+- The stores never refuse a batch for memory: past their share of `--mem-budget` they move
+  whole open windows to disk (FORMAT.md 5.5, 5.7), so ingest runs as fast as CPU and disk
+  allow. A store failure (a disk write error) answers 500: the batch may be partly applied
+  (its chunk updates and overlay events can be stored before the mover store fails), the
+  rest of the body was not, and earlier batches of the same body were. The forwarder
+  retries the same body, which is safe (below). A 413 for a body that exceeds the cap only
+  after decompression is handled by splitting.
 - 415 for a `Content-Encoding` other than identity, gzip or zstd.
 - A message time more than 10 s after the server clock (a broken game clock or anchor) is
-  clamped to the clock and counted (`tsdb_ingest_rejected_total{reason="clamped"}`).
-- Ingest is at-least-once safe: terrain updates are absolute, mover samples dedupe on
+  clamped to the clock and counted (`tsdb_ingest_rejected_total{reason="clamped"}`). On
+  `--clock data` the bound is the envelope's own `recv_ms` (at most the wall clock plus
+  10 s), so a gap in replayed data does not move times.
+- Retries are safe: an envelope whose `seq` and `recv_ms` are both at or below the last
+  applied envelope of its `src` is skipped (`duplicates` in the response,
+  `tsdb_ingest_rejected_total{reason="duplicate"}`), so it runs neither the journey rules
+  nor the clock anchor again; the journey rules of a batch the mover store refused are
+  rolled back; an envelope seen again but not applied is timed on its anchor's line (a
+  replay, PROTOCOL.md 4); terrain updates are absolute, mover samples dedupe on
   (journey, t), and overlay events with unchanged content are no-ops.
+- Envelopes stamped with their source's previous `recv_ms` although their tick is more
+  than 2 s later are counted (`one_recv` in the response,
+  `tsdb_ingest_rejected_total{reason="one_recv"}`) and logged: the forwarder lost the
+  time (PROTOCOL.md 1), and their samples collide at one instant, where the mover store
+  keeps one per journey (`tsdb_mover_store_rejected_total{reason="duplicate"}`).
+
+### Horizon
+
+The commit loop closes windows `--terrain-grace` and `--mover-grace` behind the clock,
+and data older than a datastore's or surface's horizon is late (FORMAT.md 4). So that a
+backlog is not late, each map's horizon is also held behind the data of the sources that
+feed it (`ingest.Sources`, FORMAT.md 5.8): per source (`src`) and map the server keeps the
+newest message time it applied, and closes no window of the map past the lowest of those,
+minus the grace, over the sources heard from within `--source-hold` (default 1 hour). A
+source's first envelope holds its map at once. A live source's newest time trails the
+clock by a few seconds, so live data is committed as before. A source that is behind
+(a forwarder catching up after it, the network or the server was down) holds the map at
+its own data, which it sends in time order, so none of it is late. A `caught_up` envelope
+(PROTOCOL.md 1) raises the source's time to its `recv_ms`, which releases the map. A
+source that goes quiet without one holds its maps until `--source-hold` after it was last
+heard from; every source in `sources.json` counts as heard from when the server starts,
+so after a restart each map waits up to `--source-hold` for its sources' backlogs. Data a
+source sends later than that, or out of order by more than the grace, can still be late
+(counted as `late`). Closed windows are never rewritten. While a map is held, its windows
+stay open (spilled to disk when memory runs short) and history in the held period is
+served as live; the server logs when it holds a map more than a minute behind the clock
+and when it releases it (`tsdb_horizon_held_maps`, `tsdb_horizon_hold_lag_ms`).
+`--source-hold 0` turns the holds off.
 
 ## 6. Static export (WP12)
 
@@ -280,9 +316,14 @@ What the exporter writes (`internal/v3/publish/README.md` has the details and si
   allowed (bounded cardinality, PLAN.md §4.3 G10).
 - Besides the names in `metrics.go`, the live server exports
   `tsdb_ingest_rejected_total` with the reasons `bad_line`, `bad_message`, `overloaded`,
-  `clamped`, `owner`, `unknown_gone` and `quarantined`, the cache gauges and counters with
+  `clamped`, `owner`, `unknown_gone`, `quarantined`, `duplicate` (retried envelopes
+  skipped) and `one_recv` (section 5), the cache gauges and counters with
   `cache="terrain"`, `"pyramid"`, `"decoded"` and `"encoded"`, `tsdb_mover_open_rows`,
-  `tsdb_mover_store_rejected_total{reason}`, `tsdb_overlay_open_intervals`,
+  `tsdb_mover_open_bytes`, `tsdb_spilled_windows{store}` and `tsdb_spills_total{store}`
+  (`store` is `terrain` or `movers`), `tsdb_mover_store_rejected_total{reason}` (`ahead`,
+  `behind`: before 2016, `duplicate`: rows a commit removed for an equal (journey, t),
+  `corrupt`, `wal_skipped`), `tsdb_ingest_caught_up_total`, `tsdb_horizon_held_maps`,
+  `tsdb_horizon_hold_lag_ms`, `tsdb_overlay_open_intervals`,
   `tsdb_overlay_torn_bytes_total` and the Go runtime gauges `go_memstats_heap_inuse_bytes`,
   `go_memstats_heap_alloc_bytes`, `go_memstats_sys_bytes` and `go_goroutines`.
 - `GET /healthz`: `200 ok` when the stores are open.
@@ -297,6 +338,8 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
 - `--commit-every` (commit loop period, default 1 s);
 - `--terrain-grace` (10 s) and `--mover-grace` (15 s, at least the handoff window): how
   far behind the clock windows close;
+- `--source-hold` (1 h): how long a quiet source holds its maps' horizon at its newest
+  data (section 5, "Horizon"; 0 turns it off);
 - `--web-dir <dir>` (serve a viewer build from disk) or `--no-viewer`;
 - `--pprof <addr>`, `--slow-log <duration>`, `--quiet`;
 - `--salvage-overlays`: open an overlay log damaged before its end, keeping it aside;
@@ -307,16 +350,19 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
   bodies, often posted several at once, arrive out of order. One envelope moves the
   clock at most 1 hour forward and never past the wall clock plus 10 s (such envelopes
   count as `clamped`), so one bad `recv_ms` cannot push the map clock ahead for good;
-  after a longer gap in the data the clock catches up over a few envelopes, whose
-  message times are clamped meanwhile.
+  after a longer gap in the data the clock catches up over a few envelopes. Message times
+  are clamped against their envelope's own `recv_ms`, so the data after a gap keeps its
+  times.
 
 The process sets a soft memory limit of `--mem-budget` (Go's `GOMEMLIMIT`, which takes
 precedence when set), so garbage collection works harder before the process
 grows past its budget and RSS stays within the budget plus 64 MiB (PLAN.md §5). The
 caches get about half of the budget (terrain 3/32 decoded tiles, 1/8 open windows and
-3/64 indexes, encoded tiles 1/8, coarse images 1/16, overlays 1/32; mover open rows are
-bounded by another eighth); the rest is working memory
-and the collector's headroom.
+3/64 indexes, encoded tiles 1/8, coarse images 1/16, overlays 1/32; the mover open
+windows another eighth, counted per row); the rest is working memory
+and the collector's headroom. Open windows past their share move to disk (FORMAT.md 5.5,
+5.7) and are read back by the commit that closes them, so memory stays within the budget
+however fast data arrives or however long a horizon is held.
 After 10 s without requests the server returns freed memory to the operating system.
 
 Interrupt or SIGTERM shuts down cleanly: live streams are ended at once, requests in
@@ -328,20 +374,27 @@ listens within tens of milliseconds whatever the history length; a read of a dat
 that is not loaded yet waits only for that datastore.
 
 The commit loop commits terrain at `now - terrain-grace`, runs the pyramid build, and
-commits movers at `now - mover-grace`. Updates older than the terrain horizon are late
-(FORMAT.md 4), so a forwarder whose lines arrive more than about `terrain-grace` late
-loses open-window updates until the chunk changes again or the next resync.
+commits movers at `now - mover-grace`, each map at most up to the newest data of the
+sources holding it minus the grace (section 5, "Horizon"). Updates older than the
+horizon are late (FORMAT.md 4); with the holds that only happens to data a source sends
+out of order by more than the grace, or after it was quiet for longer than
+`--source-hold`.
 
 `timeshadedb tail --dir <script-output>/timeshade --map <key> [--url ...] [--token ...]
 [--src standalone:<name>]` forwards a standalone game's files (PROTOCOL.md 2). It adds
 `src`, `map`, `instance`, `recv_ms` and an increasing `seq` to every line, posts gzip
 bodies of up to `--batch-bytes` (1 MiB), deletes a file once all of it was acknowledged
 and a newer file exists, and posts the newest file up to its last complete line without
-deleting it. Network errors, 5xx, 429 and 408 are retried with backoff (honouring
-`Retry-After`); a 400 or 413 splits the batch, and a single line that is still refused is
-skipped and logged; any other status (401, 403, 404, 415) stops the tailer with an error.
-The acknowledged offsets are kept in a state file (`--state`, default
-`<dir>/timeshadedb-tail.state.json`, `-` for none) with a hash of each file's first
-KiB, so a restarted tailer does not post lines again; reposted lines would get a new
-`recv_ms` and stamp old data at the time of the repost. `--once` forwards what is there
-and exits.
+deleting it. `recv_ms` is the time the game wrote the line, from the file (PROTOCOL.md 1:
+the file's modification time for its last line, counted back by ticks for the lines
+before it), so a backlog (a tailer that was stopped, a server that was down, a recorded
+capture posted with `--once`) keeps its times and is posted as fast as the server takes
+it. Once it has posted everything it sends a `caught_up` envelope, and again every
+`--heartbeat` (5 s) while nothing new arrives, and at the end of `--once`. Network
+errors, 5xx, 429 and 408 are retried with backoff (honouring `Retry-After`); a 400 or 413
+splits the batch, and a single line that is still refused is skipped and logged; any other
+status (401, 403, 404, 415) stops the tailer with an error. The acknowledged offsets are
+kept in a state file (`--state`, default `<dir>/timeshadedb-tail.state.json`, `-` for
+none) with a hash of each file's first KiB, so a restarted tailer does not post lines
+again (the server would skip them as duplicates only while it still knows the source's
+last `seq`). `--once` forwards what is there and exits.

@@ -49,6 +49,7 @@ type v3ServerOptions struct {
 	db, listen, ingestToken, readToken, pprof, webDir, clock string
 	memBudget                                                int64
 	window, commitEvery, terrainGrace, moverGrace, slowLog   time.Duration
+	sourceHold                                               time.Duration
 	noViewer, stdinExit, salvageOverlays, quiet              bool
 }
 
@@ -67,6 +68,7 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	fs.DurationVar(&o.moverGrace, "mover-grace", 15*time.Second, "how far behind the clock mover windows close (at least 10s)")
 	fs.DurationVar(&o.slowLog, "slow-log", 0, "log requests slower than this (0: off)")
 	fs.StringVar(&o.clock, "clock", "wall", "map clock: wall (live capture) or data (the newest ingested recv_ms, for replaying recorded captures)")
+	fs.DurationVar(&o.sourceHold, "source-hold", time.Hour, "how long a source that went quiet (or every source, after a restart) holds the horizon of its maps at its newest data, so its backlog is not late (0: the horizon follows the clock alone)")
 	fs.StringVar(&o.pprof, "pprof", "", "serve net/http/pprof on this separate address")
 	fs.StringVar(&o.webDir, "web-dir", "", "serve the viewer from this directory instead of the embedded bundle")
 	fs.BoolVar(&o.noViewer, "no-viewer", false, "do not serve the viewer")
@@ -93,6 +95,9 @@ func parseServeV3(stdout io.Writer, args []string) (*v3ServerOptions, error) {
 	}
 	if o.memBudget < 32<<20 {
 		return nil, errors.New("serve-v3: --mem-budget must be at least 32 MiB")
+	}
+	if o.sourceHold < 0 {
+		return nil, fmt.Errorf("serve-v3: bad --source-hold %v", o.sourceHold)
 	}
 	if o.clock != "wall" && o.clock != "data" {
 		return nil, fmt.Errorf("serve-v3: bad --clock %q (wall or data)", o.clock)
@@ -166,14 +171,18 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v := &v3Server{}
 	fail := func(err error) (*v3Server, error) { return nil, errors.Join(err, v.Close()) }
 	clock := ingest.WallClock
-	// refClock is the movers' MaxAhead/MaxBehind reference: on the data clock the newest
-	// data read, which runs ahead of the commit clock until those rows are applied.
-	refClock := clock
+	// refClock is the movers' MaxAhead reference: the wall clock, also for a replay on
+	// the data clock (whose data lies in the past; ingest clamps message times to the
+	// wall clock plus 10 s), so a gap in replayed data is not taken for a broken clock.
+	refClock := ingest.WallClock
 	var dataClock *ingest.DataClock
 	if o.clock == "data" {
 		dataClock = &ingest.DataClock{}
 		clock = dataClock.Now
-		refClock = dataClock.Seen
+	}
+	sources, err := ingest.OpenSources(o.db, o.sourceHold, nil)
+	if err != nil {
+		logf("%v", err)
 	}
 
 	topt := terrain.Options{DecodedCacheBytes: o.memBudget * 3 / 32, OpenWindowBytes: o.memBudget / 8, MaxIndexBytes: o.memBudget * 3 / 64}
@@ -270,6 +279,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 		CommitEvery:  o.commitEvery,
 		TerrainGrace: core.TimeMs(o.terrainGrace.Milliseconds()),
 		MoverGrace:   core.TimeMs(o.moverGrace.Milliseconds()),
+		Sources:      sources,
 		MemBudget:    o.memBudget,
 		SlowLog:      o.slowLog,
 		Logf:         logf,
@@ -280,6 +290,7 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	in := ingest.New(ingest.Stores{Terrain: ter, Movers: mov, Overlays: ovl, Maps: maps}, ingest.Options{
 		Clock:     clock,
 		DataClock: dataClock,
+		Sources:   sources,
 		Notifier:  srv.Notifier(),
 		Logf:      logf,
 	})

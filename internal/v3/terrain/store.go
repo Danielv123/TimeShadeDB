@@ -80,7 +80,6 @@ const decoderMaxMemory = 64 << 20
 // openChunkBytes is the accounted size of one open-window chunk entry.
 const openChunkBytes = core.ChunkPixelCount*2 + 64
 
-
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 func crcC(b []byte) uint32 { return crc32.Checksum(b, crcTable) }
@@ -903,6 +902,13 @@ func (s *Store) acceptLocked(d *dsState, tc core.TileCoord, block uint8, t core.
 
 // Commit implements core.TerrainStore.
 func (s *Store) Commit(ctx context.Context, upTo core.TimeMs) error {
+	return s.CommitBy(ctx, func(core.DatastoreKey) core.TimeMs { return upTo })
+}
+
+// CommitBy is Commit with a target per datastore: a server that holds the horizon of a
+// map back while one of its sources still sends older data passes a lower target for
+// that map's datastores (their open windows wait, spilled to disk if memory runs short).
+func (s *Store) CommitBy(ctx context.Context, upTo func(core.DatastoreKey) core.TimeMs) error {
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
@@ -916,7 +922,7 @@ func (s *Store) Commit(ctx context.Context, upTo core.TimeMs) error {
 	sort.Slice(dss, func(i, j int) bool { return dss[i].id < dss[j].id })
 	var first error
 	for _, d := range dss {
-		if err := s.commitDS(ctx, d, upTo); err != nil && first == nil {
+		if err := s.commitDS(ctx, d, upTo(d.key)); err != nil && first == nil {
 			first = fmt.Errorf("terrain: commit %s: %w", d.id, err)
 		}
 	}

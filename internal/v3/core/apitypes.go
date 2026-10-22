@@ -146,6 +146,12 @@ type IngestResponse struct {
 	Errors []string `json:"errors"`
 	// Seq echoes the highest envelope seq seen in the body, for tailer acknowledgements.
 	Seq *int64 `json:"seq,omitempty"`
+	// Duplicates counts envelopes skipped because their source had them applied already
+	// (a retried body); OneRecv envelopes stamped with their source's previous receive
+	// time although their tick was more than two seconds later (a forwarder that lost the
+	// time, API.md 5).
+	Duplicates int `json:"duplicates,omitempty"`
+	OneRecv    int `json:"one_recv,omitempty"`
 }
 
 // ErrorResponse is the body of every 4xx/5xx JSON error.

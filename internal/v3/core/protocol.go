@@ -33,6 +33,10 @@ type Envelope struct {
 	Instance int64  `json:"instance,omitempty"`
 	RecvMs   TimeMs `json:"recv_ms,omitempty"`
 	Seq      *int64 `json:"seq,omitempty"`
+	// CaughtUp says the forwarder has no older line of this source pending: everything
+	// it read before this envelope was sent. Such an envelope usually has no messages and
+	// then only releases the source's horizon hold (API.md 5).
+	CaughtUp bool `json:"caught_up,omitempty"`
 }
 
 // Message type names (the "type" field of every message).

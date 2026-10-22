@@ -136,6 +136,7 @@ the database is served.
     days/<YYYY-MM-DD>.json               day index, core.DayIndex as JSON
     open/<start>.wal                     samples of one open window (5.5)
   movers/wal/wal.log                     open-window samples of older stores (5.5)
+  sources.json                           per-source ingest state: horizon holds and retry dedupe (5.8)
   overlays/<datastore id>/               interval log and per-tile index (WP4, 5.6)
   icons/                                 catalog icon spritesheet and metadata (optional)
     icons.json                           core.CatalogIcons: {"png":"icons/<file>","json":"icons/<file>"}
@@ -355,6 +356,23 @@ chunk (greatest T wins, on equal T the later frame, and the in-memory update ove
 spilled one), and live reads of a tile read its frames. Spill files are a cache of the
 WAL, which keeps every update of an open window: open deletes them and the replay spills
 again as it fills the budget, so a crash during a spill or a commit loses nothing.
+
+### 5.8 Sources (`sources.json`)
+
+The live server keeps, per forwarder source (envelope `src`), what it needs to hold
+commits back for a source that is still sending older data and to recognise retried
+envelopes (API.md 5, "Horizon"). Written as tmp + rename about once a commit step;
+missing or unreadable means no sources known.
+
+```json
+{"version": 1, "sources": [{"src": "...", "seq": 123, "recv_ms": 1791630000000,
+  "seen_ms": 1791630005000, "maps": {"<map key>": 1791629999000}}]}
+```
+
+`maps` is, per map the source fed, the newest message time applied (or the newest
+`caught_up` time); `seq` and `recv_ms` are the last applied envelope's (absent without a
+`seq`); `seen_ms` is the server's wall clock when the source was last heard from. Entries
+not heard from for 7 days are dropped.
 
 ## 6. Version and compatibility rules
 

@@ -49,6 +49,8 @@ type fixtureOpt struct {
 	cfg        func(*Config)
 	openWindow int64
 	moverBytes int64
+	// sources, if set, is given to the server and the ingester (horizon holds).
+	sources *ingest.Sources
 }
 
 func (f *fixture) clock() core.TimeMs { return core.TimeMs(f.now.Load()) }
@@ -108,6 +110,9 @@ func newFixture(t *testing.T, o fixtureOpt) *fixture {
 		Clock:    f.clock,
 		LivePing: time.Hour,
 	}
+	if o.sources != nil {
+		cfg.Sources = o.sources
+	}
 	if o.cfg != nil {
 		o.cfg(&cfg)
 	}
@@ -115,7 +120,7 @@ func newFixture(t *testing.T, o fixtureOpt) *fixture {
 		t.Fatal(err)
 	}
 	f.in = ingest.New(ingest.Stores{Terrain: f.ter, Movers: f.mov, Overlays: f.ovl, Maps: f.maps},
-		ingest.Options{Clock: f.clock, Notifier: f.srv.Notifier()})
+		ingest.Options{Clock: f.clock, Notifier: f.srv.Notifier(), Sources: o.sources})
 	f.srv.SetIngester(f.in)
 
 	// History.

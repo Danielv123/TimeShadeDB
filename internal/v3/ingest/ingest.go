@@ -16,6 +16,7 @@ import (
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -56,9 +57,10 @@ type Options struct {
 	// bad messages. A move message holds at most MaxMoveEntries entries.
 	MaxMessage int
 	// FlushChunks, FlushSamples and FlushEvents bound the decoded values held before
-	// they are applied to the stores (defaults 2,048 chunk updates, 16,384 samples and
+	// they are applied to the stores (defaults 2,048 chunk updates, 12,288 samples and
 	// 16,384 overlay events). With the message bounds and the decode window they bound
-	// ingest memory per request whatever the body.
+	// ingest memory per request whatever the body. (A batch's samples are held twice
+	// while the applier runs them through the journey rules.)
 	FlushChunks, FlushSamples, FlushEvents int
 	// MaxAhead: a message time more than this after the server clock is clamped to the
 	// clock (default 10 s; < 0 disables). A broken anchor or game clock would otherwise
@@ -74,6 +76,9 @@ type Options struct {
 	// map clock far ahead; such envelopes count as clamped.
 	DataClock   *DataClock
 	MaxDataJump core.TimeMs
+	// Sources, if set, keeps per source the newest applied time (the horizon holds of the
+	// commit loop) and the last applied envelope, whose retries it skips (sources.go).
+	Sources *Sources
 	// MaxSources bounds the clock anchors (default 4,096).
 	MaxSources int
 	// MaxJourneys bounds the tracked journeys per map (default 100,000), MaxMaps the maps
@@ -95,6 +100,13 @@ type Stats struct {
 	Overloaded                  int64
 	OwnerDrops, UnknownGones    int64
 	SurfaceChanges, Quarantined int64
+	// Duplicates are envelopes skipped because their source's retry repeated them
+	// (Sources.Duplicate); CaughtUp are caught_up envelopes; OneRecv are envelopes that
+	// carried the receive time of their source's previous envelope although their tick
+	// was more than two seconds later: a forwarder that stamps a backlog with one time,
+	// which the clock anchor cannot spread back out (their samples collide and the
+	// mover store keeps one per journey and time, movers.Stats.Duplicates).
+	Duplicates, CaughtUp, OneRecv int64
 }
 
 // Ingester applies capture envelopes to the stores. It is safe for concurrent use;
@@ -103,8 +115,11 @@ type Ingester struct {
 	st  Stores
 	opt Options
 
-	mu       sync.Mutex
-	anchors  *movers.Anchors
+	mu      sync.Mutex
+	anchors *movers.Anchors
+	// jmu guards the journeys, which the applier runs (with the mover store's Append, so
+	// a refused batch rolls their changes back).
+	jmu      sync.Mutex
 	journeys map[string]*mapJourneys
 	jtick    uint64
 	// seg and win are the reusable read state of the body being applied (under mu).
@@ -113,6 +128,7 @@ type Ingester struct {
 
 	stats struct {
 		envelopes, bytes, badLines, badMessages, clamped, maps, overloaded atomic.Int64
+		duplicates, caughtUp, oneRecv                                      atomic.Int64
 		chunks, samples, overlays                                          applyCounters
 	}
 }
@@ -149,7 +165,7 @@ func New(st Stores, opt Options) *Ingester {
 		opt.FlushChunks = 2048
 	}
 	if opt.FlushSamples <= 0 {
-		opt.FlushSamples = 16384
+		opt.FlushSamples = 12288
 	}
 	if opt.FlushEvents <= 0 {
 		opt.FlushEvents = 16384
@@ -185,11 +201,14 @@ func (in *Ingester) Stats() Stats {
 		Clamped:     in.stats.clamped.Load(),
 		Maps:        in.stats.maps.Load(),
 		Overloaded:  in.stats.overloaded.Load(),
+		Duplicates:  in.stats.duplicates.Load(),
+		CaughtUp:    in.stats.caughtUp.Load(),
+		OneRecv:     in.stats.oneRecv.Load(),
 		Chunks:      in.stats.chunks.get(),
 		Samples:     in.stats.samples.get(),
 		Overlays:    in.stats.overlays.get(),
 	}
-	in.mu.Lock()
+	in.jmu.Lock()
 	for _, mj := range in.journeys {
 		js := mj.js.Stats()
 		s.OwnerDrops += js.OwnerDrops
@@ -197,7 +216,7 @@ func (in *Ingester) Stats() Stats {
 		s.SurfaceChanges += js.SurfaceChanges
 		s.Quarantined += js.Quarantined
 	}
-	in.mu.Unlock()
+	in.jmu.Unlock()
 	return s
 }
 
@@ -210,11 +229,11 @@ func (in *Ingester) AnchorOffsets(fn func(src string, offset float64)) {
 
 // Ingest reads an NDJSON body of capture envelopes and applies it. Bad lines and bad
 // messages are counted in the response, not returned as errors. It returns an error
-// wrapping core.ErrOverloaded when a store refused a batch for backpressure (API.md 5:
-// HTTP 503); the batches before it were applied, and retrying the whole body is safe
-// because ingest is idempotent (terrain updates are absolute, samples dedupe on
-// (journey, t), unchanged overlay events are no-ops). Other errors are store or read
-// failures.
+// when a store failed (a write error) or the read failed; the batches before it were
+// applied, and retrying the whole body is safe: envelopes of a source up to the last one
+// applied are skipped (Options.Sources), the journey rules of the failed batch were rolled
+// back, a replayed envelope does not reset its clock anchor, terrain updates are absolute,
+// samples dedupe on (journey, t) and unchanged overlay events are no-ops.
 func (in *Ingester) Ingest(ctx context.Context, body io.Reader) (core.IngestResponse, error) {
 	return in.ingest(ctx, body, nil)
 }
@@ -239,6 +258,7 @@ func (in *Ingester) ingest(ctx context.Context, body io.Reader, data []byte) (co
 		err = b.readBytes(ctx, data)
 	}
 	in.seg.reset()
+	b.finishLine()
 	if err == nil {
 		err = b.flush()
 	}
@@ -383,12 +403,17 @@ func (b *batch) applySegment(seg *segment) error {
 			msgs[k] = wireMsg{}
 			it.raw = nil
 			if b.full() {
+				if it.msg >= 0 && (k+1 == len(w.items) || w.items[k+1].line != it.line) && seg.lines[it.line].it.empty() {
+					// The line's last message: the batch holds all of it.
+					b.finishLine()
+				}
 				if err := b.flush(); err != nil {
 					return err
 				}
 			}
 		}
 	}
+	b.finishLine()
 	b.cur = lineState{}
 	return nil
 }
@@ -459,6 +484,7 @@ type envHeader struct {
 	Instance int64       `json:"instance,omitempty"`
 	RecvMs   core.TimeMs `json:"recv_ms,omitempty"`
 	Seq      *int64      `json:"seq,omitempty"`
+	CaughtUp bool        `json:"caught_up,omitempty"`
 }
 
 func (s *segment) next() []byte {
@@ -706,12 +732,19 @@ func WallClock() core.TimeMs { return core.TimeMs(nowMs()) }
 
 // batch collects the decoded values of one body between flushes.
 type batch struct {
-	in      *Ingester
-	ap      *applier
-	resp    core.IngestResponse
-	chunks  []core.ChunkUpdate
-	samples []core.MoverSample
-	events  []core.OverlayEvent
+	in     *Ingester
+	ap     *applier
+	resp   core.IngestResponse
+	chunks []core.ChunkUpdate
+	// raw are the move samples as decoded; jops the journey operations (moves, adopts,
+	// resyncs) in message order, which the applier runs through the journey rules.
+	raw    []core.MoverSample
+	jops   []jop
+	events []core.OverlayEvent
+	// w and marks are, since the last flush, the newest message time per (source, map)
+	// and the last finished envelope per source (Sources.Applied once applied).
+	w     map[srcMap]core.TimeMs
+	marks map[string]seqMark
 	// slab holds the pixels of the queued chunk updates (FlushChunks entries; nslab used).
 	slab  *[]core.ChunkPixels
 	nslab int
@@ -721,17 +754,74 @@ type batch struct {
 	cur lineState
 }
 
-// lineState is the envelope being applied: its header, clock anchor and server time.
+// lineState is the envelope being applied: its header, clock anchor, the bound its
+// message times are clamped to (now) and the newest message time queued since the last
+// flush (maxT, valid when hasT).
 type lineState struct {
 	ok     bool
 	env    *envHeader
 	anchor *movers.Anchor
 	now    core.TimeMs
+	maxT   core.TimeMs
+	hasT   bool
 }
+
+// jop is one journey operation for the applier.
+type jop struct {
+	kind        uint8
+	mapKey, src string
+	id          string      // adopt: the journey
+	t           core.TimeMs // resynced: the time
+	n           int         // move: how many of the batch's raw samples
+}
+
+const (
+	jopMove = iota
+	jopAdopt
+	jopBegin
+	jopResynced
+)
 
 func (b *batch) full() bool {
 	o := &b.in.opt
-	return len(b.chunks) >= o.FlushChunks || len(b.samples) >= o.FlushSamples || len(b.events) >= o.FlushEvents
+	return len(b.chunks) >= o.FlushChunks || len(b.raw) >= o.FlushSamples || len(b.events) >= o.FlushEvents
+}
+
+// foldTime moves the current line's newest message time into the batch's per-source
+// times.
+func (b *batch) foldTime() {
+	c := &b.cur
+	if !c.ok || !c.hasT {
+		return
+	}
+	k := srcMap{c.env.Src, c.env.Map}
+	if b.w == nil {
+		b.w = map[srcMap]core.TimeMs{}
+	}
+	if cur, ok := b.w[k]; !ok || c.maxT > cur {
+		b.w[k] = c.maxT
+	}
+	c.hasT = false
+}
+
+// finishLine records the end of the current line: its messages are all queued, so once
+// the batch holding them is applied it counts as applied (Sources).
+func (b *batch) finishLine() {
+	c := &b.cur
+	if !c.ok {
+		return
+	}
+	b.foldTime()
+	if c.env.Seq != nil {
+		if b.marks == nil {
+			b.marks = map[string]seqMark{}
+		}
+		mk := seqMark{*c.env.Seq, c.env.RecvMs}
+		if cur, ok := b.marks[c.env.Src]; !ok || mk.seq > cur.seq || mk.recv > cur.recv {
+			b.marks[c.env.Src] = mk
+		}
+	}
+	c.ok = false
 }
 
 // slabs recycles the pixel slabs of applied batches (the stores copy the pixels). A
@@ -786,8 +876,11 @@ func (b *batch) badMessage(env *envHeader, i int, err error) {
 }
 
 // beginLine starts applying one parsed line: it counts bad lines, and for an envelope
-// updates the data clock and the source's clock anchor.
+// skips it as a duplicate (a retry of an envelope already applied), or updates the data
+// clock and the source's clock anchor. A caught_up envelope without messages only
+// records that its source has nothing older pending.
 func (b *batch) beginLine(l *parsedLine) {
+	b.finishLine()
 	b.cur = lineState{}
 	switch {
 	case l.tooLong:
@@ -807,14 +900,49 @@ func (b *batch) beginLine(l *parsedLine) {
 		s := *env.Seq
 		b.resp.Seq = &s
 	}
-	if in.opt.DataClock != nil && in.opt.DataClock.Advance(env.RecvMs, WallClock(), in.opt.MaxAhead, in.opt.MaxDataJump) {
+	srcs := in.opt.Sources
+	if srcs != nil && env.Seq != nil && srcs.Duplicate(env.Src, *env.Seq, env.RecvMs) {
+		in.stats.duplicates.Add(1)
+		b.resp.Duplicates++
+		return
+	}
+	if env.CaughtUp && l.it.empty() {
+		in.stats.caughtUp.Add(1)
+		if srcs != nil {
+			srcs.Seen(env.Src, env.Map, env.RecvMs)
+		}
+		b.cur = lineState{ok: true, env: env, maxT: env.RecvMs, hasT: true}
+		return
+	}
+	if a := in.anchors.Get(env.Src); a != nil {
+		if tick, recv, ok := a.Last(); ok && recv == env.RecvMs && float64(env.Tick-tick) > 2*60*max(env.Speed, 1) {
+			if in.stats.oneRecv.Add(1) == 1 || b.resp.OneRecv == 0 {
+				in.opt.Logf("ingest: %s sends envelopes %d ticks apart with one recv_ms %d: a forwarder that lost the time (their samples collide)", env.Src, env.Tick-tick, env.RecvMs)
+			}
+			b.resp.OneRecv++
+		}
+	}
+	wall := WallClock()
+	if in.opt.DataClock != nil && in.opt.DataClock.Advance(env.RecvMs, wall, in.opt.MaxAhead, in.opt.MaxDataJump) {
 		in.stats.clamped.Add(1)
 	}
 	now := in.opt.Clock()
 	if in.opt.DataClock != nil {
-		now = in.opt.DataClock.Seen()
+		// Message times are clamped against the envelope's own receive time (bounded by
+		// the wall clock), not the data clock, which moves at most MaxDataJump an
+		// envelope: after a gap in the data the first envelopes keep their times.
+		now = max(in.opt.DataClock.Seen(), min(env.RecvMs, wall+max(in.opt.MaxAhead, 0)))
 	}
-	b.cur = lineState{ok: true, env: env, anchor: in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed), now: now}
+	anchor := in.anchors.Observe(env.Src, env.RecvMs, env.Tick, env.Speed)
+	// The envelope's own time counts as a message time (for Sources), clamped like one.
+	t := anchor.T(env.Tick)
+	if ahead := in.opt.MaxAhead; ahead > 0 && t > now+ahead {
+		t = now
+	}
+	b.cur = lineState{ok: true, env: env, anchor: anchor, now: now, maxT: t, hasT: true}
+	if srcs != nil {
+		srcs.Seen(env.Src, env.Map, t)
+	}
 }
 
 // timeOf returns the map time of a tick of the current envelope (its own tick when nil),
@@ -829,6 +957,9 @@ func (b *batch) timeOf(tick *int64) core.TimeMs {
 	if ahead := b.in.opt.MaxAhead; ahead > 0 && t > c.now+ahead {
 		b.in.stats.clamped.Add(1)
 		t = c.now
+	}
+	if !c.hasT || t > c.maxT {
+		c.maxT, c.hasT = t, true
 	}
 	return t
 }
@@ -851,7 +982,7 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		if m.J == "" {
 			err = errors.New("adopt without j")
 		} else {
-			b.journeys(env.Map).Adopt(env.Src, m.J)
+			b.jops = append(b.jops, jop{kind: jopAdopt, mapKey: env.Map, src: env.Src, id: m.J})
 		}
 	case core.MsgTag, core.MsgRecipe, core.MsgRail:
 		err = b.overlay(env, m, b.timeOf(nil))
@@ -859,10 +990,10 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		if !m.Created {
 			// A resync starts by listing the surfaces (capture.resync): journeys the
 			// source does not re-send before "resynced" are ended there.
-			b.journeys(env.Map).Begin(env.Src)
+			b.jops = append(b.jops, jop{kind: jopBegin, mapKey: env.Map, src: env.Src})
 		}
 	case core.MsgResynced:
-		b.samples = b.journeys(env.Map).Resynced(env.Src, b.timeOf(nil), b.samples)
+		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: b.timeOf(nil)})
 		in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
 	case core.MsgTrace:
 		in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
@@ -880,8 +1011,8 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 	}
 }
 
-func (b *batch) journeys(mapKey string) *movers.Journeys {
-	in := b.in
+// journeys returns the journey tracker of a map. Callers hold in.jmu.
+func (in *Ingester) journeysOf(mapKey string) *movers.Journeys {
 	in.jtick++
 	if mj := in.journeys[mapKey]; mj != nil {
 		mj.used = in.jtick
@@ -946,7 +1077,7 @@ func (b *batch) move(env *envHeader, m *wireMsg) error {
 	if err := sfc.Validate(); err != nil {
 		return err
 	}
-	b.moves = b.moves[:0]
+	n0 := len(b.raw)
 	for _, e := range m.M {
 		if e.J == "" {
 			continue
@@ -959,7 +1090,7 @@ func (b *batch) move(env *envHeader, m *wireMsg) error {
 		s.Meta.ID = e.J
 		if e.Gone {
 			s.Flags = core.FlagGone
-			b.moves = append(b.moves, s)
+			b.raw = append(b.raw, s)
 			continue
 		}
 		s.Meta = core.MoverMeta{ID: e.J, Kind: core.MoverKind(e.K), Force: e.F, Name: e.Name, Carriages: e.N, Kinds: e.O, Color: e.C}
@@ -1000,9 +1131,11 @@ func (b *batch) move(env *envHeader, m *wireMsg) error {
 				}
 			}
 		}
-		b.moves = append(b.moves, s)
+		b.raw = append(b.raw, s)
 	}
-	b.samples = b.journeys(env.Map).Move(env.Src, b.moves, b.samples)
+	if n := len(b.raw) - n0; n > 0 {
+		b.jops = append(b.jops, jop{kind: jopMove, mapKey: env.Map, src: env.Src, n: n})
+	}
 	return nil
 }
 
@@ -1076,9 +1209,13 @@ func (b *batch) flush() error {
 		job.updates, b.chunks = b.chunks, nil
 		job.slab, b.slab = b.slab, nil
 	}
-	job.samples, b.samples = b.samples, nil
+	job.raw, b.raw = b.raw, nil
+	job.jops, b.jops = b.jops, nil
 	job.events, b.events = b.events, nil
-	if len(job.updates)+len(job.samples)+len(job.events) == 0 {
+	b.foldTime()
+	job.w, b.w = b.w, nil
+	job.marks, b.marks = b.marks, nil
+	if len(job.updates)+len(job.jops)+len(job.events)+len(job.w)+len(job.marks) == 0 {
 		return nil
 	}
 	if dc := b.in.opt.DataClock; dc != nil {
@@ -1093,8 +1230,12 @@ var errApplierFailed = errors.New("ingest: an earlier batch failed")
 // applyJob is one batch from the reader to the applier.
 type applyJob struct {
 	updates []core.ChunkUpdate
-	samples []core.MoverSample
+	raw     []core.MoverSample
+	jops    []jop
 	events  []core.OverlayEvent
+	// w and marks go to Sources.Applied once the batch is applied.
+	w     map[srcMap]core.TimeMs
+	marks map[string]seqMark
 	// clock is the data clock's seen value when the batch was handed over, published
 	// once the batch is applied.
 	clock core.TimeMs
@@ -1123,11 +1264,16 @@ func (in *Ingester) startApplier(ctx context.Context) *applier {
 			if a.err != nil {
 				continue // drain after a failure
 			}
-			if err := a.apply(job); err != nil {
+			if err := a.apply(&job); err != nil {
 				a.err = err
 				a.failed.Store(true)
-			} else if dc := in.opt.DataClock; dc != nil {
-				dc.Publish(job.clock)
+			} else {
+				if dc := in.opt.DataClock; dc != nil {
+					dc.Publish(job.clock)
+				}
+				if in.opt.Sources != nil {
+					in.opt.Sources.Applied(job.w, job.marks)
+				}
 			}
 			if job.slab != nil {
 				putSlab(job.slab)
@@ -1144,7 +1290,10 @@ func (a *applier) finish() error {
 	return a.err
 }
 
-func (a *applier) apply(job applyJob) error {
+// apply applies one batch: chunk updates, overlay events, then the journey operations
+// and the mover store's Append. When Append fails the journey operations are rolled back,
+// so the retried batch meets the journeys as this one did.
+func (a *applier) apply(job *applyJob) error {
 	in, ctx := a.in, a.ctx
 	if len(job.updates) > 0 {
 		if in.st.Terrain == nil {
@@ -1164,24 +1313,6 @@ func (a *applier) apply(job applyJob) error {
 			}
 		}
 	}
-	if len(job.samples) > 0 {
-		if in.st.Movers == nil {
-			a.res.samples.Invalid += len(job.samples)
-		} else {
-			res, err := in.st.Movers.Append(ctx, job.samples)
-			if err != nil {
-				if errors.Is(err, core.ErrOverloaded) {
-					in.stats.overloaded.Add(1)
-				}
-				return fmt.Errorf("movers: %w", err)
-			}
-			a.res.samples.Add(res)
-			in.stats.samples.add(res)
-			if in.opt.Notifier != nil {
-				in.opt.Notifier.SamplesApplied(job.samples)
-			}
-		}
-	}
 	if len(job.events) > 0 {
 		if in.st.Overlays == nil {
 			a.res.overlays.Invalid += len(job.events)
@@ -1193,6 +1324,68 @@ func (a *applier) apply(job applyJob) error {
 			a.res.overlays.Add(res)
 			in.stats.overlays.add(res)
 		}
+	}
+	if len(job.jops) == 0 {
+		return nil
+	}
+	in.jmu.Lock()
+	defer in.jmu.Unlock()
+	var marked []*movers.Journeys
+	// The output is sized at once (it does not grow by copies) and the raw samples are
+	// let go once converted.
+	samples := make([]core.MoverSample, 0, len(job.raw)+len(job.raw)/8)
+	raw := job.raw
+	job.raw = nil
+	for _, op := range job.jops {
+		js := in.journeysOf(op.mapKey)
+		if !slices.Contains(marked, js) {
+			js.Mark()
+			marked = append(marked, js)
+		}
+		switch op.kind {
+		case jopMove:
+			samples = js.Move(op.src, raw[:op.n], samples)
+			raw = raw[op.n:]
+		case jopAdopt:
+			js.Adopt(op.src, op.id)
+		case jopBegin:
+			js.Begin(op.src)
+		case jopResynced:
+			samples = js.Resynced(op.src, op.t, samples)
+		}
+	}
+	raw = nil
+	commit := func(ok bool) {
+		for _, js := range marked {
+			if ok {
+				js.Commit()
+			} else {
+				js.Rollback()
+			}
+		}
+	}
+	if len(samples) == 0 {
+		commit(true)
+		return nil
+	}
+	if in.st.Movers == nil {
+		a.res.samples.Invalid += len(samples)
+		commit(true)
+		return nil
+	}
+	res, err := in.st.Movers.Append(ctx, samples)
+	if err != nil {
+		commit(false)
+		if errors.Is(err, core.ErrOverloaded) {
+			in.stats.overloaded.Add(1)
+		}
+		return fmt.Errorf("movers: %w", err)
+	}
+	commit(true)
+	a.res.samples.Add(res)
+	in.stats.samples.add(res)
+	if in.opt.Notifier != nil {
+		in.opt.Notifier.SamplesApplied(samples)
 	}
 	return nil
 }

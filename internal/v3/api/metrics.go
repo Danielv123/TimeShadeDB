@@ -99,6 +99,9 @@ type metrics struct {
 	commits  atomic.Uint64
 	// idleReleases counts Config.IdleRelease returns of memory to the OS.
 	idleReleases atomic.Uint64
+	// heldMaps and holdLag are the maps whose commits a source holds back more than a
+	// minute behind the clock, and the largest such hold in ms (noteHolds).
+	heldMaps, holdLag atomic.Int64
 }
 
 func newMetrics() *metrics { return &metrics{} }
@@ -144,6 +147,10 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 		val(core.MetricIngestRejected, `reason="owner"`, st.OwnerDrops)
 		val(core.MetricIngestRejected, `reason="unknown_gone"`, st.UnknownGones)
 		val(core.MetricIngestRejected, `reason="quarantined"`, st.Quarantined)
+		val(core.MetricIngestRejected, `reason="duplicate"`, st.Duplicates)
+		val(core.MetricIngestRejected, `reason="one_recv"`, st.OneRecv)
+		typ(core.MetricIngestCaughtUp, "counter")
+		val(core.MetricIngestCaughtUp, "", st.CaughtUp)
 		for _, x := range []struct {
 			name string
 			r    core.ApplyResult
@@ -162,6 +169,10 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 	val(core.MetricCommits, "", m.commits.Load())
 	typ(core.MetricIdleReleases, "counter")
 	val(core.MetricIdleReleases, "", m.idleReleases.Load())
+	typ(core.MetricHeldMaps, "gauge")
+	val(core.MetricHeldMaps, "", m.heldMaps.Load())
+	typ(core.MetricHoldLag, "gauge")
+	val(core.MetricHoldLag, "", m.holdLag.Load())
 	if ts, ok := s.cfg.Terrain.(*terrain.Store); ok {
 		st := ts.Stats()
 		typ(core.MetricBlocksWritten, "counter")
@@ -171,6 +182,10 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 		val(core.MetricTerrainBytes, "", st.RecordBytes)
 		typ(core.MetricOpenWindowBytes, "gauge")
 		val(core.MetricOpenWindowBytes, "", st.OpenWindowBytes)
+		typ(core.MetricSpilledWindows, "gauge")
+		val(core.MetricSpilledWindows, `store="terrain"`, st.SpilledWindows)
+		typ(core.MetricSpills, "counter")
+		val(core.MetricSpills, `store="terrain"`, st.Spills)
 		typ(core.MetricDecodedCacheBytes, "gauge")
 		val(core.MetricDecodedCacheBytes, `cache="terrain"`, st.DecodedCacheBytes)
 		typ(core.MetricCacheHits, "counter")
@@ -193,9 +208,16 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 		st := ms.Stats()
 		typ("tsdb_mover_open_rows", "gauge")
 		val("tsdb_mover_open_rows", "", st.OpenRows)
+		typ("tsdb_mover_open_bytes", "gauge")
+		val("tsdb_mover_open_bytes", "", st.OpenBytes)
+		typ(core.MetricSpilledWindows, "gauge")
+		val(core.MetricSpilledWindows, `store="movers"`, st.SpilledWindows)
+		typ(core.MetricSpills, "counter")
+		val(core.MetricSpills, `store="movers"`, st.Evictions)
 		typ("tsdb_mover_store_rejected_total", "counter")
 		val("tsdb_mover_store_rejected_total", `reason="ahead"`, st.Ahead)
 		val("tsdb_mover_store_rejected_total", `reason="behind"`, st.Behind)
+		val("tsdb_mover_store_rejected_total", `reason="duplicate"`, st.Duplicates)
 		val("tsdb_mover_store_rejected_total", `reason="corrupt"`, st.Corrupt)
 		val("tsdb_mover_store_rejected_total", `reason="wal_skipped"`, st.WALSkipped)
 	}
