@@ -43,7 +43,7 @@ jobs:
         id: mod
         shell: pwsh
         run: |
-          $info = Get-Content timeshadedb_exporter/info.json -Raw | ConvertFrom-Json
+          $info = Get-Content capture/mod/timeshadedb_exporter/info.json -Raw | ConvertFrom-Json
           $expectedTag = "factorio-v$($info.version)"
           if ($env:GITHUB_EVENT_NAME -eq "push" -and $env:GITHUB_REF_NAME -ne $expectedTag) {
             throw "Tag '$env:GITHUB_REF_NAME' does not match expected Factorio mod tag '$expectedTag'."
@@ -77,19 +77,23 @@ jobs:
             exit 1
           fi
 
+          # init_publish creates the mod on the portal, init_upload adds a release to it.
+          if curl -fsS -o /dev/null "https://mods.factorio.com/api/mods/${MOD_NAME}"; then
+            init_url="https://mods.factorio.com/api/v2/mods/releases/init_upload"
+          else
+            init_url="https://mods.factorio.com/api/v2/mods/init_publish"
+          fi
+
           init_response="$(
-            curl -fsS \
-              -X POST "https://mods.factorio.com/api/v2/mods/init_publish" \
-              -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}" \
-              -F "mod=${MOD_NAME}"
+            curl -fsS               -X POST "${init_url}"               -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}"               -F "mod=${MOD_NAME}"
           )"
 
           upload_url="$(
             python3 -c 'import json, sys; print(json.load(sys.stdin)["upload_url"])' <<< "${init_response}"
           )"
 
-          curl -fsS \
-            -X POST "${upload_url}" \
-            -F "file=@${ZIP_PATH}" \
-            -F "description=<timeshadedb_exporter/README.md" \
-            -F "source_url=https://github.com/${GITHUB_REPOSITORY}"
+          if [ "${init_url##*/}" = "init_publish" ]; then
+            curl -fsS               -X POST "${upload_url}"               -F "file=@${ZIP_PATH}"               -F "description=<capture/mod/README.md"               -F "source_url=https://github.com/${GITHUB_REPOSITORY}"
+          else
+            curl -fsS               -X POST "${upload_url}"               -F "file=@${ZIP_PATH}"
+          fi

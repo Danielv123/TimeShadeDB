@@ -7,7 +7,7 @@ serves two hosts:
 
 | Host | Directory | Output | Forwarder |
 |---|---|---|---|
-| Standalone mod `timeshade_capture` | `mod/timeshade_capture/` | `script-output/timeshade/<seq>-<tick>.ndjson` | `timeshadedb tail` (WP6) |
+| Standalone mod `timeshadedb_exporter` | `mod/timeshadedb_exporter/` | `script-output/timeshade/<seq>-<tick>.ndjson` | `timeshadedb tail` (WP6) |
 | Clusterio save-patch module `timeshade` | `clusterio_module/` | `\f$ipc:timeshade:out?j<envelope>` lines on stdout | the Clusterio plugin (WP10) |
 
 It replaces `timeshadedb_exporter/`, which does not run on Factorio 2.0.
@@ -23,7 +23,7 @@ It replaces `timeshadedb_exporter/`, which does not run on Factorio 2.0.
 | `lua/movers.lua` | Scan, read wheel, train/vehicle/player samples, joins and splits, Universal Edges hand-off |
 | `lua/overlays.lua` | Chart tags, recipes, rails |
 | `lua/capture.lua` | Entry points: `setup`, `config`, `resync`, `on_tick`, the event table |
-| `mod/timeshade_capture/` | The standalone mod (settings, file rotation, `/timeshade` command, remote interface) |
+| `mod/timeshadedb_exporter/` | The standalone mod (settings, file rotation, `/timeshade` command, remote interface) |
 | `clusterio_module/` | The module's `control.lua` and `globals.lua` (`ts_rt` RCON entry point) |
 | `build.mjs` | Assembles both hosts with the library into `dist/` |
 | `test/` | Unit tests (Lua 5.4 in WebAssembly), headless game tests and the UPS benchmark, a Go decode test |
@@ -31,7 +31,7 @@ It replaces `timeshadedb_exporter/`, which does not run on Factorio 2.0.
 ## Build
 
 ```sh
-node capture/build.mjs                         # dist/timeshade_capture_0.1.0{/,.zip} and dist/clusterio_module/
+node capture/build.mjs                         # dist/timeshadedb_exporter_0.1.0{/,.zip} and dist/clusterio_module/
 node capture/build.mjs --factorio-version 2.1  # Factorio 2.1 refuses mods that declare 2.0
 ```
 
@@ -40,14 +40,14 @@ build output and is not committed.
 
 ## Standalone use
 
-1. Put `dist/timeshade_capture_0.1.0.zip` (or the directory) in the game's `mods` folder.
+1. Put `dist/timeshadedb_exporter_0.1.0.zip` (or the directory) in the game's `mods` folder.
 2. Run `timeshadedb tail --dir <user data>/script-output/timeshade --url ... --token ...
    --src standalone:<name> --map <key>` next to it. It posts complete files and deletes them.
 
 Map settings (runtime, per save): capture on or off, chart debounce (600 ticks), chart reads
 per tick (1), sent-chart cache size (16,384 chunks), rail layer (off), extra forces to
 capture (forces with a player are always captured). `/timeshade stats` prints counters,
-`/timeshade resync` resends everything. Remote interface `timeshade_capture`: `resync`,
+`/timeshade resync` resends everything. Remote interface `timeshadedb_exporter`: `resync`,
 `stats`.
 
 Files: one every 60 s of game time or 4 MiB, and a new one at every load; lines are

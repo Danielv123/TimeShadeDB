@@ -284,7 +284,7 @@ function buildCapture(dir, capture = path.join(repo, "capture")) {
 	const mm = gameVersion().split(".").slice(0, 2).join(".");
 	execFileSync(process.execPath, [path.join(capture, "build.mjs"), "--out", dir, "--no-zip",
 		"--factorio-version", mm], { encoding: "utf8" });
-	const info = JSON.parse(fs.readFileSync(path.join(capture, "mod", "timeshade_capture", "info.json"), "utf8"));
+	const info = JSON.parse(fs.readFileSync(path.join(capture, "mod", "timeshadedb_exporter", "info.json"), "utf8"));
 	const modDir = path.join(dir, `${info.name}_${info.version}`);
 	// Benchmark mode has no server, but a save made in multiplayer keeps game.is_multiplayer() true, and the mod writes
 	// its files only for the server (for_player = 0), so nothing would be written. The harness's copy writes them as
@@ -314,7 +314,7 @@ async function record() {
 	const capDir = buildCapture(path.join(dir, "build"));
 	const mods = { railbench_recorder: recorderMod };
 	if (!flag("--no-capture")) {
-		mods.timeshade_capture = (dst) => copyTree(capDir, dst);
+		mods.timeshadedb_exporter = (dst) => copyTree(capDir, dst);
 	}
 	const box = sandbox(dir, { mods, spaceAge: info.spaceAge,
 		configs: { railbench_recorder: { mode: "record", ticks, refuel: flag("--refuel") } } });
@@ -370,13 +370,13 @@ async function ups() {
 	const info = saveInfo(save);
 	const dir = path.join(work, "runs", name);
 	const capDir = buildCapture(path.join(dir, "build"));
-	const box = sandbox(dir, { mods: { timeshade_capture: (dst) => copyTree(capDir, dst) }, spaceAge: info.spaceAge });
+	const box = sandbox(dir, { mods: { timeshadedb_exporter: (dst) => copyTree(capDir, dst) }, spaceAge: info.spaceAge });
 	const compare = option("--compare", null);
 	let altBox = null;
 	if (compare) {
 		const altDir = buildCapture(path.join(dir, "build-alt"), path.resolve(compare));
-		altBox = sandbox(path.join(dir, "alt"), { mods: { timeshade_capture: (dst) => copyTree(altDir, dst) }, spaceAge: info.spaceAge });
-		setEnabled(altBox, { timeshade_capture: true });
+		altBox = sandbox(path.join(dir, "alt"), { mods: { timeshadedb_exporter: (dst) => copyTree(altDir, dst) }, spaceAge: info.spaceAge });
+		setEnabled(altBox, { timeshadedb_exporter: true });
 	}
 	const per = { with: [], without: [], alt: [] };
 	const lines = [];
@@ -384,7 +384,7 @@ async function ups() {
 		for (const label of altBox ? ["without", "with", "alt"] : ["without", "with"]) {
 			const b = label === "alt" ? altBox : box;
 			if (label !== "alt") {
-				setEnabled(box, { timeshade_capture: label === "with" });
+				setEnabled(box, { timeshadedb_exporter: label === "with" });
 			}
 			const res = await runFactorio(b, ["--benchmark", path.resolve(save), "--benchmark-ticks", String(ticks),
 				"--benchmark-runs", "1", "--benchmark-verbose", "all"], `ups-${label}-${r}`, { keepStdout: false, affinity });

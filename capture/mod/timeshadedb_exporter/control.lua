@@ -125,7 +125,7 @@ script.on_event(defines.events.on_runtime_mod_setting_changed, function(e)
 	end
 end)
 
-remote.add_interface("timeshade_capture", {
+remote.add_interface("timeshadedb_exporter", {
 	--- Start a resync now (read-only, safe on any peer).
 	resync = function(trace)
 		return capture.resync(trace or ("remote-" .. game.tick))

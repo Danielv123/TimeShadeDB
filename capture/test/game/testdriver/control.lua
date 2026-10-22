@@ -1,4 +1,4 @@
--- The game-test driver for the standalone mod: runs scenario.lua against timeshade_capture's test hooks (a remote
+-- The game-test driver for the standalone mod: runs scenario.lua against timeshadedb_exporter's test hooks (a remote
 -- interface present only in a `build.mjs --test` build). Without the capture mod (the UPS baseline) it drives the same
 -- world and calls nothing.
 local scenario = require("scenario")

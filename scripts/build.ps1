@@ -10,7 +10,7 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $outputRoot = Join-Path $repoRoot $OutputDir
 $packageDir = Join-Path $outputRoot "packages"
 $modBuildDir = Join-Path $outputRoot "mods"
-$modSourceDir = Join-Path $repoRoot "timeshadedb_exporter"
+$modSourceDir = Join-Path $repoRoot "capture/mod/timeshadedb_exporter"
 
 $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $npm) {
@@ -28,7 +28,6 @@ $binaryName = "timeshadedb$exeSuffix"
 $binaryPath = Join-Path $repoRoot $binaryName
 $modInfo = Get-Content (Join-Path $modSourceDir "info.json") -Raw | ConvertFrom-Json
 $modFolderName = "$($modInfo.name)_$($modInfo.version)"
-$modStageDir = Join-Path $modBuildDir $modFolderName
 $modPackagePath = Join-Path $packageDir "$modFolderName.zip"
 
 if ($PackageName -eq "") {
@@ -57,16 +56,12 @@ finally {
     Pop-Location
 }
 
-Write-Host "Packaging Factorio mod..."
-if (Test-Path $modStageDir) {
-    Remove-Item -LiteralPath $modStageDir -Recurse -Force
+Write-Host "Building Factorio mod..."
+& node (Join-Path $repoRoot "capture/build.mjs") --out $modBuildDir
+if ($LASTEXITCODE -ne 0) {
+    throw "capture/build.mjs failed"
 }
-if (Test-Path $modPackagePath) {
-    Remove-Item -LiteralPath $modPackagePath -Force
-}
-New-Item -ItemType Directory -Force -Path $modStageDir | Out-Null
-Copy-Item -Path (Join-Path $modSourceDir "*") -Destination $modStageDir -Recurse
-Compress-Archive -LiteralPath $modStageDir -DestinationPath $modPackagePath
+Copy-Item -LiteralPath (Join-Path $modBuildDir "$modFolderName.zip") -Destination $modPackagePath -Force
 
 if (-not $SkipPackage) {
     if (Test-Path $packagePath) {

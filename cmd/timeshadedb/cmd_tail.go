@@ -36,7 +36,7 @@ func cmdTail(ctx context.Context, args []string) error {
 	return runTail(ctx, os.Stdout, os.Stderr, args)
 }
 
-// tailer forwards the capture files of the timeshade_capture mod (docs/PROTOCOL.md 2):
+// tailer forwards the capture files of the timeshadedb_exporter mod (docs/PROTOCOL.md 2):
 // it posts files in name order, adding the forwarder fields to every envelope, deletes a
 // file once ingest acknowledged all of it and a newer file exists, and posts the newest
 // file up to its last complete line without deleting it. Every line gets the time the game

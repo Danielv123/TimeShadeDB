@@ -74,7 +74,7 @@ timeshadedb serve --db v3db --listen 127.0.0.1:8080
 ```
 
 It listens on loopback by default; any other address needs `--ingest-token`. A standalone
-game with the `timeshade_capture` mod is forwarded with
+game with the `timeshadedb_exporter` mod is forwarded with
 `timeshadedb tail --dir <factorio>/script-output/timeshade --map <key> --url http://127.0.0.1:8080`.
 Ingest is not throttled by memory: open windows past their share of `--mem-budget` are
 spilled to disk. A backlog (a recorded capture posted with `tail --once`, or the lines a

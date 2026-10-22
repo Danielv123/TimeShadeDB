@@ -2,7 +2,7 @@
 -- Ported from illisis/minimap module/control.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
 -- The capture's entry points, shared by both hosts (docs/PROTOCOL.md): the standalone mod
--- (capture/mod/timeshade_capture) and the Clusterio save-patch module (capture/clusterio_module). A host calls
+-- (capture/mod/timeshadedb_exporter) and the Clusterio save-patch module (capture/clusterio_module). A host calls
 -- capture.setup with where lines go and who it is, registers capture.events, and calls capture.config (on every peer:
 -- an RCON command, on_init, a settings change) and capture.resync (read-only, so any peer may run it).
 --

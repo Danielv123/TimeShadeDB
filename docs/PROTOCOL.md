@@ -56,7 +56,7 @@ not late when it comes back.
   (key order aside) at about half the cost. The instance
   plugin parses the line, adds the forwarder fields and sends batches to the controller
   about once a second; the controller posts them to its sidecar.
-- **Standalone**: the `timeshade_capture` mod appends envelope lines with
+- **Standalone**: the `timeshadedb_exporter` mod appends envelope lines with
   `helpers.write_file("timeshade/<seq>-<tick>.ndjson", lines, true)`, starting a new file
   every 4 MiB or 60 s. `<seq>` is a counter kept in `storage` (raised every 3,600 ticks and
   at install and configuration change, on every peer alike), `<tick>` the game tick when the

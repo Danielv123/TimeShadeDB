@@ -1,9 +1,0 @@
-{
-	"name": "timeshade_capture",
-	"version": "0.1.0",
-	"title": "TimeShadeDB capture",
-	"author": "TimeShadeDB",
-	"factorio_version": "2.0",
-	"description": "Records the map chart, trains, vehicles, players, chart tags and recipes for the TimeShadeDB cluster map. Writes NDJSON to script-output/timeshade for `timeshadedb tail`.",
-	"dependencies": ["base >= 2.0.0"]
-}
