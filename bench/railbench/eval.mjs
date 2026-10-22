@@ -2,11 +2,15 @@
 // against the recorder's ground truth of the same game run, at every tick. See README.md for the metrics.
 //
 //   node bench/railbench/eval.mjs --run <name> [--work <dir>] [--modes history,live] [--batch-ms 1000]
-//       [--extra-ms 150] [--live-estimator shared|journey] [--journeys N] [--out <file>]
+//       [--extra-ms 150] [--live-estimator shared|journey] [--body server|none] [--journeys N] [--out <file>]
 //
 // --live-estimator: the live model's delay estimator (web/src/movers/clock.ts) is shared by every train of a surface,
 // as the viewer's is (default), or one per journey (each journey's live replay starts with no observations; the
 // baseline of 2026-10-21 was measured that way).
+//
+// --body: the first row of a journey after a seek (its keyframe row) and in the live payload carries, in front of its
+// own rail pieces, the pieces under the train that earlier rows listed, as the server writes them (core.RailBody, read
+// with `measure movers -bodies`; default), or only its own (`none`: the store before 2026-10-22).
 //
 // Diagnostics: RAILBENCH_WORST_CAR=<tiles> lists carriages further off than that in worst-*.json (default 5);
 // RAILBENCH_DEBUG_DELAY=<tiles> prints the live delay every 10 s and writes debug-live.json with the head mode, rail
@@ -54,6 +58,7 @@ const sessionMs = Number(option("--session-ms", 60000));
 const LIVE_TRAIL_MS = 60000; // core.LiveTrail: the live payload's trail
 const LOOKAHEAD = 60000; // the feed's history lookahead (feed.ts LOOKAHEAD_MS)
 const measureBin = option("--measure", path.join(work, "bin", "measure.exe"));
+const withBody = option("--body", "server") === "server";
 
 /** Histogram with fixed bins and an exact maximum. */
 class Hist {
@@ -130,7 +135,8 @@ const surfDirs = fs.readdirSync(path.join(dir, dbName, "movers")).filter(s => s 
 const journeys = [];
 for (const s of surfDirs) {
 	const out = path.join(dir, `journeys${tag}-${s}.json`);
-	execFileSync(measureBin, ["movers", "-db", path.join(dir, dbName), "-surface", s, "-out", out], { encoding: "utf8" });
+	execFileSync(measureBin, ["movers", "-db", path.join(dir, dbName), "-surface", s, "-out", out, ...(withBody ? ["-bodies"] : [])],
+		{ encoding: "utf8" });
 	const ex = JSON.parse(fs.readFileSync(out, "utf8"));
 	const meta = JSON.parse(fs.readFileSync(path.join(dir, dbName, "movers", s, "meta.json"), "utf8"));
 	const surfaceName = meta.key.surface;
@@ -286,18 +292,26 @@ function newModeStats() {
 	};
 }
 
-/** Fresh samples of journey j's rows [from, to) (a view keeps state in its samples, so each view gets its own). */
-function samplesOf(j, from = 0, to = j.rows.length) {
+/**
+ * Fresh samples of journey j's rows [from, to) (a view keeps state in its samples, so each view gets its own). With
+ * `first` the first one is the row as a keyframe or the live payload holds it: with its body (--body) in front of its
+ * own rail pieces.
+ */
+function samplesOf(j, from = 0, to = j.rows.length, first = false) {
 	if (!j.metaList) {
 		j.metaList = j.metas.map(([n, kinds, colour]) => ({ id: j.id, k: "t", f: j.force, name: j.name, n, o: kinds, c: colour || undefined }));
 	}
 	const out = [];
 	for (let i = from; i < to; i++) {
-		const [tt, tick, x, y, h, flags, mi, car, v, rp, ru] = j.rows[i];
+		const [tt, tick, x, y, h, flags, mi, car, v, rp, ru, body] = j.rows[i];
 		const meta = j.metaList[mi];
 		const c = car ? car.map(([cx, cy, co]) => ({ x: cx, y: cy, o: co })) : null;
 		// rail path rows (F_RAIL) also carry the speed, the rail pieces and the rail start
-		const pieces = rp ? rp.map(([px, py, dir, kind]) => ({ x: px, y: py, dir, kind })) : null;
+		let all = rp;
+		if (first && i === from && withBody && body) {
+			all = [...body, ...(rp ?? [])].slice(-1024); // core.RailWithBody
+		}
+		const pieces = all ? all.map(([px, py, dir, kind]) => ({ x: px, y: py, dir, kind })) : null;
 		out.push({ meta, s: makeSample(meta, tt, x, y, h === null ? NaN : h, flags, c, tick, v ?? NaN, pieces, !!ru) });
 	}
 	return out;
@@ -391,7 +405,7 @@ function score(st, shown, tr, kind, prev) {
 }
 
 const report = { run: name, save: run.save, game: run.game, ticks: run.ticks, clock: { a0, residual_ms: clockResid },
-	samples: sampleReport, live_estimator: liveEstimator, stopped_every_ticks: stoppedEvery, session_ms: sessionMs, modes: {} };
+	samples: sampleReport, live_estimator: liveEstimator, body: withBody ? "server" : "none", stopped_every_ticks: stoppedEvery, session_ms: sessionMs, modes: {} };
 let list = journeys.filter(j => (matched.get(j.id) ?? []).length > 0);
 if (maxJourneys > 0) {
 	list = list.slice(0, maxJourneys);
@@ -532,7 +546,7 @@ function liveShared(st, js, open = null) {
 		if (from === k && k > 0 && !(j.rows[k - 1][5] & F_GONE)) {
 			from = k - 1;
 		}
-		payload.push(...samplesOf(j, from, k));
+		payload.push(...samplesOf(j, from, k, true));
 		let to = k;
 		while (to < j.rows.length && j.rows[to][0] <= open.until + 20000) {
 			to++;
@@ -689,7 +703,7 @@ for (const mode of modes) {
 				while (to < j.rows.length && j.rows[to][0] <= s.until + LOOKAHEAD) {
 					to++;
 				}
-				playback(st, j, samplesOf(j, from, to), Math.max(s.at, q.firstT), Math.min(s.until, q.endT));
+				playback(st, j, samplesOf(j, from, to, true), Math.max(s.at, q.firstT), Math.min(s.until, q.endT));
 			}
 		}
 	} else if (mode === "live" || mode === "open") {

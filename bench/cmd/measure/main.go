@@ -13,7 +13,11 @@
 //	    (headless Factorio, WP9) and records its steady-state deltas per tick
 //	measure movers -db <v3 db> [-surface gw-bc41437d~2E1.nauvis] -out journeys.json
 //	    the train journeys stored in a v3 database, for the train evaluator's
-//	    --journeys-json (the imported, re-timed rows instead of the illisis windows)
+//	    --journeys-json (the imported, re-timed rows instead of the illisis windows);
+//	    -bodies adds each rail path row's body, as keyframes and live payloads give it
+//	measure seekcheck -db <v3 db> [-surface ...] [-every 60000] [-out check.json]
+//	    checks the bodies the mover store serves (keyframes, live payloads from disk and
+//	    from memory) against those computed from the closed windows
 //	measure replicate -db <v3 db> -out <new db> [-n 10]
 //	    a database of n copies of a v3 database under suffixed map keys (the 10x database)
 //	measure startup -server-bin <timeshadedb> -db <v3 db> [-restarts 3]
@@ -61,6 +65,8 @@ func main() {
 		cmdCapture(os.Args[2:])
 	case "movers":
 		cmdMovers(os.Args[2:])
+	case "seekcheck":
+		cmdSeekCheck(os.Args[2:])
 	case "replicate":
 		cmdReplicate(os.Args[2:])
 	case "startup":
@@ -71,7 +77,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream|capture|movers|replicate|startup [flags]")
+	fmt.Fprintln(os.Stderr, "usage: measure run|v3disk|illisis|stream|capture|movers|seekcheck|replicate|startup [flags]")
 	os.Exit(2)
 }
 
