@@ -339,9 +339,11 @@ func TestTailerFiles(t *testing.T) {
 	if len(fi.envs) != 104 {
 		t.Fatalf("%d envelopes", len(fi.envs))
 	}
-	var lastSeq float64
+	// recv_ms: the first read's last line at the clock (the file is newer than the fake
+	// clock), the line before it a tick earlier; then strictly increasing.
+	var lastSeq, lastRecv float64
 	for i, e := range fi.envs {
-		if e["src"] != "standalone:x" || e["map"] != "m" || e["recv_ms"].(float64) != 5000 || e["instance"].(float64) != 3 || e["v"].(float64) != 1 {
+		if e["src"] != "standalone:x" || e["map"] != "m" || e["instance"].(float64) != 3 || e["v"].(float64) != 1 {
 			t.Fatalf("envelope %d: %v", i, e)
 		}
 		if s := e["seq"].(float64); s <= lastSeq {
@@ -349,6 +351,14 @@ func TestTailerFiles(t *testing.T) {
 		} else {
 			lastSeq = s
 		}
+		if r := e["recv_ms"].(float64); r <= lastRecv {
+			t.Fatalf("recv_ms not increasing at %d: %v after %v", i, r, lastRecv)
+		} else {
+			lastRecv = r
+		}
+	}
+	if fi.envs[0]["recv_ms"].(float64) != 4983 || fi.envs[1]["recv_ms"].(float64) != 5000 {
+		t.Fatalf("first stamps %v %v", fi.envs[0]["recv_ms"], fi.envs[1]["recv_ms"])
 	}
 	if fi.envs[2]["tick"].(float64) != 3 {
 		t.Fatalf("completed line: %v", fi.envs[2])
@@ -407,6 +417,42 @@ func TestTailerFiles(t *testing.T) {
 	write("b.ndjson", env(14))
 	if _, err := tl.pass(ctx); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("401: %v", err)
+	}
+}
+
+// TestTailStampsFromFile: lines a game wrote earlier get their own times, from the file's
+// modification time back by ticks (a backlog keeps its times), and caught_up follows.
+func TestTailStampsFromFile(t *testing.T) {
+	fi := &fakeIngest{}
+	ts := httptest.NewServer(fi)
+	defer ts.Close()
+	dir := t.TempDir()
+	written := time.UnixMilli(1_791_000_000_000)
+	now := written.Add(time.Hour) // posted an hour later
+	tl := &tailer{dir: dir, url: ts.URL, src: "standalone:x", mapKey: "m", batchBytes: 1 << 20,
+		client: ts.Client(), logf: func(string, ...any) {}, now: func() time.Time { return now },
+		sleep: func(context.Context, time.Duration) error { return nil }, offsets: map[string]*tailFile{}}
+	path := filepath.Join(dir, "a.ndjson")
+	lines := `{"v":1,"tick":0,"msgs":[]}` + "\n" + `{"v":1,"tick":600,"msgs":[]}` + "\n" + `{"v":1,"tick":600,"msgs":[]}` + "\n" +
+		`{"v":1,"tick":1200,"speed":2,"msgs":[]}` + "\n"
+	os.WriteFile(path, []byte(lines), 0o644)
+	os.Chtimes(path, written, written)
+	if n, err := tl.pass(context.Background()); err != nil || n != 4 {
+		t.Fatalf("pass: %d %v", n, err)
+	}
+	if err := tl.caughtUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w := written.UnixMilli()
+	want := []int64{w - 5000 - 10000, w - 5000, w - 5000 + 1, w}
+	for i, e := range fi.envs[:4] {
+		if got := int64(e["recv_ms"].(float64)); got != want[i] {
+			t.Fatalf("line %d stamped %d, want %d", i, got, want[i])
+		}
+	}
+	cu := fi.envs[4]
+	if cu["caught_up"] != true || int64(cu["recv_ms"].(float64)) != now.UnixMilli() || cu["tick"].(float64) != 1200 || len(cu["msgs"].([]any)) != 0 {
+		t.Fatalf("caught_up envelope %v", cu)
 	}
 }
 

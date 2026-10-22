@@ -40,9 +40,11 @@ func cmdTail(ctx context.Context, args []string) error {
 // tailer forwards the capture files of the timeshade_capture mod (docs/v3/PROTOCOL.md 2):
 // it posts files in name order, adding the forwarder fields to every envelope, deletes a
 // file once ingest acknowledged all of it and a newer file exists, and posts the newest
-// file up to its last complete line without deleting it. The acknowledged offsets are
-// kept in a state file, so a restarted tailer does not post lines again (with a new
-// recv_ms, which would stamp old chunk and mover data at the time of the repost).
+// file up to its last complete line without deleting it. Every line gets the time the game
+// wrote it as recv_ms (lineStamps), so a backlog keeps its times however late it is
+// posted. Once everything is posted it sends caught_up envelopes (heartbeat). The
+// acknowledged offsets are kept in a state file, so a restarted tailer does not post lines
+// again.
 type tailer struct {
 	dir, url, token, src, mapKey string
 	instance                     int64
@@ -58,6 +60,12 @@ type tailer struct {
 	offsets map[string]*tailFile
 	seq     int64
 	posted  int64 // envelopes acknowledged
+	// lastRecv is the newest recv_ms stamped on a line (kept in the state file): stamps
+	// increase line by line. lastTick is the newest tick posted, for caught_up envelopes.
+	lastRecv int64
+	lastTick int64
+	// lastSent is when the tailer last posted (data or caught_up), for heartbeat.
+	lastSent time.Time
 }
 
 // tailFile is the state of one capture file: the bytes acknowledged, and a hash of its
@@ -73,8 +81,9 @@ type tailFile struct {
 const tailHeadBytes = 1024
 
 type tailState struct {
-	Version int                  `json:"version"`
-	Files   map[string]*tailFile `json:"files"`
+	Version  int                  `json:"version"`
+	Files    map[string]*tailFile `json:"files"`
+	LastRecv int64                `json:"last_recv,omitempty"`
 }
 
 // loadState reads the state file, if any.
@@ -99,6 +108,7 @@ func (t *tailer) loadState() error {
 			t.offsets[name] = f
 		}
 	}
+	t.lastRecv = max(t.lastRecv, st.LastRecv)
 	return nil
 }
 
@@ -107,7 +117,7 @@ func (t *tailer) saveState() error {
 	if t.statePath == "" {
 		return nil
 	}
-	b, err := json.Marshal(tailState{Version: 1, Files: t.offsets})
+	b, err := json.Marshal(tailState{Version: 1, Files: t.offsets, LastRecv: t.lastRecv})
 	if err != nil {
 		return err
 	}
@@ -244,22 +254,22 @@ func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, er
 		t.logf("%s: dropping %d bytes of an incomplete last line", name, len(data)-end)
 	}
 	data = data[:end]
+	lines := t.lineStamps(data, fi.ModTime())
 	total := 0
-	for len(data) > 0 {
+	for len(lines) > 0 {
 		// Cut a batch at a line boundary.
-		cut := len(data)
-		if cut > t.batchBytes {
-			cut = bytes.LastIndexByte(data[:t.batchBytes], '\n') + 1
-			if cut == 0 {
-				cut = bytes.IndexByte(data, '\n') + 1 // one line longer than a batch
-			}
+		cut, size := 0, 0
+		for cut < len(lines) && (cut == 0 || size+len(lines[cut].b) <= t.batchBytes) {
+			size += len(lines[cut].b)
+			cut++
 		}
-		n, err := t.postLines(ctx, data[:cut])
+		n, err := t.postLines(ctx, lines[:cut])
 		total += n
 		if err != nil {
 			return total, err
 		}
-		off += int64(cut)
+		lines = lines[cut:]
+		off += int64(size)
 		st.Off = off
 		if st.HeadLen < tailHeadBytes && off > int64(st.HeadLen) {
 			st.HeadLen = int(min(off, tailHeadBytes))
@@ -271,9 +281,115 @@ func (t *tailer) forward(ctx context.Context, name string, newest bool) (int, er
 		if err := t.saveState(); err != nil {
 			return total, err
 		}
-		data = data[cut:]
 	}
 	return total, nil
+}
+
+// tline is one line to post (with its newline) and the recv_ms it is stamped with.
+type tline struct {
+	b    []byte
+	recv int64
+}
+
+// lineStamps splits data (complete lines, the rest of a file from its acknowledged
+// offset) and stamps each line with when the game wrote it (docs/v3/PROTOCOL.md 1): the
+// last line with the file's modification time (no later than now), each line before it
+// that time minus the ticks to the next line at 60 x speed ticks a second (a tick that
+// goes back, a reloaded save, counts as no time). The stamps then increase strictly from
+// the newest stamp of an earlier line: when they would start at or before it, all of them
+// move up by the difference. A game that ran slower than its speed, or paused, gives
+// stamps later than the truth, which the server's clock anchor allows; stamps earlier than
+// the truth would make it place the data too early.
+func (t *tailer) lineStamps(data []byte, mtime time.Time) []tline {
+	var lines []tline
+	for len(data) > 0 {
+		i := bytes.IndexByte(data, '\n') + 1
+		lines = append(lines, tline{b: data[:i]})
+		data = data[i:]
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	now := core.FromTime(t.now())
+	last := min(core.FromTime(mtime), now)
+	ticks := make([]int64, len(lines))
+	speeds := make([]float64, len(lines))
+	for i, l := range lines {
+		ticks[i], speeds[i] = lineTick(l.b)
+	}
+	ms := float64(last)
+	lines[len(lines)-1].recv = int64(last)
+	for i := len(lines) - 2; i >= 0; i-- {
+		if d := ticks[i+1] - ticks[i]; ticks[i] >= 0 && ticks[i+1] >= 0 && d > 0 {
+			ms -= float64(d) * 1000 / (60 * speeds[i+1])
+		}
+		lines[i].recv = int64(ms)
+	}
+	if shift := t.lastRecv + 1 - lines[0].recv; shift > 0 {
+		for i := range lines {
+			lines[i].recv += shift
+		}
+	}
+	for i := 1; i < len(lines); i++ {
+		lines[i].recv = max(lines[i].recv, lines[i-1].recv+1)
+	}
+	for _, tk := range ticks {
+		t.lastTick = max(t.lastTick, tk)
+	}
+	return lines
+}
+
+// lineTick reads an envelope line's tick and speed (1 when absent) from its first
+// fields, as the capture writes them ({"v":1,"tick":T[,"speed":S],"msgs":...); -1 when
+// there is no tick.
+func lineTick(line []byte) (int64, float64) {
+	head := line[:min(len(line), 96)]
+	tick, speed := int64(-1), 1.0
+	if i := bytes.Index(head, []byte(`"tick":`)); i >= 0 {
+		rest := head[i+7:]
+		j := 0
+		for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+			j++
+		}
+		if v, err := strconv.ParseInt(string(rest[:j]), 10, 64); err == nil {
+			tick = v
+		}
+	}
+	if i := bytes.Index(head, []byte(`"speed":`)); i >= 0 {
+		rest := head[i+8:]
+		j := 0
+		for j < len(rest) && (rest[j] >= '0' && rest[j] <= '9' || rest[j] == '.' || rest[j] == 'e' || rest[j] == 'E' || rest[j] == '-' || rest[j] == '+') {
+			j++
+		}
+		if v, err := strconv.ParseFloat(string(rest[:j]), 64); err == nil && v > 0 && v <= 1000 {
+			speed = v
+		}
+	}
+	return tick, speed
+}
+
+// caughtUp posts a caught_up envelope: everything the tailer read was posted
+// (docs/v3/PROTOCOL.md 1), so the server can stop holding the map for this source.
+func (t *tailer) caughtUp(ctx context.Context) error {
+	recv := max(int64(core.FromTime(t.now())), t.lastRecv+1)
+	t.seq++
+	var line bytes.Buffer
+	fmt.Fprintf(&line, `{"src":%s,"map":%s,"recv_ms":%d,"seq":%d`, jsonString(t.src), jsonString(t.mapKey), recv, t.seq)
+	if t.instance != 0 {
+		fmt.Fprintf(&line, `,"instance":%d`, t.instance)
+	}
+	fmt.Fprintf(&line, `,"v":1,"tick":%d,"caught_up":true,"msgs":[]}`+"\n", max(t.lastTick, 0))
+	var body bytes.Buffer
+	zw := gzip.NewWriter(&body)
+	zw.Write(line.Bytes())
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	if err := t.sendRetry(ctx, body.Bytes()); err != nil {
+		return err
+	}
+	t.lastSent = t.now()
+	return nil
 }
 
 // statusError is a status other than 200 from ingest.
@@ -286,20 +402,17 @@ func (e *statusError) Error() string { return fmt.Sprintf("status %d: %s", e.cod
 
 // postLines posts lines; when ingest refuses the body itself (400, or 413 for a body
 // over its cap), it splits the batch, and skips, loudly, a single line it refuses.
-func (t *tailer) postLines(ctx context.Context, lines []byte) (int, error) {
+func (t *tailer) postLines(ctx context.Context, lines []tline) (int, error) {
 	n, err := t.post(ctx, lines)
 	var se *statusError
 	if err == nil || !errors.As(err, &se) || (se.code != http.StatusBadRequest && se.code != http.StatusRequestEntityTooLarge) {
 		return n, err
 	}
-	mid := bytes.IndexByte(lines[len(lines)/2:], '\n') + len(lines)/2 + 1
-	if mid >= len(lines) {
-		mid = bytes.IndexByte(lines, '\n') + 1
-	}
-	if mid <= 0 || mid >= len(lines) {
-		t.logf("ingest: skipping a line ingest refuses (%v): %.200s", se, lines)
+	if len(lines) == 1 {
+		t.logf("ingest: skipping a line ingest refuses (%v): %.200s", se, lines[0].b)
 		return 0, nil
 	}
+	mid := len(lines) / 2
 	n1, err := t.postLines(ctx, lines[:mid])
 	if err != nil {
 		return n1, err
@@ -311,21 +424,20 @@ func (t *tailer) postLines(ctx context.Context, lines []byte) (int, error) {
 // post sends one batch of envelope lines with the forwarder fields added. It retries
 // network errors, 5xx, 429 and 408 (the body arrived too slowly) with backoff, honouring
 // Retry-After, until ingest answers 200 or ctx ends; any other status is returned as a
-// *statusError.
-func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
-	recv := core.FromTime(t.now())
+// *statusError. A retried body is the same bytes (the same recv_ms and seq), which the
+// server skips where it applied them already.
+func (t *tailer) post(ctx context.Context, lines []tline) (int, error) {
 	var body bytes.Buffer
 	zw := gzip.NewWriter(&body)
 	n := 0
-	for len(lines) > 0 {
-		i := bytes.IndexByte(lines, '\n')
-		line := bytes.TrimSpace(lines[:i])
-		lines = lines[i+1:]
+	for _, tl := range lines {
+		line := bytes.TrimSpace(tl.b)
 		if len(line) < 2 || line[0] != '{' {
 			continue
 		}
 		t.seq++
-		fmt.Fprintf(zw, `{"src":%s,"map":%s,"recv_ms":%d,"seq":%d`, jsonString(t.src), jsonString(t.mapKey), recv, t.seq)
+		t.lastRecv = max(t.lastRecv, tl.recv)
+		fmt.Fprintf(zw, `{"src":%s,"map":%s,"recv_ms":%d,"seq":%d`, jsonString(t.src), jsonString(t.mapKey), tl.recv, t.seq)
 		if t.instance != 0 {
 			fmt.Fprintf(zw, `,"instance":%d`, t.instance)
 		}
@@ -343,19 +455,30 @@ func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
 	if n == 0 {
 		return 0, nil
 	}
+	if err := t.sendRetry(ctx, body.Bytes()); err != nil {
+		return 0, err
+	}
+	t.posted += int64(n)
+	t.lastSent = t.now()
+	return n, nil
+}
+
+// sendRetry posts a body until ingest answers 200 or ctx ends, retrying network errors,
+// 5xx, 429 and 408 with backoff (honouring Retry-After); any other status is returned as
+// a *statusError.
+func (t *tailer) sendRetry(ctx context.Context, body []byte) error {
 	backoff := 500 * time.Millisecond
 	for {
-		retry, err := t.send(ctx, body.Bytes())
+		retry, err := t.send(ctx, body)
 		if err == nil {
-			t.posted += int64(n)
-			return n, nil
+			return nil
 		}
 		if ctx.Err() != nil {
-			return 0, ctx.Err()
+			return ctx.Err()
 		}
 		var se *statusError
 		if errors.As(err, &se) && se.code != http.StatusTooManyRequests && se.code != http.StatusRequestTimeout && se.code < 500 {
-			return 0, se
+			return se
 		}
 		wait := backoff
 		if retry > 0 {
@@ -363,7 +486,7 @@ func (t *tailer) post(ctx context.Context, lines []byte) (int, error) {
 		}
 		t.logf("ingest: %v; retrying in %v", err, wait)
 		if err := t.sleep(ctx, wait); err != nil {
-			return 0, err
+			return err
 		}
 		backoff = min(backoff*2, 30*time.Second)
 	}
@@ -428,6 +551,7 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	poll := fs.Duration("poll", time.Second, "how often to look for new lines")
 	batch := fs.Int("batch-bytes", 1<<20, "largest request body before compression")
 	once := fs.Bool("once", false, "forward what is there now and exit")
+	heartbeat := fs.Duration("heartbeat", 5*time.Second, "while there is nothing new to post, send a caught_up envelope this often, so the server does not hold the map for this source (0: never; --once always sends one at the end)")
 	state := fs.String("state", "", "file that keeps the acknowledged offsets across restarts (default <dir>/timeshadedb-tail.state.json; - for none)")
 	quiet := fs.Bool("quiet", false, "log only errors")
 	if err := fs.Parse(args); err != nil {
@@ -488,6 +612,17 @@ func runTail(ctx context.Context, stdout, stderr io.Writer, args []string) error
 		}
 		if n > 0 && !*quiet {
 			logf("posted %d envelopes (%d total)", n, t.posted)
+		}
+		if *once || (n == 0 && *heartbeat > 0 && t.now().Sub(t.lastSent) >= *heartbeat) {
+			if err := t.caughtUp(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("tail: %w", err)
+			}
+			if err := t.saveState(); err != nil {
+				return fmt.Errorf("tail: state: %w", err)
+			}
 		}
 		if *once {
 			fmt.Fprintf(stdout, "posted %d envelopes\n", t.posted)
