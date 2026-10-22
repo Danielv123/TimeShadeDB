@@ -62,11 +62,21 @@
 // No history is held in memory. Per surface the store keeps the open rows (bounded
 // across surfaces by Options.MaxOpenRows; Append returns ErrOverloaded beyond it), the
 // closed rows of the last core.LiveTrail before the horizon and the last row of every
-// live journey, from which keyframes and Live are built. Options.MaxTrailRows and
+// live journey, from which keyframes and Live are built, and for every live train a
+// core.RailBody over its closed rows and one over its open rows (the rail pieces of about
+// two train lengths behind it, at most core.MaxRailPieces + 128), which give rows the body that keyframes and Live put in front
+// of a moving train's first row (FORMAT.md 7.4). A row keeps its body as a slice of its
+// RailBody's pieces. The open RailBody follows rows as they arrive; a row at or before its
+// journey's previous open row makes Append (or the WAL replay) give that journey's open
+// rows their bodies again in time order. A commit follows the closed rows in time order,
+// begins every RailBody again at each keyframe it writes, and redoes the open rows' bodies
+// from the new state. Options.MaxTrailRows and
 // Options.MaxLiveMovers bound those two summed over all surfaces: each commit trims the
 // surface it commits to what the other surfaces leave of the limit, or an equal share
 // if that is more (Store.share). Opening rebuilds these from the newest keyframe, the windows after it
-// and the WAL; nothing older is read. A window or keyframe that does not decode is
+// and the WAL; nothing older is read, except the windows the trail reaches back into and,
+// when that is past the keyframe (just after one was written), the keyframe before it and
+// the windows since, for the bodies of the trail rows before the keyframe. A window or keyframe that does not decode is
 // logged, counted (Stats.Corrupt) and skipped there, so one damaged file cannot stop
 // the store opening; Window and Keyframe return an error for it.
 //
@@ -78,7 +88,8 @@
 //
 // Open rows span up to one 5-minute window plus the commit grace (about 315 s), so in
 // real time the sustained ingest rate is bounded by MaxOpenRows / 315 s: about 3,300
-// samples/s at the default of 1,048,576 rows (75 MB). The store-level throughput in
+// samples/s at the default of 1,048,576 rows (about 125 MB at about 120 bytes per row
+// without carriages). The store-level throughput in
 // bench_test.go (500k+ samples/s) is measured with map time running far faster than
 // real time; a server expecting more live samples must raise MaxOpenRows (from its
 // memory budget) accordingly.
@@ -87,7 +98,8 @@
 //
 // Window and Keyframe decode the files; Day reads the index; Live(now) is served from
 // memory when now is at or after the horizon, and otherwise rebuilt from the keyframe
-// before now - core.LiveTrail and the windows up to now (skipping damaged files).
+// before now - core.LiveTrail and the windows up to now (skipping damaged files), with the
+// bodies followed from that keyframe's rows (and again from each later keyframe passed).
 //
 // # Journeys and clock anchors
 //

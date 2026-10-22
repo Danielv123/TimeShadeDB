@@ -3,6 +3,7 @@ package memstore
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 
@@ -144,7 +145,7 @@ func (m *Movers) Commit(ctx context.Context, upTo core.TimeMs) error {
 			}
 		}
 		for ws, rows := range closing {
-			sf.closed[ws] = buildWindow(sf.key, core.WindowClosed, ws, core.MoverWindowLen, rows)
+			sf.closed[ws] = buildWindow(sf.key, core.WindowClosed, ws, core.MoverWindowLen, rows, nil)
 		}
 		if sf.hasData {
 			h := core.WindowStart(sf.first, core.MoverKeyframeEvery) + core.MoverKeyframeEvery
@@ -152,7 +153,8 @@ func (m *Movers) Commit(ctx context.Context, upTo core.TimeMs) error {
 				h = core.WindowStart(oldH, core.MoverKeyframeEvery) + core.MoverKeyframeEvery
 			}
 			for ; h <= newH; h += core.MoverKeyframeEvery {
-				sf.keyframes[h] = buildWindow(sf.key, core.WindowKeyframe, h, 0, sf.lastRows(h, false, true))
+				rows := sf.lastRows(h, false, true)
+				sf.keyframes[h] = buildWindow(sf.key, core.WindowKeyframe, h, 0, rows, sf.bodies(rows))
 			}
 		}
 		sf.horizon = newH
@@ -182,9 +184,51 @@ func (sf *moverSurface) lastRows(before core.TimeMs, inclusive, liveOnly bool) [
 	return out
 }
 
+// bodies returns the body (core.RailBody) of each given row: the rail pieces under the train
+// that the journey's earlier rows listed, following on from the newest keyframe at or before
+// the row (its row of the journey begins the RailBody, core.RailBody.Seed). Keyframes and
+// the live payload put them in front of the first row's own pieces (core.MoverStore).
+func (sf *moverSurface) bodies(rows []*moverRow) map[*moverRow][]core.RailPiece {
+	out := map[*moverRow][]core.RailPiece{}
+	for _, r := range rows {
+		if r.s.Meta.Kind != core.KindTrain || r.s.Flags&core.FlagRail == 0 {
+			continue // only rail rows have bodies
+		}
+		var rb core.RailBody
+		from := core.TimeMs(math.MinInt64)
+		for h, kf := range sf.keyframes {
+			if h <= r.s.T && h > from {
+				from = h
+				rb = core.RailBody{}
+				for _, x := range kf.Rows {
+					if m := kf.Movers[x.Mover]; m.ID == r.s.Meta.ID && m.Kind == core.KindTrain {
+						rb.Seed(core.RailRow{T: x.T, X: x.X, Y: x.Y, Orientation: x.Orientation, Flags: x.Flags, Rail: x.Rail,
+							RailStart: x.RailStart, Carriages: m.Carriages})
+					}
+				}
+			}
+		}
+		list := sf.byID[r.s.Meta.ID]
+		i := sort.Search(len(list), func(i int) bool { return list[i].s.T >= from })
+		for _, x := range list[i:] {
+			if x.s.T > r.s.T {
+				break
+			}
+			s := &x.s
+			body := rb.Add(core.RailRow{T: s.T, X: s.X, Y: s.Y, Orientation: s.Orientation, Flags: s.Flags, Rail: s.Rail,
+				RailStart: s.RailStart, Carriages: s.Meta.Carriages})
+			if x == r && len(body) > 0 {
+				out[r] = body
+			}
+		}
+	}
+	return out
+}
+
 // buildWindow makes a MoverWindow with the canonical table and row order: one entry per
-// distinct meta, sorted by (ID, first row T), rows sorted by (entry, T).
-func buildWindow(sfc core.SurfaceKey, kind core.WindowKind, start, length core.TimeMs, rows []*moverRow) *core.MoverWindow {
+// distinct meta, sorted by (ID, first row T), rows sorted by (entry, T). A row in bodies
+// carries its body in front of its own rail pieces (core.RailWithBody).
+func buildWindow(sfc core.SurfaceKey, kind core.WindowKind, start, length core.TimeMs, rows []*moverRow, bodies map[*moverRow][]core.RailPiece) *core.MoverWindow {
 	type entry struct {
 		meta  core.MoverMeta
 		first core.TimeMs
@@ -230,7 +274,7 @@ func buildWindow(sfc core.SurfaceKey, kind core.WindowKind, start, length core.T
 			Flags:       r.s.Flags,
 			Carriages:   append([]core.Carriage(nil), r.s.Carriages...),
 			Speed:       r.s.Speed,
-			Rail:        append([]core.RailPiece(nil), r.s.Rail...),
+			Rail:        append([]core.RailPiece(nil), core.RailWithBody(bodies[r], r.s.Rail)...),
 			RailStart:   r.s.RailStart,
 		})
 	}
@@ -383,19 +427,26 @@ func (m *Movers) Live(ctx context.Context, sfc core.SurfaceKey, now core.TimeMs)
 		return nil, err
 	}
 	var rows []*moverRow
-	inTrail := map[string]bool{}
+	first := map[string]*moverRow{} // each journey's first row in the payload
 	for _, r := range sf.rows {
 		if r.s.T > now-core.LiveTrail && r.s.T <= now {
 			rows = append(rows, r)
-			inTrail[r.s.Meta.ID] = true
+			if f := first[r.s.Meta.ID]; f == nil || r.s.T < f.s.T {
+				first[r.s.Meta.ID] = r
+			}
 		}
 	}
 	for _, r := range sf.lastRows(now, true, true) {
-		if !inTrail[r.s.Meta.ID] {
+		if first[r.s.Meta.ID] == nil {
 			rows = append(rows, r)
+			first[r.s.Meta.ID] = r
 		}
 	}
-	return buildWindow(sf.key, core.WindowLive, now, core.LiveTrail, rows), nil
+	firsts := make([]*moverRow, 0, len(first))
+	for _, r := range first {
+		firsts = append(firsts, r)
+	}
+	return buildWindow(sf.key, core.WindowLive, now, core.LiveTrail, rows, sf.bodies(firsts)), nil
 }
 
 // Close implements core.MoverStore.

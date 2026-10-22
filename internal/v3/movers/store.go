@@ -161,6 +161,10 @@ type surface struct {
 	live map[string]*row
 	// trail holds the closed rows with t > horizon - LiveTrail, sorted by t.
 	trail []*row
+	// rails follows each live train's rail path over the closed rows (the state at the
+	// horizon), orails over the open rows after them in arrival order (made from rails' on a
+	// journey's first open row). They give rows their bodies (row.body).
+	rails, orails rails
 	// metas interns MoverMeta values.
 	metas map[core.MoverMeta]*core.MoverMeta
 	// days caches day indexes touched in this process (without Final); dayList is the
@@ -216,6 +220,8 @@ func Open(db string, opts Options) (*Store, error) {
 		if err != nil {
 			return nil, err
 		}
+		redo := map[*surface]map[string]bool{}
+		pending := map[*surface]bool{}
 		err = w.replay(func(key core.SurfaceKey, r row) {
 			s := m.sfc[key]
 			if s == nil {
@@ -231,12 +237,21 @@ func Open(db string, opts Options) (*Store, error) {
 			r.meta = s.intern(r.meta)
 			m.seq++
 			r.seq = m.seq
+			s.openBody(&r, redo)
 			s.open = append(s.open, r)
 			s.observe(r.t)
 			m.openRows++
+			if len(redo[s]) > 0 {
+				// replayed rows of one journey out of time order: give its open rows their
+				// bodies again once the log is read
+				pending[s] = true
+			}
 		})
 		if err != nil {
 			return nil, fmt.Errorf("movers: wal: %w", err)
+		}
+		for s := range pending {
+			s.rebody(redo[s])
 		}
 		if w.skipped > 0 {
 			m.stats.WALSkipped = int64(w.skipped)
@@ -268,12 +283,14 @@ func (m *Store) syncLoop() {
 func (m *Store) newSurface(key core.SurfaceKey) *surface {
 	id := key.ID()
 	return &surface{
-		key:   key,
-		id:    id,
-		dir:   filepath.Join(m.dir, id),
-		live:  map[string]*row{},
-		metas: map[core.MoverMeta]*core.MoverMeta{},
-		days:  map[string]*core.DayIndex{},
+		key:    key,
+		id:     id,
+		dir:    filepath.Join(m.dir, id),
+		live:   map[string]*row{},
+		rails:  rails{},
+		orails: rails{},
+		metas:  map[core.MoverMeta]*core.MoverMeta{},
+		days:   map[string]*core.DayIndex{},
 	}
 }
 
@@ -379,6 +396,7 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 			return core.ApplyResult{}, fmt.Errorf("movers: wal: %w", err)
 		}
 	}
+	redo := map[*surface]map[string]bool{}
 	for i := range accepted {
 		p := &accepted[i]
 		s := p.s
@@ -391,8 +409,14 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 		m.seq++
 		p.r.seq = m.seq
 		p.r.meta = s.intern(p.r.meta)
+		s.openBody(&p.r, redo)
 		s.open = append(s.open, p.r)
 		s.observe(p.r.t)
+	}
+	for s, ids := range redo {
+		if len(ids) > 0 {
+			s.rebody(ids)
+		}
 	}
 	m.openRows += len(accepted)
 	res.Accepted = len(accepted)
@@ -402,6 +426,57 @@ func (m *Store) Append(ctx context.Context, samples []core.MoverSample) (core.Ap
 	m.stats.Ahead += ahead
 	m.stats.Behind += behind
 	return res, nil
+}
+
+// openBody gives r, a row about to join s.open, its body from its journey's RailBody over
+// the open rows (orails). A row at or before the journey's previous open row arrived out of
+// time order: its journey is noted in redo for rebody, and its body waits for that. A
+// repeat of the previous row (a retried sample) needs no redo.
+func (s *surface) openBody(r *row, redo map[*surface]map[string]bool) {
+	r.body = nil
+	if r.meta.Kind != core.KindTrain || redo[s][r.meta.ID] {
+		return
+	}
+	b := s.orails.get(r.meta.ID, s.rails)
+	rr := r.railRow()
+	if t, ok := b.Last(); ok && r.t <= t && !b.Repeats(rr) {
+		if redo[s] == nil {
+			redo[s] = map[string]bool{}
+		}
+		redo[s][r.meta.ID] = true
+		return
+	}
+	r.body = b.Add(rr)
+}
+
+// rebody gives the open rows of the journeys in ids their bodies again, from the state at
+// the horizon and their open rows in time order (for equal times the last arrival, which
+// Commit keeps; the rows it replaces get the same body).
+func (s *surface) rebody(ids map[string]bool) {
+	byID := map[string][]*row{}
+	for i := range s.open {
+		if r := &s.open[i]; ids[r.meta.ID] {
+			byID[r.meta.ID] = append(byID[r.meta.ID], r)
+		}
+	}
+	for id := range ids {
+		rows := byID[id]
+		sortByJourney(rows)
+		delete(s.orails, id)
+		b := s.orails.get(id, s.rails)
+		for i := 0; i < len(rows); {
+			// rows[i..j] share one time; rows[j] arrived last
+			j := i
+			for j+1 < len(rows) && rows[j+1].t == rows[i].t {
+				j++
+			}
+			body := b.Add(rows[j].railRow())
+			for k := i; k <= j; k++ {
+				rows[k].body = body
+			}
+			i = j + 1
+		}
+	}
 }
 
 // Commit implements core.MoverStore.
@@ -499,6 +574,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	sync := m.opts.SyncInterval >= 0
 	before := len(s.open)
 	live := maps.Clone(s.live)
+	cr := s.rails.clone()
 	// Dedupe the open rows: for equal (journey, t) the last arrival wins.
 	ptrs := make([]*row, len(s.open))
 	for i := range s.open {
@@ -550,6 +626,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 			if err := m.writeKeyframe(s, h, live, sync); err != nil {
 				return err
 			}
+			cr = reseed(live)
 			touched[core.UTCDay(h)] = true
 		}
 		return nil
@@ -592,6 +669,10 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 			day.Windows[i] = ref
 		}
 		touched[core.UTCDay(ws)] = true
+		// rows holds each journey's rows in time order (ptrs is sorted by journey and t)
+		for _, r := range rows {
+			cr.add(r, nil)
+		}
 		advance(live, rows)
 		closedRows = append(closedRows, rows...)
 	}
@@ -617,6 +698,16 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 		trail = append([]*row(nil), trail[len(trail)-lim:]...)
 	}
 	evicted := evictLive(live, m.share(s, m.opts.MaxLiveMovers, liveLen))
+	for id := range cr {
+		if live[id] == nil {
+			delete(cr, id)
+		}
+	}
+	// The rows that stay open get their bodies again, from the new state at the horizon.
+	orails := rails{}
+	for i := range keep {
+		orails.add(&keep[i], cr)
+	}
 	// Day indexes, then the surface meta (the horizon) last.
 	for d := range touched {
 		if err := s.writeDay(d, sync); err != nil {
@@ -628,6 +719,7 @@ func (m *Store) commitSurface(s *surface, newH core.TimeMs) (int, error) {
 	}
 	s.hasHorizon, s.horizon = true, newH
 	s.live, s.trail = live, trail
+	s.rails, s.orails = cr, orails
 	m.stats.Evicted += evicted
 	s.open = keep
 	// Drop cached day indexes that can no longer change.
@@ -740,7 +832,7 @@ func (s *surface) reintern() {
 func (m *Store) writeKeyframe(s *surface, h core.TimeMs, live map[string]*row, sync bool) error {
 	rows := make([]*row, 0, len(live))
 	for _, r := range live {
-		rows = append(rows, r)
+		rows = append(rows, r.withBody())
 	}
 	w := buildWindow(s.key, core.WindowKeyframe, h, 0, rows)
 	body, err := wire.EncodeMoverWindow(w)
@@ -900,12 +992,23 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 				s.live[r.meta.ID] = &rr
 			}
 		}
+		s.rails = seedRails(w)
 		from = h
 		break
 	}
-	// Windows before the keyframe are read only for the trail.
+	// Windows before the keyframe are read only for the trail. Their rows take their bodies
+	// from the keyframe before them, as the store that wrote them gave them (only when the
+	// trail reaches back past the keyframe, just after one was written).
 	cut := s.horizon - core.LiveTrail
 	start := min(from, core.WindowStart(cut+1, core.MoverWindowLen))
+	pre := rails{}
+	if start < from {
+		pk := core.WindowStart(start, core.MoverKeyframeEvery)
+		if w, err := s.readWindow(s.keyframePath(pk)); err == nil {
+			pre = seedRails(w)
+		}
+		start = max(pk, core.WindowStart(s.first, core.MoverWindowLen))
+	}
 	for ws := start; ws < s.horizon; ws += core.MoverWindowLen {
 		if !s.hasWindow(ws) {
 			continue
@@ -925,14 +1028,23 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 		for i := range w.Rows {
 			r := rowFromCore(s.intern(&w.Movers[w.Rows[i].Mover]), &w.Rows[i])
 			rows[i] = &r
-			if r.t > cut {
-				c := r
-				s.trail = append(s.trail, &c)
-			}
+		}
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].t < rows[j].t })
+		rs := pre
+		if ws >= from {
+			rs = s.rails
+		}
+		for _, r := range rows {
+			rs.add(r, nil)
 		}
 		if ws >= from {
-			sort.SliceStable(rows, func(i, j int) bool { return rows[i].t < rows[j].t })
 			advance(s.live, rows)
+		}
+		for _, r := range rows {
+			if r.t > cut {
+				c := *r
+				s.trail = append(s.trail, &c)
+			}
 		}
 	}
 	sort.SliceStable(s.trail, func(i, j int) bool { return s.trail[i].t < s.trail[j].t })
@@ -940,6 +1052,11 @@ func (m *Store) loadSurface(key core.SurfaceKey) (*surface, error) {
 		s.trail = s.trail[len(s.trail)-m.opts.MaxTrailRows:]
 	}
 	m.stats.Evicted += evictLive(s.live, m.opts.MaxLiveMovers)
+	for id := range s.rails {
+		if s.live[id] == nil {
+			delete(s.rails, id)
+		}
+	}
 	return s, nil
 }
 
@@ -1176,7 +1293,49 @@ func (s *surface) liveFromMemory(now core.TimeMs) *core.MoverWindow {
 			rows = append(rows, r)
 		}
 	}
-	return buildWindow(s.key, core.WindowLive, now, core.LiveTrail, rows)
+	return buildWindow(s.key, core.WindowLive, now, core.LiveTrail, firstWithBody(rows))
+}
+
+// seedRails returns the rail path state a keyframe gives: each train's RailBody begun at its
+// keyframe row, which lists the pieces under the train (core.RailBody.Seed).
+func seedRails(w *core.MoverWindow) rails {
+	rs := rails{}
+	for i := range w.Rows {
+		meta := &w.Movers[w.Rows[i].Mover]
+		if meta.Kind == core.KindTrain {
+			r := rowFromCore(meta, &w.Rows[i])
+			rs.get(meta.ID, nil).Seed(r.railRow())
+		}
+	}
+	return rs
+}
+
+// reseed restarts every journey's RailBody at its row in live as a keyframe holds it, so
+// bodies after a keyframe depend on the rows since it only, whether or not the store was
+// reopened from it in between (loadSurface).
+func reseed(live map[string]*row) rails {
+	rs := rails{}
+	for id, r := range live {
+		if r.meta.Kind == core.KindTrain {
+			rs.get(id, nil).Seed(r.withBody().railRow())
+		}
+	}
+	return rs
+}
+
+// firstWithBody replaces each journey's first row in rows by the row with its body
+// (row.withBody): the live payload's first row of a moving train places its whole body.
+func firstWithBody(rows []*row) []*row {
+	first := map[string]int{}
+	for i, r := range rows {
+		if j, ok := first[r.meta.ID]; !ok || r.t < rows[j].t {
+			first[r.meta.ID] = i
+		}
+	}
+	for _, i := range first {
+		rows[i] = rows[i].withBody()
+	}
+	return rows
 }
 
 // liveFromDisk rebuilds the live payload at a closed instant now from the keyframe at
@@ -1185,6 +1344,7 @@ func (s *surface) liveFromDisk(m *Store, now, first core.TimeMs, hasData bool) (
 	cut := now - core.LiveTrail
 	last := map[string]*row{}
 	var trail []*row
+	rs := rails{}
 	if hasData && now >= first {
 		from := core.WindowStart(cut, core.MoverWindowLen)
 		kf := core.WindowStart(from, core.MoverKeyframeEvery)
@@ -1205,12 +1365,19 @@ func (s *surface) liveFromDisk(m *Store, now, first core.TimeMs, hasData bool) (
 				r := rowFromCore(&w.Movers[w.Rows[i].Mover], &w.Rows[i])
 				last[r.meta.ID] = &r
 			}
+			rs = seedRails(w)
 			break
 		}
 		if kf <= first {
 			kf = core.WindowStart(first, core.MoverWindowLen)
 		}
 		for ws := kf; ws <= now; ws += core.MoverWindowLen {
+			if ws > kf && ws%core.MoverKeyframeEvery == 0 {
+				// bodies after a keyframe follow on from its rows, as the store that wrote it did
+				if w, err := s.readWindow(s.keyframePath(ws)); err == nil {
+					rs = seedRails(w)
+				}
+			}
 			b, err := readWindowFile(s.windowPath(ws))
 			if errors.Is(err, core.ErrNoVersion) {
 				continue
@@ -1223,16 +1390,21 @@ func (s *surface) liveFromDisk(m *Store, now, first core.TimeMs, hasData bool) (
 				m.damaged(s.windowPath(ws), err)
 				continue
 			}
+			rows := make([]*row, 0, len(w.Rows))
 			for i := range w.Rows {
 				if w.Rows[i].T > now {
 					continue
 				}
 				r := rowFromCore(&w.Movers[w.Rows[i].Mover], &w.Rows[i])
-				rp := &r
-				if cur := last[r.meta.ID]; cur == nil || cur.t < r.t {
-					last[r.meta.ID] = rp
+				rows = append(rows, &r)
+			}
+			sortByJourney(rows)
+			for _, rp := range rows {
+				rs.add(rp, nil)
+				if cur := last[rp.meta.ID]; cur == nil || cur.t < rp.t {
+					last[rp.meta.ID] = rp
 				}
-				if r.t > cut {
+				if rp.t > cut {
 					trail = append(trail, rp)
 				}
 			}
@@ -1248,7 +1420,7 @@ func (s *surface) liveFromDisk(m *Store, now, first core.TimeMs, hasData bool) (
 			rows = append(rows, r)
 		}
 	}
-	return buildWindow(s.key, core.WindowLive, now, core.LiveTrail, rows), nil
+	return buildWindow(s.key, core.WindowLive, now, core.LiveTrail, firstWithBody(rows)), nil
 }
 
 // Stats returns the current counters and gauges.

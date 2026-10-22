@@ -313,6 +313,12 @@ next sample, and only the timing needs samples.
   tiles off from a keyframe, up to 69 tiles: the body was laid along the straight lead-in
   through the curves it stood on.) The path recorded for the next pieces
   then goes on from the rail under the leading joint, as after a new path.
+- A moving train's sample lists only the pieces since the sample before, so the server does
+  the same for it where a viewer may start: a keyframe row, and each journey's first row in
+  the live payload, carry the pieces under the train that earlier samples listed in front of
+  their own (FORMAT.md 7.4 "Train bodies"; `core.RailBody` follows the chain of 8.2 over the
+  stored rows and keeps a piece while its exit lies within the train length, 7 n - 3, plus 4
+  tiles behind the leading joint). The capture sends nothing more for it.
 
 ### 8.2 The chain
 

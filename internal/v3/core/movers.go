@@ -290,9 +290,13 @@ type SurfaceInfo struct {
 //   - For every UTC hour boundary h with oldHorizon < h <= newHorizon and FirstT < h it
 //     writes a keyframe at h: the last row before h of every journey whose last row
 //     before h is not a gone. Keyframe rows are copies of those rows (including their
-//     carriages, if any).
+//     carriages, if any), except that a train's rail row carries its body in front of its
+//     own rail pieces (RailWithBody): RailBody over the journey's rows in time order, begun
+//     at its row of the newest keyframe at or before the row (RailBody.Seed), or at its
+//     first row without one (docs/v3/FORMAT.md 7.4).
 //   - Live(now) returns every row with now-LiveTrail < T <= now and, for every live
-//     journey whose last row is older, that last row. It reads open and closed data.
+//     journey whose last row is older, that last row; each journey's first row carries its
+//     body as a keyframe row does. It reads open and closed data.
 //   - Mover tables list one entry per distinct MoverMeta in the window, sorted by
 //     (ID, first row T); rows are sorted by (entry, T).
 type MoverStore interface {

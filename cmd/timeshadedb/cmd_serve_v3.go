@@ -208,7 +208,8 @@ func openV3Server(ctx context.Context, o *v3ServerOptions, logf func(string, ...
 	v.rend = rend
 	v.closers = append(v.closers, rend.Close)
 
-	// About 72 bytes per open mover row (WP4); an eighth of the budget.
+	// About 72 bytes per open mover row (WP4); an eighth of the budget. A row without
+	// carriages now takes about 120 bytes (movers.row), so this undercounts.
 	maxRows := int(o.memBudget / 8 / 72)
 	mov, err := movers.Open(o.db, movers.Options{SyncInterval: time.Second, MaxOpenRows: maxRows, Clock: refClock, Logf: logf,
 		LightEncoder: true})

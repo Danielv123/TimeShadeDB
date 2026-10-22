@@ -152,12 +152,15 @@ Static: yes.
 ### `GET movers/{sfc}/keyframe/{t}.bin`
 
 MVW3 kind 2: the last row before `t` of every live journey (with carriages, if that row
-had them). Keyframes are at UTC hour boundaries. Cache: immutable. Static: yes.
+had them; a moving train's rail row with the pieces under the train in front of its own,
+FORMAT.md 7.4). Keyframes are at UTC hour boundaries. Cache: immutable. Static: yes.
 
 ### `GET movers/{sfc}/live.bin`
 
 MVW3 kind 3 at `now`: every row of the last 60 s plus the last row of every live journey
-older than that. Cache: live (static export: rewritten every `live_ms`, `max-age=5`).
+older than that. Each journey's first row carries a moving train's body like a keyframe row
+(FORMAT.md 7.4), so the payload alone places every carriage; later rows and `movers` events
+are as stored. Cache: live (static export: rewritten every `live_ms`, `max-age=5`).
 Static: yes.
 
 Seeking to time t: fetch the day index, load the newest keyframe at or before t and the
