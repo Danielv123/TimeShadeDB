@@ -113,6 +113,12 @@
 // memory when now is at or after the horizon, and otherwise rebuilt from the keyframe
 // before now - core.LiveTrail and the windows up to now (skipping damaged files), with the
 // bodies followed from that keyframe's rows (and again from each later keyframe passed).
+// When the trail (now - core.LiveTrail, now] reaches into an evicted window (an instant
+// in a held horizon's past, or windows that alone exceed OpenBytes), Live reads back only
+// the windows the trail overlaps; earlier windows give each journey's newest row from
+// their index, and a train's body begins again there as at a keyframe. A live request
+// holds the trail and the trains' rows of at most two windows, however long the horizon
+// is held.
 //
 // # Journeys and clock anchors
 //

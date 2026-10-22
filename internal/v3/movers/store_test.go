@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -168,6 +169,16 @@ func sameWindow(t *testing.T, what string, got, want *core.MoverWindow) {
 // compareStores checks every read of a against the reference b.
 func compareStores(t *testing.T, ctx context.Context, a, b core.MoverStore, t0, t1 core.TimeMs) {
 	t.Helper()
+	compareStoresBodies(t, ctx, a, b, t0, t1, true)
+}
+
+// compareStoresBodies is compareStores; without liveBodies the rail pieces of each
+// journey's first live row are not compared: where the trail overlaps an evicted window,
+// the store begins a train's body at its row before that window as a keyframe would,
+// which differs from memstore's on random pieces that do not form a path (TestLiveHeldEvicting
+// checks the bodies on real tracks).
+func compareStoresBodies(t *testing.T, ctx context.Context, a, b core.MoverStore, t0, t1 core.TimeMs, liveBodies bool) {
+	t.Helper()
 	sa, err := a.Surfaces(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -219,6 +230,9 @@ func compareStores(t *testing.T, ctx context.Context, a, b core.MoverStore, t0, 
 				t.Fatalf("live %d: %v", now, err)
 			}
 			lb, _ := b.Live(ctx, info.Key, now)
+			if !liveBodies {
+				la, lb = withoutFirstRails(la), withoutFirstRails(lb)
+			}
 			sameWindow(t, fmt.Sprintf("live %v at %d (horizon %d)", info.Key, now, info.Horizon), la, lb)
 		}
 		// A window that is still open and a misaligned start are not served.
@@ -229,6 +243,20 @@ func compareStores(t *testing.T, ctx context.Context, a, b core.MoverStore, t0, 
 			t.Fatalf("misaligned window: %v", err)
 		}
 	}
+}
+
+// withoutFirstRails returns a copy of w without the rail pieces of each journey's first
+// row.
+func withoutFirstRails(w *core.MoverWindow) *core.MoverWindow {
+	c := memstore.CloneWindow(w)
+	seen := map[string]bool{}
+	for i := range c.Rows {
+		if id := c.Movers[c.Rows[i].Mover].ID; !seen[id] {
+			seen[id] = true
+			c.Rows[i].Rail = nil
+		}
+	}
+	return c
 }
 
 // TestDifferential feeds the same random batches to the store and to memstore, with
@@ -435,7 +463,7 @@ func TestEvictsInsteadOfRefusing(t *testing.T) {
 }
 
 // TestDifferentialEvicting is TestDifferential with an open-window budget so small that
-// almost every window is evicted and read back from its log at commit.
+// almost every window is evicted and read back from its log at commit (and by Live).
 func TestDifferentialEvicting(t *testing.T) {
 	ctx := context.Background()
 	for seed := int64(1); seed <= 4; seed++ {
@@ -481,7 +509,7 @@ func TestDifferentialEvicting(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				compareStores(t, ctx, a, b, t0, now)
+				compareStoresBodies(t, ctx, a, b, t0, now, false)
 			}
 		})
 	}
@@ -705,5 +733,72 @@ func crash(m *Store) {
 				w.log.f.Close()
 			}
 		}
+	}
+}
+
+// TestLiveHeapHeldHour holds the horizon over an hour of 400 samples/s with a 16 MiB
+// open-window budget, so every window is evicted (each holds more than the budget), and
+// checks that a live request holds about the trail it serves, not the held hour.
+func TestLiveHeapHeldHour(t *testing.T) {
+	if testing.Short() {
+		t.Skip("appends 1.4 million rows")
+	}
+	ctx := context.Background()
+	const budget = 16 << 20
+	m, _ := openTemp(t, Options{SyncInterval: -1, OpenBytes: budget, MaxAhead: -1, MinTime: -1})
+	defer m.Close()
+	sfc := coretest.SFC
+	t0 := coretest.T0 - 2*core.Hour
+	var batch []core.MoverSample
+	for ms := core.TimeMs(0); ms < core.Hour; ms += 500 {
+		for j := 0; j < 200; j++ {
+			batch = append(batch, core.MoverSample{Surface: sfc, T: t0 + ms, X: float64(j), Y: float64(ms / 1000),
+				Meta: core.MoverMeta{ID: fmt.Sprint("p", j), Kind: core.KindPlayer, Force: "player", Name: "p"}})
+		}
+		if len(batch) >= 8000 {
+			if _, err := m.Append(ctx, batch); err != nil {
+				t.Fatal(err)
+			}
+			batch = batch[:0]
+		}
+	}
+	if _, err := m.Append(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	if st := m.Stats(); st.SpilledWindows < 11 || st.OpenBytes > budget {
+		t.Fatalf("stats %+v: want every window evicted within the budget", st)
+	}
+	var before runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var peak atomic.Uint64
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		var ms runtime.MemStats
+		for {
+			runtime.ReadMemStats(&ms)
+			if ms.HeapInuse > peak.Load() {
+				peak.Store(ms.HeapInuse)
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+	w, err := m.Live(ctx, sfc, t0+core.Hour-1)
+	close(stop)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Rows) != 200*120 {
+		t.Fatalf("live: %d rows, want %d", len(w.Rows), 200*120)
+	}
+	// The trail is 24,000 rows (a few MiB); the hour is 1.44 million rows (over 200 MiB).
+	if grew := int64(peak.Load()) - int64(before.HeapInuse); grew > 2*budget {
+		t.Fatalf("live grew the heap by %d MiB, want at most %d MiB", grew>>20, 2*budget>>20)
 	}
 }

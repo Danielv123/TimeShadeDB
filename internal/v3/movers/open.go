@@ -382,28 +382,40 @@ func (m *Store) windowRows(s *surface, w *openWin) ([]row, error) {
 // the position). It changes nothing but the log's file handle, so readers holding m.mu
 // for reading may call it.
 func (m *Store) readWinRows(s *surface, w *openWin) ([]row, error) {
+	rows := make([]row, 0, w.n)
+	err := m.eachWinRow(s, w, func(r row) {
+		r.seq = uint64(len(rows) + 1)
+		rows = append(rows, r)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// eachWinRow calls fn for every row of an evicted window's log, in arrival order, without
+// holding them (readWinRows).
+func (m *Store) eachWinRow(s *surface, w *openWin, fn func(row)) error {
 	m.lmu.Lock()
 	err := m.closeLog(w.log) // flushed and closed, so the read sees every write
 	size := w.log.size
 	m.lmu.Unlock()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	rows := make([]row, 0, w.n)
 	_, _, skipped, err := readLog(w.log.path, size, func(sfc core.SurfaceKey, r row) {
 		if sfc != s.key || core.WindowStart(r.t, core.MoverWindowLen) != w.start {
 			return
 		}
-		r.seq = uint64(len(rows) + 1)
-		rows = append(rows, r)
+		fn(r)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("reading evicted window %d: %w", w.start, err)
+		return fmt.Errorf("reading evicted window %d: %w", w.start, err)
 	}
 	if skipped > 0 {
 		m.opts.Logf("movers: wal %s: skipped %d frames that did not decode", w.log.path, skipped)
 	}
-	return rows, nil
+	return nil
 }
 
 // readLog reads the frames of a log up to limit bytes (< 0: the whole file) and calls fn

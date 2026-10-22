@@ -278,3 +278,53 @@ func TestRailBodiesReopenAtKeyframe(t *testing.T) {
 		t.Fatal("no live row with a body")
 	}
 }
+
+// TestLiveHeldEvicting holds the horizon (no commit) over an hour of trains on random
+// tracks with an open-window budget so small that every window but the newest is evicted,
+// and checks the live payload at instants across the open hour: it reads back at most the
+// windows its trail overlaps, carries the bodies, and equals memstore's.
+func TestLiveHeldEvicting(t *testing.T) {
+	ctx := context.Background()
+	rng := rand.New(rand.NewSource(11))
+	t0 := coretest.T0 - 2*core.Hour
+	all, bodies := railJourneys(rng, t0, 900) // 1 h
+	samples := map[string]map[core.TimeMs]core.MoverSample{}
+	for _, s := range all {
+		if samples[s.Meta.ID] == nil {
+			samples[s.Meta.ID] = map[core.TimeMs]core.MoverSample{}
+		}
+		samples[s.Meta.ID][s.T] = s
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].T < all[j].T })
+	a, _ := openTemp(t, Options{SyncInterval: -1, MaxAhead: -1, MinTime: -1, OpenBytes: 16 << 10})
+	defer a.Close()
+	b := memstore.NewMovers()
+	for i := 0; i < len(all); i += 100 {
+		batch := all[i:min(i+100, len(all))]
+		if _, err := a.Append(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+		b.Append(ctx, batch)
+	}
+	if st := a.Stats(); st.SpilledWindows < 10 {
+		t.Fatalf("%d windows evicted, want most of 12", st.SpilledWindows)
+	}
+	with := 0
+	end := all[len(all)-1].T
+	for now := t0 + 30*core.Second; now <= end; now += 7*core.Minute + 13*core.Second {
+		before := a.Stats().LiveReadBacks
+		l, err := a.Live(ctx, coretest.SFC, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := a.Stats().LiveReadBacks - before; n > 2 {
+			t.Fatalf("live at %d read back %d windows, want at most the 2 its trail overlaps", now, n)
+		}
+		with += checkBodies(t, fmt.Sprintf("live at %d", now), l, samples, bodies)
+		lb, _ := b.Live(ctx, coretest.SFC, now)
+		sameWindow(t, fmt.Sprintf("live at %d", now), l, lb)
+	}
+	if with == 0 {
+		t.Fatal("no live row with a body")
+	}
+}

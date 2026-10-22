@@ -125,8 +125,9 @@ type Store struct {
 	upTo    core.TimeMs
 	hasUpTo bool
 	// corrupt counts damaged window and keyframe files skipped (Live updates it without
-	// the write lock).
-	corrupt atomic.Int64
+	// the write lock); liveReadBacks counts evicted windows Live read back.
+	corrupt       atomic.Int64
+	liveReadBacks atomic.Int64
 
 	stop chan struct{}
 	done chan struct{}
@@ -161,6 +162,9 @@ type Stats struct {
 	Corrupt int64
 	// WALSkipped counts WAL frames with a valid CRC that did not decode at Open.
 	WALSkipped int64
+	// LiveReadBacks counts evicted windows the live payload read back from their logs
+	// (at most the windows of the last LiveTrail per request).
+	LiveReadBacks int64
 }
 
 // surface is the per-surface state.
@@ -1516,8 +1520,8 @@ func (m *Store) Live(ctx context.Context, sfc core.SurfaceKey, now core.TimeMs) 
 // liveFromMemory builds the live payload at now >= horizon from the trail and the open
 // windows. An evicted window gives each journey's newest row from its index; when one
 // holds rows the payload needs beyond that (rows of the last LiveTrail, or rows after
-// now), the open rows are read back from the logs and their bodies followed again
-// (liveExact). Eviction keeps a surface's newest windows resident, so that only happens
+// now), the rows of the windows the trail overlaps are read back from their logs and
+// their bodies followed again (liveExact). Eviction keeps a surface's newest windows resident, so that only happens
 // for an instant in the past or when the newest windows alone exceed the budget.
 func (m *Store) liveFromMemory(s *surface, now core.TimeMs) (*core.MoverWindow, error) {
 	cut := now - core.LiveTrail
@@ -1588,43 +1592,118 @@ func (s *surface) livePayload(now core.TimeMs, newest map[string]*row, recent []
 	return buildWindow(s.key, core.WindowLive, now, core.LiveTrail, firstWithBody(rows))
 }
 
-// liveExact is liveFromMemory with every open row at or before now, evicted ones read
-// back from their logs, and the bodies followed again from the state at the horizon in
-// time order. Callers hold m.mu for reading.
+// liveExact is liveFromMemory when a window the payload's trail overlaps was evicted. It
+// reads back only the windows that hold rows in (now - LiveTrail, now], evicted ones from
+// their logs (which keep no bodies), and keeps of them the trail rows and the trains'
+// rows up to now, whose bodies it follows again in time order; of the other rows only
+// each journey's newest. The windows before those give each journey's newest row from
+// their rows or index, and a train's row there, with its body, begins its RailBody as a
+// keyframe row begins one (reseed). So a request holds the trail and the trains' rows of
+// at most two windows, however many windows a held horizon keeps open. Callers hold m.mu
+// for reading.
 func (m *Store) liveExact(s *surface, now core.TimeMs) (*core.MoverWindow, error) {
+	cut := now - core.LiveTrail
+	starts := make([]core.TimeMs, 0, len(s.open))
+	for ws, w := range s.open {
+		if w.n > 0 && w.tmin <= now {
+			starts = append(starts, ws)
+		}
+	}
+	// Windows do not overlap in time: a later window's rows are newer.
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
+	newest := map[string]*row{}
+	newer := func(r *row) bool {
+		cur := newest[r.meta.ID]
+		return cur == nil || r.t > cur.t || (r.t == cur.t && r.seq > cur.seq)
+	}
+	consider := func(r *row) {
+		if newer(r) {
+			newest[r.meta.ID] = r
+		}
+	}
+	own := map[string]*row{} // copies of rows read back that newest points to
 	var all []row
-	for _, w := range s.open {
-		if w.n == 0 || w.tmin > now {
+	for _, ws := range starts {
+		w := s.open[ws]
+		if w.tmax <= cut {
+			// before the trail
+			if w.spilled {
+				for _, r := range w.last {
+					consider(r)
+				}
+			} else {
+				for i := range w.rows {
+					consider(&w.rows[i])
+				}
+			}
 			continue
 		}
-		rows := w.rows
-		if w.spilled {
-			var err error
-			if rows, err = m.readWinRows(s, w); err != nil {
-				return nil, err
+		take := func(r *row, resident bool) {
+			switch {
+			case r.t > now:
+			case r.t > cut || r.meta.Kind == core.KindTrain:
+				all = append(all, *r)
+			case resident:
+				consider(r)
+			case newer(r):
+				c := own[r.meta.ID]
+				if c == nil {
+					c = new(row)
+					own[r.meta.ID] = c
+				}
+				*c = *r
+				newest[r.meta.ID] = c
 			}
 		}
-		for i := range rows {
-			if rows[i].t <= now {
-				all = append(all, rows[i])
+		if !w.spilled {
+			for i := range w.rows {
+				take(&w.rows[i], true)
 			}
+			continue
 		}
+		var seq uint64
+		if err := m.eachWinRow(s, w, func(r row) {
+			seq++
+			r.seq = seq
+			take(&r, false)
+		}); err != nil {
+			return nil, err
+		}
+		m.liveReadBacks.Add(1)
 	}
 	ptrs := make([]*row, len(all))
 	for i := range all {
 		ptrs[i] = &all[i]
 	}
 	sortByJourney(ptrs)
-	followRows(rails{}, s.rails, ptrs)
-	ptrs = dedupe(ptrs)
-	newest := map[string]*row{}
-	var recent []*row
-	cut := now - core.LiveTrail
+	// A train with rows in the earlier windows begins at its newest row there; the others
+	// at the state at the horizon (followRows clones what it takes from base).
+	seeds := rails{}
 	for _, r := range ptrs {
-		newest[r.meta.ID] = r // ptrs is sorted by journey and t
+		if b := newest[r.meta.ID]; b != nil && r.meta.Kind == core.KindTrain && seeds[r.meta.ID] == nil {
+			nb := new(core.RailBody)
+			nb.Seed(b.withBody().railRow())
+			seeds[r.meta.ID] = nb
+		}
+	}
+	base := s.rails
+	if len(seeds) > 0 {
+		base = make(rails, len(s.rails)+len(seeds))
+		for id, b := range s.rails {
+			base[id] = b
+		}
+		for id, b := range seeds {
+			base[id] = b
+		}
+	}
+	followRows(rails{}, base, ptrs)
+	ptrs = dedupe(ptrs)
+	var recent []*row
+	for _, r := range ptrs {
 		if r.t > cut {
 			recent = append(recent, r)
 		}
+		consider(r)
 	}
 	return s.livePayload(now, newest, recent), nil
 }
@@ -1764,6 +1843,7 @@ func (m *Store) Stats() Stats {
 	st.OpenRows = m.openRows
 	st.OpenBytes = m.resident
 	st.Corrupt = m.corrupt.Load()
+	st.LiveReadBacks = m.liveReadBacks.Load()
 	for _, s := range m.sfc {
 		st.TrailRows += len(s.trail)
 		st.LiveMovers += len(s.live)
