@@ -170,25 +170,26 @@ orientation along the chord. U0 and the path fix every carriage; U0 advances by 
 
 ## 5. Consequences for train samples
 
-(What the capture and viewer now do with these findings is section 8.)
+These findings are why a train sample carries the leading carriage's own orientation and the
+pieces it ran over (section 8). The numbers come from the maps of section 6
+(`bench/railbench/simulate.mjs`).
 
-- **Heading.** The capture's sample heading `h` (second carriage towards the first) lags the
-  rail tangent on curves by up to 18 degrees on 2.0 curves and 22 on legacy curves (p50 12.5
-  and 15.9 on curves), so a pose built from `h` does not describe the curve. The leading
-  carriage's own orientation (turned to point the way the train leads) is the tangent at its
-  arc position: within 0.4 degrees p50 and 3.5 degrees max of the rail tangent (the excess is
-  the kinks of 2.9).
-- **The path is fixed by the pieces.** With the piece sequence between two samples, the head
-  path is exact and only the timing needs samples (`simulate.mjs` rule `railpath`).
-  A viewer with the rail layer can find the pieces itself: the shortest directed rail path
-  between the pieces under two consecutive samples was the true path for all but 4 of 25,033
-  sample pairs on the four maps (`simulate.mjs` rule `matched`); a rail distance travelled per
-  sample (or speed and time) detects the rest.
-- **From poses alone.** Between (position, tangent) pairs, a line/arc/line path of radius
+- Heading. A heading from the second carriage towards the first lags the rail tangent on
+  curves by up to 18 degrees on 2.0 curves and 22 on legacy curves (p50 12.5 and 15.9), so a
+  pose built from it does not describe the curve. The leading carriage's own orientation
+  (turned to point the way the train leads) is the tangent at its arc position: within 0.4
+  degrees p50 and 3.5 degrees max of the rail tangent (the excess is the kinks of 2.9).
+- The path is fixed by the pieces. With the piece sequence between two samples, the head
+  path is exact and only the timing needs samples (rule `railpath`). A viewer with the rail
+  layer could find the pieces itself: the shortest directed rail path between the pieces
+  under two consecutive samples was the true path for all but 4 of 25,033 sample pairs
+  (rule `matched`). A rail distance travelled per sample (or speed and time) detects the
+  rest.
+- From poses alone. Between (position, tangent) pairs, a line/arc/line path of radius
   √(13² - 2²) = 12.85 (the carriage centre's radius on a curve) follows the curves to within
-  0.28 tile p99 (simulate.mjs rule `railshape`), but the pieces' kinks and curved-rail-b's
-  shrinking radius leave short gaps no such path fits (13% of sample pairs on the benchmark
-  map), so poses alone need 60 to 80% more samples than the piece sequence on the four maps.
+  0.28 tile p99 (rule `railshape`). The pieces' kinks and curved-rail-b's shrinking radius
+  leave short gaps no such path fits (13% of sample pairs on `benchmark_bizzlebazzle`), so
+  poses alone need 60 to 80% more samples than the piece sequence.
 
 ## 6. Checked against the game
 
@@ -206,7 +207,6 @@ recorded one.
 | Model length against `rail_length` | within 0.0004 (`rail_length` is reported in 1/1000) |
 | Joints' distance from the model curve, 2.0 curves / half-diagonal / ramp / straight | max 0.012 / 0.007 / 0.003 / 0.009; p99 0.008 / 0.0045 / 0.002 / 0.003 |
 | The same, legacy curve / legacy straight | max 0.008 / 0.011, p99 0.006 / 0.003 |
-| The same against a quadratic Bezier through the ends (the old classifier) | curved-rail-b max 0.046, legacy curve 0.037 |
 | Carriage centre off the rail centre line on curves | 2.0 p50 0.152, max 0.21; legacy p50 0.213, max 0.221 |
 | Rail distance moved per tick / speed, curved-rail-b and ramp | p50 1.0013 and 0.9996 (plan: 0.990 and 0.930) |
 | Carriage centre from its own front joint with the back joint 4 behind | max 0.0064 (all types) |
@@ -235,7 +235,7 @@ The game's own polynomial fits (0.01) and its 1/256 grid (0.004) account for the
 
 ## 8. Train paths between samples
 
-The v3 capture and viewer describe a train by its rail path and the timing along it
+The capture and viewer describe a train by its rail path and the timing along it
 (`capture/lua/core.lua`, `capture/lua/movers.lua`; `web/src/movers/railpath.ts`,
 `web/src/movers/track.ts`; protocol fields `v`, `rp`, `ru` in [PROTOCOL.md](PROTOCOL.md) 3.1,
 storage in [FORMAT.md](FORMAT.md) 7.4). A curve costs no samples: its pieces travel with the
@@ -250,22 +250,18 @@ next sample, and only the timing needs samples.
   train runs towards. Reads are at most 5 tiles of travel apart (the wait rounded down; sooner
   while accelerating: the next read is where `v w + a w^2 / 2 = 5` with the acceleration
   since the last read; at most 30 ticks), less than the shortest curved piece (5.078), so no
-  curved piece passes between two reads. (Rounded up, a train at 1.33 tiles a tick was read
-  every 4 ticks, 5.3 tiles, and passed a curved-rail-a unseen on the Aron map. 5 tiles rounded
-  down reads about as often as the 2026-10 capture's 4 rounded up, 1.4% more on the benchmark
-  map; 4 rounded down read 39% more and cost 20% more Lua time.)
+  curved piece passes between two reads. Rounding the wait up would not hold this: a train
+  at 1.33 tiles a tick would be read every 4 ticks, 5.3 tiles apart.
 - Only curved pieces and ramps are recorded (`rp` kinds 1 to 4). Between two of them the
   rails are straight. The rail is read while the leading carriage turns (its orientation
   differs from the last read's: on a straight it stays exactly the same until its front
   joint is on a curve, and the next read comes at most 5 tiles later, still on that piece),
   while the last rail read was a curved piece or ramp, and otherwise every third read. A
-  ramp shows no turn, and three reads are at most 15 tiles apart, less than its 16. (A
-  chain without its ramps is right in plan, but its rail distance is 0.76 tile short per
-  ramp, 4.8%, and every carriage behind a ramp is drawn that far off: carriage p99 0.74
-  tile on the benchmark map when only turns were read, 0.14 with every third read.) A
-  piece's ends are whole-tile points (every end the game reported in section 7's vectors
-  is): for the piece built facing north, front end then back end, as offset and outward
-  direction,
+  ramp shows no turn, and three reads are at most 15 tiles apart, less than its 16. A chain
+  that misses a ramp is right in plan, but its rail distance is 0.76 tile short (4.8%), and
+  every carriage behind the ramp is drawn that far off. A piece's ends are whole-tile
+  points (every end the game reported in section 7's vectors is): for the piece built
+  facing north, front end then back end, as offset and outward direction,
 
   | Kind | Front end | Back end |
   |---|---|---|
@@ -292,9 +288,9 @@ next sample, and only the timing needs samples.
   the leading carriage, so a short piece can pass under the end between two reads that did
   not look at the rail, before the carriage turns; when a turning carriage's read finds a
   straight rail, the read walks back the same way (at most 12 rails) to the last rail it
-  looked at and records what continues the path. (Without that walk, a curved-rail-a of an
-  S-bend on the Aron map was only found at the next curve 100 tiles on, and a live viewer
-  drew the train off its path for 22 frames.)
+  looked at and records what continues the path. Without that walk, a piece missed this
+  way (for example the curved-rail-a of an S-bend) is only found at the next curve, and a
+  live viewer draws the train off its path until then.
 - Where a new path begins (first sight, a changed train, end switch, surface change, a
   missed piece, a resync) the sample lists the curved pieces and ramps under the whole train
   instead, rear first: `LuaTrain.get_rails()` lists the rails under the train from its front
@@ -302,17 +298,17 @@ next sample, and only the timing needs samples.
   A changed train (`on_train_created` after a join or a split) begins a new path at its next
   read: its leading joint may have jumped back (carriages taken from the leading end) or
   ahead (carriages coupled there), and its last read before the change is sent first.
-- A stop sample, and the sample where a stopped train starts, list, besides the pieces entered since the previous sample, the pieces
-  under the train that came before them (in front, rear first) and any under the train's
-  end after them (a piece no read looked at), but begins no new path: a viewer that has the
-  samples before it already holds those pieces and skips them as resends (8.2). A parked
-  train is not sampled again until it moves, so a keyframe or the live payload holds only its
-  stop sample, and that sample alone must place every carriage; the live payload keeps the
-  last 60 s of rows, which often begin at a start. (With only the pieces entered since the
-  previous sample, 11.7% of the parked trains on the benchmark map were drawn more than 2
-  tiles off from a keyframe, up to 69 tiles: the body was laid along the straight lead-in
-  through the curves it stood on.) The path recorded for the next pieces
-  then goes on from the rail under the leading joint, as after a new path.
+- A stop sample, and the sample where a stopped train starts, list the pieces entered since
+  the previous sample, the pieces under the train that came before them (in front, rear
+  first) and any under the train's end after them (a piece no read looked at). They begin no
+  new path: a viewer that has the samples before them already holds those pieces and skips
+  them as resends (8.2). A parked train is not sampled again until it moves, so a keyframe
+  or the live payload holds only its stop sample, and that sample alone must place every
+  carriage. The live payload keeps the last 60 s of rows, which often begin at a start.
+  With only the pieces entered since the previous sample, a viewer that starts from a
+  keyframe would lay a parked train's body along the straight lead-in instead of the curves
+  it stands on. The path recorded for the next pieces then goes on from the rail under the
+  leading joint, as after a new path.
 - A moving train's sample lists only the pieces since the sample before, so the server does
   the same for it where a viewer may start: a keyframe row, and each journey's first row in
   the live payload, carry the pieces under the train that earlier samples listed in front of
@@ -357,8 +353,8 @@ carriages' facing joints as 3 (section 3: vanilla rolling stock), and a sample's
 joint 2 tiles ahead of its centre in plan (about 0.2 tile short while the leading carriage
 stands on a ramp's slope). Pitches measured from a run's `car` replace the 7 between
 carriages; a modded carriage with other joint distances is still placed by a leading joint 2
-tiles ahead of its centre, so its body is drawn off the rails by the difference (not measured:
-the benchmark maps are vanilla).
+tiles ahead of its centre, so its body is drawn off the rails by the difference (not
+checked: the maps of section 6 are vanilla).
 
 When a new run begins and the previous sample's leading joint lies on the new chain behind
 the run's first sample (a first sight after a resync, a missed piece whose new path reaches

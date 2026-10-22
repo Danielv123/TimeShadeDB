@@ -1,16 +1,17 @@
-# Static export and S3 publisher (WP12)
+# Static export and S3 publisher
 
-`timeshadedb publish` writes the static export of a v3 database: the files of the HTTP API
-subset in `docs/API.md` section 6, under the same relative paths, plus the viewer. The
-viewer's `StaticSource` reads them from a directory, an S3 bucket or a CDN in front of one
-(decision D6). The export is incremental: immutable objects are stored once, and mutable ones
-are stored again only when their bytes change.
+`timeshadedb publish` writes the static export of a database: the files of the HTTP API
+subset in [docs/API.md](../../docs/API.md) section 6, under the same relative paths, plus the
+viewer. The viewer's `StaticSource` reads them from a directory, an S3 bucket or a CDN in
+front of one, so a map can be hosted without a running server. The export is incremental:
+immutable objects are stored once, and mutable ones are stored again only when their bytes
+change.
 
 ## Commands
 
 ```powershell
 # From a database that no server has open (the stores are opened in this process):
-timeshadedb publish --db v3db --dir C:\www\map
+timeshadedb publish --db C:\tsdb\db --dir C:\www\map
 
 # From a running server (serve, or the Clusterio sidecar), once or every minute:
 timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --dir C:\www\map
@@ -33,8 +34,8 @@ timeshadedb publish-serve --dir C:\www\map --listen 127.0.0.1:8090
   the CDN) must allow public reads and, if the viewer is hosted elsewhere, CORS `GET`.
 - `--encoding gzip` (default), `zstd` or `identity`. Objects are stored compressed with
   `Content-Encoding` set (images and bodies under 256 bytes are stored as they are). gzip at
-  `--gzip-level 6` was smaller than zstd's default level on the test data (372 MB against
-  392 MB for the whole export) and every browser accepts it.
+  `--gzip-level 6` came out about 5% smaller than zstd's default level on the test data, and
+  every browser accepts it.
 - `--no-viewer`, `--web-dir <dir>` (default: the bundle embedded in the binary; a binary built
   without one exports data only), `--no-movers`, `--no-overlays`, `--workers` (8),
   `--max-attempts` (6), `--live-ms` (the catalog's poll interval; default `--every`).
@@ -83,31 +84,23 @@ sub-path, build the viewer with `npx vite build --base ./` and pass `--web-dir`.
 ## Tile versions
 
 The live server renders any version on request; a static export has to store every file a
-viewer may ask for. The viewer (WP7) resolves the version of every visible tile from the
+viewer may ask for. The viewer resolves the version of every visible tile from the
 day's timeline, then loads it as a full tile, or, when it already holds an older version of
 the same z0 tile at most 4 versions back, as a chain of consecutive tile deltas.
 
-**Default: every version of every tile as a full tile (`tile/.../{v}.bin`, version 0
-included), at every level, plus every consecutive z0 delta (`{v}-{v+1}`).** This is the only
-choice with which the current viewer can show any time from a cold start: scrubbing backwards,
+By default the export holds every version of every tile as a full tile (`tile/.../{v}.bin`,
+version 0 included), at every level, plus every consecutive z0 delta (`{v}-{v+1}`). With
+anything less the viewer cannot show every time from a cold start: scrubbing backwards,
 opening a history link, or jumping more than 4 versions ahead all load full tiles. Deltas make
-timelapse and small scrubs cheap (about 0.7 KB per delta against 26 KB per z0 tile).
-
-On the imported test data (one week of a 57-instance gridworld, 22 MB database) the export is
-24,668 objects and 372 MB with gzip: z0 tiles 8,898 files and 232 MB, z-1 1,502 files and
-90 MB, z-2 523 files and 25 MB, coarser levels 6 MB, deltas 8,766 files and 6 MB, mover
-files 10.5 MB, timelines 0.13 MB. The full export takes 13 s from `--db` on the owner's
-32-core machine; an unchanged second round plans 936 objects (open timelines, overlays, live
-movers, catalog) and stores 7 of them in 43 ms.
+timelapse and small scrubs cheap (about 0.7 KB per delta against 26 KB per z0 tile). Most of
+the export's bytes are z0 tiles, then z-1 tiles.
 
 `--keyframe-every N` (N > 1) exports a z0 version as a full tile only when it is 0, 1, the
-newest at the time of the round, or a multiple of N; deltas and coarse levels are unchanged.
-With N = 16 the test export shrinks to 156 MB (coarse levels then dominate). **The current
-viewer does not support it**: a cold load of a version without a full tile gets a 404 and
-the viewer keeps drawing the older texture it has (measured with `browsercheck.mjs`: the
-history step showed the latest image and logged 25 tile 404s). Using it needs a viewer change
-(load the newest full version at or below the wanted one, then chain deltas up to N - 1) and
-a way to tell the viewer N (for example a catalog field); until then, keep the default.
+newest at the time of the round, or a multiple of N. Deltas and coarse levels are unchanged.
+The viewer does not support it yet: a cold load of a version without a full tile gets a 404
+and the viewer keeps drawing the older texture it has. Using it needs a viewer change (load
+the newest full version at or below the wanted one, then chain deltas up to N - 1) and a way
+to tell the viewer N, for example a catalog field. Until then, keep the default.
 
 ## Durable queue and state
 
@@ -145,20 +138,17 @@ stop the round at once (`target refused the credentials`). Other 4xx skip the ob
 round. An object the source no longer has (404) is skipped.
 
 After a crash, objects stored but not yet in the fsynced part of `done.log` are stored again
-with the same bytes (harmless). Measured on the test data against a fake S3 endpoint: killed
-after 4,205 PUTs with 4,096 records durable, the restarted publisher resumed the queue and
-stored the 109 others a second time, everything else once; a further round stored only the
-catalog and the six `live.bin` files.
+with the same bytes (harmless).
 
 Objects are never deleted. Publishing a different database to the same target needs
 `--reset` and a CDN purge, because tile versions of two databases share names.
 
 ## Known limits
 
-- Coarse levels on a running server lag z0 by the pyramid schedule (up to 5 minutes at z-1, an
-  hour at z <= -3; WP3), and a static export has no live coarse content, so with `--from` the
-  zoomed-out map can be that far behind. An offline database (`--db` after an import) is built
-  to its horizon.
+- A static export has no live coarse content, so its coarse levels lag z0 by the pyramid
+  schedule (`internal/pyramid` `DefaultIntervals`: 15 minutes at z-1, an hour at z-2, 8 hours
+  at z <= -3). With `--from` the zoomed-out map can be that far behind. An offline database
+  (`--db` after an import) is built to its horizon.
 - The state holds one record per stored object in memory (about 100 bytes each): about 2.5 MB
   for the test week, about 130 MB for a year of the same map. Tracking the highest stored
   version per tile instead would make it O(tiles).
@@ -191,7 +181,7 @@ running `serve`.
 Browser check (needs a built viewer, Chromium and `playwright-core`):
 
 ```sh
-timeshadedb publish --db v3db --dir out
+timeshadedb publish --db <db> --dir out
 timeshadedb publish-serve --dir out --listen 127.0.0.1:0
 node internal/publish/browsercheck.mjs --pw <dir>/node_modules/playwright-core --chrome <chrome.exe> --url http://127.0.0.1:<port>/
 ```
@@ -199,9 +189,4 @@ node internal/publish/browsercheck.mjs --pw <dir>/node_modules/playwright-core -
 It waits for the first full paint, checks that terrain is drawn, zooms to z0, scrubs to the
 middle of the history (cold historical versions), plays a timelapse (deltas), zooms out, and
 fails on any request to `/api/v3/` or any failed tile, delta, palette, catalog or viewer
-request. On the test-data export (WebGL2, headless Chromium 1223): first full paint 190-197 ms
-on loopback, all checks passed, 48 tile and 24 delta requests, no failed request but one
-overlay 404 for a tile without intervals. With `--renderer canvas2d` the viewer's worker
-loader resolves the relative static base `./` against the worker script (`/assets/`) and every
-tile request 404s; with an absolute base (`?data=http://host/`) all checks pass. That is a
-viewer bug (WP7), not an export problem.
+request. An overlay 404 is expected for a tile without intervals.

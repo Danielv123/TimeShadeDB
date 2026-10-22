@@ -1,9 +1,10 @@
-# TimeShadeDB v3 capture protocol
+# TimeShadeDB capture protocol
 
 Status: protocol version 1 (`v` field). Go types: `internal/core/protocol.go`.
-Example: `web/fixtures/envelopes.ndjson`. Producers: the capture Lua (WP9). Forwarders:
-the Clusterio plugin (WP10) and `timeshadedb tail` (WP6). Consumer: `POST /api/v3/ingest`
-(WP6, API.md 5).
+Example: `web/fixtures/envelopes.ndjson`. Producer: the capture Lua
+([capture/README.md](../capture/README.md)). Forwarders: the Clusterio plugin
+([clusterio/README.md](../clusterio/README.md)) and `timeshadedb tail` (API.md 8).
+Consumer: `POST /api/v3/ingest` (API.md 5).
 
 ## 1. Envelope
 
@@ -51,18 +52,18 @@ not late when it comes back.
   each, built from one JSON encoding per message and cut between messages (port of
   illisis `tick.lua`; `send_json` is not used because it sends 4,000 bytes or more
   through a file the host reads later, out of order with printed lines; printed lines
-  of any length reach the host in order). The capture
-  encodes with `capture/lua/json.lua`, which gives the same JSON as `helpers.table_to_json`
-  (key order aside) at about half the cost. The instance
-  plugin parses the line, adds the forwarder fields and sends batches to the controller
-  about once a second; the controller posts them to its sidecar.
-- **Standalone**: the `timeshadedb_exporter` mod appends envelope lines with
+  of any length reach the host in order). The capture encodes with `capture/lua/json.lua`,
+  which gives the same JSON as `helpers.table_to_json` (key order aside) at a lower cost.
+  The instance plugin parses the line, adds the forwarder fields and sends batches to the
+  controller about once a second. The controller posts them to its sidecar.
+- **Standalone**: the `timeshadedb_exporter` mod (`capture/mod/timeshadedb_exporter/`)
+  appends envelope lines with
   `helpers.write_file("timeshade/<seq>-<tick>.ndjson", lines, true)`, starting a new file
   every 4 MiB or 60 s. `<seq>` is a counter kept in `storage` (raised every 3,600 ticks and
   at install and configuration change, on every peer alike), `<tick>` the game tick when the
   file was opened; both are zero-padded to 10 digits, so names sort in write order within a
-  game. Lines are buffered and appended every 120 ticks or 256 KiB (one `write_file` call
-  costs about 1 ms on Windows), so up to 2 s of lines are lost if the game exits. In
+  game. Lines are buffered and appended every 120 ticks or 256 KiB (each `write_file` call
+  opens, appends to and closes the file), so up to 2 s of lines are lost if the game exits. In
   multiplayer only the server writes (`for_player = 0`). Loading the same save twice can
   reuse a name and append to that file. `timeshadedb
   tail --dir <script-output>/timeshade --url ... --token ... --src standalone:<name> --map
@@ -105,32 +106,29 @@ Gone: `{j, gone: true, tick?}`.
 | `k` | `t` train, `v` vehicle, `p` player |
 | `f`, `name` | force; leading carriage or vehicle prototype, or player name |
 | `x`, `y` | tiles; a train's leading carriage centre |
-| `h` | orientation 0..1 (0 north, 0.25 east). Trains with `v` (rail path samples): the leading carriage's own orientation turned to the direction of travel, which is the rail tangent at its centre (RAIL-GEOMETRY.md 5); trains without `v` (older captures, imported data): second carriage towards the first (a single carriage: its orientation in the direction of travel). Absent: unknown. |
+| `h` | orientation 0..1 (0 north, 0.25 east). Trains with `v` (rail path samples): the leading carriage's own orientation turned to the direction of travel, which is the rail tangent at its centre (RAIL-GEOMETRY.md 5); trains without `v` (imported data): second carriage towards the first (a single carriage: its orientation in the direction of travel). Absent: unknown. |
 | `n`, `o`, `c` | train carriage count; kinds from the leading end (`L` loco, `C` cargo, `F` fluid, `A` artillery, lower case faces back; vehicles `S` spidertron or `C` car); colour `rrggbb` |
 | `tick` | the game tick of the read, when it is not the envelope's: a train's chord vertex is sent one read late |
 | `stop` | at rest. A parked train is not read again until it moves: after its stop sample it sends only resync samples. A rail path stop sample's `rp` describes the whole train (see `rp`), so a keyframe or the live payload, which hold only a parked train's last sample, place every carriage |
 | `es` | the leading end switched at this sample (also when a stopped train starts off the other way); the sample before it is the old leading end's last read |
-| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 1,000 carriages through Clusterio, so a sample fits an IPC line, and 4,000 in the standalone mod's files); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage (older captures also sent it on stop, start and end switch). The viewer places rail path samples' carriages by vanilla rolling stock's joint (4) and connection (3) distances, measured pitches from `car` aside (RAIL-GEOMETRY.md 3, 8.2) |
+| `car` | every carriage from the leading end as `[x, y, orientation]` (x, y to 0.01 tile, orientation to 0.001; at most 1,000 carriages through Clusterio, so a sample fits an IPC line, and 4,000 in the standalone mod's files); sent on first sight, after the train changed (join, split), on a surface change and in resyncs; rail path samples need it for nothing else, since the rail path places every carriage. The viewer places rail path samples' carriages by vanilla rolling stock's joint (4) and connection (3) distances, measured pitches from `car` aside (RAIL-GEOMETRY.md 3, 8.2) |
 | `v` | trains: the speed in tiles a tick (4 decimals, never negative). Its presence makes the sample a rail path sample (RAIL-GEOMETRY.md 8) |
 | `rp` | rail path samples: the curved rail pieces and rail ramps the leading carriage's front joint entered since the previous sample, in order, as `[x, y, direction, kind]`: the entity's position (whole tiles), its `defines.direction` and its kind, 1 `curved-rail-a`, 2 `curved-rail-b`, 3 `legacy-curved-rail`, 4 `rail-ramp` (the `elevated-` pieces share their ground piece's kind). Rails between them are straight, so the pieces are the exact path the leading joint ran along. Absent: none. With `ru`: the pieces under the whole train, rear first (at most 120, and with `car` as many as fit beside it in a line, at least 8). With `stop`, and on the sample where a stopped train starts (no `ru`): the pieces entered since the previous sample, with the pieces under the train that came before them in front (rear first, at most 120 of those) and any under the train's leading end after them, so that sample alone describes the whole train (a keyframe or the live payload may begin with it); a reader that holds the samples before it already has those pieces and skips them (a piece already on the path that does not continue it is a resend) |
 | `ru` | a new rail path begins at this sample (first sight, a changed train (join, split), end switch, surface change, a resync, or a piece that does not continue the recorded path: a missed piece); the path since the previous sample is not given |
 | `vx`, `vy` | legacy (illisis), ignored |
 
-**Deploy order for rail path samples.** The fields `v`, `rp` and `ru` are additive for
-stored data and for readers: samples without `v` (older captures, imported data) keep their
-meaning, and a server and viewer that know `v` read both. They are not additive the other
-way. A capture that sends `v` changes what `h` means (the leading carriage's own
-orientation) and no longer sends `car` on stop, start and end switch, which an older viewer
-needs to draw a train's body; and an older viewer cannot decode windows, keyframes or live
-payloads that hold rail rows (FORMAT.md 7.4 header bit 1 adds two columns; it reports
-trailing bytes). So update the server and the viewer (one `timeshadedb` binary with its
-embedded web app) before the capture (the Clusterio plugin's module or the standalone mod).
-A capture running ahead of its server only loses train bodies and headings until the
-server is updated; nothing stored is damaged.
+Deploy order: update the server and the viewer (one `timeshadedb` binary with its embedded
+web app) before the capture (the Clusterio plugin's module or the standalone mod). Samples
+without `v` keep their meaning, so a server and viewer that know `v` read both kinds. The
+reverse does not hold. With `v`, `h` is the leading carriage's own orientation and `car` is
+not sent on stop, start and end switch, and a viewer that does not know rail rows cannot
+decode windows, keyframes or live payloads that hold them (FORMAT.md 7.4 header bit 1). A
+capture running ahead of its server only loses train bodies and headings until the server
+is updated. Nothing stored is damaged.
 
 ## 4. Clock anchors
 
-The map clock is wall-clock milliseconds (PLAN.md §4.1). Ingest keeps one anchor per `src`.
+The map clock is wall-clock milliseconds. Ingest keeps one anchor per `src`.
 Every envelope is a point `(tick, recv_ms)`; its arrival lag is never negative, so the true
 clock is a line on or under every point. The anchor fits that line, with a slope (ms per
 tick) measured rather than assumed, because a busy server runs below 60 UPS:
@@ -162,15 +160,16 @@ At exactly 60 UPS this is the minimum of `obs = recv_ms - tick * 1000 / tps` ove
 - Every message time is `t_ms(message tick or envelope tick)`. Mover samples also keep the
   raw tick, so velocity is exact below 60 UPS.
 - `tsdb_clock_anchor_offset_ms{src}` exports the current offset.
-- Measured with 20-400 ms arrival lag and 2% stalls of +3 s (TestAnchorSlowServer): after the
-  first minute the error stays under 150 ms at 1 envelope/s (mostly 60-90 ms) and 45 ms at 4/s, at any
-  rate from 3 to 60 UPS. In the first 10 s of a source (or after a reset) the nominal rate is
-  used, so a slow server is off by up to `(1 - ups/60) * 10 s`; an abrupt UPS drop from 60 to
-  40 is off by up to about 3 s for the following minute.
+- Accuracy: with 20-400 ms arrival lag and 2% stalls of +3 s, the error after the first
+  minute stays under 150 ms at 1 or 4 envelopes a second, at any rate from 3 to 60 UPS
+  (`TestAnchorSlowServer` in `internal/movers`). In the first 10 s of a source (or after a
+  reset) the nominal rate is used, so a slow server is off by up to `(1 - ups/60) * 10 s`.
+  An abrupt UPS drop from 60 to 40 is off by up to about 3 s for the following minute
+  (`TestAnchorRateChange`).
 
 ## 5. Mapping to stored data
 
-The ingest decoder (WP6) produces core values:
+Ingest (`internal/ingest`) turns messages into core values:
 
 | Message | Becomes |
 |---|---|
@@ -182,7 +181,7 @@ The ingest decoder (WP6) produces core values:
 | `recipe` | `OverlayEvent{Kind: recipe, Key: "<instance>/<u>", Recipe: r, Quality: q}`; no `r`: `Close` |
 | `rail` | `OverlayEvent{Kind: rail, Key: "<instance>/<u>", Name, Direction: dir}`; no `name`: `Close` |
 | `map` | stored in `<db>/maps.json`, shown in the catalog |
-| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`); not stored. The Clusterio controller may keep its own copy (WP10) |
+| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`); not stored |
 | `surfaces` without `created` | starts a resync of the source (a resync begins by listing the surfaces): journeys it does not re-send before `resynced` are ended there |
 | `resynced` | ends the resync: every journey the source owns and did not re-send gets a gone at the message time; logged |
 | `trace` | logged |
@@ -193,9 +192,10 @@ Ordering: messages of one source are applied in envelope order. Across sources, 
 order by T (terrain: newest T wins per window; movers: sorted per journey). Duplicates from
 forwarder retries are harmless (API.md 5).
 
-## 6. Capture requirements (WP9)
+## 6. Capture requirements
 
-These are protocol-level requirements; the Lua is WP9's.
+These are protocol-level requirements. The capture in `capture/lua/` meets them
+([capture/README.md](../capture/README.md)).
 
 - Never write game state from capture-only data (desync safety). What only decides what is
   printed (the chart cache, the debounce, the outbox, a resync's progress) lives in
@@ -227,4 +227,5 @@ These are protocol-level requirements; the Lua is WP9's.
   the heartbeat; send `h` for vehicles too.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for
   every player.
-- Budget: at most 0.3 ms per tick with 100 moving trains and 50,000 charted chunks (D9).
+- Budget: at most 0.3 ms per tick with 100 moving trains and 50,000 charted chunks
+  (`node capture/test/run_game.mjs --mode bench` checks it).

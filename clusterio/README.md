@@ -1,6 +1,6 @@
 # TimeShadeDB map for Clusterio
 
-A Clusterio 2 plugin (`timeshade`) that records every instance's map into a TimeShadeDB v3 server
+A Clusterio 2 plugin (`timeshade`) that records every instance's map into a TimeShadeDB server
 and shows it in the Clusterio web UI. It records terrain from the game's own chart, trains,
 vehicles, players, chart tags, machine recipes and optional rails, live and through time.
 
@@ -9,7 +9,7 @@ vehicles, players, chart tags, machine recipes and optional rails, live and thro
 | Instances (`instance.ts`, `forward.ts`) | The save-patch module `timeshade` (the capture Lua, [capture/](../capture/README.md)) prints envelopes on the IPC channel `timeshade:out`. The plugin stamps each one with `recv_ms` and `seq`, splits it by map, and sends what arrived to the controller about once a second. At every start, on a `gridworld.tile` change, on a capture setting change and on a new controller session it runs `/sc ts_rt.config(...) ts_rt.resync(...)` over RCON. |
 | Controller (`controller.ts`) | Runs `timeshadedb serve --listen 127.0.0.1:0` as a sidecar (`sidecar.ts`). It forwards envelopes to the sidecar's `POST /api/v3/ingest` (`ingest.ts`), and publishes the cluster's maps as `map` messages: titles, gridworld instance bounds and Universal Edges lines. |
 | Proxy (`http.ts`) | `/api/timeshade/*` on the controller's web server goes to the sidecar. Viewer files are open. The API (`/api/timeshade/api/v3/*`) needs a Clusterio token of a user with `timeshade.view`. |
-| Web UI (`web/`) | A **Map** page at `/timeshade` that shows the TimeShadeDB viewer in a frame. |
+| Web UI (`web/`) | A Map page at `/timeshade` that shows the TimeShadeDB viewer in a frame. |
 
 ## Maps
 
@@ -28,7 +28,7 @@ less than 10 s apart.
 ## Install
 
 1. Install the plugin next to Clusterio:
-   `npm install @timeshadedb/clusterio-plugin` (not published yet; use the tarball from
+   `npm install @timeshadedb/clusterio-plugin` (not published yet, use the tarball from
    `npm pack`). Automatic discovery adds it to `plugin-list.json`.
 2. The binary: npm installs the `@timeshadedb/bin-<platform>-<arch>` package for the machine as
    an optional dependency. These packages are built by `npm run build:npm-binaries` and are not
@@ -37,9 +37,8 @@ less than 10 s apart.
 3. Restart the controller and the hosts. Instances get the module at their next start (save
    patching).
 
-The binary must embed a viewer built with relative asset URLs (`vite build --base ./`; the v3
-viewer config sets `base: "./"`). Otherwise the viewer cannot load its scripts under
-`/api/timeshade/`.
+The binary must embed a viewer built with relative asset URLs, as
+[web/vite.config.ts](../web/vite.config.ts) and `build:binary -- --web` do. Otherwise the viewer cannot load its scripts under `/api/timeshade/`.
 
 ### Controller config
 
@@ -48,8 +47,8 @@ viewer config sets `base: "./"`). Otherwise the viewer cannot load its scripts u
 | `timeshade.binary_path` | unset | The timeshadedb executable. Unset: `TIMESHADEDB_BINARY`, then the platform package, then `bin/` |
 | `timeshade.database_directory` | `<controller database>/timeshade` | Where the map is stored |
 | `timeshade.mem_budget_mb` | 256 | `serve --mem-budget` |
-| `timeshade.queue_mb` | 64 | Capture data kept in memory while the sidecar is down or slow; past it the queue continues on disk |
-| `timeshade.queue_disk_mb` | 4096 | Capture data kept on disk past the memory queue (`timeshade-queue/` in the controller's database directory), also across controller restarts; past it the oldest is dropped |
+| `timeshade.queue_mb` | 64 | Capture data kept in memory while the sidecar is down or slow. Past it the queue continues on disk |
+| `timeshade.queue_disk_mb` | 4096 | Capture data kept on disk past the memory queue (`timeshade-queue/` in the controller's database directory), also across controller restarts. Past it the oldest is dropped |
 
 Changing any of the first three restarts the sidecar.
 
@@ -65,46 +64,53 @@ Changing any of the first three restarts the sidecar.
 `timeshade.view` (granted to the default role) is needed for the Map page, for view tokens and
 for every API request through the proxy.
 
-## How the pieces behave
+## Sidecar
 
-- **Sidecar.** The sidecar listens on a random loopback port with a random ingest token and
-  read token, new at every controller start. Only the controller knows the tokens. Its first
-  stdout line names the port. If it exits unasked, it is restarted after 1 s, and the delay
-  doubles up to 60 s. A run of a minute or more resets the delay. A process that does not
-  print its address within 30 s is killed. On controller shutdown, queued data gets up to 3 s
-  to go out (what is left stays on disk and goes out after the next start), then the sidecar's
-  stdin closes (`--exit-on-stdin-close`). It is killed after 10 s.
-  If the controller dies, the sidecar exits on its own when its stdin closes.
-- **Forwarding.** Bodies are gzip NDJSON of up to 1 MiB, one request at a time, in order.
-  Network errors, 5xx and 429 are retried with backoff and `Retry-After`; ingest is idempotent.
-  A 400 or 413 splits the batch, and a single refused line is dropped. Lines the sidecar
-  counts as bad are logged (rate-limited). While the sidecar is down the queue holds up to
-  `timeshade.queue_mb` in memory and the rest on disk, up to `timeshade.queue_disk_mb`.
-  Instances keep up to 32 MiB in memory while the controller link is down, and the rest on
-  disk (`timeshade-pending/` in the instance directory, up to 4 GiB, also across host
-  restarts). Each line keeps the time it arrived at the instance, so a backlog lands where it
-  belongs (docs/API.md 5, "Horizon").
-- **Caught up.** While an instance has nothing waiting it sends a `caught_up` envelope per map
-  every 5 s, and `ended` ones when it stops, so the map server holds a map's horizon back only
-  for an instance that still has data to send (docs/PROTOCOL.md 1).
-- **Auth.**
-  - Tokens are accepted as `X-Access-Token`, `Authorization: Bearer` or `?token=` (the
-    viewer's live events use `?token=`).
-  - A Clusterio user token works. So does a view token from the web page: audience
-    `timeshade.view`, 24 h, signed with the controller's secret. Clusterio's own routes refuse
-    view tokens.
-  - Both kinds of token stop working when the user's tokens are revoked or the user is gone.
-  - The client's token is never forwarded. The proxy sends the sidecar's read token instead.
-  - The proxy forwards only GET and HEAD, only the viewer files and `api/v3/*`. It does not
-    forward `ingest`, `/metrics` or `/healthz`.
-  - Responses from the API are marked `private`, and every response gets `no-transform`, so
-    the controller's compression leaves the sidecar's zstd or gzip bodies and the live event
-    stream alone.
-- **Web page.**
-  - The page asks for a view token over the control link (`ViewTokenRequest`).
-  - It opens `<web root>api/timeshade/?data=<absolute api base>&token=<view token>` in a
-    frame. The token is renewed 10 minutes before it expires, which reloads the frame.
-  - **Open in a new tab** opens the same URL.
+The sidecar listens on a random loopback port with a random ingest token and read token, new
+at every controller start. Only the controller knows the tokens. Its first stdout line names
+the port. If it exits unasked, it is restarted after 1 s, and the delay doubles up to 60 s. A
+run of a minute or more resets the delay. A process that does not print its address within
+30 s is killed. On controller shutdown, queued data gets up to 3 s to go out (what is left
+stays on disk and goes out after the next start), then the sidecar's stdin closes
+(`--exit-on-stdin-close`). It is killed after 10 s. If the controller dies, the sidecar exits
+on its own when its stdin closes.
+
+## Forwarding
+
+Bodies are gzip NDJSON of up to 1 MiB, one request at a time, in order. Network errors, 5xx
+and 429 are retried with backoff and `Retry-After`. Ingest is idempotent. A 400 or 413 splits
+the batch, and a single refused line is dropped. Lines the sidecar counts as bad are logged
+(rate-limited). While the sidecar is down the queue holds up to `timeshade.queue_mb` in memory
+and the rest on disk, up to `timeshade.queue_disk_mb`.
+
+Instances keep up to 32 MiB in memory while the controller link is down, and the rest on disk
+(`timeshade-pending/` in the instance directory, up to 4 GiB, also across host restarts). Each
+line keeps the time it arrived at the instance, so a backlog lands where it belongs
+([docs/API.md](../docs/API.md) 5, "Horizon").
+
+While an instance has nothing waiting it sends a `caught_up` envelope per map every 5 s, and
+`ended` ones when it stops. The map server then holds a map's horizon back only for an
+instance that still has data to send (PROTOCOL.md 1).
+
+## Auth
+
+- Tokens are accepted as `X-Access-Token`, `Authorization: Bearer` or `?token=` (the
+  viewer's live events use `?token=`).
+- A Clusterio user token works. So does a view token from the web page: audience
+  `timeshade.view`, 24 h, signed with the controller's secret. Clusterio's own routes refuse
+  view tokens.
+- Both kinds of token stop working when the user's tokens are revoked or the user is gone.
+- The client's token is never forwarded. The proxy sends the sidecar's read token instead.
+- The proxy forwards only GET and HEAD, only the viewer files and `api/v3/*`. It does not
+  forward `ingest`, `/metrics` or `/healthz`.
+- Responses from the API are marked `private`, and every response gets `no-transform`, so
+  the controller's compression leaves the sidecar's zstd or gzip bodies and the live event
+  stream alone.
+
+The Map page asks for a view token over the control link (`ViewTokenRequest`) and opens
+`<web root>api/timeshade/?data=<absolute api base>&token=<view token>` in a frame. The token
+is renewed 10 minutes before it expires, which reloads the frame. Open in a new tab opens the
+same URL.
 
 ## Development
 
@@ -127,30 +133,15 @@ Tests (`node --test`):
   between the tiles comes out as one journey with a handoff, decoded from the MVW3 window. The
   test is skipped without `bin/timeshadedb(.exe)` or `TIMESHADEDB_BINARY`.
 
-Checked by hand on 2026-10-19 with a real cluster: Clusterio 2.0.2 installed from npm, the plugin
-installed from its `npm pack` tarball, one host and two instances on Factorio 2.1.19 headless.
-`ts_rt.seam` stood in for charting, and a car was spawned over RCON. Results:
-
-- The module was patched in.
-- The RCON config and resync ran, with `timeshade.extra_forces=player` taken from the instance
-  config.
-- Terrain and movers of both instances reached the catalog.
-- View, tile and live requests worked through the proxy.
-- The proxy answered 401 without a token or with a bad one, and 403 for a user without roles.
-  A revoked token stopped working.
-- A killed sidecar was restarted and kept storing data.
-- Controller shutdown stopped the sidecar.
-
 ## Not done yet
 
-- **Stopped instances.** When an instance stops, its players are not ended. The capture sends
-  gones at a clean stop, but not after a crash. Ingest's `Journeys.Stopped` has no protocol
-  message.
-- **Universal Edges lines** are drawn on the world's map only for edge sides on an instance's
+- When an instance stops, its players are not ended. The capture sends gones at a clean
+  stop, but not after a crash. Ingest's `Journeys.Stopped` has no protocol message.
+- Universal Edges lines are drawn on the world's map only for edge sides on an instance's
   `tile.surface`. The controller does not know the instance's other tiled surfaces.
-- **S3 publishing.** The plugin does not run `publish --s3` (WP12).
-- **Binary packages.** The `@timeshadedb/bin-*` packages and the plugin are not published. The
-  scope name is a placeholder.
+- The plugin does not run `timeshadedb publish` (static export to S3).
+- The `@timeshadedb/bin-*` packages and the plugin are not published. The scope name is a
+  placeholder.
 
 ## Licence
 

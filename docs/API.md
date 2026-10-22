@@ -1,4 +1,4 @@
-# TimeShadeDB v3 HTTP API
+# TimeShadeDB HTTP API
 
 Status: API version 1 (`catalog.version`). JSON shapes are the Go types in
 `internal/core/apitypes.go`, mirrored in `web/src/api/types.ts`. Example responses are in
@@ -6,9 +6,9 @@ Status: API version 1 (`catalog.version`). JSON shapes are the Go types in
 
 ## 1. Basics
 
-- Base path: `/api/v3/`. Every path below is relative to it. The static export (WP12)
-  writes the same relative paths under its root, so one viewer `DataSource` works with
-  both; section 6 lists what the static export contains.
+- Base path: `/api/v3/`. Every path below is relative to it. The static export writes the
+  same relative paths under its root, so one viewer `DataSource` works with both. Section 6
+  lists what the static export contains.
 - Path parameters:
   - `{ds}`: a datastore id (`gw-bc41437d~2E1.nauvis.player`), `{sfc}`: a surface id
     (`gw-bc41437d~2E1.nauvis`). Both must be canonical (FORMAT.md 1); others are 400.
@@ -20,8 +20,8 @@ Status: API version 1 (`catalog.version`). JSON shapes are the Go types in
 - Default listen address is `127.0.0.1`. Binding anything else requires `--ingest-token`.
 - Responses carry `X-TSDB-Now: <map clock ms>` on `catalog`, `view`, `movers/*/live.bin`
   (the live server sends it on every `/api/v3/` response) and as the `now` field of live
-  events. Viewers keep a data clock from it (never
-  `Date.now()` alone), as illisis `movers.ts` does.
+  events. Viewers keep a data clock from it, never `Date.now()` alone
+  (`web/src/map/clock.ts`).
 - Compression: binary and JSON bodies are sent with `Content-Encoding: zstd` when
   `Accept-Encoding` includes `zstd`, else `gzip`, else identity, with
   `Vary: Accept-Encoding`. The server caches encoded bytes per (resource, encoding).
@@ -57,9 +57,10 @@ Status and body `{"error": "...", "code": "..."}` (`core.ErrorResponse`):
 | 503 | `overloaded` | ingest bodies in flight over their budget, too many live clients; `Retry-After` seconds given (the stores never refuse ingest for memory: they spill to disk, FORMAT.md 5.5, 5.7) |
 | 500 | `internal` | anything else |
 
-**Hostile requests** (PLAN.md §4.3 G2): parameter validation, the grid bound check and the
-datastore lookup happen before any per-tile allocation. A request for an invalid or unknown
-tile allocates nothing that outlives it and answers in under 1 ms.
+Parameter validation, the grid bound check and the datastore lookup happen before any
+per-tile allocation. A request for an invalid or unknown tile allocates nothing that
+outlives it and answers in under 1 ms (the "Hostile requests" targets in
+`bench/targets.json`).
 
 ### 1.3 Authentication
 
@@ -71,7 +72,8 @@ tile allocates nothing that outlives it and answers in under 1 ms.
   when listening on anything but loopback.
 - Tokens are compared in constant time. Behind Clusterio, the plugin proxies
   `/api/timeshade/*` to the sidecar after its own auth and the `timeshade.view` permission
-  (WP10); the sidecar itself listens on 127.0.0.1 with random tokens.
+  ([clusterio/README.md](../clusterio/README.md)). The sidecar itself listens on 127.0.0.1
+  with random tokens.
 
 ## 2. Terrain
 
@@ -177,8 +179,8 @@ grace; the open part of the last 60 s comes from `live.bin` or live events.
 intervals change. Cache: short, with `ETag: "<version>"`. Static: yes, without query
 parameters (the whole history of the tile; `max-age=60`).
 
-Rail intervals (`kind: "rail"`) carry the rail prototype `name` and `dir`; the viewer
-map-matches trains against them when present (PLAN.md §4.8 step 6).
+Rail intervals (`kind: "rail"`) carry the rail prototype `name` and `dir`. The viewer draws
+them as an optional debug layer (`web/src/overlays/layers.ts`).
 
 ## 5. Live events and ingest
 
@@ -259,9 +261,9 @@ newest time of a chunk update or mover sample it applied (the data with a horizo
 map and trace messages hold nothing), and closes no window of the map past the lowest of those,
 minus the grace, over the sources that had data (or a `caught_up` envelope) for the map
 within `--source-hold` (default 1 hour). A source's first envelope holds its map at once.
-A live source's newest time trails the clock by a few seconds, so live data is committed
-as before (the committed horizon trails it by those seconds more than with the clock
-alone; viewers see the open windows as live meanwhile). A source that is behind
+A live source's newest time trails the clock by a few seconds, so the committed horizon
+trails the clock by those seconds more than with the clock alone. Viewers see the open
+windows as live meanwhile. A source that is behind
 (a forwarder catching up after it, the network or the server was down) holds the map at
 its own data, which it sends in time order, so none of it is late. A `caught_up` envelope
 (PROTOCOL.md 1) raises the source's time to its `recv_ms` (a forwarder that is idle sends
@@ -270,8 +272,8 @@ stopped) releases the source's maps until it sends again. A source that goes qui
 without one holds its maps until `--source-hold` after it last had data for them; every
 source in `sources.json` counts as heard from when the server starts, so after a restart
 each map waits up to `--source-hold` for its sources' backlogs. A map with data that no
-source in `sources.json` feeds (a database from before that file, or one whose file was
-lost) is held at its newest data from the start in the same way, until a source sends data
+source in `sources.json` feeds (for example because the file was lost) is held at its
+newest data from the start in the same way, until a source sends data
 or `caught_up` for it (its own hold then takes over) or `--source-hold` passes, so a
 forwarder that reconnects some time after the restart still finds its backlog ahead of
 the horizon. Data a source sends later than that, or out of order by more than the grace,
@@ -284,7 +286,7 @@ served as live; the server logs when it holds a map more than a minute behind th
 and when it releases it (`tsdb_horizon_held_maps`, `tsdb_horizon_hold_lag_ms`).
 `--source-hold 0` turns the holds off.
 
-## 6. Static export (WP12)
+## 6. Static export
 
 `timeshadedb publish --dir <out> | --s3 ...` writes the immutable files once and rewrites
 the mutable ones. Static file names drop query strings; the viewer's static `DataSource`
@@ -306,7 +308,8 @@ maps calls to these paths:
 On the live server the catalog route is `catalog` and also answers `catalog.json`. Uploads
 set `Content-Encoding` (gzip by default) and `Content-Type` per object.
 
-What the exporter writes (`internal/publish/README.md` has the details and sizes):
+What the exporter writes ([internal/publish/README.md](../internal/publish/README.md) has
+the details):
 
 - Tile versions: every version of every tile at every level as a full tile (version 0
   included), plus `tiledelta` for every consecutive z0 pair from version 1. The viewer can
@@ -326,8 +329,8 @@ What the exporter writes (`internal/publish/README.md` has the details and sizes
 
 - `GET /metrics` (outside `/api/v3/`): Prometheus text. Names are constants in
   `internal/core/metrics.go` (prefix `tsdb_`), with labels `ds`, `sfc`, `route`, `code`,
-  `result`, `kind`, `cache`, `reason`, `src` as documented there. Per-entity series are not
-  allowed (bounded cardinality, PLAN.md §4.3 G10).
+  `result`, `kind`, `cache`, `reason`, `src` as documented there. There are no per-entity
+  series, so the number of series stays bounded.
 - Besides the names in `metrics.go`, the live server exports
   `tsdb_ingest_rejected_total` with the reasons `bad_line`, `bad_message`, `overloaded`,
   `clamped`, `owner`, `unknown_gone`, `quarantined`, `duplicate` (retried envelopes
@@ -350,7 +353,8 @@ What the exporter writes (`internal/publish/README.md` has the details and sizes
 
 `timeshadedb serve --db <dir>` opens (or creates) the database and serves this API, the
 live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It prints
-`listening on <addr>` as its first stdout line. Flags beyond the shared ones (README.md):
+`listening on <addr>` as its first stdout line. Flags beyond the shared ones
+([README.md](README.md)):
 
 - `--commit-every` (commit loop period, default 1 s);
 - `--terrain-grace` (10 s) and `--mover-grace` (15 s, at least the handoff window): how
@@ -362,8 +366,8 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
 - `--salvage-overlays`: open an overlay log damaged before its end, keeping it aside;
 - `--exit-on-stdin-close`: stop when the parent process goes away (the Clusterio sidecar).
 - `--clock data`: the map clock is the newest ingested `recv_ms` (seeded from the newest
-  data in the database) instead of the wall clock, for replaying recorded captures (a
-  backlog, a benchmark stream). The graces then default to 2 minutes, because replayed
+  data in the database) instead of the wall clock, for replaying recorded captures. The
+  graces then default to 2 minutes, because replayed
   bodies, often posted several at once, arrive out of order. One envelope moves the
   clock at most 1 hour forward and never past the wall clock plus 10 s (such envelopes
   count as `clamped`), so one bad `recv_ms` cannot push the map clock ahead for good;
@@ -371,21 +375,19 @@ live events, ingest, `/metrics`, `/healthz` and the embedded viewer at `/`. It p
   are clamped against their envelope's own `recv_ms`, so the data after a gap keeps its
   times.
 
-The process sets a soft memory limit of `--mem-budget` (Go's `GOMEMLIMIT`, which takes
-precedence when set), so garbage collection works harder before the process
-grows past its budget and RSS stays within the budget plus 64 MiB (PLAN.md §5). The
-caches get about half of the budget (terrain 3/32 decoded tiles, 1/8 open windows and
-3/64 indexes, encoded tiles 1/8, coarse images 1/16, overlays 1/32; the mover open
-windows another eighth, counted per row); the rest is working memory
-and the collector's headroom. Open windows past their share move to disk (FORMAT.md 5.5,
-5.7) and are read back by the commit that closes them, so memory stays within the budget
-however fast data arrives or however long a horizon is held. About 50 MiB of working
-memory does not shrink with the budget (the zstd encoders and decoders, ingest's decode
-buffers), so the budget + 64 MiB bound holds from the default 256 MiB up; with a smaller
-budget, ingest at full speed takes more (measured with 12 copies of a 10-minute capture
-through `tail --once`: 156 MiB working set and 195 MiB private bytes at 64 MiB, 175 MiB
-and 218 MiB at 128 MiB, 257 MiB and 302 MiB at 256 MiB).
-After 10 s without requests the server returns freed memory to the operating system.
+The process sets a soft memory limit of `--mem-budget` (at least 32 MiB). Go's
+`GOMEMLIMIT` takes precedence when set. Garbage collection then works harder before the
+process grows past its budget, and RSS stays within the budget plus 64 MiB. The caches
+get about half of the budget: terrain 3/32 for decoded tiles, 1/8 for open windows and
+3/64 for indexes, encoded tiles 1/8, coarse images 1/16, overlays 1/32, and the mover open
+windows another 1/8, counted per row. The rest is working memory and the collector's
+headroom. Open windows past their share move to disk (FORMAT.md 5.5, 5.7) and are read
+back by the commit that closes them, so memory stays within the budget however fast data
+arrives or however long a horizon is held. About 50 MiB of working memory does not shrink
+with the budget (the zstd encoders and decoders, ingest's decode buffers), so the
+budget + 64 MiB bound holds from the default 256 MiB up. With a smaller budget, ingest at
+full speed takes more. After 10 s without requests the server returns freed memory to the
+operating system.
 
 Interrupt or SIGTERM shuts down cleanly: live streams are ended at once, requests in
 flight get up to 5 s (then their connections are closed), ingest requests in flight are

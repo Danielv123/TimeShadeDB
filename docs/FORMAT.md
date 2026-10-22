@@ -1,4 +1,4 @@
-# TimeShadeDB v3 formats
+# TimeShadeDB formats
 
 Status: format version 1. Normative unless a section says "tunable" or "recommended".
 The executable definitions are `internal/core` (types and semantics),
@@ -9,7 +9,7 @@ The executable definitions are `internal/core` (types and semantics),
 - All integers are little-endian. `i64`/`u32`/... are fixed width.
 - `uvarint` is unsigned LEB128 (Go `binary.AppendUvarint`), at most 10 bytes.
   `varint` is zigzag (`(n << 1) ^ (n >> 63)`) followed by uvarint.
-- Times are `TimeMs`: int64 Unix milliseconds on the map clock (PLAN.md §4.1, D2).
+- Times are `TimeMs`: int64 Unix milliseconds on the map clock (PROTOCOL.md 4).
   Windows are aligned to the epoch: window of length `W` containing `t` is
   `[floor(t/W)*W, floor(t/W)*W + W)`.
 - Names in ids: `EscapeName` keeps bytes in `[a-z0-9_-]` and writes every other byte of the
@@ -84,17 +84,16 @@ The full rules are on `core.TerrainStore`. In short:
    newest accepted update time of the datastore), a live read also applies the newest open
    update of each chunk. Live content has no version; it is served without caching.
 
-Coarse levels (z < 0, WP3) have their own versions per coarse tile: each record the
-pyramid writes is the next version. Recommended schedule (tunable): write a version of a
-coarse tile when a descendant changed, at most once per aligned interval of 15 min (z -1),
-60 min (z -2) or 8 h (z <= -3), and always keep the latest state reachable. The
-reference oracle (`memstore.Pyramid`) writes a version at every change. (The plan's 5/15/60
-min schedule stored about 2.3 B per chunk-hour over the illisis test map, which with z0
-exceeds the PLAN.md §5 disk target; see 5.4.)
+Coarse levels (z < 0) have their own versions per coarse tile: each record the pyramid
+writes is the next version. Recommended schedule (tunable): write a version of a coarse
+tile when a descendant changed, at most once per aligned interval of 15 min (z -1), 60 min
+(z -2) or 8 h (z <= -3), and always keep the latest state reachable. The reference oracle
+(`memstore.Pyramid`) writes a version at every change. Shorter intervals cost disk space,
+and the live latest (below) keeps every level current between versions.
 
-As implemented in `internal/pyramid` (WP3): a version is built for time T and its
-content is exactly the 2 x 2 average of the committed z0 content at T, so it is
-effective at T. The live server builds at T = the datastore horizon after each commit;
+`internal/pyramid` builds a version for time T. Its content is exactly the 2 x 2 average
+of the committed z0 content at T, so it is effective at T. The live server builds at
+T = the datastore horizon after each commit;
 a level is due when a multiple of its interval lies between the previous successful build
 pass and T (with a commit every window: when T is a multiple). Each interval is a multiple
 of the finer one, so when a tile is built every finer level is current at T. A tile
@@ -120,14 +119,14 @@ the database is served.
 ```
 <db>/
   timeshadedb-v3.json                    {"format":"timeshadedb-v3","version":1}
-  maps.json                              map metadata from "map" messages (WP6)
+  maps.json                              map metadata from "map" messages
   datastores/<datastore id>/
     meta.json                            {"key":{...},"window_ms":60000,"grid_origin":-256,"format_version":1}
     palette.bin                          append-only palette (5.2)
-    state.json                           committed horizon and update time range (5.7, WP2)
+    state.json                           committed horizon and update time range (5.7)
     tiles/<x>_<y>.blk, .idx              z0 terrain series, one per tile (5.1, 5.3)
-    pyramid/<z>/<x>_<y>.blk, .idx        coarse snapshots, z = -1, -2, ... (5.4, WP3)
-    wal/                                 write-ahead log of open windows (WP2, tunable)
+    pyramid/<z>/<x>_<y>.blk, .idx        coarse snapshots, z = -1, -2, ... (5.4)
+    wal/                                 write-ahead log of open windows (5.7, tunable)
     open/<start>.spill                   open windows spilled out of memory, a cache of wal/ (5.7)
   movers/<surface id>/
     meta.json                            {"key":{...},"format_version":1}
@@ -135,9 +134,9 @@ the database is served.
     keyframes/<YYYY-MM-DD>/<t>.mvw       hourly keyframes (5.5)
     days/<YYYY-MM-DD>.json               day index, core.DayIndex as JSON
     open/<start>.wal                     samples of one open window (5.5)
-  movers/wal/wal.log                     open-window samples of older stores (5.5)
+  movers/wal/wal.log                     single-file log of open-window samples, moved into open/ on open (5.5)
   sources.json                           per-source ingest state: horizon holds and retry dedupe (5.8)
-  overlays/<datastore id>/               interval log and per-tile index (WP4, 5.6)
+  overlays/<datastore id>/               interval log and per-tile index (5.6)
   icons/                                 catalog icon spritesheet and metadata (optional)
     icons.json                           core.CatalogIcons: {"png":"icons/<file>","json":"icons/<file>"}
     <file>                               the two files icons.json names ([A-Za-z0-9._-], content-hashed)
@@ -182,8 +181,8 @@ is the record's `Seq`.
 | 22 | 1 | flags |
 | 23 | 1 | reserved, 0 |
 
-The PLAN sketched a 16-byte `.blk` header; it is 32 bytes here so the index can be rebuilt
-from `.blk` alone (it needs `t_start` and `t_len`) and torn headers are detectable.
+The `.blk` header holds `t_start` and `t_len` and its own CRC, so the index can be rebuilt
+from `.blk` alone and torn headers are detectable.
 
 Rules:
 
@@ -235,20 +234,16 @@ choose positions for the pixels that differ from the committed content; when mor
 earlier `t_end`: 262,144 indices (512 x 512, row-major), u8 or u16 LE when wide. It carries
 the same `t_start`/`t_len` as the delta it follows.
 
-Keyframe rule (tunable, WP2): write a keyframe when the delta bytes since the last keyframe
-reach 2x the size of that keyframe, and at most every 256 records of chain. The prototype
-measured keyframes as 55% of the bytes at a 256-record cap, so this rule should be tuned
-against the §5 disk target.
-WP2 measured the rule on the test-data replay (60 s windows, zstd default level): factor 2
-gives 3.31 B per chunk-hour over the whole map with a cold read p95 of 1.07 ms, factor 4
-3.08 B and 1.09 ms, factor 8 2.79 B and 1.30 ms. The store's default is factor 4 with the
-256-record cap. Before the first keyframe of a tile, the size of record 0 (the first delta,
-which holds the whole content) stands in for the keyframe size.
+Keyframe rule (tunable): write a keyframe when the delta bytes since the last keyframe
+reach 4 times the size of that keyframe, or after 256 records of chain
+(`terrain.Options.KeyframeFactor` and `MaxChain`). Before the first keyframe of a tile, the
+size of record 0 (the first delta, which holds the whole content) stands in for the
+keyframe size.
 
 Indices refer to the datastore palette (5.2). A record uses the wide flag if any index in it
 is above 255.
 
-### 5.4 Coarse snapshots (WP3)
+### 5.4 Coarse snapshots
 
 Series `pyramid/<z>/<x>_<y>` (series name `<datastore id>/pyramid/<z>/<x>_<y>`, e.g.
 `gw-bc41437d~2E1.nauvis.player/pyramid/-2/0_-1`). Every record is one version: version n
@@ -264,21 +259,11 @@ nothing). Two kinds:
   `(32*(b & 15) + (p & 31), 32*(b >> 4) + (p >> 5))`), except that the n values are
   u16 LE RGB565 colours, not palette indices.
 
-Snapshot rule (tunable; defaults measured on the illisis test map): write a snapshot
-instead of a delta when more than half the pixels changed, after 512 deltas, or when the
-delta bytes since the last snapshot would exceed 64 times that snapshot. With the default
-15 min / 60 min / 8 h schedule, an offline rebuild of the illisis history (all 12 surfaces;
-the same versions as a live server that commits every window) stores 2.89 MB, 1.88 B per
-chunk-hour including record headers and index (nauvis alone 1.40), with cold reads of any
-historical version at p95 about 1.1-1.8 ms (`internal/pyramid` TestIllisisHistory,
-TestIllisisTuning). The plan's 5/15/60 min schedule stored 2.29 B per chunk-hour. WP2's z0
-on the same map is 3.09 B per chunk-hour (5.3), so z0 and pyramid together come to 4.96.
-Replayed live through WP2's file-backed terrain store (a commit before every batch of
-1,024 updates, `Update` after each commit, a flush at the end), the whole map stored
-3.09 B per chunk-hour for z0 and 1.82 for the pyramid, 4.91 in total
-(`internal/pyramid` TestWholeMapFileStores, with TSDB_TESTDATA set).
+Snapshot rule (tunable): write a snapshot instead of a delta when half the pixels or more
+changed, after 512 deltas, or when the delta bytes since the last snapshot would exceed 64
+times that snapshot (`pyramid.Options.MaxChain` and `SnapshotRatio`).
 
-### 5.5 Mover windows on disk (WP4)
+### 5.5 Mover windows on disk
 
 A `.mvw` file is a single zstd frame whose content is an MVW3 body (7.4). Closed windows
 have kind 1, keyframes kind 2. Because the file is already a zstd frame of the wire body,
@@ -297,17 +282,16 @@ beyond it whole windows, oldest first, are evicted and read back from their logs
 commit that closes them, so the budget never makes ingest refuse samples. A log is deleted
 after the commit that closed its window wrote `meta.json`; on open, logs of windows below
 the horizon are deleted (a crash between the two) and the others replayed (a torn tail is
-truncated). Stores before these logs kept every open sample in one file,
-`movers/wal/wal.log` (the same records), rewritten at every commit; opening such a
-database moves its rows into the window logs and deletes it.
+truncated). A database can also hold every open sample in one file, `movers/wal/wal.log`
+(the same records). Opening it moves those rows into the window logs and deletes the file.
 
-### 5.6 Overlays on disk (WP4, recommended)
+### 5.6 Overlays on disk (recommended)
 
 An append-only log of `core.OverlayEvent` records plus a per-tile index of interval
-positions, both rebuildable from the log. The format is WP4's choice; only the API output
-(API.md "overlays") is a contract.
+positions, both rebuildable from the log. The format is internal to `internal/overlays`.
+Only the API output (API.md 4) is a contract.
 
-### 5.7 Terrain state and WAL (WP2)
+### 5.7 Terrain state and WAL
 
 `state.json` holds `{"horizon": ms, "committing": ms, "first": ms, "last": ms, "has_data":
 bool}`: the committed horizon, the target of a commit that has not finished, and the
@@ -385,8 +369,8 @@ not saved.
 - `timeshadedb-v3.json` `version` and every `meta.json` `format_version` are 1. A reader
   rejects a higher version and never writes to it.
 - Additions that old readers can ignore (new JSON fields, new files) keep the version. Any
-  change to a byte layout in this document bumps it, and a migration (the copy-and-swap
-  generation framework in `migration.go`) converts existing data.
+  change to a byte layout in this document bumps it, and existing data then needs a
+  migration.
 
 ## 7. Wire formats
 
@@ -509,16 +493,12 @@ skips those pieces as resends. Rows that list the whole train themselves (with r
 samples and the sample after a stop) get no body, nor do rows whose path was lost (a piece that
 neither continues the path nor is on it) until such a row. The body follows on from the newest
 keyframe at or before the row, whose row begins the path again, so it is the same whether or
-not the store restarted in between. Closed windows (kind 1) never carry bodies. Older data and
-older stores give keyframes without bodies, which read as before.
+not the store restarted in between. Closed windows (kind 1) never carry bodies. A keyframe
+without bodies is also valid.
 
 Positions: a train's x, y is its leading carriage centre; carriages list every carriage from
 the leading end. Orientation is Factorio's (0 north, 0.25 east); a train's points from the
 second carriage to the first, except on rail rows (bit 7), where it is the leading carriage's
 own orientation. Velocity is not stored except a rail row's speed: viewers derive it from
 neighbouring rows (with ticks when present: `ticks / (60 * speed)` seconds). Windows without
-rail rows keep the eight-column layout, so older readers read them unchanged.
-
-Measured on a synthetic train track (1,000 samples, 250-350 ms apart): 8.1 B/sample raw,
-2.1 B/sample after zstd (`wire.TestMoverWindowSizeOnTrainTrack`). The PLAN target is
-6 B/sample stored on the imported data.
+rail rows use the eight-column layout with header bit 1 clear.
