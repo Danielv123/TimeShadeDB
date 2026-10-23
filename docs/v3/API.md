@@ -264,8 +264,9 @@ as before (the committed horizon trails it by those seconds more than with the c
 alone; viewers see the open windows as live meanwhile). A source that is behind
 (a forwarder catching up after it, the network or the server was down) holds the map at
 its own data, which it sends in time order, so none of it is late. A `caught_up` envelope
-(PROTOCOL.md 1) raises the source's time to its `recv_ms` (a forwarder that is idle sends
-one every few seconds, so its source holds nothing back), and one marked `ended` (the game
+(PROTOCOL.md 1) raises the source's time for its map to its `recv_ms` (a forwarder sends
+one every few seconds for a map it has nothing to send for, so its source holds that map
+nothing back), and one marked `ended` (the game
 stopped) releases the source's maps until it sends again. A source that goes quiet
 without one holds its maps until `--source-hold` after it last had data for them; every
 source in `sources.json` counts as heard from when the server starts, so after a restart
@@ -339,6 +340,8 @@ What the exporter writes (`internal/v3/publish/README.md` has the details and si
   `corrupt`, `wal_skipped`), `tsdb_ingest_caught_up_total`, `tsdb_horizon_held_maps`,
   `tsdb_horizon_hold_lag_ms`, `tsdb_ingest_resolved_gones_total` (gones of journeys the
   journey rules had forgotten, after a restart, completed from the mover store's last row),
+  `tsdb_ingest_adopt_late_total` (samples and gones of a journey's previous owner from
+  before an adopt that arrived after it, kept),
   `tsdb_mover_live_evicted_total` (live journeys forgotten past the store's live-journey
   bound), `tsdb_overlay_open_intervals`,
   `tsdb_overlay_torn_bytes_total` and the Go runtime gauges `go_memstats_heap_inuse_bytes`,

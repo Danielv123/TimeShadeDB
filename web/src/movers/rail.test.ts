@@ -133,3 +133,40 @@ test("rail samples: a stop links to the start however long it stood; it stands, 
   truthChain.carriage(U0 + 0.005 * 100, out);
   assert.ok(Math.hypot(h.x - out[0], h.y - out[1]) < 1e-3, "accelerating");
 });
+
+test("rail samples: a crossing without its gone row (two instances' ticks) is timed by the time between the samples", () => {
+  // The source's samples count from tick 649,000, the destination's from 469,000 (or 829,000): its first sample, a
+  // first sight listing the pieces under the train, links back to the source's last on the rail path.
+  for (const base of [469_000, 829_000]) {
+    const tr = new T.Track("j1", meta);
+    const at = (t: number, rp: { x: number; y: number; dir: number; kind: number }[] | null, ru: boolean, tick: number) => {
+      const s = sample(t, rp, ru);
+      return T.makeSample(meta, s.t, s.x, s.y, s.o, s.flags, null, tick + t, s.v, rp, ru);
+    };
+    tr.insert(at(0, null, true, 649_000));
+    tr.insert(at(60, null, false, 649_000));
+    tr.insert(at(120, [A, B], true, base));
+    assert.ok(T.railLinked(tr, 1), "linked on the destination's chain");
+    const h = T.newHead();
+    let worst = 0;
+    for (let t = 60; t <= 120; t += 5) {
+      T.headAt(tr, msOf(t), Infinity, h);
+      truthChain.carriage(uAt(t), out);
+      worst = Math.max(worst, Math.hypot(h.x - out[0], h.y - out[1]));
+    }
+    assert.ok(worst < 1e-3, `base ${base}: head off the truth by ${worst}`);
+    // Live, past the destination's first sample: on at its speed at the source's rate of ticks, 60 a second.
+    T.headAt(tr, msOf(130), msOf(130), h);
+    assert.equal(h.mode, "extrap");
+    truthChain.carriage(uAt(120) + vAt(120) * 10, out);
+    assert.ok(Math.hypot(h.x - out[0], h.y - out[1]) < 1e-3, `base ${base}: extrapolated at the game's rate`);
+  }
+});
+
+test("tickRate: samples of one game only", () => {
+  const s = (t: number, tick: number | null) => T.makeSample(meta, t, 0, 0, 0, T.F_RAIL, null, tick, 0.1);
+  assert.equal(T.tickRate(s(0, 100), s(1000, 160)), 60);
+  assert.ok(Number.isNaN(T.tickRate(s(0, 649_477), s(500, 469_564))), "ticks going back");
+  assert.ok(Number.isNaN(T.tickRate(s(0, 469_564), s(500, 649_477))), "faster than any game");
+  assert.ok(Number.isNaN(T.tickRate(s(0, null), s(500, 30))), "no tick");
+});

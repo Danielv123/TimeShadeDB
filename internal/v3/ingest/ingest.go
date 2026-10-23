@@ -103,6 +103,9 @@ type Stats struct {
 	// ResolvedGones are gones of journeys the journey rules had forgotten (a server
 	// restart), completed from the mover store's state.
 	ResolvedGones int64
+	// LateKept are samples and gones of a journey's previous owner that arrived after
+	// another source adopted it, from before the adopt: kept (movers.Journeys).
+	LateKept int64
 	// Duplicates are envelopes skipped because their source's retry repeated them
 	// (Sources.Duplicate); CaughtUp are caught_up envelopes; OneRecv are envelopes that
 	// carried the receive time of their source's previous envelope although their tick
@@ -128,6 +131,9 @@ type Ingester struct {
 	// seg and win are the reusable read state of the body being applied (under mu).
 	seg segment
 	win window
+	// resynced is, per source, the trace of the last resync logged (under mu): the
+	// Clusterio instance sends a resync's "resynced" to each of its maps, logged once.
+	resynced map[string]string
 
 	stats struct {
 		envelopes, bytes, badLines, badMessages, clamped, maps, overloaded atomic.Int64
@@ -219,6 +225,7 @@ func (in *Ingester) Stats() Stats {
 		s.SurfaceChanges += js.SurfaceChanges
 		s.Quarantined += js.Quarantined
 		s.ResolvedGones += js.ResolvedGones
+		s.LateKept += js.LateKept
 	}
 	in.jmu.Unlock()
 	return s
@@ -780,7 +787,7 @@ type jop struct {
 	kind        uint8
 	mapKey, src string
 	id          string      // adopt: the journey
-	t           core.TimeMs // resynced: the time
+	t           core.TimeMs // adopt, resynced: the time
 	n           int         // move: how many of the batch's raw samples
 }
 
@@ -1005,7 +1012,7 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		if m.J == "" {
 			err = errors.New("adopt without j")
 		} else {
-			b.jops = append(b.jops, jop{kind: jopAdopt, mapKey: env.Map, src: env.Src, id: m.J})
+			b.jops = append(b.jops, jop{kind: jopAdopt, mapKey: env.Map, src: env.Src, id: m.J, t: b.timeOf(nil)})
 		}
 	case core.MsgTag, core.MsgRecipe, core.MsgRail:
 		err = b.overlay(env, m, b.timeOf(nil))
@@ -1019,7 +1026,13 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		t := b.timeOf(nil)
 		b.holds(t)
 		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: t})
-		in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
+		if in.resynced[env.Src] != m.Trace || m.Trace == "" {
+			if in.resynced == nil || len(in.resynced) >= 10_000 {
+				in.resynced = map[string]string{}
+			}
+			in.resynced[env.Src] = m.Trace
+			in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
+		}
 	case core.MsgTrace:
 		in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
 	case core.MsgMap:
@@ -1384,7 +1397,7 @@ func (a *applier) apply(job *applyJob) error {
 			samples = js.Move(op.src, raw[:op.n], samples)
 			raw = raw[op.n:]
 		case jopAdopt:
-			js.Adopt(op.src, op.id)
+			js.Adopt(op.src, op.id, op.t)
 		case jopBegin:
 			js.Begin(op.src)
 		case jopResynced:

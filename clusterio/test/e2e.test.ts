@@ -11,7 +11,7 @@ import jwt from "jsonwebtoken";
 import { binaryName } from "../binary.js";
 import loadControllerPlugin from "../controller.js";
 import loadInstancePlugin from "../instance.js";
-import { EnvelopesEvent } from "../messages.js";
+import { EnvelopesEvent, EnvelopesRequest } from "../messages.js";
 import { fakeControllerContext, fakeInstanceContext, fakeUser, sleep, until } from "./fakes.js";
 
 const pluginDir = path.resolve(import.meta.dirname, "..", "..", "..");
@@ -100,7 +100,7 @@ test("two gridworld instances: a train crossing between them is one journey with
 	const instances = new Map<number, ReturnType<typeof fakeInstanceContext>>();
 	for (const id of [101, 102, 103]) {
 		const f = fakeInstanceContext(id, { "gridworld.tile": id === 103 ? null : tile(id - 101) },
-			(event: EnvelopesEvent) => c.deliver(EnvelopesEvent, event, { type: "instance", id }));
+			(message: EnvelopesRequest | EnvelopesEvent) => c.deliver(message.constructor, message, { type: "instance", id }));
 		await loadInstancePlugin(f.context, { now, batchMs: 20 });
 		instances.set(id, f);
 	}
@@ -133,8 +133,9 @@ test("two gridworld instances: a train crossing between them is one journey with
 			const t = t0 + 12_000 + (i * 1000);
 			await send(102, t, [{ type: "move", s: "nauvis", m: [sample(102, t, 260 + (5 * i))] }]);
 		}
-		// A second train whose adopt reaches the controller before the old instance's gone: the gone of a journey
-		// that now belongs to another source is dropped, so it stays one journey, without a gone between.
+		// A second train whose adopt reaches the controller before the old instance's gone (each instance sends about
+		// once a second, a Universal Edges crossing takes less): the gone is from before the adopt, so it is kept, and
+		// the train stays one journey with a handoff.
 		const j2 = "101.6000.9";
 		const s2 = (id: number, t: number, x: number) => ({ ...sample(id, t, x), j: j2, y: 40.5 });
 		for (let i = 0; i <= 10; i++) {
@@ -143,7 +144,10 @@ test("two gridworld instances: a train crossing between them is one journey with
 		}
 		await send(102, t0 + 41_000, [{ type: "adopt", j: j2, trace: "ue.2" }]);
 		await sleep(100);
-		await send(101, t0 + 41_500, [{ type: "move", s: "nauvis", m: [{ j: j2, gone: true, tick: tickOf(101, t0 + 41_500) }] }]);
+		// printed at 40.5 s, so its envelope says so; it reaches the plugin after the adopt
+		await instances.get(101)!.ipc({ v: 1, tick: tickOf(101, t0 + 40_500), msgs: [
+			{ type: "move", s: "nauvis", m: [{ j: j2, gone: true, tick: tickOf(101, t0 + 40_500) }] },
+		] });
 		for (let i = 0; i <= 8; i++) {
 			const t = t0 + 42_000 + (i * 1000);
 			await send(102, t, [{ type: "move", s: "nauvis", m: [s2(102, t, 260 + (5 * i))] }]);
@@ -183,8 +187,9 @@ test("two gridworld instances: a train crossing between them is one journey with
 		assert.ok(train.some(r => r.x < 256) && train.some(r => r.x > 256), "positions from both tiles");
 		assert.equal(train.at(-1)!.x, 300);
 		const train2 = mvw.rows.filter(r => r.id === j2);
-		assert.equal(train2.length, 11 + 9, "both instances' samples, no gone");
-		assert.ok(train2.every(r => !(r.flags & 2)));
+		assert.equal(train2.length, 11 + 1 + 9, "both instances' samples and the late gone");
+		const gone2 = train2.filter(r => r.flags & 2);
+		assert.deepEqual(gone2.map(r => [r.t, Boolean(r.flags & 4)]), [[t0 + 40_500, true]], "the gone, a handoff");
 
 		const catalog = JSON.parse((await api("catalog")).body.toString());
 		const gw = catalog.maps.find((m: any) => m.key === "gw-w");

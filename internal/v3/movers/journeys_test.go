@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"timeshadedb/internal/v3/core"
@@ -90,6 +91,149 @@ func TestJourneysStaleBeforeNewOwner(t *testing.T) {
 	out = js.Move("a", []core.MoverSample{at(5000+core.HandoffWindow, 6)}, out)
 	if js.Owner(meta.ID) != "a" || len(out) != 8 || js.Stats().Quarantined != 1 {
 		t.Fatalf("resume after the window: owner %q, out %d, stats %+v", js.Owner(meta.ID), len(out), js.Stats())
+	}
+}
+
+// TestJourneysLateAfterAdopt: the source's last samples and gone arrive after the
+// destination's adopt. Those from before the cut are kept; a sample after it is
+// dropped and a gone after it is kept just before it; a rolled-back batch leaves the
+// previous owner able to send them again.
+func TestJourneysLateAfterAdopt(t *testing.T) {
+	sfc := core.SurfaceKey{Map: "gw", Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "7.1.2", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 22, Kinds: "LC"}
+	bare := core.MoverMeta{ID: meta.ID, Kind: core.KindTrain, Force: "player", Name: "locomotive"}
+	at := func(t core.TimeMs, x float64) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: bare, T: t, X: x, Tick: int64(t) / 10}
+	}
+	gone := func(t core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: meta.ID}, T: t, Tick: int64(t) / 10, Flags: core.FlagGone}
+	}
+	js := NewJourneys(0)
+	first := at(1000, 1)
+	first.Meta = meta
+	out := js.Move("a", []core.MoverSample{first}, nil)
+	// b adopts at 3000, but its first sample is from 2900: the cut.
+	js.Adopt("b", meta.ID, 3000)
+	out = js.Move("b", []core.MoverSample{at(2900, 50)}, out)
+	js.Mark()
+	n := len(out)
+	out = js.Move("a", []core.MoverSample{at(2000, 2), at(2950, 3), gone(3100)}, out)
+	if len(out) != n+2 {
+		t.Fatalf("late rows = %+v", out[n:])
+	}
+	if s := out[n]; s.T != 2000 || s.Meta != meta {
+		t.Fatalf("late sample = %+v (meta carried forward from the source)", s)
+	}
+	if g := out[n+1]; g.Flags&core.FlagGone == 0 || g.T != 2899 || g.Meta != meta || g.Surface != sfc {
+		t.Fatalf("late gone = %+v, want at 2899 with the source's meta", g)
+	}
+	if g := out[n+1]; g.Flags&core.FlagNoTick == 0 || g.Tick != 0 {
+		t.Fatalf("late gone moved before the cut kept its tick: %+v", g)
+	}
+	if st := js.Stats(); st.LateKept != 2 || st.OwnerDrops != 1 || js.Owner(meta.ID) != "b" {
+		t.Fatalf("stats %+v, owner %q", st, js.Owner(meta.ID))
+	}
+	// Rolled back (the store refused the batch): the retry meets the same state.
+	js.Rollback()
+	out = js.Move("a", []core.MoverSample{at(2000, 2), gone(2500)}, out[:n])
+	if g := out[n+1]; len(out) != n+2 || g.T != 2500 || g.Tick != 250 || g.Flags&core.FlagNoTick != 0 {
+		t.Fatalf("after rollback: %+v", out[n:])
+	}
+	// The gone ends what a may send: a later sample of it is dropped.
+	out = js.Move("a", []core.MoverSample{at(2600, 4)}, out)
+	if len(out) != n+2 || js.Owner(meta.ID) != "b" {
+		t.Fatalf("after the late gone: %+v, owner %q", out[n:], js.Owner(meta.ID))
+	}
+	// Another source gets nothing from the adopt.
+	out = js.Move("c", []core.MoverSample{at(2000, 9)}, out)
+	if len(out) != n+2 {
+		t.Fatalf("a third source's sample was kept")
+	}
+}
+
+// TestJourneysAdoptUnknown: after a server restart (the Clusterio controller restarts
+// its sidecar) the destination's adopt can come before anything of the journey. The
+// first other source with samples from before the cut is taken as the previous owner;
+// a gone first gets its meta from the store (Lookup).
+func TestJourneysAdoptUnknown(t *testing.T) {
+	sfc := core.SurfaceKey{Map: "gw", Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "7.1.2", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 3}
+	at := func(t core.TimeMs) core.MoverSample { return core.MoverSample{Surface: sfc, Meta: meta, T: t} }
+	gone := func(t core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: meta.ID}, T: t, Flags: core.FlagGone}
+	}
+	js := NewJourneys(0)
+	js.Adopt("b", meta.ID, 3000)
+	out := js.Move("a", []core.MoverSample{at(2000), at(2900), gone(2950)}, nil)
+	out = js.Move("c", []core.MoverSample{at(2500)}, out)
+	if len(out) != 3 || out[2].Flags&core.FlagGone == 0 || out[2].Meta != meta || js.Owner(meta.ID) != "b" {
+		t.Fatalf("out %+v, owner %q", out, js.Owner(meta.ID))
+	}
+	if st := js.Stats(); st.LateKept != 3 || st.OwnerDrops != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+	// Only the gone arrives late: its meta from the store.
+	js = NewJourneys(0)
+	js.Lookup = func(k core.SurfaceKey, id string) (core.MoverMeta, bool) { return meta, k == sfc && id == meta.ID }
+	js.Adopt("b", meta.ID, 3000)
+	out = js.Move("a", []core.MoverSample{gone(3500)}, nil)
+	if len(out) != 1 || out[0].T != 2999 || out[0].Meta != meta {
+		t.Fatalf("gone = %+v", out)
+	}
+	// The previous owner's gone came before the adopt: nothing late is taken.
+	js = NewJourneys(0)
+	js.Move("a", []core.MoverSample{at(1000), gone(2000)}, nil)
+	js.Adopt("b", meta.ID, 3000)
+	if out = js.Move("a", []core.MoverSample{at(2100)}, nil); len(out) != 0 {
+		t.Fatalf("a sample after its own gone was kept: %+v", out)
+	}
+}
+
+// TestJourneysAfterGone: the gone arrives before the adopt, and the next owner's first
+// samples are a few ms earlier (its clock anchored on its own). They are moved just
+// after the gone; a larger overlap is left as it is, and so is the old owner resuming.
+func TestJourneysAfterGone(t *testing.T) {
+	sfc := core.SurfaceKey{Map: "gw", Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "7.1.2", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 3}
+	at := func(t core.TimeMs) core.MoverSample { return core.MoverSample{Surface: sfc, Meta: meta, T: t} }
+	gone := func(t core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: meta.ID}, T: t, Flags: core.FlagGone}
+	}
+	times := func(out []core.MoverSample) []core.TimeMs {
+		var ts []core.TimeMs
+		for _, s := range out {
+			ts = append(ts, s.T)
+		}
+		return ts
+	}
+	js := NewJourneys(0)
+	out := js.Move("a", []core.MoverSample{at(1000), gone(3000)}, nil)
+	js.Adopt("b", meta.ID, 3010)
+	out = js.Move("b", []core.MoverSample{at(2995), at(2998), at(3100), at(3050)}, out)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 3001, 3002, 3100, 3050}) {
+		t.Fatalf("times %v", got)
+	}
+	if st := js.Stats(); st.AfterGone != 2 {
+		t.Fatalf("stats %+v", st)
+	}
+	// Without an adopt (a gridworld crossing), and with an overlap past goneSlack.
+	js = NewJourneys(0)
+	out = js.Move("a", []core.MoverSample{at(1000), gone(3000)}, nil)
+	out = js.Move("b", []core.MoverSample{at(2999)}, out)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 3001}) {
+		t.Fatalf("no adopt: times %v", got)
+	}
+	js = NewJourneys(0)
+	out = js.Move("a", []core.MoverSample{at(1000), gone(3000)}, nil)
+	out = js.Move("b", []core.MoverSample{at(2000), at(2999)}, out)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 2000, 2999}) {
+		t.Fatalf("large overlap: times %v", got)
+	}
+	// The old owner resuming after the handoff window keeps its times.
+	js = NewJourneys(0)
+	out = js.Move("a", []core.MoverSample{at(1000), gone(3000), at(3000 + core.HandoffWindow)}, nil)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 3000 + core.HandoffWindow}) {
+		t.Fatalf("resume: times %v", got)
 	}
 }
 

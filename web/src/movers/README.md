@@ -32,7 +32,12 @@ windows, keyframes and live payloads (`docs/v3/FORMAT.md` 7.4) and live `movers`
    than its speeds allow, so a train that comes back past a place is not put on its later
    pass. Between two samples of a run the leading joint's rail distance follows the timing
    model (stand-then-accelerate from a stop, brake-then-stand into one, else a cubic Hermite
-   in time with the captured speeds), the head is the midpoint of the joints at that rail
+   in time with the captured speeds) over the game ticks between them. Two samples whose ticks
+   cannot be of one game (going back, at a rate no game runs at, or more than 4 times off the
+   neighbouring samples' rate: an instance crossing whose gone row was lost, which puts two
+   instances' tick counts side by side) are timed by the time between them at the neighbours'
+   rate instead (`railTicks`; `tickRate` also keeps such pairs out of every other rate). The
+   head is the midpoint of the joints at that rail
    distance and 4 behind it, and every carriage sits on the chain at its joint distances
    (`placeRailCarriages`; pitches within a quarter tile of 7 are taken as 7). Past the newest
    sample the head runs on along the chain at its speed, braking to a stop when the last two

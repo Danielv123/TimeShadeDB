@@ -367,37 +367,76 @@ func TestTraceJourneysTwoSources(t *testing.T) {
 	}
 }
 
-// TestTraceAdopt: with Universal Edges the destination adopts the journey before the
-// source's gone arrives; the source's gone is then dropped by the owner rule and the
-// journey continues without a gone row.
+// TestTraceAdopt replays the traces as Universal Edges crossings between two instances
+// in the order ingest meets them: at every crossing the destination's adopt and first
+// sample arrive before the source's last two samples and its gone (each instance
+// batches about once a second, a crossing takes less). The owner rule goes by sample
+// time across the adopt, so every row is kept and every crossing is one journey with a
+// handoff.
 func TestTraceAdopt(t *testing.T) {
-	trace := readTrace(t, filepath.Join("testdata", "trace_constructron.txt.gz"))
-	meta := traceMeta("constructron")
-	samples := traceSamples(trace, meta)
-	js := NewJourneys(0)
-	srcs := [2]string{"clusterio:1", "clusterio:2"}
-	cur := 0
-	var out []core.MoverSample
-	gones := 0
-	for _, s := range samples {
-		if s.Flags&core.FlagGone != 0 {
-			if prev := js.Adopt(srcs[1-cur], meta.ID); prev != srcs[cur] {
-				t.Fatalf("adopt: previous owner %q, want %q", prev, srcs[cur])
+	ctx := context.Background()
+	for name, path := range traceFiles(t) {
+		t.Run(name, func(t *testing.T) {
+			trace := readTrace(t, path)
+			wantH, wantE := expectedHandoffs(trace)
+			meta := traceMeta(name)
+			samples := traceSamples(trace, meta)
+			// The crossings (a gone resumed by the next row within the window) and the
+			// rows delivered after the destination's adopt: the gone and up to two
+			// samples before it (not a resume, which the destination sent).
+			cross := map[int]bool{}
+			late := map[int]bool{}
+			for g, s := range samples {
+				if s.Flags&core.FlagGone == 0 || g+1 >= len(samples) || samples[g+1].Flags&core.FlagGone != 0 ||
+					samples[g+1].T > s.T+core.HandoffWindow {
+					continue
+				}
+				cross[g] = true
+				late[g] = true
+				for k := g - 1; k >= 1 && k >= g-2 && samples[k].Flags&core.FlagGone == 0 && samples[k-1].Flags&core.FlagGone == 0; k-- {
+					late[k] = true
+				}
 			}
-			out = js.Move(srcs[cur], []core.MoverSample{s}, out)
-			cur = 1 - cur
-			gones++
-			continue
-		}
-		out = js.Move(srcs[cur], []core.MoverSample{s}, out)
-	}
-	if len(out) != len(samples)-gones || js.Stats().OwnerDrops != int64(gones) {
-		t.Fatalf("out %d of %d, owner drops %d", len(out), len(samples), js.Stats().OwnerDrops)
-	}
-	for _, s := range out {
-		if s.Flags&core.FlagGone != 0 {
-			t.Fatal("a gone survived adoption")
-		}
+			js := NewJourneys(0)
+			srcs := [2]string{"clusterio:1", "clusterio:2"}
+			cur := 0
+			var out, held []core.MoverSample
+			for k, s := range samples {
+				if s.Flags&core.FlagGone != 0 {
+					s.Meta = core.MoverMeta{ID: meta.ID} // gones carry no meta on the wire
+				}
+				switch {
+				case late[k]:
+					held = append(held, s)
+				case k > 0 && cross[k-1]:
+					dst := srcs[1-cur]
+					if prev := js.Adopt(dst, meta.ID, s.T); prev != srcs[cur] {
+						t.Fatalf("adopt: previous owner %q, want %q", prev, srcs[cur])
+					}
+					out = js.Move(dst, []core.MoverSample{s}, out)
+					out = js.Move(srcs[cur], held, out)
+					held = nil
+					cur = 1 - cur
+				default:
+					out = js.Move(srcs[cur], []core.MoverSample{s}, out)
+				}
+			}
+			st := js.Stats()
+			if len(out) != len(samples) || st.OwnerDrops != 0 || st.LateKept != int64(len(late)) {
+				t.Fatalf("out %d of %d, stats %+v, %d late", len(out), len(samples), st, len(late))
+			}
+			m, _ := openTemp(t, Options{SyncInterval: -1, NoWAL: true, MinTime: -1})
+			defer m.Close()
+			if _, err := m.Append(ctx, out); err != nil {
+				t.Fatal(err)
+			}
+			ok(t, m.Commit(ctx, trace[len(trace)-1].t+core.Hour))
+			c := checkTrace(t, m, trace)
+			if c.rows != len(trace) || c.handoffs != wantH || c.gones != wantH+wantE {
+				t.Fatalf("got %+v, want %d rows, %d handoffs, %d ends", c, len(trace), wantH, wantE)
+			}
+			t.Logf("%s: %d crossings, %d rows arrived after the adopt and were kept", name, len(cross), len(late))
+		})
 	}
 }
 
