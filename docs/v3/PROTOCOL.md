@@ -182,7 +182,7 @@ The ingest decoder (WP6) produces core values:
 | `recipe` | `OverlayEvent{Kind: recipe, Key: "<instance>/<u>", Recipe: r, Quality: q}`; no `r`: `Close` |
 | `rail` | `OverlayEvent{Kind: rail, Key: "<instance>/<u>", Name, Direction: dir}`; no `name`: `Close` |
 | `map` | stored in `<db>/maps.json`, shown in the catalog |
-| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`); not stored. The Clusterio controller may keep its own copy (WP10) |
+| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`) at the message time; not stored. The previous owner's samples from before that time, and its gone, still count when they arrive after the adopt (an instance batches about once a second, a crossing takes less); a gone from after it is stored just before it. The Clusterio controller may keep its own copy (WP10) |
 | `surfaces` without `created` | starts a resync of the source (a resync begins by listing the surfaces): journeys it does not re-send before `resynced` are ended there |
 | `resynced` | ends the resync: every journey the source owns and did not re-send gets a gone at the message time; logged |
 | `trace` | logged |

@@ -103,6 +103,9 @@ type Stats struct {
 	// ResolvedGones are gones of journeys the journey rules had forgotten (a server
 	// restart), completed from the mover store's state.
 	ResolvedGones int64
+	// LateKept are samples and gones of a journey's previous owner that arrived after
+	// another source adopted it, from before the adopt: kept (movers.Journeys).
+	LateKept int64
 	// Duplicates are envelopes skipped because their source's retry repeated them
 	// (Sources.Duplicate); CaughtUp are caught_up envelopes; OneRecv are envelopes that
 	// carried the receive time of their source's previous envelope although their tick
@@ -219,6 +222,7 @@ func (in *Ingester) Stats() Stats {
 		s.SurfaceChanges += js.SurfaceChanges
 		s.Quarantined += js.Quarantined
 		s.ResolvedGones += js.ResolvedGones
+		s.LateKept += js.LateKept
 	}
 	in.jmu.Unlock()
 	return s
@@ -780,7 +784,7 @@ type jop struct {
 	kind        uint8
 	mapKey, src string
 	id          string      // adopt: the journey
-	t           core.TimeMs // resynced: the time
+	t           core.TimeMs // adopt, resynced: the time
 	n           int         // move: how many of the batch's raw samples
 }
 
@@ -1005,7 +1009,7 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		if m.J == "" {
 			err = errors.New("adopt without j")
 		} else {
-			b.jops = append(b.jops, jop{kind: jopAdopt, mapKey: env.Map, src: env.Src, id: m.J})
+			b.jops = append(b.jops, jop{kind: jopAdopt, mapKey: env.Map, src: env.Src, id: m.J, t: b.timeOf(nil)})
 		}
 	case core.MsgTag, core.MsgRecipe, core.MsgRail:
 		err = b.overlay(env, m, b.timeOf(nil))
@@ -1384,7 +1388,7 @@ func (a *applier) apply(job *applyJob) error {
 			samples = js.Move(op.src, raw[:op.n], samples)
 			raw = raw[op.n:]
 		case jopAdopt:
-			js.Adopt(op.src, op.id)
+			js.Adopt(op.src, op.id, op.t)
 		case jopBegin:
 			js.Begin(op.src)
 		case jopResynced:

@@ -133,8 +133,8 @@ test("two gridworld instances: a train crossing between them is one journey with
 			const t = t0 + 12_000 + (i * 1000);
 			await send(102, t, [{ type: "move", s: "nauvis", m: [sample(102, t, 260 + (5 * i))] }]);
 		}
-		// A second train whose adopt reaches the controller before the old instance's gone: the gone of a journey
-		// that now belongs to another source is dropped, so it stays one journey, without a gone between.
+		// A second train whose adopt reaches the controller before the old instance's gone: the gone is kept just
+		// before the adopt, so the train stays one journey with a handoff.
 		const j2 = "101.6000.9";
 		const s2 = (id: number, t: number, x: number) => ({ ...sample(id, t, x), j: j2, y: 40.5 });
 		for (let i = 0; i <= 10; i++) {
@@ -183,8 +183,9 @@ test("two gridworld instances: a train crossing between them is one journey with
 		assert.ok(train.some(r => r.x < 256) && train.some(r => r.x > 256), "positions from both tiles");
 		assert.equal(train.at(-1)!.x, 300);
 		const train2 = mvw.rows.filter(r => r.id === j2);
-		assert.equal(train2.length, 11 + 9, "both instances' samples, no gone");
-		assert.ok(train2.every(r => !(r.flags & 2)));
+		assert.equal(train2.length, 11 + 1 + 9, "both instances' samples and the late gone");
+		const gone2 = train2.filter(r => r.flags & 2);
+		assert.deepEqual(gone2.map(r => [r.t, Boolean(r.flags & 4)]), [[t0 + 40_999, true]], "the gone, a handoff");
 
 		const catalog = JSON.parse((await api("catalog")).body.toString());
 		const gw = catalog.maps.find((m: any) => m.key === "gw-w");

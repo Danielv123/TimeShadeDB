@@ -19,6 +19,14 @@ import (
 //   - Owner rule (illisis K28): a journey belongs to the first source that samples it.
 //     Samples and gones from any other source are dropped, until an "adopt" message
 //     moves the journey to the adopting source (Universal Edges, gridworld crossings).
+//     Across an adopt the rule goes by sample time: the previous owner's samples from
+//     before the adopt (its time, or the adopting source's first sample when earlier:
+//     the cut) and its gone are kept when they arrive after the adopt (Stats.LateKept).
+//     Each instance batches its envelopes about once a second and a Universal Edges
+//     crossing takes less, so the destination's adopt often reaches ingest before the
+//     source's last samples and gone. A late gone after the cut is kept just before it,
+//     so the journey's rows stay one path with a handoff; late samples after it are
+//     dropped.
 //     A gone from the owner clears the owner, so the next source to sample the journey
 //     owns it: a train crossing between gridworld instances keeps its id, and the gone
 //     followed by a sample within core.HandoffWindow becomes a handoff in the store.
@@ -147,6 +155,9 @@ type JourneyStats struct {
 	// Quarantined are samples dropped because their source sent the journey's gone
 	// less than core.HandoffWindow earlier and no other source has claimed it yet.
 	Quarantined int64
+	// LateKept are samples and gones of a journey's previous owner from before another
+	// source adopted it, kept although they arrived after the adopt.
+	LateKept int64
 }
 
 type journey struct {
@@ -160,6 +171,13 @@ type journey struct {
 	// the journey before goneT + HandoffWindow unless another source owned it since.
 	goneBy string
 	goneT  core.TimeMs
+	// prev is the owner an adopt took the journey from, with its surface and meta then;
+	// its samples before cut, and its gone, are still the journey's (late). Cleared by
+	// its gone and whenever the journey changes owner otherwise.
+	prev     string
+	prevSfc  core.SurfaceKey
+	prevMeta core.MoverMeta
+	cut      core.TimeMs
 }
 
 // NewJourneys returns a tracker of at most max journeys (default 100,000 when max <= 0).
@@ -208,6 +226,10 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 	for _, s := range samples {
 		j := js.get(s.Meta.ID)
 		if j != nil && j.owner != "" && j.owner != src {
+			if j.prev == src {
+				out = js.late(j, s, out)
+				continue
+			}
 			js.stats.OwnerDrops++
 			continue
 		}
@@ -230,7 +252,7 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			out = append(out, goneOf(j, s.T, s.Tick, s.Flags))
 			// The owner's gone clears the owner; meta and surface are kept so a resumed
 			// journey carries forward its train details.
-			j.owner, j.goneBy, j.goneT = "", src, s.T
+			j.owner, j.goneBy, j.goneT, j.prev = "", src, s.T, ""
 			j.lastT = s.T
 			continue
 		}
@@ -259,6 +281,11 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 				s.Meta.Color = j.meta.Color
 			}
 		}
+		if j.owner != src {
+			j.prev = ""
+		} else if j.prev != "" && s.T < j.cut {
+			j.cut = s.T // the adopting source's first sample came before the adopt
+		}
 		j.owner, j.sfc, j.meta, j.known, j.lastT = src, s.Surface, s.Meta, true, s.T
 		j.goneBy = ""
 		if seen := js.seen[src]; seen != nil {
@@ -270,15 +297,53 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 	return out
 }
 
-// Adopt makes src the owner of journey id (the "adopt" message) and returns the
-// previous owner ("" when none).
-func (js *Journeys) Adopt(src, id string) string {
+// late handles sample s of j's previous owner, which arrived after another source
+// adopted j: a sample from before the cut is kept, and so is the gone (just before the
+// cut at the latest), which ends what the previous owner may still send.
+func (js *Journeys) late(j *journey, s core.MoverSample, out []core.MoverSample) []core.MoverSample {
+	if s.Flags&core.FlagGone != 0 {
+		js.change(j)
+		g := core.MoverSample{Surface: j.prevSfc, Meta: j.prevMeta, T: min(s.T, j.cut-1), Tick: s.Tick, Flags: core.FlagGone | s.Flags&core.FlagNoTick}
+		j.prev = ""
+		js.stats.LateKept++
+		return append(out, g)
+	}
+	if s.T >= j.cut {
+		js.stats.OwnerDrops++
+		return out
+	}
+	js.change(j)
+	if s.Meta.Kind == core.KindTrain && j.prevMeta.Kind == core.KindTrain {
+		if s.Meta.Carriages == 0 {
+			s.Meta.Carriages = j.prevMeta.Carriages
+		}
+		if s.Meta.Kinds == "" {
+			s.Meta.Kinds = j.prevMeta.Kinds
+		}
+		if s.Meta.Color == "" {
+			s.Meta.Color = j.prevMeta.Color
+		}
+	}
+	j.prevSfc, j.prevMeta = s.Surface, s.Meta
+	js.stats.LateKept++
+	return append(out, s)
+}
+
+// Adopt makes src the owner of journey id (the "adopt" message) at t, the adopt's
+// time, and returns the previous owner ("" when none). The previous owner's samples
+// from before t and its gone are still taken when they arrive later (Move).
+func (js *Journeys) Adopt(src, id string, t core.TimeMs) string {
 	j := js.get(id)
 	if j == nil {
 		j = js.add(id)
 	}
 	js.change(j)
 	prev := j.owner
+	if prev != "" && prev != src && j.known {
+		j.prev, j.prevSfc, j.prevMeta, j.cut = prev, j.sfc, j.meta, t
+	} else if prev != src {
+		j.prev = ""
+	}
 	j.owner, j.goneBy = src, ""
 	return prev
 }

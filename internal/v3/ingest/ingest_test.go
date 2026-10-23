@@ -346,6 +346,35 @@ func TestIngestResyncEndsJourneys(t *testing.T) {
 	}
 }
 
+// TestIngestAdoptKeepsSourceTail: a Universal Edges destination's adopt reaches ingest
+// before the source's last sample and gone, which were batched later. Both are from
+// before the adopt by their sample time and are kept.
+func TestIngestAdoptKeepsSourceTail(t *testing.T) {
+	f := newFixture(t, Options{})
+	mv := func(x float64) map[string]any {
+		return map[string]any{"j": "1.1.7", "k": "t", "f": "player", "name": "locomotive", "x": x, "y": 1, "h": 0.25, "n": 2}
+	}
+	move := func(m map[string]any) map[string]any {
+		return map[string]any{"type": "move", "s": "nauvis", "m": []any{m}}
+	}
+	f.ingest(t, line(t, env{V: 1, Tick: 60, Src: "a", Map: "gw-w", RecvMs: int64(base), Msgs: []any{move(mv(1))}}))
+	f.ingest(t, line(t, env{V: 1, Tick: 6000, Src: "b", Map: "gw-w", RecvMs: int64(base + 2000), Msgs: []any{
+		map[string]any{"type": "adopt", "j": "1.1.7", "trace": "x"}, move(mv(40)),
+	}}))
+	resp := f.ingest(t, line(t, env{V: 1, Tick: 150, Src: "a", Map: "gw-w", RecvMs: int64(base + 1500), Msgs: []any{
+		move(mv(20)), move(map[string]any{"j": "1.1.7", "gone": true}),
+	}}))
+	st := f.in.Stats()
+	if resp.Samples.Accepted != 2 || st.LateKept != 2 || st.OwnerDrops != 0 {
+		t.Fatalf("resp %+v, stats %+v", resp.Samples, st)
+	}
+	// Later samples of the source are not the journey's any more.
+	resp = f.ingest(t, line(t, env{V: 1, Tick: 210, Src: "a", Map: "gw-w", RecvMs: int64(base + 2500), Msgs: []any{move(mv(30))}}))
+	if resp.Samples.Accepted != 0 || f.in.Stats().OwnerDrops != 1 {
+		t.Fatalf("resp %+v, stats %+v", resp.Samples, f.in.Stats())
+	}
+}
+
 func TestReadLineLimits(t *testing.T) {
 	f := newFixture(t, Options{MaxLine: 100})
 	body := strings.Repeat("x", 70000) + "\n" + line(t, env{V: 1, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{}})

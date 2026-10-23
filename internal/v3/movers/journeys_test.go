@@ -93,6 +93,60 @@ func TestJourneysStaleBeforeNewOwner(t *testing.T) {
 	}
 }
 
+// TestJourneysLateAfterAdopt: the source's last samples and gone arrive after the
+// destination's adopt. Those from before the cut are kept; a sample after it is
+// dropped and a gone after it is kept just before it; a rolled-back batch leaves the
+// previous owner able to send them again.
+func TestJourneysLateAfterAdopt(t *testing.T) {
+	sfc := core.SurfaceKey{Map: "gw", Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "7.1.2", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 22, Kinds: "LC"}
+	bare := core.MoverMeta{ID: meta.ID, Kind: core.KindTrain, Force: "player", Name: "locomotive"}
+	at := func(t core.TimeMs, x float64) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: bare, T: t, X: x, Tick: int64(t) / 10}
+	}
+	gone := func(t core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: meta.ID}, T: t, Tick: int64(t) / 10, Flags: core.FlagGone}
+	}
+	js := NewJourneys(0)
+	first := at(1000, 1)
+	first.Meta = meta
+	out := js.Move("a", []core.MoverSample{first}, nil)
+	// b adopts at 3000, but its first sample is from 2900: the cut.
+	js.Adopt("b", meta.ID, 3000)
+	out = js.Move("b", []core.MoverSample{at(2900, 50)}, out)
+	js.Mark()
+	n := len(out)
+	out = js.Move("a", []core.MoverSample{at(2000, 2), at(2950, 3), gone(3100)}, out)
+	if len(out) != n+2 {
+		t.Fatalf("late rows = %+v", out[n:])
+	}
+	if s := out[n]; s.T != 2000 || s.Meta != meta {
+		t.Fatalf("late sample = %+v (meta carried forward from the source)", s)
+	}
+	if g := out[n+1]; g.Flags&core.FlagGone == 0 || g.T != 2899 || g.Meta != meta || g.Surface != sfc {
+		t.Fatalf("late gone = %+v, want at 2899 with the source's meta", g)
+	}
+	if st := js.Stats(); st.LateKept != 2 || st.OwnerDrops != 1 || js.Owner(meta.ID) != "b" {
+		t.Fatalf("stats %+v, owner %q", st, js.Owner(meta.ID))
+	}
+	// Rolled back (the store refused the batch): the retry meets the same state.
+	js.Rollback()
+	out = js.Move("a", []core.MoverSample{at(2000, 2), gone(2500)}, out[:n])
+	if len(out) != n+2 || out[n+1].T != 2500 {
+		t.Fatalf("after rollback: %+v", out[n:])
+	}
+	// The gone ends what a may send: a later sample of it is dropped.
+	out = js.Move("a", []core.MoverSample{at(2600, 4)}, out)
+	if len(out) != n+2 || js.Owner(meta.ID) != "b" {
+		t.Fatalf("after the late gone: %+v, owner %q", out[n:], js.Owner(meta.ID))
+	}
+	// Another source gets nothing from the adopt.
+	out = js.Move("c", []core.MoverSample{at(2000, 9)}, out)
+	if len(out) != n+2 {
+		t.Fatalf("a third source's sample was kept")
+	}
+}
+
 func TestJourneysResyncAndStopped(t *testing.T) {
 	js := NewJourneys(0)
 	sfc := core.SurfaceKey{Map: "m", Surface: "s"}

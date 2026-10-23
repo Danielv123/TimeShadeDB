@@ -339,6 +339,8 @@ What the exporter writes (`internal/v3/publish/README.md` has the details and si
   `corrupt`, `wal_skipped`), `tsdb_ingest_caught_up_total`, `tsdb_horizon_held_maps`,
   `tsdb_horizon_hold_lag_ms`, `tsdb_ingest_resolved_gones_total` (gones of journeys the
   journey rules had forgotten, after a restart, completed from the mover store's last row),
+  `tsdb_ingest_adopt_late_total` (samples and gones of a journey's previous owner from
+  before an adopt that arrived after it, kept),
   `tsdb_mover_live_evicted_total` (live journeys forgotten past the store's live-journey
   bound), `tsdb_overlay_open_intervals`,
   `tsdb_overlay_torn_bytes_total` and the Go runtime gauges `go_memstats_heap_inuse_bytes`,
