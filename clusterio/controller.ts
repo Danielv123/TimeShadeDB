@@ -177,7 +177,15 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 			queue.push(JSON.stringify({ ...env, src: `clusterio:${src.id}`, instance: src.id }));
 		}
 	};
-	controller.handle(EnvelopesRequest, envelopes);
+	controller.handle(EnvelopesRequest, async (request: EnvelopesRequest, src: lib.Address) => {
+		// Clusterio runs the shutdown hook before it closes the links, so a request can arrive after the queue closed.
+		// It fails, and the instance keeps the batch and sends it again after the reconnect (the map server skips
+		// what it has by seq).
+		if (queue.isClosed) {
+			throw new lib.RequestError("timeshade: the controller is shutting down");
+		}
+		await envelopes(request, src);
+	});
 	controller.handle(EnvelopesEvent, envelopes);
 	controller.handle(ViewTokenRequest, async (_request: ViewTokenRequest, src: lib.Address) => {
 		const user = controller.wsServer.controlConnections.get(src.id)?.user;

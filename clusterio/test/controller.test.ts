@@ -75,6 +75,23 @@ test("envelopes are forwarded with src and instance from the link address; maps 
 	}
 });
 
+test("after the shutdown hook closed the queue, a request fails (the instance keeps it) and an event is dropped", async () => {
+	const { c, plugin } = await start();
+	const env = (seq: number) => ({ v: 1, tick: seq, msgs: [], map: "i-1", recv_ms: seq, seq });
+	try {
+		// Clusterio runs the hook first and closes the links after it, so messages can still arrive.
+		await c.call("shutdown");
+		assert.ok(plugin.queue.isClosed);
+		await assert.rejects(
+			c.deliver(EnvelopesRequest, new EnvelopesRequest([env(7)]), { type: "instance", id: 1 }),
+			/shutting down/,
+		);
+		await c.deliver(EnvelopesEvent, new EnvelopesEvent([env(8)]), { type: "instance", id: 1 });
+	} finally {
+		await c.web.close();
+	}
+});
+
 test("view tokens: given to user connections over the link, accepted by the proxy, which reaches the sidecar", async () => {
 	const { c, plugin } = await start();
 	try {

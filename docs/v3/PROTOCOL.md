@@ -42,9 +42,9 @@ every few seconds once it has posted everything in the directory, and when it st
 (`ended` when the newest file has not changed for 10 s, so the game is not running); the
 Clusterio instance for each of its maps that had no envelope for 5 s, queued after
 everything that waits (so a map without data is not held back while the instance's other
-map is busy), and `ended` for every map when the instance stops. A forwarder that stops without one (killed, or its host lost) leaves its
-source holding its maps for the server's `--source-hold`, so the lines it still has are
-not late when it comes back.
+map is busy), and `ended` for every map when the instance stops. A forwarder that stops
+without one (killed, or its host lost) leaves its source holding its maps for the server's
+`--source-hold`, so the lines it still has are not late when it comes back.
 
 ## 2. Transports
 
