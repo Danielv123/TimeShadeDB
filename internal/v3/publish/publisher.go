@@ -205,10 +205,11 @@ func (p *Publisher) run(ctx context.Context, items []Item, st *Stats) error {
 		st.Bytes += counters.bytes.Load()
 	}()
 	for phase := 0; phase < numPhases; phase++ {
-		if phase == phaseIndexes && counters.rejected.Load()+counters.failed.Load() > 0 {
-			// A data object of this round is not stored: storing a final index now
-			// would keep the next rounds from planning it again.
-			p.opt.Logf("publish: final timelines and day indexes deferred to the next round (objects were refused or unreadable)")
+		if phase == phaseIndexes && counters.rejected.Load()+counters.failed.Load()+counters.missing.Load() > 0 {
+			// A data object of this round is not stored (refused, unreadable, or gone
+			// from the source since planning): storing a final index now would name it
+			// for good and keep the next rounds from planning it again.
+			p.opt.Logf("publish: final timelines and day indexes deferred to the next round (objects were refused, unreadable or missing)")
 			continue
 		}
 		var batch []*Item

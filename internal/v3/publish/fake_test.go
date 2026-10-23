@@ -28,6 +28,8 @@ type fakeDB struct {
 	gets   map[string]int
 	empty  bool // overlays answer no intervals
 	lister bool // implements OverlayLister through ListOverlayTiles
+	// missing answers not found for these paths (an object gone between planning and reading).
+	missing map[string]bool
 }
 
 const fakeDS = "m.s.player"
@@ -69,6 +71,9 @@ func (f *fakeDB) Get(ctx context.Context, path string) (Resource, error) {
 		return Resource{Body: b, ContentType: "application/json"}, err
 	}
 	nf := func() (Resource, error) { return Resource{}, fmt.Errorf("get %s: %w", path, ErrNotFound) }
+	if f.missing[path] {
+		return nf()
+	}
 	day := core.UTCDay(f.day0)
 	switch {
 	case path == "catalog":
