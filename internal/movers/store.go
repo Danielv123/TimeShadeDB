@@ -306,10 +306,11 @@ func (m *Store) newSurface(key core.SurfaceKey) *surface {
 	}
 }
 
-// lastMeta is a journey's newest open row: its meta (nil for a gone) and time.
+// lastMeta is a journey's newest open row: its meta (nil for a gone), time and position.
 type lastMeta struct {
 	meta *core.MoverMeta
 	t    core.TimeMs
+	x, y int32
 }
 
 // noteOpen records r, a row joining the open windows, in lastOpen.
@@ -317,7 +318,7 @@ func (s *surface) noteOpen(r *row) {
 	if cur, ok := s.lastOpen[r.meta.ID]; ok && cur.t > r.t {
 		return
 	}
-	lm := lastMeta{meta: r.meta, t: r.t}
+	lm := lastMeta{meta: r.meta, t: r.t, x: r.x, y: r.y}
 	if r.gone() {
 		lm.meta = nil
 	}
@@ -344,6 +345,51 @@ func (m *Store) LastMeta(sfc core.SurfaceKey, id string) (core.MoverMeta, bool) 
 		return *r.meta, true
 	}
 	return core.MoverMeta{}, false
+}
+
+// LiveJourney is a journey live on a surface of the store (LiveJourneys): its newest row
+// there, open or closed, is not a gone.
+type LiveJourney struct {
+	Surface core.SurfaceKey
+	Meta    core.MoverMeta
+	// X, Y and T are the newest row's position and time.
+	X, Y float64
+	T    core.TimeMs
+}
+
+// LiveJourneys returns the journeys live on the surfaces of map mapKey (as LastMeta sees
+// them) for which keep, given the surface, the journey and its newest row's position,
+// reports true; a journey live on two surfaces is listed once per surface. keep runs
+// under the store's read lock and must not call the store. Ingest's journey rules use it
+// at a resync, to end the journeys of the resyncing source they forgot (Journeys.Live).
+// It walks every live journey of the map's surfaces once and copies only those kept.
+func (m *Store) LiveJourneys(mapKey string, keep func(sfc core.SurfaceKey, id string, x, y float64) bool) []LiveJourney {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []LiveJourney
+	add := func(s *surface, meta *core.MoverMeta, t core.TimeMs, x, y int32) {
+		fx, fy := float64(x)/core.PosUnits, float64(y)/core.PosUnits
+		if keep(s.key, meta.ID, fx, fy) {
+			out = append(out, LiveJourney{Surface: s.key, Meta: *meta, X: fx, Y: fy, T: t})
+		}
+	}
+	for key, s := range m.sfc {
+		if key.Map != mapKey {
+			continue
+		}
+		// A journey's newest open row is newer than its closed rows.
+		for _, lm := range s.lastOpen {
+			if lm.meta != nil {
+				add(s, lm.meta, lm.t, lm.x, lm.y)
+			}
+		}
+		for id, r := range s.live {
+			if _, ok := s.lastOpen[id]; !ok {
+				add(s, r.meta, r.t, r.x, r.y)
+			}
+		}
+	}
+	return out
 }
 
 func (s *surface) intern(meta *core.MoverMeta) *core.MoverMeta {

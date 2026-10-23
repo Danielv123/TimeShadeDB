@@ -873,20 +873,23 @@ function protocolOf(source: DataSource): string | undefined {
 }
 
 /** Loads the icon spritesheet named by the catalog (paths relative to the source base). */
-async function loadIconAtlas(source: DataSource, catalog: Catalog): Promise<IconAtlas | null> {
+export async function loadIconAtlas(source: DataSource, catalog: Catalog): Promise<IconAtlas | null> {
   if (!catalog.icons) {
     return null;
   }
   const base = new URL((source as { base?: string }).base ?? "./", location.href);
+  // Both files are fetched with the source's authorization, as every other request: behind a proxy that checks it
+  // (the Clusterio plugin's) a plain <img> or fetch is refused.
+  const headers = (source as { requestHeaders?: () => Record<string, string> }).requestHeaders?.() ?? {};
   try {
     const [meta, img] = await Promise.all([
-      fetch(new URL(catalog.icons.json, base)).then(r => (r.ok ? (r.json() as Promise<Record<string, { name: string; icon?: { x: number; y: number; size: number } }[]>>) : null)),
-      (async () => {
-        const im = new Image();
-        im.src = new URL(catalog.icons!.png, base).href;
-        await im.decode();
-        return im;
-      })(),
+      fetch(new URL(catalog.icons.json, base), { headers }).then(r => (r.ok ? (r.json() as Promise<Record<string, { name: string; icon?: { x: number; y: number; size: number } }[]>>) : null)),
+      fetch(new URL(catalog.icons.png, base), { headers }).then(async r => {
+        if (!r.ok) {
+          throw new Error(`icons: ${r.status}`);
+        }
+        return createImageBitmap(await r.blob());
+      }),
     ]);
     if (!meta) {
       return null;

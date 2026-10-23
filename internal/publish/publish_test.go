@@ -489,6 +489,39 @@ func TestPublishAuthAndRejected(t *testing.T) {
 	}
 }
 
+func TestPublishDefersFinalIndexesForMissingObjects(t *testing.T) {
+	db := newFakeDB()
+	db.final = true
+	db.missing = map[string]bool{"tile/m.s.player/0/0/0/2.bin": true}
+	s3 := newFakeS3(t)
+	ctx := context.Background()
+	p, _ := newTestPublisher(t, db, s3.target(t), t.TempDir(), Options{})
+	st, err := p.Round(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Missing != 1 {
+		t.Fatalf("stats %v", st)
+	}
+	for _, k := range []string{"timeline/m.s.player/0/2026-10-12.json", "movers/m.s/day/2026-10-12.json"} {
+		if _, ok := s3.objects[k]; ok {
+			t.Errorf("%s stored although a tile it names was missing", k)
+		}
+	}
+	// Once the object can be read, the next round stores it and the final indexes.
+	db.missing = nil
+	s3.takePuts()
+	if _, err := p.Round(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second := s3.takePuts()
+	for _, k := range []string{"tile/m.s.player/0/0/0/2.bin", "timeline/m.s.player/0/2026-10-12.json", "movers/m.s/day/2026-10-12.json"} {
+		if !slices.Contains(second, k) {
+			t.Errorf("%s not stored in the next round", k)
+		}
+	}
+}
+
 func TestKeyframeEvery(t *testing.T) {
 	db := newFakeDB()
 	db.latest = map[core.TileCoord]core.Version{{X: 0, Y: 0}: 10, {Z: -1}: 5}

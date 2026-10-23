@@ -22,7 +22,7 @@ the forwarder adds the second group before posting.
 | `instance` | forwarder | int, optional | Clusterio instance id (overlay keys, instance bounds) |
 | `recv_ms` | forwarder | int | wall-clock ms when the line was written or first read (below) |
 | `seq` | forwarder | int, optional | increasing per `src`; echoed by ingest for acknowledgements; ingest skips an envelope whose `seq` and `recv_ms` are both at or below the last applied envelope of its `src` (a retried body) |
-| `caught_up` | forwarder | bool, optional | the forwarder has no older line of this `src` pending: everything it read was sent. Such an envelope may have no messages (`"msgs":[]`); then ingest only notes that the source has caught up to `recv_ms` (API.md 5, "Horizon") and does not use it for the clock anchor or the data clock |
+| `caught_up` | forwarder | bool, optional | the forwarder has no older line of this `src` and `map` pending: everything it read for the map was sent before this envelope. Such an envelope may have no messages (`"msgs":[]`); then ingest only notes that the source has caught up to `recv_ms` (API.md 5, "Horizon") and does not use it for the clock anchor or the data clock |
 | `ended` | forwarder | bool, optional | with `caught_up`: the source stopped (its game exited), so ingest need not wait for more of it until it sends again |
 
 Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not fatal).
@@ -41,10 +41,11 @@ later than the truth, which the anchor allows.
 Forwarders send `caught_up` envelopes while they have nothing to send: `timeshadedb tail`
 every few seconds once it has posted everything in the directory, and when it stops
 (`ended` when the newest file has not changed for 10 s, so the game is not running); the
-Clusterio instance every few seconds while its queue is empty, and `ended` when the
-instance stops. A forwarder that stops without one (killed, or its host lost) leaves its
-source holding its maps for the server's `--source-hold`, so the lines it still has are
-not late when it comes back.
+Clusterio instance for each of its maps that had no envelope for 5 s, queued after
+everything that waits (so a map without data is not held back while the instance's other
+map is busy), and `ended` for every map when the instance stops. A forwarder that stops
+without one (killed, or its host lost) leaves its source holding its maps for the server's
+`--source-hold`, so the lines it still has are not late when it comes back.
 
 ## 2. Transports
 
@@ -55,7 +56,9 @@ not late when it comes back.
   of any length reach the host in order). The capture encodes with `capture/lua/json.lua`,
   which gives the same JSON as `helpers.table_to_json` (key order aside) at a lower cost.
   The instance plugin parses the line, adds the forwarder fields and sends batches to the
-  controller about once a second. The controller posts them to its sidecar.
+  controller about once a second, as requests: a batch the controller did not acknowledge
+  stays queued and is sent again (Clusterio drops events it cannot forward without telling
+  the sender). The controller posts them to its sidecar.
 - **Standalone**: the `timeshadedb_exporter` mod (`capture/mod/timeshadedb_exporter/`)
   appends envelope lines with
   `helpers.write_file("timeshade/<seq>-<tick>.ndjson", lines, true)`, starting a new file
@@ -176,17 +179,47 @@ Ingest (`internal/ingest`) turns messages into core values:
 | `chunk` with `d` | `ChunkUpdate{DS: {map, s, f}, Chunk: {x, y}, T, Pixels: DecodeChart(d)}`; a chart that does not inflate to 2,048 bytes is a bad message |
 | `chunk` without `d` | `ChunkUpdate{..., Deleted: true}` |
 | `move` sample | `MoverSample{Surface: {map, s}, Meta: {j, k, f, name, n, o, c}, T, Tick, X, Y, Orientation: h, Flags, Carriages: car}` with `FlagStop` for `stop`, `FlagEndSwitch` for `es`, `FlagNoHeading` when `h` is absent; a train sample with `v` and `h` also gets `FlagRail`, `Speed: v`, `Rail: rp`, `RailStart: ru` (a piece with an unknown kind or direction drops `rp` and sets `RailStart`) |
-| `move` gone | `MoverSample{..., Flags: FlagGone}` with the journey's last known meta (ingest keeps the last meta per journey in a bounded map; unknown: kind from the id prefix, empty names) |
+| `move` gone | `MoverSample{..., Flags: FlagGone}` with the journey's last known meta and surface (ingest keeps them per journey in a bounded map; a journey it forgot, after a restart: the mover store's newest row of the journey on the gone's surface; a gone of a journey neither knows, or that already ended, is dropped) |
 | `tag` | `OverlayEvent{DS: {map, s, f}, T, Interval: {Kind: tag, Key: "<instance>/<n>", Instance, X, Y, Icon, Text}}`; no `x`: `Close` |
 | `recipe` | `OverlayEvent{Kind: recipe, Key: "<instance>/<u>", Recipe: r, Quality: q}`; no `r`: `Close` |
 | `rail` | `OverlayEvent{Kind: rail, Key: "<instance>/<u>", Name, Direction: dir}`; no `name`: `Close` |
 | `map` | stored in `<db>/maps.json`, shown in the catalog |
-| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`); not stored |
+| `adopt` | moves the journey to the adopting source in ingest's owner map (`movers.Journeys`) at the message time; not stored. The previous owner's samples from before that time, and its gone, still count when they arrive after the adopt (an instance batches about once a second, a crossing takes less; after a server restart, which does not know the previous owner, the first other source's); a gone from after it is stored just before it. When the gone came first, the next owner's samples up to 250 ms before it are stored just after it (each instance's clock is anchored on its own), also at a crossing without an adopt |
 | `surfaces` without `created` | starts a resync of the source (a resync begins by listing the surfaces): journeys it does not re-send before `resynced` are ended there |
-| `resynced` | ends the resync: every journey the source owns and did not re-send gets a gone at the message time; logged |
+| `resynced` | ends the resync: every journey the source owns and did not re-send gets a gone at the message time. So does every journey the mover store has live on the map that ingest's owner map does not know (the server restarted since its last sample) and the source did not re-send, when its newest row lies in the source's region: on a gridworld map the bounds of the envelope's `instance` from the `map` message, on the source's own map (`i-<instance>`, or any map of a `standalone:` source) the whole map. See "Resync after a restart" below; logged |
 | `trace` | logged |
 
 Standalone sources use instance 0 in overlay keys.
+
+**Resync after a restart.** Ingest's owner map lives in memory only, so after a server
+restart (the Clusterio controller restarts its sidecar) it knows no journey. A journey whose
+last stored row is not a gone and that no source samples again, such as a train an
+instance lost when it came back from an older save, would stay live for ever: in every
+keyframe and live payload. The `resynced` rule above ends it at the resync of the source
+whose region holds it, with the newest row's meta and surface (a gone without a tick,
+counted in `tsdb_ingest_resync_forgotten_total`). The details:
+
+- Left alone: journeys the source re-sent; journeys the owner map knows, because a source
+  sampled them since the restart (another source's stay its own) or ingest already sent their
+  gone; journeys another source adopted and has not sampled yet; journeys with a row at or
+  after the resync time, or a row earlier in the same ingest batch. A journey the resyncing
+  source adopted but never sampled is ended wherever it lies.
+- Region: a gridworld tile is `[x1, x2) x [y1, y2)` of its instance's `bounds`, tested on the
+  journey's newest position (a train's leading carriage), on every surface of the map. A
+  parked train in another tile stays. Without the instance's bounds (no `map` message yet), and
+  on a map other sources may share (anything but `i-<instance>` and a `standalone:` source's
+  map), the resync ends only the journeys the source owns. A standalone map is taken to have
+  a single source: two games tailed into one map key end each other's forgotten journeys.
+- A train between two tiles (a Universal Edges crossing) whose newest row lies in the
+  resyncing tile while the neighbour holds it: once the neighbour samples it since the
+  restart it is the neighbour's and stays. When both restarted and the neighbour has not
+  sampled it yet, it is ended at the resync and starts again at the neighbour's next sample
+  (a handoff within 10 s); a moving train is sampled at least every 2 s, so only a train
+  parked across the border is missing until the neighbour resyncs.
+- Players and vehicles follow the same rules. Both open and closed rows count (the newest
+  wins); journeys the store's live bound already forgot are not live and need nothing.
+- The ended journeys are not added to the owner map; a later sample starts the journey again
+  as usual. A batch the mover store refuses is retried with the same result.
 
 Ordering: messages of one source are applied in envelope order. Across sources, stores
 order by T (terrain: newest T wins per window; movers: sorted per journey). Duplicates from

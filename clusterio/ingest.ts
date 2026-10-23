@@ -119,6 +119,11 @@ export class IngestQueue {
 		this.trim();
 	}
 
+	/** True once close() ran: push() keeps nothing more. */
+	get isClosed(): boolean {
+		return this.closed;
+	}
+
 	/** Queues one NDJSON line (no newline). */
 	push(line: string): void {
 		if (this.closed) {

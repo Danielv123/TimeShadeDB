@@ -5,8 +5,10 @@
 package movers
 
 import (
+	"cmp"
 	"container/list"
 	"maps"
+	"slices"
 	"strings"
 
 	"timeshadedb/internal/core"
@@ -19,6 +21,24 @@ import (
 //   - Owner rule (illisis K28): a journey belongs to the first source that samples it.
 //     Samples and gones from any other source are dropped, until an "adopt" message
 //     moves the journey to the adopting source (Universal Edges, gridworld crossings).
+//     Across an adopt the rule goes by sample time: the previous owner's samples from
+//     before the adopt (its time, or the adopting source's first sample when earlier:
+//     the cut) and its gone are kept when they arrive after the adopt (Stats.LateKept).
+//     Each instance batches its envelopes about once a second and a Universal Edges
+//     crossing takes less, so the destination's adopt often reaches ingest before the
+//     source's last samples and gone. A late gone after the cut is kept just before it,
+//     so the journey's rows stay one path with a handoff; late samples after it are
+//     dropped. An adopt of a journey Journeys does not know (the server restarted, as
+//     it does with the Clusterio controller, and the instances' backlogs arrive in any
+//     order) takes the first other source that sends samples from before the cut as
+//     the previous owner. Known limits: only the last adopt is remembered, so when a
+//     journey returns to its source (A to B to A) before A's late tail and gone of the
+//     first crossing arrive, they are taken as the owner's and the gone ends the
+//     journey there.
+//     Each instance's clock is anchored on its own, so the next owner's first samples
+//     can come a few ms before the gone of the last one. Those up to goneSlack before
+//     it are moved just after it, so the gone stays between the two sources' rows
+//     (Stats.AfterGone).
 //     A gone from the owner clears the owner, so the next source to sample the journey
 //     owns it: a train crossing between gridworld instances keeps its id, and the gone
 //     followed by a sample within core.HandoffWindow becomes a handoff in the store.
@@ -37,9 +57,14 @@ import (
 //     the old surface at the sample's time (the mover left that surface).
 //   - Train carriage count, kinds and colour are carried forward from the previous
 //     sample when a sample omits them.
-//   - Resync: after Begin(src), Resynced(src, t) emits gones for every journey src owns
-//     that it did not re-send. Stopped(src, t) emits gones for src's players (its
-//     trains and vehicles stay parked).
+//   - Resync: after Begin(src), Resynced(src, t, region) emits gones for every journey
+//     src owns that it did not re-send. Ownership lives only in memory, so after a
+//     server restart it also ends the journeys the store still has live (Live) that
+//     Journeys does not know and src did not re-send, when their newest row lies in
+//     src's region (its gridworld tile, or the whole map of a single source): a game
+//     restarted from an older save no longer has them, and nothing else would end them.
+//     See Resynced for what is left alone. Stopped(src, t) emits gones for src's players
+//     (its trains and vehicles stay parked).
 //
 // Memory is bounded: at most max journeys are tracked; the least recently seen is
 // forgotten first (its next sample starts a new owner).
@@ -51,6 +76,10 @@ type Journeys struct {
 	// Lookup, if set, returns the meta of journey id's last row on surface sfc when the
 	// journey is live there (the store's state), for gones of journeys Journeys forgot.
 	Lookup func(sfc core.SurfaceKey, id string) (core.MoverMeta, bool)
+	// Live, if set, returns the journeys live in the store on this map for which keep
+	// reports true (Store.LiveJourneys), for resyncs. keep must not be called after Live
+	// returns.
+	Live func(keep func(sfc core.SurfaceKey, id string, x, y float64) bool) []LiveJourney
 
 	max   int
 	byID  map[string]*list.Element
@@ -147,6 +176,15 @@ type JourneyStats struct {
 	// Quarantined are samples dropped because their source sent the journey's gone
 	// less than core.HandoffWindow earlier and no other source has claimed it yet.
 	Quarantined int64
+	// LateKept are samples and gones of a journey's previous owner from before another
+	// source adopted it, kept although they arrived after the adopt.
+	LateKept int64
+	// AfterGone are samples of a journey's next owner from just before the last
+	// owner's gone, moved to just after it.
+	AfterGone int64
+	// ResyncForgotten are journeys the store had live that Journeys did not know (a
+	// server restart), ended by a resync of the source whose region holds them.
+	ResyncForgotten int64
 }
 
 type journey struct {
@@ -160,7 +198,28 @@ type journey struct {
 	// the journey before goneT + HandoffWindow unless another source owned it since.
 	goneBy string
 	goneT  core.TimeMs
+	// prev is the owner an adopt took the journey from, with its surface and meta then
+	// (prevKnown); its samples before cut, and its gone, are still the journey's (late).
+	// anyPrev: the adopt did not know the journey, so the first other source with a
+	// sample before cut becomes prev. Cleared by prev's gone and whenever the journey
+	// changes owner otherwise.
+	prev      string
+	anyPrev   bool
+	prevKnown bool
+	prevSfc   core.SurfaceKey
+	prevMeta  core.MoverMeta
+	cut       core.TimeMs
+	// afterBy sent the gone that ended the last ownership at afterT: another source's
+	// samples up to goneSlack before afterT are moved after it. Cleared by the first
+	// sample kept at its own time and when an adopt takes the journey from an owner.
+	afterBy string
+	afterT  core.TimeMs
 }
+
+// goneSlack is how far a next owner's sample may come before the last owner's gone and
+// still be moved after it. Instance clocks differ by tens of ms at a crossing; a larger
+// overlap is left as it is.
+const goneSlack core.TimeMs = 250
 
 // NewJourneys returns a tracker of at most max journeys (default 100,000 when max <= 0).
 func NewJourneys(max int) *Journeys {
@@ -208,6 +267,10 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 	for _, s := range samples {
 		j := js.get(s.Meta.ID)
 		if j != nil && j.owner != "" && j.owner != src {
+			if j.prev == src || j.anyPrev {
+				out = js.late(j, src, s, out)
+				continue
+			}
 			js.stats.OwnerDrops++
 			continue
 		}
@@ -230,7 +293,8 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			out = append(out, goneOf(j, s.T, s.Tick, s.Flags))
 			// The owner's gone clears the owner; meta and surface are kept so a resumed
 			// journey carries forward its train details.
-			j.owner, j.goneBy, j.goneT = "", src, s.T
+			j.owner, j.goneBy, j.goneT, j.prev, j.anyPrev = "", src, s.T, "", false
+			j.afterBy, j.afterT = src, s.T
 			j.lastT = s.T
 			continue
 		}
@@ -259,6 +323,20 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 				s.Meta.Color = j.meta.Color
 			}
 		}
+		if j.afterBy != "" {
+			if j.afterBy != src && s.T <= j.afterT && j.afterT-s.T <= goneSlack {
+				s.T = j.afterT + 1
+				j.afterT = s.T // a second such sample goes after this one
+				js.stats.AfterGone++
+			} else {
+				j.afterBy = ""
+			}
+		}
+		if j.owner != src {
+			j.prev, j.anyPrev = "", false
+		} else if (j.prev != "" || j.anyPrev) && s.T < j.cut {
+			j.cut = s.T // the adopting source's first sample came before the adopt
+		}
 		j.owner, j.sfc, j.meta, j.known, j.lastT = src, s.Surface, s.Meta, true, s.T
 		j.goneBy = ""
 		if seen := js.seen[src]; seen != nil {
@@ -270,15 +348,91 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 	return out
 }
 
-// Adopt makes src the owner of journey id (the "adopt" message) and returns the
-// previous owner ("" when none).
-func (js *Journeys) Adopt(src, id string) string {
+// late handles sample s from src, j's previous owner (or, with anyPrev, any other
+// source), which arrived after another source adopted j: a sample from before the cut
+// is kept, and so is the gone (just before the cut at the latest), which ends what the
+// previous owner may still send.
+func (js *Journeys) late(j *journey, src string, s core.MoverSample, out []core.MoverSample) []core.MoverSample {
+	if s.Flags&core.FlagGone != 0 {
+		if j.anyPrev {
+			// A gone before any sample of an unknown previous owner: the store's last row
+			// of the journey gives its meta, as for gones of journeys Journeys forgot.
+			var meta core.MoverMeta
+			ok := js.Lookup != nil
+			if ok {
+				meta, ok = js.Lookup(s.Surface, s.Meta.ID)
+			}
+			if !ok {
+				js.stats.OwnerDrops++
+				return out
+			}
+			js.change(j)
+			j.prev, j.anyPrev, j.prevKnown, j.prevSfc, j.prevMeta = src, false, true, s.Surface, meta
+			js.stats.ResolvedGones++
+		}
+		js.change(j)
+		g := core.MoverSample{Surface: j.prevSfc, Meta: j.prevMeta, T: s.T, Tick: s.Tick, Flags: core.FlagGone | s.Flags&core.FlagNoTick}
+		if g.T >= j.cut {
+			// Moved before the cut, its tick no longer matches its time. (A sample of the
+			// previous owner at exactly cut-1 is replaced by it in the store.)
+			g.T, g.Tick, g.Flags = j.cut-1, 0, g.Flags|core.FlagNoTick
+		}
+		j.prev, j.anyPrev = "", false
+		if !j.prevKnown {
+			js.stats.UnknownGones++
+			return out
+		}
+		js.stats.LateKept++
+		return append(out, g)
+	}
+	if s.T >= j.cut {
+		js.stats.OwnerDrops++
+		return out
+	}
+	js.change(j)
+	if j.anyPrev {
+		j.prev, j.anyPrev = src, false
+	}
+	if j.prevKnown && s.Meta.Kind == core.KindTrain && j.prevMeta.Kind == core.KindTrain {
+		if s.Meta.Carriages == 0 {
+			s.Meta.Carriages = j.prevMeta.Carriages
+		}
+		if s.Meta.Kinds == "" {
+			s.Meta.Kinds = j.prevMeta.Kinds
+		}
+		if s.Meta.Color == "" {
+			s.Meta.Color = j.prevMeta.Color
+		}
+	}
+	j.prevKnown, j.prevSfc, j.prevMeta = true, s.Surface, s.Meta
+	js.stats.LateKept++
+	return append(out, s)
+}
+
+// Adopt makes src the owner of journey id (the "adopt" message) at t, the adopt's
+// time, and returns the previous owner ("" when none). The previous owner's samples
+// from before t and its gone are still taken when they arrive later (Move); when
+// Journeys did not know the journey, those of the first other source that sends any.
+func (js *Journeys) Adopt(src, id string, t core.TimeMs) string {
 	j := js.get(id)
 	if j == nil {
 		j = js.add(id)
 	}
 	js.change(j)
 	prev := j.owner
+	switch {
+	case prev == src:
+	case prev != "" && j.known:
+		j.prev, j.anyPrev, j.prevKnown, j.prevSfc, j.prevMeta, j.cut = prev, false, true, j.sfc, j.meta, t
+		j.afterBy = ""
+	case prev == "" && j.goneBy == "" && !j.known:
+		// unknown: forgotten by the bound, or the server restarted since its last sample
+		j.prev, j.anyPrev, j.prevKnown, j.cut = "", true, false, t
+		j.afterBy = ""
+	default:
+		// the previous owner's gone came first: nothing of it is still to come
+		j.prev, j.anyPrev = "", false
+	}
 	j.owner, j.goneBy = src, ""
 	return prev
 }
@@ -297,16 +451,96 @@ func (js *Journeys) Begin(src string) {
 	js.seen[src] = map[string]bool{}
 }
 
+// Region is the part of a map a source captures, which its resync speaks for
+// (Journeys.Resynced): the whole map (All), a gridworld tile (Bounds: [x1, y1, x2, y2)
+// in tiles, as core.InstanceInfo.Bounds), or nothing (the zero value).
+type Region struct {
+	All    bool
+	Bounds *core.Quad
+}
+
+// Has reports whether position (x, y) lies in r.
+func (r Region) Has(x, y float64) bool {
+	if r.All {
+		return true
+	}
+	b := r.Bounds
+	return b != nil && x >= b[0] && x < b[2] && y >= b[1] && y < b[3]
+}
+
 // Resynced ends a resync of src at t: every journey src owns that it did not sample
 // since Begin gets a gone, appended to out.
-func (js *Journeys) Resynced(src string, t core.TimeMs, out []core.MoverSample) []core.MoverSample {
+//
+// So does every journey the store has live on this map (Live) that src did not sample
+// since Begin and that Journeys does not know (the server restarted since its last
+// sample, or the bound forgot it), when its newest row lies in region and before t;
+// also one src adopted but never sampled, wherever it is. Each such surface gets a gone
+// at t with the newest row's meta (Stats.ResyncForgotten). Left alone are journeys
+// Journeys knows (a sample since the restart: another source's, or ended by a gone
+// already sent), those another source adopted without a sample yet, and those with rows
+// earlier in this batch. A train another source owns whose newest row lies in src's
+// tile (a crossing when both restarted) is ended too, until that source samples it
+// again. The store's state does not change before the batch is stored, so a retried
+// batch ends the same journeys. Journeys it did not know stay untracked, so a resync
+// that ends thousands does not push out the ones it tracks.
+func (js *Journeys) Resynced(src string, t core.TimeMs, region Region, out []core.MoverSample) []core.MoverSample {
 	seen := js.seen[src]
 	if seen == nil {
 		return out
 	}
 	js.changeSeen(src)
 	delete(js.seen, src)
-	return js.endOwned(src, t, out, func(j *journey) bool { return !seen[j.id] })
+	out = js.endOwned(src, t, out, func(j *journey) bool { return !seen[j.id] })
+	if js.Live == nil {
+		return out
+	}
+	type key struct {
+		sfc core.SurfaceKey
+		id  string
+	}
+	var pending map[key]bool
+	n := len(out)
+	stale := js.Live(func(sfc core.SurfaceKey, id string, x, y float64) bool {
+		if seen[id] {
+			return false
+		}
+		owned := false
+		if e := js.byID[id]; e != nil {
+			j := e.Value.(*journey)
+			if j.known || j.owner != "" && j.owner != src {
+				return false
+			}
+			owned = j.owner == src
+		}
+		if !owned && !region.Has(x, y) {
+			return false
+		}
+		if pending == nil {
+			pending = map[key]bool{}
+			for _, s := range out[:n] {
+				pending[key{s.Surface, s.Meta.ID}] = true
+			}
+		}
+		return !pending[key{sfc, id}]
+	})
+	slices.SortFunc(stale, func(a, b LiveJourney) int {
+		return cmp.Or(cmp.Compare(a.Surface.Map, b.Surface.Map), cmp.Compare(a.Surface.Surface, b.Surface.Surface),
+			cmp.Compare(a.Meta.ID, b.Meta.ID))
+	})
+	for _, lj := range stale {
+		if lj.T >= t {
+			continue // a gone at t would not end it
+		}
+		out = append(out, core.MoverSample{Surface: lj.Surface, Meta: lj.Meta, T: t, Flags: core.FlagGone | core.FlagNoTick})
+		if e := js.byID[lj.Meta.ID]; e != nil {
+			j := e.Value.(*journey)
+			js.change(j)
+			j.owner, j.sfc, j.meta, j.known, j.lastT = "", lj.Surface, lj.Meta, true, t
+			j.prev, j.anyPrev, j.goneBy, j.afterBy = "", false, "", ""
+		}
+		js.stats.ResyncForgotten++
+	}
+	return out
 }
 
 // Stopped handles a stopped source at t: its players are gone; its trains and vehicles

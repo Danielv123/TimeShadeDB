@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import loadControllerPlugin from "../controller.js";
-import { EnvelopesEvent, ViewTokenRequest } from "../messages.js";
+import { EnvelopesEvent, EnvelopesRequest, ViewTokenRequest } from "../messages.js";
 import { fakeControllerContext, fakeUser, until } from "./fakes.js";
 
 const fake = path.join(import.meta.dirname, "fake_sidecar.js");
@@ -42,8 +42,11 @@ test("the sidecar runs serve on a random loopback port with random tokens, the d
 test("envelopes are forwarded with src and instance from the link address; maps are published", async () => {
 	const { c, plugin, received } = await start();
 	try {
-		await c.deliver(EnvelopesEvent, new EnvelopesEvent([
+		// A request while the instance runs, an event (the same handling) at its exit.
+		await c.deliver(EnvelopesRequest, new EnvelopesRequest([
 			{ v: 1, tick: 10, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: 0, y: 0 }], map: "gw-w", recv_ms: 1000, seq: 5 },
+		]), { type: "instance", id: 1 });
+		await c.deliver(EnvelopesEvent, new EnvelopesEvent([
 			// src and instance in the payload are overwritten
 			{ v: 1, tick: 11, msgs: [], map: "i-1", recv_ms: 1001, seq: 6, src: "spoof", instance: 99 } as any,
 		]), { type: "instance", id: 1 });
@@ -52,7 +55,8 @@ test("envelopes are forwarded with src and instance from the link address; maps 
 		const fwd = lines.filter(l => l.src === "clusterio:1");
 		assert.deepEqual(fwd.map(l => [l.map, l.instance, l.tick, l.seq]), [["gw-w", 1, 10, 5], ["i-1", 1, 11, 6]]);
 		const maps = lines.filter(l => l.src === "clusterio:controller");
-		assert.deepEqual(maps.map(l => l.map).sort(), ["gw-w", "i-1", "i-2"]);
+		// All of them twice when the maps timer (100 ms here) fired before the sidecar was ready, once more at ready.
+		assert.deepEqual([...new Set(maps.map(l => l.map))].sort(), ["gw-w", "i-1", "i-2"]);
 		const gw = maps.find(l => l.map === "gw-w");
 		assert.deepEqual(gw.msgs, [{ type: "map", info: {
 			key: "gw-w", title: "Gridworld w", tile_size: 512, instances: [{ id: "1", name: "inst1", bounds: [-256, -256, 256, 256] }],
@@ -68,6 +72,23 @@ test("envelopes are forwarded with src and instance from the link address; maps 
 		assert.deepEqual(added.map(l => [l.map, l.msgs[0].info.title]), [["i-2", "renamed"]]);
 	} finally {
 		await c.call("shutdown");
+		await c.web.close();
+	}
+});
+
+test("after the shutdown hook closed the queue, a request fails (the instance keeps it) and an event is dropped", async () => {
+	const { c, plugin } = await start();
+	const env = (seq: number) => ({ v: 1, tick: seq, msgs: [], map: "i-1", recv_ms: seq, seq });
+	try {
+		// Clusterio runs the hook first and closes the links after it, so messages can still arrive.
+		await c.call("shutdown");
+		assert.ok(plugin.queue.isClosed);
+		await assert.rejects(
+			c.deliver(EnvelopesRequest, new EnvelopesRequest([env(7)]), { type: "instance", id: 1 }),
+			/shutting down/,
+		);
+		await c.deliver(EnvelopesEvent, new EnvelopesEvent([env(8)]), { type: "instance", id: 1 });
+	} finally {
 		await c.web.close();
 	}
 });

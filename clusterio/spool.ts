@@ -15,6 +15,10 @@ const SEGMENT_BYTES = 8 << 20;
 export class DiskTail {
 	/** Segment numbers on disk, oldest first. */
 	private segs: number[] = [];
+	/** Segments taken and not done yet: their files stay, so their numbers are not used again until done. */
+	private taken = new Set<number>();
+	/** The number of the next segment appended (past every number on disk). */
+	private next = 0;
 	private writeFd: number | undefined;
 	private writeSeg: number | undefined;
 	private writeBytes = 0;
@@ -33,6 +37,7 @@ export class DiskTail {
 			}
 		}
 		this.segs.sort((a, b) => a - b);
+		this.next = this.segs.length > 0 ? this.segs[this.segs.length - 1] + 1 : 0;
 		for (const s of this.segs) {
 			const text = fs.readFileSync(this.file(s), "utf8");
 			this.bytes += Buffer.byteLength(text);
@@ -55,7 +60,7 @@ export class DiskTail {
 		}
 		if (this.writeFd === undefined || this.writeBytes >= SEGMENT_BYTES) {
 			this.closeWrite();
-			const seg = this.segs.length > 0 ? this.segs[this.segs.length - 1] + 1 : 0;
+			const seg = this.next++;
 			this.segs.push(seg);
 			this.writeSeg = seg;
 			this.writeFd = fs.openSync(this.file(seg), "a");
@@ -100,6 +105,7 @@ export class DiskTail {
 		if (seg === this.writeSeg) {
 			this.closeWrite();
 		}
+		this.taken.add(seg);
 		const text = readOrEmpty(this.file(seg));
 		const lines = text.split("\n").filter(l => l.length > 0);
 		this.bytes -= Buffer.byteLength(text);
@@ -109,6 +115,7 @@ export class DiskTail {
 
 	/** Every line of a taken segment was acknowledged: delete it. */
 	done(seg: number): void {
+		this.taken.delete(seg);
 		fs.rmSync(this.file(seg), { force: true });
 	}
 
@@ -117,7 +124,7 @@ export class DiskTail {
 		if (lines.length === 0) {
 			return;
 		}
-		const seg = (this.segs.length > 0 ? this.segs[0] : 0) - 1;
+		const seg = Math.min(0, ...this.segs, ...this.taken) - 1;
 		const text = lines.join("\n") + "\n";
 		fs.writeFileSync(this.file(seg), text);
 		this.segs.unshift(seg);

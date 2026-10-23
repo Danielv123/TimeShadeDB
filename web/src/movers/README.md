@@ -34,7 +34,11 @@ onto the chain in order, no further along than its speeds allow, so a train that
 past a place is not put on its later pass. A run's first sample is placed no earlier than its
 last listed piece. Between two samples of a run the leading joint's rail distance follows the
 timing model (stand-then-accelerate from a stop, brake-then-stand into one, else a cubic
-Hermite in time with the captured speeds). The head is the midpoint of the joints at that rail
+Hermite in time with the captured speeds) over the game ticks between them. Two samples whose
+ticks cannot be of one game (going back, at a rate no game runs at, or more than 4 times off
+the neighbouring samples' rate, as at an instance crossing whose gone row was lost) are timed
+by the time between them at the neighbours' rate instead (`railTicks`, and `tickRate` keeps
+such pairs out of every other rate). The head is the midpoint of the joints at that rail
 distance and 4 behind it, and every carriage sits on the chain at its joint distances
 (`placeRailCarriages`, vanilla joint distances 4 and 3, pitches within a quarter tile of 7
 taken as 7).

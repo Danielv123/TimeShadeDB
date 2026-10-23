@@ -13,6 +13,7 @@ import (
 
 	"timeshadedb/internal/core"
 	"timeshadedb/internal/core/memstore"
+	"timeshadedb/internal/movers"
 )
 
 const base core.TimeMs = 1_792_000_000_000 // 2026-10-15
@@ -343,6 +344,86 @@ func TestIngestResyncEndsJourneys(t *testing.T) {
 	}
 	if !gone {
 		t.Fatalf("v2 not ended: %+v", live.Rows)
+	}
+}
+
+// TestResyncRegion: the part of a map a resync speaks for, from the map metadata and
+// the envelope's source and instance.
+func TestResyncRegion(t *testing.T) {
+	f := newFixture(t, Options{})
+	tile := core.Quad{256, -256, 768, 256}
+	if _, err := f.maps.Put(core.MapInfo{Key: "gw-w", TileSize: 512, Instances: []core.InstanceInfo{{ID: "7", Bounds: &tile}, {ID: "8"}}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		src, mapKey string
+		inst        int64
+		want        movers.Region
+	}{
+		{"clusterio:7", "gw-w", 7, movers.Region{Bounds: &tile}},
+		{"clusterio:8", "gw-w", 8, movers.Region{}}, // no bounds
+		{"clusterio:9", "gw-w", 9, movers.Region{}}, // not on the map yet
+		{"standalone:x", "gw-w", 0, movers.Region{}},
+		{"clusterio:7", "i-7", 7, movers.Region{All: true}},
+		{"clusterio:7", "i-8", 7, movers.Region{}},
+		{"standalone:x", "x", 0, movers.Region{All: true}},
+		{"other", "x", 0, movers.Region{}},
+	} {
+		if got := f.in.region(&envHeader{Src: c.src, Map: c.mapKey, Instance: c.inst}); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s on %s: %+v, want %+v", c.src, c.mapKey, got, c.want)
+		}
+	}
+}
+
+// TestIngestAdoptKeepsSourceTail: a Universal Edges destination's adopt reaches ingest
+// before the source's last sample and gone, which were batched later. Both are from
+// before the adopt by their sample time and are kept.
+func TestIngestAdoptKeepsSourceTail(t *testing.T) {
+	f := newFixture(t, Options{})
+	mv := func(x float64) map[string]any {
+		return map[string]any{"j": "1.1.7", "k": "t", "f": "player", "name": "locomotive", "x": x, "y": 1, "h": 0.25, "n": 2}
+	}
+	move := func(m map[string]any) map[string]any {
+		return map[string]any{"type": "move", "s": "nauvis", "m": []any{m}}
+	}
+	f.ingest(t, line(t, env{V: 1, Tick: 60, Src: "a", Map: "gw-w", RecvMs: int64(base), Msgs: []any{move(mv(1))}}))
+	f.ingest(t, line(t, env{V: 1, Tick: 6000, Src: "b", Map: "gw-w", RecvMs: int64(base + 2000), Msgs: []any{
+		map[string]any{"type": "adopt", "j": "1.1.7", "trace": "x"}, move(mv(40)),
+	}}))
+	resp := f.ingest(t, line(t, env{V: 1, Tick: 150, Src: "a", Map: "gw-w", RecvMs: int64(base + 1500), Msgs: []any{
+		move(mv(20)), move(map[string]any{"j": "1.1.7", "gone": true}),
+	}}))
+	st := f.in.Stats()
+	if resp.Samples.Accepted != 2 || st.LateKept != 2 || st.OwnerDrops != 0 {
+		t.Fatalf("resp %+v, stats %+v", resp.Samples, st)
+	}
+	// Later samples of the source are not the journey's any more.
+	resp = f.ingest(t, line(t, env{V: 1, Tick: 210, Src: "a", Map: "gw-w", RecvMs: int64(base + 2500), Msgs: []any{move(mv(30))}}))
+	if resp.Samples.Accepted != 0 || f.in.Stats().OwnerDrops != 1 {
+		t.Fatalf("resp %+v, stats %+v", resp.Samples, f.in.Stats())
+	}
+}
+
+// TestIngestResyncLoggedOnce: the Clusterio instance sends a resync's "resynced" to each
+// of its maps; the log has it once.
+func TestIngestResyncLoggedOnce(t *testing.T) {
+	var logged []string
+	f := newFixture(t, Options{Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }})
+	done := func(mapKey, trace string, recv int64) string {
+		return line(t, env{V: 1, Tick: 60, Src: "s", Map: mapKey, RecvMs: recv, Msgs: []any{
+			map[string]any{"type": "resynced", "trace": trace, "counts": map[string]int{"movers": 1}},
+		}})
+	}
+	f.ingest(t, done("gw-w", "r1", int64(base))+done("i-1", "r1", int64(base)))
+	f.ingest(t, done("gw-w", "r2", int64(base+1000))+done("i-1", "r2", int64(base+1000)))
+	n := 0
+	for _, l := range logged {
+		if strings.Contains(l, " resynced ") {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("resyncs logged %d times, want 2: %q", n, logged)
 	}
 }
 
