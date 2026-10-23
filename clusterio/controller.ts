@@ -3,14 +3,16 @@
 // LICENSE-BlueOak-1.0.0.md).
 //
 // The controller side (PLAN.md §4.10): it runs the map server as a sidecar, forwards the instances' envelopes to its
-// ingest, publishes the cluster's maps (titles, gridworld bounds, Universal Edges lines) as "map" messages, proxies
-// the map behind Clusterio's auth, and mints view tokens for the web page.
+// ingest, publishes the cluster's maps (titles, gridworld bounds, Universal Edges lines) as "map" messages, copies the
+// default mod pack's exported icons into the map's database, proxies the map behind Clusterio's auth, and mints view
+// tokens for the web page.
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import * as lib from "@clusterio/lib";
 import type { ControllerPluginContext } from "@clusterio/controller";
 import { findBinary } from "./binary.js";
 import { addRoutes, mintViewToken } from "./http.js";
+import { syncIcons } from "./icons.js";
 import { IngestQueue, type IngestQueueOptions } from "./ingest.js";
 import {
 	edgeLines, mapInfos, mapOf, tileOf, ueApi, type ClusterInstance, type EdgeApiLike, type Quad,
@@ -37,6 +39,8 @@ export type ControllerOptions = {
 	mapsEveryMs?: number;
 	/** The clock stamped on map messages (tests that replay a recorded time with --clock data). */
 	now?: () => number;
+	/** Clusterio's static directory with the data export files (default: static/ in the working directory). */
+	staticDir?: string;
 };
 
 export default async function loadControllerPlugin(context: ControllerPluginContext, options: ControllerOptions = {}) {
@@ -162,11 +166,35 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 		publishMaps(full).catch(err => logger.error(`timeshade: publishing maps failed:\n${err?.stack ?? err}`));
 	};
 
+	// Icons (icons.ts): the default mod pack's export, copied at start and when that pack, its export or the default
+	// changes. The gridworld cluster runs one mod pack; instances on other packs are drawn with the default's icons.
+	// Without an export nothing changes: the icons copied before stay. Clusterio's own routes read and write the export
+	// files under the relative path "static", which is the controller's working directory.
+	const staticDir = options.staticDir ?? path.resolve("static");
+	let iconsDone: Promise<void> = Promise.resolve();
+	const updateIcons = () => {
+		iconsDone = iconsDone.then(async () => {
+			const id = controller.config.get("controller.default_mod_pack_id");
+			const pack = id === null ? undefined : controller.modPacks.get(id);
+			const assets = pack && !pack.isDeleted ? pack.exportManifest?.assets : undefined;
+			const result = await syncIcons(staticDir, path.join(dbDir(), "icons"), assets);
+			if (result === "copied") {
+				lifecycle(logger, "timeshade.icons", "copied", { mod_pack: id, spritesheet: assets!.spritesheet });
+			} else if (result === "none") {
+				lifecycle(logger, "timeshade.icons", "none", { mod_pack: id }, "verbose");
+			}
+		}).catch((err: any) => {
+			logger.warn(`timeshade: copying the default mod pack's icons failed: ${err.message}`);
+		});
+		return iconsDone;
+	};
+
 	sidecar.on("ready", () => {
 		queue.wake();
 		publish(true);
 	});
 	startSidecar();
+	updateIcons();
 	const mapsTimer = setInterval(publish, options.mapsEveryMs ?? MAPS_EVERY_MS);
 	mapsTimer.unref?.();
 
@@ -211,23 +239,35 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 			await publishMaps();
 		}
 	});
+	controller.hooks.modPacksUpdated.attach(plugin.name, async (modPacks: lib.ModPack[]) => {
+		const id = controller.config.get("controller.default_mod_pack_id");
+		if (modPacks.some(pack => pack.id === id)) {
+			await updateIcons();
+		}
+	});
 	controller.hooks.controllerConfigFieldChanged.attach(plugin.name, async (field: string) => {
 		if (RESTART_FIELDS.has(field)) {
 			lifecycle(logger, "timeshade.sidecar", "restart", { field });
 			await sidecar.stop();
 			startSidecar();
+			if (field === "timeshade.database_directory") {
+				await updateIcons();
+			}
 		} else if (field === "timeshade.queue_mb") {
 			queue.setMaxQueueBytes(controller.config.get("timeshade.queue_mb") * 1024 * 1024);
+		} else if (field === "controller.default_mod_pack_id") {
+			await updateIcons();
 		}
 	});
 	// Clusterio waits up to 15 s for this hook: up to 3 s to hand over what is queued (the rest stays on disk for the
 	// next start), then the sidecar stops (its stdin closes; it is killed after 10 s).
 	controller.hooks.shutdown.attach(plugin.name, async () => {
 		clearInterval(mapsTimer);
+		await iconsDone;
 		await queue.drain(3000);
 		queue.close();
 		await sidecar.stop();
 	});
 
-	return { sidecar, queue, publishMaps, tokens: { ingestToken, readToken } };
+	return { sidecar, queue, publishMaps, updateIcons, tokens: { ingestToken, readToken } };
 }
