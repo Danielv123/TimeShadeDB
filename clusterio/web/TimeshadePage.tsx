@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useState } from "react";
+import React, { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Alert, Button, Space, Spin } from "antd";
 import { ControlContext, PageHeader, PageLayout } from "@clusterio/web_ui";
 import { ViewTokenRequest } from "../messages";
@@ -14,6 +14,8 @@ type State = { url: string; running: boolean } | { error: string } | undefined;
 export default function TimeshadePage() {
 	const control = useContext(ControlContext);
 	const [state, setState] = useState<State>();
+	const frame = useRef<HTMLIFrameElement>(null);
+	const [height, setHeight] = useState<number>();
 
 	useEffect(() => {
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -40,6 +42,23 @@ export default function TimeshadePage() {
 		};
 	}, [control]);
 
+	// The frame takes the height the window leaves below its top and above the layout's padding under it, so the
+	// viewer's time bar is on screen without scrolling the page.
+	useLayoutEffect(() => {
+		const fit = () => {
+			const el = frame.current;
+			if (!el) {
+				return;
+			}
+			const top = el.getBoundingClientRect().top + window.scrollY;
+			const below = document.documentElement.scrollHeight - top - el.offsetHeight;
+			setHeight(Math.max(400, Math.floor(window.innerHeight - top - below)));
+		};
+		fit();
+		window.addEventListener("resize", fit);
+		return () => window.removeEventListener("resize", fit);
+	}, [state]);
+
 	const extra = state && "url" in state
 		? <Button href={state.url} target="_blank" rel="noopener noreferrer">Open in a new tab</Button>
 		: undefined;
@@ -50,9 +69,10 @@ export default function TimeshadePage() {
 		{state && "url" in state && <Space direction="vertical" style={{ width: "100%" }}>
 			{!state.running && <Alert type="warning" showIcon message="The map server is starting or restarting; the map may not load yet." />}
 			<iframe
+				ref={frame}
 				title="TimeShadeDB map"
 				src={state.url}
-				style={{ width: "100%", height: "calc(100vh - 180px)", minHeight: 400, border: 0 }}
+				style={{ width: "100%", height: height ?? "calc(100vh - 250px)", minHeight: 400, border: 0, display: "block" }}
 				allow="fullscreen"
 			/>
 		</Space>}

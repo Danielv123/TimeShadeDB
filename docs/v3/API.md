@@ -130,7 +130,8 @@ transparent). Cache: immutable. Static: no.
 
 The catalog icon files (`catalog.icons.png` and `.json` are `icons/<file>` relative to the
 API base). The live server serves exactly the two files named in `<db>/icons/icons.json`
-(FORMAT.md 5); their names are content-hashed. Cache: immutable. Static: yes.
+(FORMAT.md 5), read again when that file changes; their names are content-hashed. Cache:
+immutable. Static: yes.
 
 ### `GET tiledelta/{ds}/{x}/{y}/{from}-{to}.bin`
 
@@ -341,7 +342,9 @@ What the exporter writes (`internal/v3/publish/README.md` has the details and si
   `tsdb_horizon_hold_lag_ms`, `tsdb_ingest_resolved_gones_total` (gones of journeys the
   journey rules had forgotten, after a restart, completed from the mover store's last row),
   `tsdb_ingest_adopt_late_total` (samples and gones of a journey's previous owner from
-  before an adopt that arrived after it, kept),
+  before an adopt that arrived after it, kept), `tsdb_ingest_resync_forgotten_total`
+  (journeys the mover store had live that the journey rules had forgotten, after a restart,
+  ended by a resync of the source whose region holds them, PROTOCOL.md 5),
   `tsdb_mover_live_evicted_total` (live journeys forgotten past the store's live-journey
   bound), `tsdb_overlay_open_intervals`,
   `tsdb_overlay_torn_bytes_total` and the Go runtime gauges `go_memstats_heap_inuse_bytes`,

@@ -1,9 +1,11 @@
 package movers
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -247,7 +249,7 @@ func TestJourneysResyncAndStopped(t *testing.T) {
 	js.Move("b", []core.MoverSample{mk("t3", core.KindTrain), mk("p:eve", core.KindPlayer)}, nil)
 	js.Begin("a")
 	js.Move("a", []core.MoverSample{mk("t1", core.KindTrain)}, nil)
-	out := js.Resynced("a", 200, nil)
+	out := js.Resynced("a", 200, Region{}, nil)
 	if len(out) != 2 {
 		t.Fatalf("resynced gones = %+v", out)
 	}
@@ -265,7 +267,7 @@ func TestJourneysResyncAndStopped(t *testing.T) {
 	if len(out) != 1 || out[0].Meta.ID != "p:eve" || js.Owner("t3") != "b" {
 		t.Fatalf("stopped = %+v", out)
 	}
-	if out := js.Resynced("a", 400, nil); len(out) != 0 {
+	if out := js.Resynced("a", 400, Region{}, nil); len(out) != 0 {
 		t.Fatalf("resynced without begin = %+v", out)
 	}
 }
@@ -284,6 +286,136 @@ func TestJourneysBounded(t *testing.T) {
 		t.Fatal("wrong journeys evicted")
 	}
 }
+
+// resyncStore is a mover store holding, on map mapKey's nauvis, journeys from before a
+// server restart, and fresh journey rules wired to it as ingest wires them.
+func resyncStore(t *testing.T, mapKey string) (*Store, *Journeys, core.SurfaceKey) {
+	t.Helper()
+	ctx := context.Background()
+	m, _ := openTemp(t, Options{SyncInterval: -1, MaxAhead: -1})
+	t.Cleanup(func() { m.Close() })
+	sfc := core.SurfaceKey{Map: mapKey, Surface: "nauvis"}
+	const t0 core.TimeMs = 1_792_000_000_000
+	train := func(id string, x, y float64, tt core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: id, Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 22},
+			T: tt, X: x, Y: y, Flags: core.FlagStop}
+	}
+	gone := func(id string, tt core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: id, Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 22},
+			T: tt, Flags: core.FlagGone}
+	}
+	// Closed rows (committed below), then open ones.
+	appendAll(t, m, []core.MoverSample{
+		train("a.1.1", 179.5, -99, t0), // in tile a, never sent again: ended
+		train("a.1.2", 10, 10, t0),     // in tile a, re-sent: stays
+		train("b.1.3", 300, 0, t0),     // parked in tile b: stays
+		train("b.1.4", 200, 0, t0),     // in tile a, sampled by b since the restart: stays
+		train("c.1.5", 100, 0, t0),     // in tile a, adopted by b without a sample: stays
+		train("a.1.6", 50, 50, t0),     // in tile a, gone in an open window: not live
+		train("a.1.7", 600, 0, t0),     // in tile b, adopted by a without a sample: ended
+		train("a.1.8", 60, 60, t0),     // in tile a, ended by a gone: not live
+		gone("a.1.8", t0+1000),
+	})
+	ok(t, m.Commit(ctx, t0+2*core.MoverWindowLen))
+	appendAll(t, m, []core.MoverSample{
+		gone("a.1.6", t0+2*core.MoverWindowLen+1000),
+		{Surface: sfc, Meta: core.MoverMeta{ID: "p:bob", Kind: core.KindPlayer, Force: "player", Name: "bob"},
+			T: t0 + 2*core.MoverWindowLen + 2000, X: -20.25, Y: 30}, // in tile a, open rows only: ended
+	})
+	js := NewJourneys(0)
+	js.Lookup = m.LastMeta
+	js.Live = func(keep func(core.SurfaceKey, string, float64, float64) bool) []LiveJourney {
+		return m.LiveJourneys(mapKey, keep)
+	}
+	return m, js, sfc
+}
+
+// TestJourneysResyncForgotten: after a server restart the journey rules know none of the
+// journeys the store has live. A resync of a gridworld instance ends those in its tile
+// that it did not re-send, and leaves those in other tiles, re-sent ones, ones another
+// source sampled or adopted since the restart, and ones that are not live. A rolled back
+// batch ends the same journeys when retried, and once stored they are no longer live.
+func TestJourneysResyncForgotten(t *testing.T) {
+	m, js, sfc := resyncStore(t, "gw-w")
+	const tr core.TimeMs = 1_792_000_000_000 + time15m
+	tileA := core.Quad{-256, -256, 256, 256}
+	js.Move("b", []core.MoverSample{{Surface: sfc, Meta: core.MoverMeta{ID: "b.1.4", Kind: core.KindTrain}, T: tr - 5000, X: 210, Y: 0}}, nil)
+	js.Adopt("b", "c.1.5", tr-4000)
+	js.Adopt("a", "a.1.7", tr-4000)
+	js.Begin("a")
+	resent := js.Move("a", []core.MoverSample{{Surface: sfc, Meta: core.MoverMeta{ID: "a.1.2", Kind: core.KindTrain}, T: tr - 1000, X: 10, Y: 10}}, nil)
+	js.Mark()
+	out := js.Resynced("a", tr, Region{Bounds: &tileA}, slices.Clone(resent))[len(resent):]
+	want := []string{"a.1.1", "a.1.7", "p:bob"}
+	var got []string
+	for _, g := range out {
+		got = append(got, g.Meta.ID)
+		if g.Flags != core.FlagGone|core.FlagNoTick || g.T != tr || g.Surface != sfc || g.Meta.Name == "" {
+			t.Fatalf("gone = %+v", g)
+		}
+		if g.Meta.ID == "a.1.1" && g.Meta.Carriages != 22 {
+			t.Fatalf("gone meta = %+v", g.Meta)
+		}
+	}
+	if !slices.Equal(got, want) || js.Stats().ResyncForgotten != 3 {
+		t.Fatalf("ended %v, want %v (stats %+v)", got, want, js.Stats())
+	}
+	// The store refused the batch: the retry ends the same journeys.
+	js.Rollback()
+	if js.Stats().ResyncForgotten != 0 || js.Owner("a.1.7") != "a" {
+		t.Fatalf("after rollback: owner %q, stats %+v", js.Owner("a.1.7"), js.Stats())
+	}
+	js.Mark()
+	again := js.Resynced("a", tr, Region{Bounds: &tileA}, slices.Clone(resent))
+	js.Commit()
+	if !slices.EqualFunc(again[len(resent):], out, func(a, b core.MoverSample) bool { return reflect.DeepEqual(a, b) }) {
+		t.Fatalf("retry ended %+v, want %+v", again, out)
+	}
+	appendAll(t, m, again)
+	if got := m.LiveJourneys("gw-w", func(core.SurfaceKey, string, float64, float64) bool { return true }); len(got) != 4 {
+		t.Fatalf("live after the gones: %+v", got)
+	}
+	// The next resync has nothing left to end but the journeys it owns.
+	js.Begin("a")
+	js.Move("a", []core.MoverSample{{Surface: sfc, Meta: core.MoverMeta{ID: "a.1.2", Kind: core.KindTrain}, T: tr + 1000, X: 10, Y: 10}}, nil)
+	if out := js.Resynced("a", tr+2000, Region{Bounds: &tileA}, nil); len(out) != 0 {
+		t.Fatalf("second resync ended %+v", out)
+	}
+}
+
+// TestJourneysResyncForgottenSingleSource: on the map of a single source (a Clusterio
+// instance's own map, a standalone game) a resync ends every forgotten journey it did
+// not re-send, wherever it is; without a region only the journeys it owns.
+func TestJourneysResyncForgottenSingleSource(t *testing.T) {
+	_, js, sfc := resyncStore(t, "i-1")
+	const tr core.TimeMs = 1_792_000_000_000 + time15m
+	js.Begin("a")
+	js.Resynced("a", tr, Region{}, nil)
+	if js.Stats().ResyncForgotten != 0 {
+		t.Fatalf("no region: stats %+v", js.Stats())
+	}
+	js.Begin("a")
+	js.Move("a", []core.MoverSample{{Surface: sfc, Meta: core.MoverMeta{ID: "a.1.2", Kind: core.KindTrain}, T: tr - 1000, X: 10, Y: 10}}, nil)
+	var got []string
+	for _, g := range js.Resynced("a", tr, Region{All: true}, nil) {
+		got = append(got, g.Meta.ID)
+	}
+	if want := []string{"a.1.1", "a.1.7", "b.1.3", "b.1.4", "c.1.5", "p:bob"}; !slices.Equal(got, want) {
+		t.Fatalf("ended %v, want %v", got, want)
+	}
+}
+
+// appendAll stores samples, all of which must be accepted.
+func appendAll(t *testing.T, m *Store, samples []core.MoverSample) {
+	t.Helper()
+	res, err := m.Append(context.Background(), samples)
+	if err != nil || res.Accepted != len(samples) {
+		t.Fatalf("append: %+v, %v", res, err)
+	}
+}
+
+// time15m is 15 minutes after the first samples of resyncStore: the resync.
+const time15m = 15 * core.Minute
 
 func TestAnchorJitter(t *testing.T) {
 	// A source at 60 UPS whose envelopes arrive 20-400 ms late; the true offset is

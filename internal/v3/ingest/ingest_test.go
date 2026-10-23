@@ -13,6 +13,7 @@ import (
 
 	"timeshadedb/internal/v3/core"
 	"timeshadedb/internal/v3/core/memstore"
+	"timeshadedb/internal/v3/movers"
 )
 
 const base core.TimeMs = 1_792_000_000_000 // 2026-10-15
@@ -343,6 +344,34 @@ func TestIngestResyncEndsJourneys(t *testing.T) {
 	}
 	if !gone {
 		t.Fatalf("v2 not ended: %+v", live.Rows)
+	}
+}
+
+// TestResyncRegion: the part of a map a resync speaks for, from the map metadata and
+// the envelope's source and instance.
+func TestResyncRegion(t *testing.T) {
+	f := newFixture(t, Options{})
+	tile := core.Quad{256, -256, 768, 256}
+	if _, err := f.maps.Put(core.MapInfo{Key: "gw-w", TileSize: 512, Instances: []core.InstanceInfo{{ID: "7", Bounds: &tile}, {ID: "8"}}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		src, mapKey string
+		inst        int64
+		want        movers.Region
+	}{
+		{"clusterio:7", "gw-w", 7, movers.Region{Bounds: &tile}},
+		{"clusterio:8", "gw-w", 8, movers.Region{}}, // no bounds
+		{"clusterio:9", "gw-w", 9, movers.Region{}}, // not on the map yet
+		{"standalone:x", "gw-w", 0, movers.Region{}},
+		{"clusterio:7", "i-7", 7, movers.Region{All: true}},
+		{"clusterio:7", "i-8", 7, movers.Region{}},
+		{"standalone:x", "x", 0, movers.Region{All: true}},
+		{"other", "x", 0, movers.Region{}},
+	} {
+		if got := f.in.region(&envHeader{Src: c.src, Map: c.mapKey, Instance: c.inst}); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s on %s: %+v, want %+v", c.src, c.mapKey, got, c.want)
+		}
 	}
 }
 

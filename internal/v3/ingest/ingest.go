@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -106,6 +107,9 @@ type Stats struct {
 	// LateKept are samples and gones of a journey's previous owner that arrived after
 	// another source adopted it, from before the adopt: kept (movers.Journeys).
 	LateKept int64
+	// ResyncForgotten are journeys the mover store had live that the journey rules had
+	// forgotten (a restart), ended by a resync of the source whose region holds them.
+	ResyncForgotten int64
 	// Duplicates are envelopes skipped because their source's retry repeated them
 	// (Sources.Duplicate); CaughtUp are caught_up envelopes; OneRecv are envelopes that
 	// carried the receive time of their source's previous envelope although their tick
@@ -226,6 +230,7 @@ func (in *Ingester) Stats() Stats {
 		s.Quarantined += js.Quarantined
 		s.ResolvedGones += js.ResolvedGones
 		s.LateKept += js.LateKept
+		s.ResyncForgotten += js.ResyncForgotten
 	}
 	in.jmu.Unlock()
 	return s
@@ -786,9 +791,10 @@ type lineState struct {
 type jop struct {
 	kind        uint8
 	mapKey, src string
-	id          string      // adopt: the journey
-	t           core.TimeMs // adopt, resynced: the time
-	n           int         // move: how many of the batch's raw samples
+	id          string        // adopt: the journey
+	t           core.TimeMs   // adopt, resynced: the time
+	n           int           // move: how many of the batch's raw samples
+	region      movers.Region // resynced: the part of the map the source captures
 }
 
 const (
@@ -1025,7 +1031,7 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 	case core.MsgResynced:
 		t := b.timeOf(nil)
 		b.holds(t)
-		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: t})
+		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: t, region: in.region(env)})
 		if in.resynced[env.Src] != m.Trace || m.Trace == "" {
 			if in.resynced == nil || len(in.resynced) >= 10_000 {
 				in.resynced = map[string]string{}
@@ -1047,6 +1053,32 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 	if err != nil {
 		b.badMessage(env, i, err)
 	}
+}
+
+// region returns the part of env's map its source captures, where its resync ends the
+// journeys the store has live that the journey rules forgot (movers.Journeys.Resynced): on
+// a gridworld map the bounds of the envelope's instance (core.MapInfo), on the map of a
+// single source the whole map: a Clusterio instance's own map (i-<instance>) or a
+// standalone source's (src standalone:<name>, which feeds its map alone). Otherwise
+// nothing: a gridworld map without the instance's bounds yet, or a map other sources
+// may share.
+func (in *Ingester) region(env *envHeader) movers.Region {
+	if in.st.Maps != nil {
+		if info, ok := in.st.Maps.Get(env.Map); ok && info.TileSize > 0 {
+			id := strconv.FormatInt(env.Instance, 10)
+			for _, i := range info.Instances {
+				if i.ID == id && i.Bounds != nil && env.Instance != 0 {
+					b := *i.Bounds
+					return movers.Region{Bounds: &b}
+				}
+			}
+			return movers.Region{}
+		}
+	}
+	if env.Instance != 0 && env.Map == "i-"+strconv.FormatInt(env.Instance, 10) || strings.HasPrefix(env.Src, "standalone:") {
+		return movers.Region{All: true}
+	}
+	return movers.Region{}
 }
 
 // journeys returns the journey tracker of a map. Callers hold in.jmu.
@@ -1071,6 +1103,13 @@ func (in *Ingester) journeysOf(mapKey string) *movers.Journeys {
 		LastMeta(core.SurfaceKey, string) (core.MoverMeta, bool)
 	}); ok {
 		mj.js.Lookup = lm.LastMeta
+	}
+	if lj, ok := in.st.Movers.(interface {
+		LiveJourneys(string, func(core.SurfaceKey, string, float64, float64) bool) []movers.LiveJourney
+	}); ok {
+		mj.js.Live = func(keep func(core.SurfaceKey, string, float64, float64) bool) []movers.LiveJourney {
+			return lj.LiveJourneys(mapKey, keep)
+		}
 	}
 	in.journeys[mapKey] = mj
 	return mj.js
@@ -1401,7 +1440,7 @@ func (a *applier) apply(job *applyJob) error {
 		case jopBegin:
 			js.Begin(op.src)
 		case jopResynced:
-			samples = js.Resynced(op.src, op.t, samples)
+			samples = js.Resynced(op.src, op.t, op.region, samples)
 		}
 	}
 	raw = nil

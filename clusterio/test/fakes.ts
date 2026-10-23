@@ -145,9 +145,12 @@ export async function listen(app: http.RequestListener) {
 
 export type FakeController = Awaited<ReturnType<typeof fakeControllerContext>>;
 
+/** A mod pack as the controller's modPacks datastore holds it: the export manifest's assets, if exported. */
+export type FakeModPack = { id: number; isDeleted?: boolean; exportManifest?: { assets: Record<string, string> } };
+
 /**
- * A controller with what the plugin touches: config, instances, users, the auth secret, a real express app on a
- * random port, handle() for link messages, control connections and hooks.
+ * A controller with what the plugin touches: config, instances, mod packs, users, the auth secret, a real express app
+ * on a random port, handle() for link messages, control connections and hooks.
  */
 export async function fakeControllerContext(fields: Record<string, unknown> = {}) {
 	const lines: Line[] = [];
@@ -159,14 +162,16 @@ export async function fakeControllerContext(fields: Record<string, unknown> = {}
 		"timeshade.mem_budget_mb": 64,
 		"timeshade.queue_mb": 64,
 		"timeshade.queue_disk_mb": 4096,
+		"controller.default_mod_pack_id": null,
 		...fields,
 	});
 	const handlers = new Map<any, Hook>();
 	const instances = new Map<number, { id: number; config: ReturnType<typeof fakeConfig> }>();
+	const modPacks = new Map<number, FakeModPack>();
 	const users = new Map<string, ReturnType<typeof fakeUser>>();
 	const controls = new Map<number, { user: ReturnType<typeof fakeUser> }>();
 	const { hooks, call } = fakeHooks([
-		"instanceConfigFieldChanged", "instanceStatusChanged", "controllerConfigFieldChanged", "shutdown",
+		"instanceConfigFieldChanged", "instanceStatusChanged", "controllerConfigFieldChanged", "modPacksUpdated", "shutdown",
 	]);
 	const app = express();
 	const authSecret = Buffer.from("0123456789abcdef0123456789abcdef");
@@ -179,6 +184,7 @@ export async function fakeControllerContext(fields: Record<string, unknown> = {}
 			get: (id: number) => instances.get(id),
 			values: () => instances.values(),
 		},
+		modPacks: { get: (id: number) => modPacks.get(id) },
 		users: { getByName: (name: string) => users.get(name) },
 		wsServer: { controlConnections: controls },
 		handle: (Class: any, fn: Hook) => {
@@ -189,7 +195,7 @@ export async function fakeControllerContext(fields: Record<string, unknown> = {}
 	const web = await listen(app as unknown as http.RequestListener);
 	const context = { controller, logger: fakeLogger(lines), plugin: { name: "timeshade" } } as any;
 	return {
-		context, controller, lines, dir, web, users, instances, controls, call,
+		context, controller, lines, dir, web, users, instances, modPacks, controls, call,
 		addInstance(id: number, fields: Record<string, unknown> = {}) {
 			const record = { id, config: fakeConfig({ "instance.name": `inst${id}`, ...fields }) };
 			instances.set(id, record);

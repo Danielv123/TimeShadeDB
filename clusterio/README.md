@@ -7,7 +7,7 @@ vehicles, players, chart tags, machine recipes and optional rails, live and thro
 | Part | What it does |
 |---|---|
 | Instances (`instance.ts`, `forward.ts`) | The save-patch module `timeshade` (the capture Lua, [capture/](../capture/README.md)) prints envelopes on the IPC channel `timeshade:out`. The plugin stamps each one with `recv_ms` and `seq`, splits it by map, and sends what arrived to the controller about once a second, as a request; what the controller did not acknowledge is sent again. At every start, on a `gridworld.tile` change, on a capture setting change and on a new controller session it runs `/sc ts_rt.config(...) ts_rt.resync(...)` over RCON. |
-| Controller (`controller.ts`) | Runs `timeshadedb serve-v3 --listen 127.0.0.1:0` as a sidecar (`sidecar.ts`). It forwards envelopes to the sidecar's `POST /api/v3/ingest` (`ingest.ts`), and publishes the cluster's maps as `map` messages: titles, gridworld instance bounds and Universal Edges lines. |
+| Controller (`controller.ts`) | Runs `timeshadedb serve-v3 --listen 127.0.0.1:0` as a sidecar (`sidecar.ts`). It forwards envelopes to the sidecar's `POST /api/v3/ingest` (`ingest.ts`), and publishes the cluster's maps as `map` messages: titles, gridworld instance bounds and Universal Edges lines. It copies the default mod pack's exported icons into the map's database (`icons.ts`). |
 | Proxy (`http.ts`) | `/api/timeshade/*` on the controller's web server goes to the sidecar. Viewer files are open. The API (`/api/timeshade/api/v3/*`) needs a Clusterio token of a user with `timeshade.view`. |
 | Web UI (`web/`) | A **Map** page at `/timeshade` that shows the TimeShadeDB viewer in a frame. |
 
@@ -26,6 +26,12 @@ journey, with a handoff where the old instance's gone and the new instance's fir
 less than 10 s apart. The old instance's last samples and gone often reach the sidecar after
 the adopt (each instance sends once a second); they are kept by their time.
 
+Who owns a journey lives only in the sidecar's memory. After a sidecar restart, an
+instance's resync also ends the journeys the map still shows live in its gridworld tile (on
+its own map: anywhere) that it did not re-send and that no instance has sampled since the
+restart, such as a train lost when the instance came back from an older save
+([docs/v3/PROTOCOL.md](../docs/v3/PROTOCOL.md) 5, "Resync after a restart").
+
 ## Install
 
 1. Install the plugin next to Clusterio:
@@ -37,6 +43,9 @@ the adopt (each instance sends once a second); they are kept by their time.
    environment variable, or put a build in `bin/` (`npm run build:binary -- --web`).
 3. Restart the controller and the hosts. Instances get the module at their next start (save
    patching).
+4. For icons (machine recipes and chart-tag icons), run
+   `clusterioctl instance export-data <instance>` once per mod pack, with an instance of that
+   pack, and again after the pack's mods change. See [Icons](#icons).
 
 The binary must embed a viewer built with relative asset URLs (`vite build --base ./`; the v3
 viewer config sets `base: "./"`). Otherwise the viewer cannot load its scripts under
@@ -66,7 +75,29 @@ Changing any of the first three restarts the sidecar.
 `timeshade.view` (granted to the default role) is needed for the Map page, for view tokens and
 for every API request through the proxy.
 
-## How the pieces behave
+## Icons
+
+The viewer draws machine recipes and chart-tag icons from the mod pack's icon spritesheet.
+Without one it draws no recipes, and tags show their text only.
+
+`clusterioctl instance export-data <instance>` uploads the data export of the instance's mod
+pack to the controller. Clusterio keeps its files in the controller's `static/` directory
+(relative to the controller's working directory) under content-hashed names, and lists them
+in the mod pack's export manifest. The controller plugin copies the spritesheet and
+`metadata.json` of the **default mod pack** (`controller.default_mod_pack_id`) into
+`<database directory>/icons/` under the same names, and writes `icons.json` last
+([docs/v3/FORMAT.md](../docs/v3/FORMAT.md) 5). It removes the files the previous `icons.json`
+named. The sidecar's catalog names the new icons within 2 s, without a restart; an open map
+page gets them when it is reloaded.
+
+The copy runs at controller start, when the default mod pack changes (a new export, or the
+`controller.default_mod_pack_id` setting), and after a `timeshade.database_directory`
+change. Without a default mod pack, or when it has no export, nothing changes and the icons
+copied before stay. Only the default mod pack's icons are used: the map has one spritesheet
+for all instances, and a gridworld cluster runs one mod pack. Instances on another pack get
+the default's icons: a tag whose icon is missing from it shows its text, and such a recipe is
+not drawn.
+
 
 - **Sidecar.** The sidecar listens on a random loopback port with a random ingest token and
   read token, new at every controller start. Only the controller knows the tokens. Its first

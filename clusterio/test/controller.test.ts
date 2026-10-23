@@ -55,7 +55,8 @@ test("envelopes are forwarded with src and instance from the link address; maps 
 		const fwd = lines.filter(l => l.src === "clusterio:1");
 		assert.deepEqual(fwd.map(l => [l.map, l.instance, l.tick, l.seq]), [["gw-w", 1, 10, 5], ["i-1", 1, 11, 6]]);
 		const maps = lines.filter(l => l.src === "clusterio:controller");
-		assert.deepEqual(maps.map(l => l.map).sort(), ["gw-w", "i-1", "i-2"]);
+		// All of them twice when the maps timer (100 ms here) fired before the sidecar was ready, once more at ready.
+		assert.deepEqual([...new Set(maps.map(l => l.map))].sort(), ["gw-w", "i-1", "i-2"]);
 		const gw = maps.find(l => l.map === "gw-w");
 		assert.deepEqual(gw.msgs, [{ type: "map", info: {
 			key: "gw-w", title: "Gridworld w", tile_size: 512, instances: [{ id: "1", name: "inst1", bounds: [-256, -256, 256, 256] }],

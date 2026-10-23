@@ -111,7 +111,7 @@ type Server struct {
 	hub     *hub
 	live    *liveState
 	metrics *metrics
-	icons   *core.CatalogIcons
+	icons   iconsCache
 	spool   spool
 	// ingestWG counts ingest requests in flight (WaitIngest).
 	ingestWG sync.WaitGroup
@@ -190,7 +190,7 @@ func New(cfg Config) (*Server, error) {
 	s.files, _ = cfg.Movers.(MoverFiles)
 	s.hub = newHub(cfg.LiveClients, cfg.LiveBuffer)
 	s.live = newLiveState()
-	s.icons = loadIcons(cfg.IconsDir)
+	s.icons.dir = cfg.IconsDir
 	return s, nil
 }
 
