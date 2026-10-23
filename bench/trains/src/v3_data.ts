@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { HANDOFF_MS } from "./illisis_data.ts";
 import type { Journey, TrainSample } from "./types.ts";
 
-// core.MoverFlags (internal/v3/core/movers.go).
+// core.MoverFlags (internal/core/movers.go).
 const F_STOP = 1 << 0;
 const F_GONE = 1 << 1;
 const F_HANDOFF = 1 << 2;

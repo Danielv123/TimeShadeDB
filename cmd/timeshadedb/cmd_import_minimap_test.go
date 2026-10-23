@@ -9,14 +9,13 @@ import (
 	"strings"
 	"testing"
 
+	"timeshadedb/internal/core"
 	"timeshadedb/internal/import/minimap/minimaptest"
-	"timeshadedb/internal/v3/core"
 )
 
 func TestImportMinimapCommand(t *testing.T) {
-	c, ok := lookupCommand("import-minimap")
-	if !ok || c.Group != GroupV3 {
-		t.Fatalf("import-minimap not registered as a v3 command: %+v", c)
+	if _, ok := lookupCommand("import-minimap"); !ok {
+		t.Fatal("import-minimap is not registered")
 	}
 	exp := minimaptest.Write(t, t.TempDir())
 	out := t.TempDir()

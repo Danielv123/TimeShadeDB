@@ -1,4 +1,4 @@
-// Trains of the rail path model (F_RAIL, docs/v3/RAIL-GEOMETRY.md 8) in the viewer: the head
+// Trains of the rail path model (F_RAIL, docs/RAIL-GEOMETRY.md 8) in the viewer: the head
 // between sparse samples follows the rail path by the timing model, carriages sit on it at their
 // joint distances, extrapolation stays on it, a missed piece and an end switch start a new run,
 // and a first sight after a resync links back. Run with `npm test`.

@@ -199,7 +199,7 @@ function fake.chart(s, f, x, y, chart)
 	world.charts[key] = chart
 end
 
--- Rails (docs/v3/RAIL-GEOMETRY.md): the shapes of curved-rail-a and curved-rail-b for the piece built facing north
+-- Rails (docs/RAIL-GEOMETRY.md): the shapes of curved-rail-a and curved-rail-b for the piece built facing north
 -- (spec 2.4, 2.5), placed by the spec's 8-fold symmetry (2.1).
 local RAIL_R, CURVE_A_LENGTH, CURVE_B_LENGTH = 13, 5.132284556, 5.077891568
 

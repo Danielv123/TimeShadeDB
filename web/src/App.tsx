@@ -29,7 +29,7 @@ interface UrlState {
 }
 
 /**
- * Page URL state. Datastore: `ds` (a catalog datastore id, as the WP11 suite passes it) or
+ * Page URL state. Datastore: `ds` (a catalog datastore id, as the benchmark suite passes it) or
  * `map` + `surface` + `force`; camera: `x`, `y` and `s` (CSS px per tile) or `z` (a level,
  * 2^z px per tile); `t` (absent = live); `layers`. See boot.ts urlDatastore/urlScale.
  */
@@ -200,7 +200,7 @@ export function App({ boot }: { boot: Promise<Boot> }) {
     if (initialUrl.t !== null) {
       v.setTime(initialUrl.t);
     }
-    // Hooks for tests and benchmarks (WP11): drive the view from the console or Playwright.
+    // Hooks for tests and benchmarks: drive the view from the console or Playwright.
     (window as unknown as { __tsdbMap?: unknown }).__tsdbMap = {
       view: v,
       setCamera: (x: number, y: number, scale: number) => v.setCamera({ x, y, scale }),
@@ -211,7 +211,7 @@ export function App({ boot }: { boot: Promise<Boot> }) {
       fit: () => v.fit(),
       state: () => v.state(),
     };
-    // The TsdbControl contract (web/src/api/types.ts) the WP11 benchmark drives.
+    // The TsdbControl contract (web/src/api/types.ts) the client benchmark (bench/web) drives.
     const hostEl = host.current;
     window.__tsdbControl = createControl(v, {
       size: () => ({ width: hostEl.clientWidth, height: hostEl.clientHeight }),

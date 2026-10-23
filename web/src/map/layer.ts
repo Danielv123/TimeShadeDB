@@ -1,7 +1,7 @@
-// The MapLayer contract (WP0). The map engine (WP7, web/src/map/) owns the canvas, the
+// The MapLayer contract. The map engine (web/src/map/) owns the canvas, the
 // camera, terrain drawing and time; everything drawn above terrain (trains, vehicles,
-// players, tags, recipes, UE edges, rails, instance bounds) is a MapLayer (WP8,
-// web/src/movers/, web/src/overlays/), listed in web/src/layers/index.ts.
+// players, tags, recipes, UE edges, rails, instance bounds) is a MapLayer
+// (web/src/movers/, web/src/overlays/), listed in web/src/layers/index.ts.
 //
 // Coordinates: world tiles (Factorio map tiles), +x east, +y south, surface-local. Screen
 // coordinates are CSS pixels from the canvas's top-left corner.
@@ -91,7 +91,7 @@ export interface MapLayer {
   hitTest?(x: number, y: number, frame: FrameState): LayerHit | null;
   /**
    * How many ms the displayed live time should trail the data clock for this layer (the
-   * movers layer's adaptive delay, PLAN.md §4.8 step 1). The engine uses the largest value
+   * movers layer's adaptive delay, web/src/movers/clock.ts). The engine uses the largest value
    * over the enabled layers for FrameState.time in live mode. Optional; layers draw
    * correctly either way (the movers layer also clamps its own time).
    */

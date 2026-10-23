@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // randomRows returns n chunk rows with incompressible charts (the worst case for the

@@ -1,4 +1,4 @@
-// Command acceptance runs the whole WP11 suite and writes bench/REPORT.md. It is what
+// Command acceptance runs the whole acceptance suite and writes bench/REPORT.md. It is what
 // bench/run_acceptance.sh and bench/run_acceptance.ps1 call.
 //
 // Two modes:
@@ -7,7 +7,7 @@
 //	                 `timeshadedb import-minimap`, then disk, tile, ingest, startup,
 //	                 attack, soak, train and client benchmarks against v3, and the
 //	                 capture's UPS benchmark (headless Factorio, `measure capture`).
-//	-mode baseline   the Wave 1 baselines: TimeShadeDB master (-master-bin) over the
+//	-mode baseline   the baselines: TimeShadeDB master (-master-bin) over the
 //	                 same inputs, and the illisis viewer and export.
 //
 // Each step writes a result file under -results/<label>/; a failing step is logged and
@@ -381,7 +381,7 @@ func (r *runner) candidate() {
 		if c.testdata == "" {
 			return errors.New("-testdata (TSDB_TESTDATA) is not set")
 		}
-		// Graded on the imported rows (re-timed, deduped, handoffs flagged by WP5), read
+		// Graded on the imported rows (re-timed, deduped, handoffs flagged by the importer), read
 		// back from the database; the rail mask comes from the test data's final chart.
 		journeys := filepath.Join(c.work, "trains-v3-journeys.json")
 		if err := r.run("trains", r.tool("measure"), "movers", "-db", imported, "-surface", "gw-bc41437d~2E1.nauvis", "-out", journeys); err != nil {
@@ -400,7 +400,7 @@ func (r *runner) candidate() {
 	r.step("web", func() error {
 		// The same view as the illisis run: gridworld nauvis, z0, centred on (0, 0).
 		srv, err := benchlib.StartServer(benchlib.ServerSpec{Binary: bin,
-			Args: []string{"serve-v3", "--db", "{db}", "--listen", "{listen}"}, DB: imported,
+			Args: []string{"serve", "--db", "{db}", "--listen", "{listen}"}, DB: imported,
 			Log: logFile(filepath.Join(c.work, "logs", "web-server.log"))})
 		if err != nil {
 			return err
@@ -412,7 +412,7 @@ func (r *runner) candidate() {
 	})
 	r.step("capture", func() error {
 		// Headless Factorio (FACTORIO_EXE or the Steam path): the capture's cost per tick
-		// on the WP9 benchmark save, with and without the capture, interleaved.
+		// on the capture's benchmark save, with and without the capture, interleaved.
 		args := []string{"capture", "-repo", c.repo, "-label", "v3", "-scenario", "ups", "-out", r.out("v3", "capture-ups"),
 			"-runs", strconv.Itoa(c.capRuns)}
 		if c.capAff != "" {

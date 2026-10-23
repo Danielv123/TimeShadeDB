@@ -54,7 +54,7 @@ export function seedRequest(params: URLSearchParams, viewport: { width: number; 
 
 /**
  * The datastore id a page URL names: `ds` (a datastore id as the catalog has it, e.g.
- * "gw-bc41437d~2E1.nauvis.player"; docs/v3/README.md), else `map` + `surface` + `force`
+ * "gw-bc41437d~2E1.nauvis.player"; docs/README.md), else `map` + `surface` + `force`
  * (default "player"); null when neither is complete. `ds` wins when both are present.
  * index.html's early-start script repeats this rule.
  */

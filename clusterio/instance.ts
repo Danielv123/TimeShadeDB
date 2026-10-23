@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
 // Ported from illisis/minimap instance.ts (Blue Oak Model License 1.0.0, see LICENSE-BlueOak-1.0.0.md).
 //
-// The instance side (PLAN.md §4.10): Lua's capture module prints envelopes on the IPC channel timeshade:out; this
+// The instance side: Lua's capture module prints envelopes on the IPC channel timeshade:out; this
 // stamps each with its arrival time, splits it by map, and sends what arrived to the controller about once a second,
 // as a request: what the controller did not take stays queued. A map without envelopes for a few seconds gets a
 // caught_up envelope, and every map an ended one when the instance stops, so the map server holds a map's horizon back
-// only for an instance that still has data of it to send (docs/v3/API.md 5, "Horizon").
+// only for an instance that still has data of it to send (docs/API.md 5, "Horizon").
 // It configures the capture over RCON at every start, on a gridworld.tile change and on a new controller session.
 import * as lib from "@clusterio/lib";
 import type { InstancePluginContext } from "@clusterio/host";
@@ -54,7 +54,7 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	const warn = rateLimited(logger);
 	const splitter = new Splitter(instance.id);
 	splitter.setTile(tileOf(instance.config as unknown as { get(name: string): unknown }));
-	// Increasing per source (docs/v3/PROTOCOL.md 1), also across host restarts.
+	// Increasing per source (docs/PROTOCOL.md 1), also across host restarts.
 	let seq = now() * 1000;
 	const nextSeq = () => ++seq;
 	let pending: { env: Envelope; bytes: number }[] = [];
@@ -217,7 +217,7 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	/**
 	 * Sends what waits, one request at a time. A request that fails (the controller is away, or the session it was sent
 	 * in ended) leaves its envelopes queued for the next try, in memory and then on disk; a delivered one may come again
-	 * after a failure that hid its response, which ingest skips (docs/v3/PROTOCOL.md 1, seq). Tries after failures back
+	 * after a failure that hid its response, which ingest skips (docs/PROTOCOL.md 1, seq). Tries after failures back
 	 * off up to MAX_RETRY_MS (the host logs each failed message) until the link connects or resumes.
 	 */
 	async function flush() {

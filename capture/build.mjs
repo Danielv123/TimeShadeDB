@@ -1,7 +1,7 @@
 // Assembles the two capture hosts from the shared library (no dependencies, Node 22+):
-//   <out>/timeshade_capture_<version>/      the standalone mod, unpacked (Factorio loads mod directories)
-//   <out>/timeshade_capture_<version>.zip   the same, zipped for the mod portal or a mods folder
-//   <out>/clusterio_module/                 the Clusterio save-patch module "timeshade" (a plugin's module/ directory)
+//   <out>/timeshadedb_exporter_<version>/      the standalone mod, unpacked (Factorio loads mod directories)
+//   <out>/timeshadedb_exporter_<version>.zip   the same, zipped for the mod portal or a mods folder
+//   <out>/clusterio_module/                    the Clusterio save-patch module "timeshade" (a plugin's module/ directory)
 // Usage: node capture/build.mjs [--out <dir>] [--test] [--no-zip] [--factorio-version 2.1]
 //   --test adds capture/test/game/{hooks,synthetic}.lua to the mod (a remote interface the game tests use); never ship
 //   that build.
@@ -23,7 +23,7 @@ const out = path.resolve(option("--out", path.join(here, "dist")));
 const test = flag("--test");
 
 const lib = path.join(here, "lua");
-const modSrc = path.join(here, "mod", "timeshade_capture");
+const modSrc = path.join(here, "mod", "timeshadedb_exporter");
 const moduleSrc = path.join(here, "clusterio_module");
 
 const info = JSON.parse(fs.readFileSync(path.join(modSrc, "info.json"), "utf8"));

@@ -1,4 +1,4 @@
-// Canvas2D fallback renderer (PLAN.md §8 risk "WebGL2 unavailable"). Each tile becomes a
+// Canvas2D fallback renderer, for when WebGL2 is unavailable. Each tile becomes a
 // 512x512 RGBA canvas filled through a 65,536-entry lookup table (renderer.ts), the method
 // measured about 23x faster than illisis's per-pixel decode path. Drawn scaled with image
 // smoothing off.

@@ -1,4 +1,4 @@
-// Fits a recorded train line to the rail model (docs/v3/RAIL-GEOMETRY.md section 3): the rail path under the train and
+// Fits a recorded train line to the rail model (docs/RAIL-GEOMETRY.md section 3): the rail path under the train and
 // each carriage's front joint as an arc length on it. geometry.mjs measures the model with it and gen-vectors.mjs takes
 // real-game placement cases from it.
 import { chainPos } from "./railnet.mjs";

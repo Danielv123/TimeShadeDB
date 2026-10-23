@@ -4,6 +4,6 @@
 	"title": "TimeShadeDB capture test driver",
 	"author": "TimeShadeDB",
 	"factorio_version": "2.0",
-	"description": "Headless test scenario for timeshade_capture (capture/test/run_game.mjs). Not for play.",
-	"dependencies": ["base >= 2.0.0", "? timeshade_capture"]
+	"description": "Headless test scenario for timeshadedb_exporter (capture/test/run_game.mjs). Not for play.",
+	"dependencies": ["base >= 2.0.0", "? timeshadedb_exporter"]
 }

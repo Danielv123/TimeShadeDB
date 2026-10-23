@@ -117,7 +117,7 @@ async function survey() {
 }
 
 /**
- * The capture's envelopes of a recorded run through the real v3 ingest: starts `timeshadedb serve-v3 --clock data` on
+ * The capture's envelopes of a recorded run through the real v3 ingest: starts `timeshadedb serve --clock data` on
  * a free port with its own database under the run, posts every envelope of write/script-output/timeshade in name order
  * as `timeshadedb tail` does (gzip NDJSON with src, map, recv_ms, seq), except that recv_ms is the game time of the
  * envelope's tick plus a fixed lag (the benchmark ran faster than real time), then posts one trace envelope 7 minutes
@@ -137,10 +137,10 @@ async function feed() {
 	const token = "railbench";
 	const { spawn } = await import("node:child_process");
 	const budget = option("--mem-budget", null);
-	const srv = spawn(bin, ["serve-v3", "--db", db, "--listen", "127.0.0.1:0", "--clock", "data", "--ingest-token", token,
+	const srv = spawn(bin, ["serve", "--db", db, "--listen", "127.0.0.1:0", "--clock", "data", "--ingest-token", token,
 		"--no-viewer", "--quiet", "--exit-on-stdin-close", ...(budget ? ["--mem-budget", String(Number(budget))] : [])],
 	{ stdio: ["pipe", "pipe", "pipe"] });
-	const logPath = path.join(dir, "serve-v3.log");
+	const logPath = path.join(dir, "serve.log");
 	const log = fs.createWriteStream(logPath);
 	srv.stderr.on("data", (d) => log.write(d));
 	const addr = await new Promise((resolve, reject) => {
@@ -153,9 +153,9 @@ async function feed() {
 				resolve(m[1]);
 			}
 		});
-		srv.on("exit", (c) => reject(new Error(`serve-v3 exited ${c}, see ${logPath}`)));
+		srv.on("exit", (c) => reject(new Error(`serve exited ${c}, see ${logPath}`)));
 	});
-	console.log(`serve-v3 on ${addr}, db ${db}`);
+	console.log(`serve on ${addr}, db ${db}`);
 	const url = `http://${addr}/api/v3/ingest`;
 	const files = fs.readdirSync(capDir).filter(f => f.endsWith(".ndjson")).sort();
 	const lagMs = Number(option("--lag-ms", 250));
@@ -200,9 +200,9 @@ async function feed() {
 			}
 			const tick = Number(/"tick":(\d+)/.exec(line)?.[1]);
 			// game time runs at the envelope's game speed (a save may run slower than 1, as the l1n3 save does at 0.2):
-			// the tailer would see the envelopes arrive at that pace, and serve-v3 converts sample ticks with it
+			// the tailer would see the envelopes arrive at that pace, and serve converts sample ticks with it
 			// --speed replays the run as if the game had run at that speed (the capture only writes game.speed into the
-			// envelope; serve-v3 and the viewer use it to put ticks on the clock)
+			// envelope; serve and the viewer use it to put ticks on the clock)
 			if (asSpeed !== null) {
 				line = line.replace(/"speed":[\d.eE+-]+,/, "").replace('{"v":1,', `{"v":1,"speed":${Number(asSpeed)},`);
 			}
@@ -284,7 +284,7 @@ function buildCapture(dir, capture = path.join(repo, "capture")) {
 	const mm = gameVersion().split(".").slice(0, 2).join(".");
 	execFileSync(process.execPath, [path.join(capture, "build.mjs"), "--out", dir, "--no-zip",
 		"--factorio-version", mm], { encoding: "utf8" });
-	const info = JSON.parse(fs.readFileSync(path.join(capture, "mod", "timeshade_capture", "info.json"), "utf8"));
+	const info = JSON.parse(fs.readFileSync(path.join(capture, "mod", "timeshadedb_exporter", "info.json"), "utf8"));
 	const modDir = path.join(dir, `${info.name}_${info.version}`);
 	// Benchmark mode has no server, but a save made in multiplayer keeps game.is_multiplayer() true, and the mod writes
 	// its files only for the server (for_player = 0), so nothing would be written. The harness's copy writes them as
@@ -314,7 +314,7 @@ async function record() {
 	const capDir = buildCapture(path.join(dir, "build"));
 	const mods = { railbench_recorder: recorderMod };
 	if (!flag("--no-capture")) {
-		mods.timeshade_capture = (dst) => copyTree(capDir, dst);
+		mods.timeshadedb_exporter = (dst) => copyTree(capDir, dst);
 	}
 	const box = sandbox(dir, { mods, spaceAge: info.spaceAge,
 		configs: { railbench_recorder: { mode: "record", ticks, refuel: flag("--refuel") } } });
@@ -370,13 +370,13 @@ async function ups() {
 	const info = saveInfo(save);
 	const dir = path.join(work, "runs", name);
 	const capDir = buildCapture(path.join(dir, "build"));
-	const box = sandbox(dir, { mods: { timeshade_capture: (dst) => copyTree(capDir, dst) }, spaceAge: info.spaceAge });
+	const box = sandbox(dir, { mods: { timeshadedb_exporter: (dst) => copyTree(capDir, dst) }, spaceAge: info.spaceAge });
 	const compare = option("--compare", null);
 	let altBox = null;
 	if (compare) {
 		const altDir = buildCapture(path.join(dir, "build-alt"), path.resolve(compare));
-		altBox = sandbox(path.join(dir, "alt"), { mods: { timeshade_capture: (dst) => copyTree(altDir, dst) }, spaceAge: info.spaceAge });
-		setEnabled(altBox, { timeshade_capture: true });
+		altBox = sandbox(path.join(dir, "alt"), { mods: { timeshadedb_exporter: (dst) => copyTree(altDir, dst) }, spaceAge: info.spaceAge });
+		setEnabled(altBox, { timeshadedb_exporter: true });
 	}
 	const per = { with: [], without: [], alt: [] };
 	const lines = [];
@@ -384,7 +384,7 @@ async function ups() {
 		for (const label of altBox ? ["without", "with", "alt"] : ["without", "with"]) {
 			const b = label === "alt" ? altBox : box;
 			if (label !== "alt") {
-				setEnabled(box, { timeshade_capture: label === "with" });
+				setEnabled(box, { timeshadedb_exporter: label === "with" });
 			}
 			const res = await runFactorio(b, ["--benchmark", path.resolve(save), "--benchmark-ticks", String(ticks),
 				"--benchmark-runs", "1", "--benchmark-verbose", "all"], `ups-${label}-${r}`, { keepStdout: false, affinity });

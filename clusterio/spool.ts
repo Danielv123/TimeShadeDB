@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-// The part of a line queue that does not fit in memory, on disk (docs/v3/API.md 5: a forwarder that cannot send keeps
+// The part of a line queue that does not fit in memory, on disk (docs/API.md 5: a forwarder that cannot send keeps
 // what it has rather than dropping it). A queue keeps its oldest lines in memory and, once those pass its memory
 // bound, appends every new line here instead, so the order is: memory, then the segments oldest first. When the memory
 // part is sent the queue takes the oldest segment back (take); the segment's file is deleted only once the queue says

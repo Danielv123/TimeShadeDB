@@ -1,4 +1,4 @@
-// WebGL2 terrain renderer (PLAN.md §4.7). z0 tiles are R8UI (pal8) or R16UI (pal16)
+// WebGL2 terrain renderer. z0 tiles are R8UI (pal8) or R16UI (pal16)
 // palette-index textures; the fragment shader looks colours up in a 256x256 RGBA palette
 // texture (65,536 entries). Coarse tiles are R16UI RGB565, expanded in the shader with the
 // same bit replication as FORMAT.md 3. Integer textures, so sampling is always nearest.

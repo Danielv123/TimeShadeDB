@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
 // Ported from illisis/minimap integrations.ts (Blue Oak Model License 1.0.0, see LICENSE-BlueOak-1.0.0.md).
 //
-// The optional integrations (PLAN.md §4.10): gridworld's tile config, read from each instance's config, and Universal
+// The optional integrations: gridworld's tile config, read from each instance's config, and Universal
 // Edges' edges, through UE's own module file. Neither is a dependency; both are found at run time. Map keys are raw
-// strings (docs/v3/PROTOCOL.md 1): `gw-<world>` for a gridworld world, `i-<instance id>` for everything else, the same
+// strings (docs/PROTOCOL.md 1): `gw-<world>` for a gridworld world, `i-<instance id>` for everything else, the same
 // keys the illisis importer produces (it unescapes illisis's directory names).
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -18,7 +18,7 @@ export type Quad = [number, number, number, number];
 /** core.InstanceInfo. */
 export type InstanceInfo = { id: string; name: string; bounds?: Quad };
 
-/** core.MapInfo, the payload of a "map" message (docs/v3/PROTOCOL.md 3). */
+/** core.MapInfo, the payload of a "map" message (docs/PROTOCOL.md 3). */
 export type MapInfo = {
 	key: string;
 	title: string;

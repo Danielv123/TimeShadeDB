@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // The test binary doubles as a fake server: TestMain runs it when BENCHLIB_FAKE is set.
@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 
 var fakeIngested atomic.Int64
 
-// fakeV3 serves a minimal subset of docs/v3/API.md on 127.0.0.1:0 and prints the
+// fakeV3 serves a minimal subset of docs/API.md on 127.0.0.1:0 and prints the
 // listening line first, as the v3 contract requires.
 func fakeV3() {
 	l, err := net.Listen("tcp", "127.0.0.1:0")

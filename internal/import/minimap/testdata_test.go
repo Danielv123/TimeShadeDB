@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/memstore"
 	"timeshadedb/internal/import/minimap"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/memstore"
 )
 
 // sourceCounts are the illisis export's mover counts as measured by the research scripts
@@ -64,7 +64,7 @@ func sameCounts(a, b map[string]int) bool {
 }
 
 // TestTestdata imports the full illisis test export into the memstores and checks the
-// WP5 acceptance criteria. Set TSDB_TESTDATA to the export root (the directory holding
+// importer's acceptance criteria. Set TSDB_TESTDATA to the export root (the directory holding
 // maps.json.gz) to run it.
 func TestTestdata(t *testing.T) {
 	root := os.Getenv("TSDB_TESTDATA")

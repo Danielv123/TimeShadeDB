@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // OverlayReport counts what the overlay import read and wrote for one datastore.

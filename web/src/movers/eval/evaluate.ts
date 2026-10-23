@@ -1,4 +1,4 @@
-// Train rendering metrics (PLAN.md §5 "Trains"), shared by the CLI (train_eval.mjs) and the
+// Train rendering metrics (the Trains targets in bench/targets.json), shared by the CLI (train_eval.mjs) and the
 // tests. Inputs are illisis-style journeys (research out/trains.jsonl) and a rail bitmask of
 // the final chart (research scripts/rail_mask.py). Pure computation, no Node APIs.
 //

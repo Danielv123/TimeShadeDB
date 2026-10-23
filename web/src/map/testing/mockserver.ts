@@ -1,5 +1,5 @@
 // A mock TimeShadeDB v3 server for tests and benchmarks (Node only). Serves a MockDataset as
-// the live API under /api/v3/ and as a static export under /static/ (docs/v3/API.md 1-6),
+// the live API under /api/v3/ and as a static export under /static/ (docs/API.md 1-6),
 // with gzip Content-Encoding, X-TSDB-Now, the documented cache headers and error bodies,
 // optional latency, a request log and "holds" that keep matching requests open until
 // released (to observe the viewer while tiles load). Optionally serves a directory of

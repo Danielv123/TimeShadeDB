@@ -2,7 +2,7 @@
 // spritesheet and metadata.json (lib.ExportMetadata: entries with sprite coordinates per prototype type, the shape the
 // viewer's iconIndex reads) to the controller, which keeps them in its static directory under content-hashed names and
 // lists them in the mod pack's export manifest. The map server serves the icons named by <db>/icons/icons.json
-// (docs/v3/FORMAT.md 5) and reads that file again when it changes.
+// (docs/FORMAT.md 5) and reads that file again when it changes.
 import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 

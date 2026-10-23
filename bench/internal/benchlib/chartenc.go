@@ -8,7 +8,7 @@ import (
 
 	"github.com/klauspost/compress/zlib"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // chartEncoder encodes charts in the core.EncodeChart format (base64 of zlib-deflated

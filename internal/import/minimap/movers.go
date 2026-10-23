@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"math"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // Row flags of decoded source rows.

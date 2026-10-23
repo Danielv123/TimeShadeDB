@@ -2,7 +2,7 @@
   "name": "timeshadedb-bench-trains",
   "private": true,
   "type": "module",
-  "description": "Train rendering evaluator (PLAN.md section 4.8 and 5): leave-one-out error, carriage distance to rail pixels, frame-to-frame jumps.",
+  "description": "Train rendering evaluator: leave-one-out error, carriage distance to rail pixels, frame-to-frame jumps.",
   "scripts": {
     "build": "node build.mjs",
     "eval": "node build.mjs && node dist/eval.mjs",

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BlueOak-1.0.0
-// The map behind Clusterio's auth (docs/v3/API.md 1.3): /api/timeshade/* on the controller's web server is proxied to
+// The map behind Clusterio's auth (docs/API.md 1.3): /api/timeshade/* on the controller's web server is proxied to
 // the sidecar. The API (/api/timeshade/api/v3/*) needs a Clusterio user token, or a view token minted for the web
 // page, of a user with timeshade.view; the viewer's own files (/api/timeshade/, /api/timeshade/assets/*) are open, as
 // they are on the sidecar. The sidecar listens on 127.0.0.1 with its own random read token, which only this proxy

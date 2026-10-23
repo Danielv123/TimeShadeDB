@@ -17,8 +17,8 @@ import (
 	"sync"
 	"testing"
 
+	"timeshadedb/internal/core"
 	"timeshadedb/internal/import/minimap/minimaptest"
-	"timeshadedb/internal/v3/core"
 )
 
 func TestPublishFlags(t *testing.T) {
@@ -221,7 +221,7 @@ func TestPublishDBToDir(t *testing.T) {
 	}
 
 	// From the running server: the same immutable files.
-	base, stop := startServeV3(t, "--db", db)
+	base, stop := startServe(t, "--db", db)
 	out2 := filepath.Join(t.TempDir(), "out2")
 	buf.Reset()
 	if err := runPublish(context.Background(), &buf, io.Discard, []string{"--from", base + "/api/v3/", "--dir", out2, "--web-dir", web}); err != nil {

@@ -54,7 +54,7 @@ func FreePort() (int, error) {
 // Args may contain these placeholders:
 //   - {addr}: replaced by 127.0.0.1:<free port> chosen by the harness (v2 `serve --addr`);
 //   - {listen}: replaced by 127.0.0.1:0; the server must print "listening on <addr>" as
-//     its first stdout line (v3 contract, docs/v3/README.md);
+//     its first stdout line (v3 contract, docs/README.md);
 //   - {db}: replaced by DB.
 type ServerSpec struct {
 	Binary string

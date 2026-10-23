@@ -45,7 +45,7 @@ export const plugin: lib.PluginDeclaration = {
 		},
 		"timeshade.mem_budget_mb": {
 			title: "Memory budget (MiB)",
-			description: "The map server's cache and buffer budget (serve-v3 --mem-budget). A change restarts it.",
+			description: "The map server's cache and buffer budget (serve --mem-budget). A change restarts it.",
 			type: "number",
 			initialValue: 256,
 			validator: (value: number) => {

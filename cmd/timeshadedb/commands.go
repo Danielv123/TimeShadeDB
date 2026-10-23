@@ -1,17 +1,14 @@
 package main
 
 // Command registry. Every subcommand registers itself from an init function in its own
-// file, so work packages add commands without editing a shared switch:
+// file, cmd_<name>.go:
 //
-//	// cmd_publish.go (owned by WP12)
 //	func init() {
-//		register(Command{Name: "publish", Summary: "export the v3 database as static files", Group: GroupV3, Run: cmdPublish})
+//		register(Command{Name: "publish", Summary: "export the database as static files", Run: cmdPublish})
 //	}
 //
-// File naming: cmd_<name>.go, one file per command or per closely related group.
 // Command names are lower-case words joined by '-'. Run receives the arguments after
-// the command name and should parse them with its own flag.FlagSet. The planned v3
-// commands and their owners are listed in docs/v3/README.md.
+// the command name and should parse them with its own flag.FlagSet.
 
 import (
 	"context"
@@ -22,21 +19,12 @@ import (
 	"strings"
 )
 
-// Command groups, used to order the usage text.
-const (
-	GroupV3     = "v3"
-	GroupLegacy = "legacy"
-	GroupTools  = "tools"
-)
-
 // Command is one timeshadedb subcommand.
 type Command struct {
 	// Name is the word after "timeshadedb" on the command line.
 	Name string
 	// Summary is one line for the usage text.
 	Summary string
-	// Group is GroupV3, GroupLegacy or GroupTools.
-	Group string
 	// Run executes the command with the arguments after the name.
 	Run func(ctx context.Context, args []string) error
 }
@@ -54,11 +42,6 @@ func register(c Command) {
 	}
 	if c.Run == nil {
 		panic(fmt.Sprintf("timeshadedb: command %q has no Run", c.Name))
-	}
-	switch c.Group {
-	case GroupV3, GroupLegacy, GroupTools:
-	default:
-		panic(fmt.Sprintf("timeshadedb: command %q has unknown group %q", c.Name, c.Group))
 	}
 	if _, dup := commands[c.Name]; dup {
 		panic(fmt.Sprintf("timeshadedb: command %q registered twice", c.Name))
@@ -101,19 +84,8 @@ func runCommand(ctx context.Context, stdout io.Writer, args []string) error {
 
 func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: timeshadedb <command> [flags]")
-	for _, group := range []string{GroupV3, GroupTools, GroupLegacy} {
-		var names []string
-		for _, name := range commandNames() {
-			if commands[name].Group == group {
-				names = append(names, name)
-			}
-		}
-		if len(names) == 0 {
-			continue
-		}
-		fmt.Fprintf(w, "\n%s commands:\n", group)
-		for _, name := range names {
-			fmt.Fprintf(w, "  %-18s %s\n", name, commands[name].Summary)
-		}
+	fmt.Fprintln(w, "\ncommands:")
+	for _, name := range commandNames() {
+		fmt.Fprintf(w, "  %-18s %s\n", name, commands[name].Summary)
 	}
 }

@@ -13,7 +13,7 @@ import (
 // DefaultServerArgs are the server arguments per target when --server-args is not given.
 var DefaultServerArgs = map[string]string{
 	"v2": "serve --db {db} --addr {addr}",
-	"v3": "serve-v3 --db {db} --listen {listen}",
+	"v3": "serve --db {db} --listen {listen}",
 }
 
 // ServerFlags are the flags every server-driving tool shares.

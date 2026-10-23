@@ -2,7 +2,7 @@
 // The integrations wiring is ported from illisis/minimap controller.ts (Blue Oak Model License 1.0.0, see
 // LICENSE-BlueOak-1.0.0.md).
 //
-// The controller side (PLAN.md §4.10): it runs the map server as a sidecar, forwards the instances' envelopes to its
+// The controller side: it runs the map server as a sidecar, forwards the instances' envelopes to its
 // ingest, publishes the cluster's maps (titles, gridworld bounds, Universal Edges lines) as "map" messages, copies the
 // default mod pack's exported icons into the map's database, proxies the map behind Clusterio's auth, and mints view
 // tokens for the web page.
@@ -29,10 +29,10 @@ const MAPS_RESEND_MS = 10 * 60_000;
 const RESTART_FIELDS = new Set(["timeshade.binary_path", "timeshade.database_directory", "timeshade.mem_budget_mb"]);
 
 export type ControllerOptions = {
-	/** Run this instead of the timeshadedb binary (tests): the command and the arguments before "serve-v3". */
+	/** Run this instead of the timeshadedb binary (tests): the command and the arguments before "serve". */
 	command?: string;
 	commandArgs?: string[];
-	/** More serve-v3 flags (tests: --clock data and short graces). */
+	/** More serve flags (tests: --clock data and short graces). */
 	extraArgs?: string[];
 	sidecar?: Partial<SidecarOptions>;
 	queue?: Partial<IngestQueueOptions>;
@@ -73,7 +73,7 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 		return {
 			command,
 			args: [
-				...prefix, "serve-v3", "--db", dbDir(), "--listen", "127.0.0.1:0", "--ingest-token", ingestToken,
+				...prefix, "serve", "--db", dbDir(), "--listen", "127.0.0.1:0", "--ingest-token", ingestToken,
 				"--read-token", readToken, "--mem-budget", String(mem), "--exit-on-stdin-close", ...(options.extraArgs ?? []),
 			],
 		};
@@ -130,7 +130,7 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 		});
 	};
 
-	// Map messages (docs/v3/PROTOCOL.md 3): sent when a map changed, and all of them every 10 minutes and after each
+	// Map messages (docs/PROTOCOL.md 3): sent when a map changed, and all of them every 10 minutes and after each
 	// sidecar start. The controller's envelopes count ticks at 60 a second from its start, so they anchor cleanly.
 	const clock = options.now ?? Date.now;
 	const startedMs = clock();

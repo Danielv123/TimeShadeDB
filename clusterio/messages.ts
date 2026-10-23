@@ -1,7 +1,7 @@
 import { Type, type Static } from "@sinclair/typebox";
 
 /**
- * One capture envelope as the instance forwards it (docs/v3/PROTOCOL.md 1): Lua's fields plus `map`, `recv_ms` and
+ * One capture envelope as the instance forwards it (docs/PROTOCOL.md 1): Lua's fields plus `map`, `recv_ms` and
  * `seq`. The controller sets `src` and `instance` from the link address, never from the payload. The messages are
  * checked by the sidecar's ingest, not here.
  */
@@ -13,7 +13,7 @@ export const Envelope = Type.Object({
 	map: Type.String({ minLength: 1, maxLength: 200 }),
 	recv_ms: Type.Integer(),
 	seq: Type.Integer(),
-	/** Nothing older of this instance waits to be sent (docs/v3/PROTOCOL.md 1); `ended`: the instance stopped. */
+	/** Nothing older of this instance waits to be sent (docs/PROTOCOL.md 1); `ended`: the instance stopped. */
 	caught_up: Type.Optional(Type.Boolean()),
 	ended: Type.Optional(Type.Boolean()),
 });

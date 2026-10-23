@@ -20,21 +20,19 @@ import (
 	"time"
 
 	"timeshadedb"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/publish"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/publish"
 )
 
 func init() {
 	register(Command{
 		Name:    "publish",
-		Summary: "export the v3 database as static files to a directory or an S3/R2 bucket",
-		Group:   GroupV3,
+		Summary: "export the database as static files to a directory or an S3/R2 bucket",
 		Run:     cmdPublish,
 	})
 	register(Command{
 		Name:    "publish-serve",
 		Summary: "serve a directory written by publish --dir (for testing an export)",
-		Group:   GroupV3,
 		Run:     cmdPublishServe,
 	})
 }
@@ -57,7 +55,7 @@ func parsePublish(stdout io.Writer, args []string) (*publishOptions, error) {
 	o := &publishOptions{}
 	f := flag.NewFlagSet("publish", flag.ContinueOnError)
 	f.SetOutput(io.Discard)
-	f.StringVar(&o.db, "db", "", "v3 database to export (opened here: no server may run on it)")
+	f.StringVar(&o.db, "db", "", "database to export (opened here: no server may run on it)")
 	f.StringVar(&o.from, "from", "", "export from a running server instead: its API base URL, e.g. http://127.0.0.1:8080/api/v3/")
 	f.StringVar(&o.readToken, "read-token", "", "read token of the --from server")
 	f.StringVar(&o.dir, "dir", "", "write the export into this directory")
@@ -141,7 +139,7 @@ func runPublish(ctx context.Context, stdout, stderr io.Writer, args []string) er
 		if fi, err := os.Stat(o.db); err != nil || !fi.IsDir() {
 			return fmt.Errorf("publish: --db %s is not a directory", o.db)
 		}
-		v, err := openV3Server(ctx, &v3ServerOptions{db: o.db, memBudget: 256 << 20, window: 60 * time.Second, clock: "wall", noViewer: true}, logf)
+		v, err := openServer(ctx, &serverOptions{db: o.db, memBudget: 256 << 20, window: 60 * time.Second, clock: "wall", noViewer: true}, logf)
 		if err != nil {
 			return fmt.Errorf("publish: %w", err)
 		}

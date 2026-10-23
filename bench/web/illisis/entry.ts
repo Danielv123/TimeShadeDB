@@ -2,7 +2,7 @@
 // (web/map_view.ts, web/view/*), never from the viewer bundle in the test data. It mounts
 // the viewer like web/public.ts does, without the controls, exposes it for the runner,
 // and records paint events into window.__tsdbPerf (the v3 perf hook format,
-// docs/v3/README.md), so one runner measures both viewers.
+// docs/README.md), so one runner measures both viewers.
 //
 // "Full" means: every area the frame shows (viewer.shown) has a decoded entry for the
 // time shown and no load is in flight; illisis draws areas only from their own data, so

@@ -131,7 +131,7 @@ export class RecipesLayer extends IntervalLayer {
   }
 }
 
-/** Rail entities from the optional rail layer (WP9), as short grey strokes along their direction. Debug aid; off by default. */
+/** Rail entities from the capture's optional rail layer, as short grey strokes along their direction. Debug aid; off by default. */
 export class RailsLayer extends IntervalLayer {
   readonly id = "rails";
   readonly order = 15;

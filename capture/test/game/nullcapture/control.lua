@@ -1,4 +1,4 @@
--- The UPS benchmark's baseline (capture/test/run_game.mjs --mode bench). It stands in for timeshade_capture's test
+-- The UPS benchmark's baseline (capture/test/run_game.mjs --mode bench). It stands in for timeshadedb_exporter's test
 -- interface with no-ops, so the run without the capture pays the same cost for the driver's remote calls (each tick's
 -- list of chart events is copied between Lua states) and the difference between the runs is the capture's own cost.
 local function none()

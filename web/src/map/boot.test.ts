@@ -57,7 +57,7 @@ test("index.html early requests equal boot.ts seedRequest/seedPath", () => {
     if (i % 4 === 1) {
       p.set("t", String(1791630000000 + Math.floor(r(7) * 1e9)));
     }
-    // WP11's parameters: ds instead of map/surface/force, z instead of s (or both).
+    // The benchmark suite's parameters: ds instead of map/surface/force, z instead of s (or both).
     if (i % 7 === 3) {
       p.set("ds", datastoreId({ map: p.get("map")!, surface: p.get("surface")!, force: p.get("force") ?? "player" }));
       if (i % 2 === 0) {
@@ -104,7 +104,7 @@ test("index.html early requests equal boot.ts seedRequest/seedPath", () => {
   assert.ok(odd?.startsWith("view/a%20b.c.d/0?"));
 });
 
-test("URL parameters: ds and z (WP11) next to map/surface/force and s", () => {
+test("URL parameters: ds and z (the bench suite) next to map/surface/force and s", () => {
   const q = (s: string) => new URLSearchParams(s);
   assert.equal(urlDatastore(q("ds=gw-bc41437d~2E1.nauvis.player")), "gw-bc41437d~2E1.nauvis.player");
   assert.equal(urlDatastore(q("map=gw-bc41437d.1&surface=nauvis")), "gw-bc41437d~2E1.nauvis.player");

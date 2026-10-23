@@ -1,7 +1,7 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/overlays.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- Overlays (docs/v3/PROTOCOL.md section 3): chart tags, machine recipes and, when enabled, rail entities. Each change
+-- Overlays (docs/PROTOCOL.md section 3): chart tags, machine recipes and, when enabled, rail entities. Each change
 -- sends the new state; the server closes the old one. Removal is seen through the mined and died events, so nothing is
 -- registered with script.register_on_object_destroyed and the resync can stay read-only.
 --

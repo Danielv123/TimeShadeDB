@@ -1,5 +1,5 @@
 // The illisis/minimap viewer's train placement, ported for the train evaluator only, as the
-// baseline the v3 viewer is measured against (PLAN.md §5 "Trains"). Not used for drawing.
+// baseline the v3 viewer is measured against. Not used for drawing.
 //
 // Ported from illisis-minimap web/view/movers.ts (place, heading, line, carriages) at 91a6461.
 // Copyright (c) illisis-minimap contributors. Licensed under the Blue Oak Model License 1.0.0

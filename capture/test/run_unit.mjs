@@ -10,7 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const roots = [path.join(here, "..", "lua"), path.join(here, "unit")];
 const filter = process.argv[2] ?? "";
 
-// The shared rail geometry vectors (docs/v3/rail-geometry-vectors.json) as Lua source, for __vectors() in the tests.
+// The shared rail geometry vectors (docs/rail-geometry-vectors.json) as Lua source, for __vectors() in the tests.
 const toLua = (v) => {
 	if (Array.isArray(v)) {
 		return `{${v.map(toLua).join(",")}}`;
@@ -20,7 +20,7 @@ const toLua = (v) => {
 	}
 	return typeof v === "string" ? JSON.stringify(v) : v === null ? "nil" : String(v);
 };
-const vectorsLua = "return " + toLua(JSON.parse(fs.readFileSync(path.join(here, "..", "..", "docs", "v3", "rail-geometry-vectors.json"), "utf8")));
+const vectorsLua = "return " + toLua(JSON.parse(fs.readFileSync(path.join(here, "..", "..", "docs", "rail-geometry-vectors.json"), "utf8")));
 
 const files = fs.readdirSync(path.join(here, "unit"))
 	.filter(f => f.endsWith("_test.lua") && f.includes(filter))

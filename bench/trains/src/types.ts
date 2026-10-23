@@ -1,6 +1,6 @@
 // The evaluator's view of train data and of a train renderer. A renderer is whatever
 // turns samples into a drawn train: the illisis viewer's code (baseline), simple
-// reference interpolators, or the v3 viewer's movers module (WP8).
+// reference interpolators, or the v3 viewer's movers module (web/src/movers/bench.ts).
 
 /** One mover sample or gone, in map-clock milliseconds and world tiles. */
 export interface TrainSample {

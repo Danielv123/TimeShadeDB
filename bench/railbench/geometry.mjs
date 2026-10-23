@@ -1,5 +1,5 @@
 // Curve geometry study from the railbench ground truth (README.md "Geometry"): checks the rail model of
-// docs/v3/RAIL-GEOMETRY.md (railgeom.mjs) against where the game really put every carriage.
+// docs/RAIL-GEOMETRY.md (railgeom.mjs) against where the game really put every carriage.
 //
 //   node bench/railbench/geometry.mjs --run <name> [--run <name2> ...] [--every 10] [--train-every 30] [--work <dir>]
 //       [--out <file>]

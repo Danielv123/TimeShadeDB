@@ -1,8 +1,8 @@
-// Runs trains_bench.ts in Chromium and prints the result (WP8 "500 trains at 60 fps").
+// Runs trains_bench.ts in Chromium and prints the result (target: 500 trains at 60 fps).
 //
 // usage (from web/): node src/movers/bench/run.mjs [--trains 500] [--seconds 5] [--headed]
 // Needs `playwright-core` resolvable (NODE_PATH or a local install; it is not a dependency
-// of this package; WP11's bench/web owns Playwright) and a Chromium: PLAYWRIGHT_CHROMIUM or
+// of this package; bench/web owns Playwright) and a Chromium: PLAYWRIGHT_CHROMIUM or
 // the Playwright browser cache.
 import { build } from "esbuild";
 import { mkdtempSync, writeFileSync, readdirSync, existsSync } from "node:fs";

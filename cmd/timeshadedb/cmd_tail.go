@@ -21,14 +21,13 @@ import (
 	"syscall"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 func init() {
 	register(Command{
 		Name:    "tail",
 		Summary: "forward a standalone game's capture files (script-output/timeshade) to POST /api/v3/ingest",
-		Group:   GroupV3,
 		Run:     cmdTail,
 	})
 }
@@ -37,7 +36,7 @@ func cmdTail(ctx context.Context, args []string) error {
 	return runTail(ctx, os.Stdout, os.Stderr, args)
 }
 
-// tailer forwards the capture files of the timeshade_capture mod (docs/v3/PROTOCOL.md 2):
+// tailer forwards the capture files of the timeshadedb_exporter mod (docs/PROTOCOL.md 2):
 // it posts files in name order, adding the forwarder fields to every envelope, deletes a
 // file once ingest acknowledged all of it and a newer file exists, and posts the newest
 // file up to its last complete line without deleting it. Every line gets the time the game
@@ -400,7 +399,7 @@ type tline struct {
 }
 
 // lineStamps splits data (complete lines, the rest of a file from its acknowledged
-// offset) and stamps each line with when the game wrote it (docs/v3/PROTOCOL.md 1): the
+// offset) and stamps each line with when the game wrote it (docs/PROTOCOL.md 1): the
 // last line with the file's end time (fileEnds: its modification time, no later than now
 // or than its successor allows), each line before it that time minus the ticks to the next
 // line at 60 x speed ticks a second (a tick that
@@ -480,7 +479,7 @@ func lineTick(line []byte) (int64, float64) {
 }
 
 // caughtUp posts a caught_up envelope: everything the tailer read was posted
-// (docs/v3/PROTOCOL.md 1), so the server need not hold the map for this source beyond
+// (docs/PROTOCOL.md 1), so the server need not hold the map for this source beyond
 // now. With ended it says the game stopped, and the server stops holding the map for the
 // source at all until it sends again.
 func (t *tailer) caughtUp(ctx context.Context, ended bool) error {

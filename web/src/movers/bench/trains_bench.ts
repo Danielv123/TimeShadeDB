@@ -1,4 +1,4 @@
-// Browser benchmark for the movers layer (WP8 acceptance "500 trains at 60 fps"): N trains
+// Browser benchmark for the movers layer (target: 500 trains at 60 fps): N trains
 // of five carriages circling loops of different radii, sampled every ~0.4 s, evaluated
 // (MoverView.frame) and drawn (drawMovers) on a 1920x1080 2D canvas every animation frame,
 // all on screen. Results go to window.__trainsBench for the runner (bench/run.mjs).

@@ -1,4 +1,4 @@
-// Grid and id helpers (docs/v3/FORMAT.md sections 1 and 2). Mirrors internal/v3/core
+// Grid and id helpers (docs/FORMAT.md sections 1 and 2). Mirrors internal/core
 // keys.go and grid.go. No imports, so `node --test` can load it directly.
 
 export const CHUNK_SIZE = 32;

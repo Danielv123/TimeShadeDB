@@ -1,4 +1,4 @@
-// bench.ts: the v3 movers as a renderer for the WP11 train evaluator (bench/trains).
+// bench.ts: the v3 movers as a renderer for the train evaluator (bench/trains).
 import "./eval/ts-resolve.mjs";
 import assert from "node:assert/strict";
 import { test } from "node:test";

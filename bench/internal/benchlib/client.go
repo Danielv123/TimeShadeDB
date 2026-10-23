@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // ErrUnsupported is returned by a target for a workload its API cannot take (for
@@ -320,8 +320,8 @@ func (v *V2) HostileURL(rng *rand.Rand, known []DSInfo) string {
 
 // ---------------------------------------------------------------- v3
 
-// V3 talks to the v3 API (docs/v3/API.md) and posts capture envelopes
-// (docs/v3/PROTOCOL.md). Its encoders may be called from several goroutines.
+// V3 talks to the v3 API (docs/API.md) and posts capture envelopes
+// (docs/PROTOCOL.md). Its encoders may be called from several goroutines.
 type V3 struct {
 	C   *Client
 	Src string

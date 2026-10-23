@@ -1,4 +1,4 @@
-// Package benchlib holds what the WP11 benchmark tools share: the result file format,
+// Package benchlib holds what the benchmark tools under bench/ share: the result file format,
 // statistics, process memory sampling, server launching, the v2 and v3 HTTP targets, and
 // the synthetic workload generator.
 package benchlib
@@ -155,7 +155,7 @@ func FormatFloat(v float64) string {
 	return s
 }
 
-// Machine describes where a benchmark ran. Every report records it (PLAN.md §5).
+// Machine describes where a benchmark ran. Every report records it.
 type Machine struct {
 	OS        string `json:"os"`
 	Arch      string `json:"arch"`

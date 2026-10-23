@@ -10,7 +10,7 @@ import (
 	"reflect"
 	"testing"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 func TestChangeRoundTrip(t *testing.T) {

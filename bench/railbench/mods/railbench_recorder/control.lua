@@ -306,8 +306,8 @@ script.on_event(defines.events.on_tick, function(e)
 		if cfg.mode == "record" then
 			flush(true)
 			log("RBRECORD done at tick " .. tick)
-			if remote.interfaces["timeshade_capture"] then
-				log("RBCAPTURE " .. helpers.table_to_json(remote.call("timeshade_capture", "stats")))
+			if remote.interfaces["timeshadedb_exporter"] then
+				log("RBCAPTURE " .. helpers.table_to_json(remote.call("timeshadedb_exporter", "stats")))
 			end
 		else
 			survey_report(rails_counted)

@@ -1,4 +1,4 @@
-// Live timing for movers (PLAN.md §4.8 step 1): the arrival-lag estimate, the adaptive
+// Live timing for movers: the arrival-lag estimate, the adaptive
 // display delay and the data horizon. Times are map-clock ms from DataSource.now(),
 // which follows the server's clock (catalog.now, X-TSDB-Now), never Date.now().
 

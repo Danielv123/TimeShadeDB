@@ -1,6 +1,6 @@
-// The reference rail model (railgeom.mjs) against the shared test vectors (docs/v3/rail-geometry-vectors.json): the
+// The reference rail model (railgeom.mjs) against the shared test vectors (docs/rail-geometry-vectors.json): the
 // pieces' points, the ends the game reported, and carriages as the game placed them. The capture (Lua), viewer (TS) and
-// server (Go) implementations of docs/v3/RAIL-GEOMETRY.md load the same file.
+// server (Go) implementations of docs/RAIL-GEOMETRY.md load the same file.
 //
 //   node --test bench/railbench/railgeom.test.mjs
 import assert from "node:assert/strict";
@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { railLength, railPoint, orientationOf, placeTrain } from "./railgeom.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const vectors = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "docs", "v3", "rail-geometry-vectors.json"), "utf8"));
+const vectors = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "docs", "rail-geometry-vectors.json"), "utf8"));
 
 const turnDiff = (a, b) => {
 	const d = Math.abs(a - b) % 1;

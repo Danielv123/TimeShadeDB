@@ -1,4 +1,4 @@
-// Reference implementation of the rail centre-line geometry in docs/v3/RAIL-GEOMETRY.md: where a point at arc length s
+// Reference implementation of the rail centre-line geometry in docs/RAIL-GEOMETRY.md: where a point at arc length s
 // along a rail piece lies, for every rail type of Factorio 2.x (2.0 rails, elevated rails, rail ramps and the legacy
 // rails of migrated 1.1 saves), and how rolling stock sits on that path. Written from the formulas the spec derives;
 // bench/railbench/geometry.mjs checks it against the recorded ground truth and gen-vectors.mjs writes the shared test
@@ -297,7 +297,7 @@ export function placeTrain(path, u0, n, joint = 4, connection = 3) {
 }
 
 /**
- * The timing model between two train samples (docs/v3/RAIL-GEOMETRY.md 8): the rail distance tau ticks after the first
+ * The timing model between two train samples (docs/RAIL-GEOMETRY.md 8): the rail distance tau ticks after the first
  * sample, and its rate, for samples T ticks and L rail distance apart with speeds va and vb (tiles a tick). From rest
  * (va = 0) when uniform acceleration to vb covers L in less than T, the train stands until then; to rest (vb = 0) when
  * uniform braking from va covers L in less than T, it stops early and stands; otherwise a cubic Hermite in time with the

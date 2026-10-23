@@ -493,7 +493,7 @@ t.test("timing model: braking, starting and cruising as RAIL-GEOMETRY.md 8", fun
 	t.expect_eq(core.timing_u(5, 0, 1, 1, 0), 5)
 end)
 
--- The shared rail geometry vectors (docs/v3/RAIL-GEOMETRY.md 7; run_unit.mjs passes them as __vectors).
+-- The shared rail geometry vectors (docs/RAIL-GEOMETRY.md 7; run_unit.mjs passes them as __vectors).
 local KIND = { ["curved-rail-a"] = 1, ["elevated-curved-rail-a"] = 1, ["curved-rail-b"] = 2,
 	["elevated-curved-rail-b"] = 2, ["legacy-curved-rail"] = 3, ["rail-ramp"] = 4 }
 

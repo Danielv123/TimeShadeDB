@@ -7,17 +7,10 @@ import (
 	"testing"
 )
 
-func TestCommandRegistryHasLegacyCommands(t *testing.T) {
-	for _, name := range []string{
-		"import-csv", "query-tile", "stats", "verify", "inspect-index", "export-tile", "compact",
-		"copy-chunks", "benchmark", "serve", "tail-chunk-tsv",
-	} {
-		c, ok := lookupCommand(name)
-		if !ok {
+func TestCommandRegistry(t *testing.T) {
+	for _, name := range []string{"serve", "tail", "import-minimap", "publish", "publish-serve"} {
+		if _, ok := lookupCommand(name); !ok {
 			t.Fatalf("command %q is not registered", name)
-		}
-		if c.Group != GroupLegacy {
-			t.Fatalf("command %q group = %q, want %q", name, c.Group, GroupLegacy)
 		}
 	}
 }
@@ -27,7 +20,7 @@ func TestRunCommandUsageAndUnknown(t *testing.T) {
 	if err := runCommand(context.Background(), &out, []string{"help"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "legacy commands:") || !strings.Contains(out.String(), "serve") {
+	if !strings.Contains(out.String(), "commands:") || !strings.Contains(out.String(), "serve") {
 		t.Fatalf("usage text missing commands:\n%s", out.String())
 	}
 	if err := runCommand(context.Background(), &out, nil); err == nil || !strings.Contains(err.Error(), "usage:") {
@@ -41,10 +34,9 @@ func TestRunCommandUsageAndUnknown(t *testing.T) {
 func TestRegisterRejectsBadCommands(t *testing.T) {
 	noop := func(context.Context, []string) error { return nil }
 	for _, c := range []Command{
-		{Name: "Bad_Name", Group: GroupV3, Run: noop},
-		{Name: "no-run", Group: GroupV3},
-		{Name: "no-group", Run: noop},
-		{Name: "serve", Group: GroupLegacy, Run: noop},
+		{Name: "Bad_Name", Run: noop},
+		{Name: "no-run"},
+		{Name: "serve", Run: noop},
 	} {
 		func() {
 			defer func() {

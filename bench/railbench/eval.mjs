@@ -384,7 +384,7 @@ function score(st, shown, tr, kind, prev) {
 		tpy = ty;
 	}
 	if (prev) {
-		// a jump: the drawn head moved more than the true speed over one frame plus 2 tiles (as the WP11 evaluator,
+		// a jump: the drawn head moved more than the true speed over one frame plus 2 tiles (as the train evaluator in bench/trains,
 		// with the true speed instead of the captured one)
 		if (Math.hypot(hx - prev.x, hy - prev.y) > truth.speed * prev.dtTicks + 2) {
 			st.jumps++;

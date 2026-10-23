@@ -1,5 +1,5 @@
-// window.__tsdbControl (TsdbControl in web/src/api/types.ts): the control surface the WP11
-// Playwright suite drives, as a thin adapter over MapView. DOM-free so it runs under
+// window.__tsdbControl (TsdbControl in web/src/api/types.ts): the control surface the
+// Playwright benchmark (bench/web) drives, as a thin adapter over MapView. DOM-free so it runs under
 // node --test.
 
 import type { CatalogDatastore, TimeMs, TsdbControl } from "../api/types";

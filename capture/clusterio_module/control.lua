@@ -1,10 +1,10 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/control.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- TimeShadeDB capture, Clusterio save-patch module (docs/v3/PROTOCOL.md section 2, "Clusterio"). capture/build.mjs puts
+-- TimeShadeDB capture, Clusterio save-patch module (docs/PROTOCOL.md section 2, "Clusterio"). capture/build.mjs puts
 -- the shared library (capture/lua) next to this file, so the save holds modules/timeshade/{control,globals,capture,...}.
 --
--- Lines are printed in Clusterio's IPC frame, "\f$ipc:timeshade:out?j" .. envelope; the instance plugin (WP10) parses
+-- Lines are printed in Clusterio's IPC frame, "\f$ipc:timeshade:out?j" .. envelope; the instance plugin (clusterio/instance.ts) parses
 -- them, adds src, map, instance, recv_ms and seq, and forwards them. Nothing is captured until the instance plugin calls
 -- ts_rt.config over RCON at each start (commands run on every peer), followed by ts_rt.resync.
 local clusterio_api = require("modules/clusterio/api")

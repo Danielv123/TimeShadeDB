@@ -1,4 +1,4 @@
-// A stand-in for `timeshadedb serve-v3` in the sidecar and controller tests, run with node. It prints
+// A stand-in for `timeshadedb serve` in the sidecar and controller tests, run with node. It prints
 // "listening on <addr>" (unless FAKE_MODE=silent), records ingest bodies, answers GET /api/v3/* with what it got,
 // exits on POST /_crash, after FAKE_CRASH_MS, and when its stdin closes (as --exit-on-stdin-close does).
 import * as http from "node:http";

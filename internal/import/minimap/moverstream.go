@@ -10,7 +10,7 @@ import (
 	"sort"
 	"sync"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // The mover import streams: each surface's window files are decoded in name (time)

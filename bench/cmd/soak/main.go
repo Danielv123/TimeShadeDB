@@ -1,6 +1,6 @@
 // Command soak replays a workload at a fixed speed-up for a fixed wall time while
 // sampling server memory, and reports whether memory stays bounded as history grows
-// (PLAN.md §5 "Server RSS": <= mem-budget + 64 MB at any history length, growth < 5%
+// (the Memory targets in bench/targets.json: <= mem-budget + 64 MB at any history length, growth < 5%
 // between hour 1 and hour 6 of a soak at 100x replay).
 //
 // "Hour 1" generalises to the end of the first sixth of the run, so a short run reports

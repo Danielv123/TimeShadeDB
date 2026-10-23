@@ -472,7 +472,7 @@ export class MapView {
 
   /**
    * How far live mode trails the data clock: the largest MapLayer.delay() of the enabled
-   * layers (the movers layer's adaptive delay, PLAN §4.8 step 1), or `liveDelayMs` when no
+   * layers (the movers layer's adaptive delay, web/src/movers/clock.ts), or `liveDelayMs` when no
    * layer reports one. Changes of that target (a layer attaching, a layer turned off) are
    * slewed, so the displayed time never jumps by seconds (delay.ts).
    */

@@ -2,7 +2,7 @@
 -- Ported from illisis/minimap module/tick.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
 -- The outbox: handlers append messages during a tick, and the on_tick step flushes them as envelope lines
--- ({"v":1,"tick":T,"msgs":[...]}, docs/v3/PROTOCOL.md section 1) under core.LIMIT bytes each. Where a line goes is the
+-- ({"v":1,"tick":T,"msgs":[...]}, docs/PROTOCOL.md section 1) under core.LIMIT bytes each. Where a line goes is the
 -- host's choice (outbox.sink): the Clusterio module prints it in Clusterio's IPC frame, the standalone mod appends it to
 -- a script-output file.
 --

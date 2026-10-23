@@ -13,9 +13,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"timeshadedb/bench/internal/benchlib"
-	"timeshadedb/internal/v3/core"
-	"timeshadedb/internal/v3/core/wire"
-	"timeshadedb/internal/v3/movers"
+	"timeshadedb/internal/core"
+	"timeshadedb/internal/core/wire"
+	"timeshadedb/internal/movers"
 )
 
 // seekCheck is what `measure seekcheck` writes: for each source of first rows (the stored
@@ -51,7 +51,7 @@ func cmdSeekCheck(args []string) {
 	db := fs.String("db", "", "v3 database directory")
 	surface := fs.String("surface", "gw-bc41437d~2E1.nauvis", "surface directory under movers/")
 	every := fs.Int64("every", 60000, "map ms between live payloads")
-	grace := fs.Int64("grace", 15000, "commit this far behind the newest row (serve-v3 --mover-grace)")
+	grace := fs.Int64("grace", 15000, "commit this far behind the newest row (serve --mover-grace)")
 	out := fs.String("out", "", "output JSON file (default stdout)")
 	fs.Parse(args)
 	if *db == "" {

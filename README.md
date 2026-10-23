@@ -5,116 +5,80 @@
 
 # TimeShadeDB
 
-TimeShadeDB stores timestamped canvas history and serves an embedded web interface for querying and replaying the canvas over time.
+TimeShadeDB records a Factorio map over time and lets you scroll back through its history in the browser. It stores the map chart, trains, vehicles, players, chart tags, machine recipes and optionally rails. Trains are drawn on the rails, also between samples.
 
-## Build
+It is one Go binary that stores the data, serves the HTTP API and embeds a WebGL viewer. It runs next to a single game, or as a [Clusterio plugin](clusterio/README.md) for a whole cluster.
+
+## Recording a single game
+
+1. Install the `timeshadedb_exporter` mod (build it with `node capture/build.mjs`, see [capture/README.md](capture/README.md)). It writes the capture to `script-output/timeshade/`.
+2. Start the server and forward the capture to it:
+
+```sh
+timeshadedb serve --db mymap
+timeshadedb tail --dir <factorio user data>/script-output/timeshade --map mymap
+```
+
+3. Open http://127.0.0.1:8080.
+
+`serve` listens on loopback by default. Any other address needs `--ingest-token`, and `--read-token` protects reads. `--mem-budget` (default 256 MiB) bounds the caches and buffers. Ingest is not throttled by memory. Open windows past their share of the budget are spilled to disk instead.
+
+`tail` posts complete capture files and deletes them once the server has them. If the forwarder or the server is down, the backlog is sent later and stored at the times it was captured, as long as each source sends in time order. A forwarder may stay away for up to `--source-hold` (default 1 hour) before the server stops waiting for it. To replay a recorded capture, run `serve --clock data` and `tail --once`.
+
+## Clusterio
+
+The plugin in [clusterio/](clusterio/README.md) runs `timeshadedb serve` as a sidecar on the controller, records every instance through a save-patch module and shows the map on a page in the Clusterio web UI. Gridworld worlds become one map, and trains crossing Universal Edges keep their journey.
+
+## Publishing a static map
+
+`timeshadedb publish` exports a database as static files, to a directory or an S3/R2 bucket, so a CDN can serve the map without a server. It uploads each immutable file once and mutable files only when they change.
+
+```sh
+timeshadedb publish --db mymap --dir C:\www\map
+timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-bucket map --state publish-state
+```
+
+See [internal/publish/README.md](internal/publish/README.md) for the flags.
+
+## Importing an illisis/minimap export
+
+`timeshadedb import-minimap` reads an illisis/minimap S3 export (the directory with `maps.json.gz`) into a new database: terrain, movers, tags, recipes and icons.
+
+```sh
+timeshadedb import-minimap --db mymap --verify D:\minimap-export
+```
+
+`--db` must be empty or not exist. `--verify` compares the result with the export. Without `--db` the import runs in memory, which only checks the export.
+
+## Building
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
-The build script rebuilds the web bundle, compiles the Go binary with the current embedded assets, and writes a package archive under `build/packages/`.
+This builds the web bundle, the Go binary with the bundle embedded and the Factorio mod, and writes zips to `build/packages/`. By hand:
 
-## Datastore upgrades
-
-`manifest.json` contains a datastore-wide `datastore_version`, separate from the
-storage-family `version` and the versions embedded in binary files. Writable
-opens automatically run every registered `N -> N+1` migration. Read-only opens
-reject outdated datastores, and newer versions are always rejected.
-
-Migrations copy the active datastore, validate the copy, and then atomically
-replace a small root manifest that selects the new generation. The source stays
-active if any step fails. Upgrades require space for another full copy and all
-other writers must be stopped. Previous and interrupted generations remain
-unselected for manual cleanup.
-
-## Moving a v2 chunk database to v3
-
-`timeshadedb migrate-v3` copies every datastore of a v2 chunk database into a v3
-terrain store (see `docs/v3/`), then compares both pixel by pixel at random ticks:
-
-```powershell
-timeshadedb migrate-v3 --from factorio.tshd --db v3db
-timeshadedb migrate-v3 --from factorio.tshd --dry-run --verify 20
+```sh
+npm --prefix web ci && npm --prefix web run build
+go build ./cmd/timeshadedb
+node capture/build.mjs
 ```
 
-v2 stores game ticks and v3 stores map-clock milliseconds. `--epoch auto` (the
-default) puts each savefile's latest tick at the time its `progress.json` was last
-written; pass `--epoch` as RFC 3339 or Unix milliseconds to choose it, and `--ups`
-if the game did not run at 60 UPS. The savefile UUID becomes the v3 map name unless
-`--map` is given. v3 keeps the net change per chunk and terrain window (`--window`,
-default 60s), so states that lasted less than a window are not carried over; at every
-window boundary the copy equals the v2 database. The source is opened read-only.
-`--dry-run` migrates into memory and writes nothing. `--db` writes the v3 terrain
-store and then builds its coarse zoom levels (the pyramid).
+`timeshadedb help` lists the commands and `timeshadedb <command> -h` their flags.
 
-## Importing an illisis/minimap export
+## Releasing the mod
 
-`timeshadedb import-minimap` reads an illisis/minimap S3 export (the directory that
-holds `maps.json.gz`) and writes terrain, movers, tags and recipes into a v3 database,
-then builds the pyramid and stores the map metadata in `maps.json`:
+Pushing a tag `factorio-v<version>` publishes the mod to the Factorio Mod Portal, where `<version>` matches `capture/mod/timeshadedb_exporter/info.json`. The workflow needs the repository secret `FACTORIO_MOD_PORTAL_API_KEY`, an API key with the `ModPortal: Publish Mods` permission (the first release) and `ModPortal: Upload Mods` (every version after it). It can also be run by hand from GitHub Actions.
 
-```powershell
-timeshadedb import-minimap --db v3db --verify D:\minimap-export
-```
+## Documentation
 
-Without `--db` it imports into in-memory stores, which only checks the export.
-`--verify` compares the imported state with the export and reads the movers and
-overlays back. An import cannot resume or add to a database: `--db` must be empty
-(or not exist yet), and the command fails if a store dropped any update as late.
-The catalog icons of the export are copied into `v3db/icons`.
-
-## Serving a v3 database
-
-`timeshadedb serve-v3` serves the v3 HTTP API (`docs/v3/API.md`), live events, ingest
-and the embedded viewer (build it first with `npm --prefix web run build`):
-
-```powershell
-timeshadedb serve-v3 --db v3db --listen 127.0.0.1:8080
-```
-
-It listens on loopback by default; any other address needs `--ingest-token`. A standalone
-game with the `timeshade_capture` mod is forwarded with
-`timeshadedb tail --dir <factorio>/script-output/timeshade --map <key> --url http://127.0.0.1:8080`.
-Ingest is not throttled by memory: open windows past their share of `--mem-budget` are
-spilled to disk. A backlog (a recorded capture posted with `tail --once`, or the lines a
-forwarder kept while it, the network or the server was down) keeps the times it was
-captured at and is stored in full, as long as each source sends its data in time order:
-the server holds a map's horizon behind the data of a source that is still catching up
-(docs/v3/API.md section 5). A forwarder may stay away for up to `--source-hold` (default
-1 hour) while the server keeps running; past that its source no longer holds the map and
-the rest of its backlog is late. A server that is down holds nothing back, so the length
-of its downtime is not limited.
-
-## Publishing a static map
-
-`timeshadedb publish` exports a v3 database as static files (the API subset of
-`docs/v3/API.md` section 6 plus the viewer) to a directory or an S3/R2 bucket, storing each
-immutable file once and mutable files only when they change:
-
-```powershell
-timeshadedb publish --db v3db --dir C:\www\map
-timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-bucket map --state publish-state
-```
-
-See `internal/v3/publish/README.md` for the flags, the tile versions it exports and the
-durable upload queue.
-
-## Factorio export
-
-The `timeshadedb_exporter` mod writes charted chunks to
-`script-output/timeshadedb/chunk-charted.tsv`. Send them to `serve` with:
-
-```powershell
-timeshadedb tail-chunk-tsv --input chunk-charted.tsv --savefile SAVE_UUID --base-url http://127.0.0.1:8080
-```
-
-## Factorio mod deployment
-
-GitHub Actions publishes the Factorio mod to the Factorio Mod Portal when a tag
-named `factorio-v<version>` is pushed, where `<version>` matches
-`timeshadedb_exporter/info.json`.
-
-Configure the repository secret `FACTORIO_MOD_PORTAL_API_KEY` with a Factorio
-API key that has `ModPortal: Publish Mods` permission. The deploy workflow can
-also be run manually from GitHub Actions.
+| | |
+|---|---|
+| [docs/README.md](docs/README.md) | Repository layout and the code contracts between the parts |
+| [docs/API.md](docs/API.md) | The HTTP API, live events, ingest and the static export |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Capture envelopes from the game to the server |
+| [docs/FORMAT.md](docs/FORMAT.md) | Terrain semantics, the on-disk layout and the wire formats |
+| [docs/RAIL-GEOMETRY.md](docs/RAIL-GEOMETRY.md) | How trains are placed on the rails |
+| [capture/README.md](capture/README.md) | The capture Lua, the mod and the Clusterio module |
+| [clusterio/README.md](clusterio/README.md) | The Clusterio plugin |
+| [bench/README.md](bench/README.md) | Benchmarks and the acceptance suite |

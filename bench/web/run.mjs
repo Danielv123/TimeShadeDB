@@ -1,4 +1,4 @@
-// Client benchmark runner (PLAN.md section 5, Client rows). Drives a viewer in headless
+// Client benchmark runner (the Client targets in bench/targets.json). Drives a viewer in headless
 // Chromium through window.__tsdbPerf (paint events) and window.__tsdbControl (view, time,
 // timelapse), with network emulation (default 40 ms RTT, 50 Mbit/s), and writes a result
 // file in the bench format.
@@ -278,7 +278,7 @@ if (viewer === "illisis") {
     let since = await page.evaluate((t) => { const s = performance.now(); window.__tsdbControl.seek(t); return s; }, t);
     await nextPaint(page, since, "scrub start");
     const scrub = [], scrubBytes = [];
-    // "Bytes <= the changed tiles" (PLAN.md 5): v3 tile URLs carry the tile's version
+    // "Bytes <= the changed tiles" (target client_scrub_bytes): v3 tile URLs carry the tile's version
     // (tile/{ds}/{z}/{x}/{y}/{ver}.bin), so a step that downloads a URL this page has
     // already downloaded fetched an unchanged tile again. Bytes of first-seen tile and
     // tiledelta URLs are the changed tiles; the rest (view manifests, ...) is overhead.

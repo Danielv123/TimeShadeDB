@@ -1,4 +1,4 @@
-// Headless Factorio tests of the capture (docs/v3/PROTOCOL.md section 6). Needs a Factorio 2.x install; nothing else.
+// Headless Factorio tests of the capture (docs/PROTOCOL.md section 6). Needs a Factorio 2.x install; nothing else.
 //
 //   node run_game.mjs [--mode test|clusterio|bench|all] [--factorio <factorio.exe>] [--keep] [--ticks N]
 //   test options: [--write-fixture] (rewrite fixtures/game_envelopes.ndjson from this run)
@@ -147,7 +147,7 @@ function majorMinor() {
 function buildCapture(out) {
 	execFileSync(process.execPath, [path.join(captureDir, "build.mjs"), "--out", out, "--test", "--no-zip",
 		"--factorio-version", majorMinor()], { encoding: "utf8" });
-	const info = JSON.parse(fs.readFileSync(path.join(captureDir, "mod", "timeshade_capture", "info.json"), "utf8"));
+	const info = JSON.parse(fs.readFileSync(path.join(captureDir, "mod", "timeshadedb_exporter", "info.json"), "utf8"));
 	return { modDir: path.join(out, `${info.name}_${info.version}`), moduleDir: path.join(out, "clusterio_module"),
 		version: info.version };
 }
@@ -454,7 +454,7 @@ async function runTest() {
 	console.log("== test: standalone mod");
 	const build = buildCapture(path.join(root, "build"));
 	const box = sandbox("test", {
-		[`timeshade_capture`]: (dst) => copyTree(build.modDir, dst),
+		[`timeshadedb_exporter`]: (dst) => copyTree(build.modDir, dst),
 		timeshade_capture_testdriver: (dst) => {
 			copyTree(path.join(here, "game", "testdriver"), dst);
 			for (const f of ["scenario.lua", "synthetic.lua"]) {
@@ -463,7 +463,7 @@ async function runTest() {
 		},
 	}, { mode: "test", read_cost: 2150 });
 	// the capture mod writes the config so the driver mod is not needed in it: drop the stray file
-	fs.rmSync(path.join(box.modsDir, "timeshade_capture", "config.lua"));
+	fs.rmSync(path.join(box.modsDir, "timeshadedb_exporter", "config.lua"));
 	const save = path.join(box.dir, "test.zip");
 	run(box, ["--create", save], "create");
 	const res = run(box, ["--benchmark", save, "--benchmark-ticks", String(TEST_TICKS)], "benchmark");
@@ -693,7 +693,7 @@ function runBench() {
 			return out;
 		}
 		const box = sandbox(name, {
-			timeshade_capture: (dst) => {
+			timeshadedb_exporter: (dst) => {
 				copyTree(modDir, dst);
 				if (realLua) {
 					fs.writeFileSync(path.join(dst, "test", "real_charts.lua"), realLua);
@@ -703,14 +703,14 @@ function runBench() {
 			// the baseline's stand-in for the capture's test interface: the driver's remote calls cost the same in both
 			timeshade_capture_null: (dst) => copyTree(path.join(here, "game", "nullcapture"), dst),
 		}, cfg);
-		fs.rmSync(path.join(box.modsDir, "timeshade_capture", "config.lua"));
+		fs.rmSync(path.join(box.modsDir, "timeshadedb_exporter", "config.lua"));
 		fs.rmSync(path.join(box.modsDir, "timeshade_capture_null", "config.lua"));
 		setEnabled(box, { timeshade_capture_null: false }); // both define the test interface
 		const out = [];
 		if (withoutToo) {
-			out.push(["without", box, () => setEnabled(box, { timeshade_capture: false, timeshade_capture_null: true })]);
+			out.push(["without", box, () => setEnabled(box, { timeshadedb_exporter: false, timeshade_capture_null: true })]);
 		}
-		out.push(["with", box, () => setEnabled(box, { timeshade_capture: true, timeshade_capture_null: false })]);
+		out.push(["with", box, () => setEnabled(box, { timeshadedb_exporter: true, timeshade_capture_null: false })]);
 		return out;
 	};
 	const variants = boxes("bench", build.modDir, build.moduleDir, true);
@@ -727,7 +727,9 @@ function runBench() {
 		const altOut = path.join(root, "build-alt");
 		execFileSync(process.execPath, [path.join(compareDir, "build.mjs"), "--out", altOut, "--test", "--no-zip",
 			"--factorio-version", majorMinor()], { encoding: "utf8" });
-		const altInfo = JSON.parse(fs.readFileSync(path.join(compareDir, "mod", "timeshade_capture", "info.json"), "utf8"));
+		// Checkouts from before the mod was renamed have it as mod/timeshade_capture.
+		const altMod = ["timeshadedb_exporter", "timeshade_capture"].map(n => path.join(compareDir, "mod", n, "info.json")).find(f => fs.existsSync(f));
+		const altInfo = JSON.parse(fs.readFileSync(altMod ?? path.join(compareDir, "mod", "timeshadedb_exporter", "info.json"), "utf8"));
 		const [alt] = boxes("bench-alt", path.join(altOut, `${altInfo.name}_${altInfo.version}`),
 			path.join(altOut, "clusterio_module"), false);
 		alt[1].save = path.join(alt[1].dir, "bench.zip");
@@ -822,7 +824,7 @@ function runBench() {
 	const deltaResync = result.with.resyncLua.mean - result.without.resyncLua.mean;
 	note(`bench: during a resync (400 ticks from tick ${resyncTick}): Lua ${fmt(result.with.resyncLua)} with, `
 		+ `${fmt(result.without.resyncLua)} without; capture costs ${deltaResync.toFixed(4)} ms/tick`);
-	// The budget (PLAN D9) is for the steady state; both measures of it must hold. A resync is a transient (start and
+	// The budget is for the steady state; both measures of it must hold. A resync is a transient (start and
 	// reconnect, about 3.5 min per 50,000 chunks): reported against the budget, not failed.
 	const BUDGET = 0.3;
 	check(delta <= BUDGET, `bench: capture Lua cost ${delta.toFixed(4)} ms/tick within the ${BUDGET} ms budget`);

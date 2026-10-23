@@ -1,5 +1,5 @@
 // Train evaluator CLI. Reads train journeys and the rail mask from the illisis test data,
-// runs a renderer through the PLAN.md section 5 train metrics, and writes a result file
+// runs a renderer through the train metrics (metrics.ts), and writes a result file
 // in the bench result format (bench/internal/benchlib/result.go).
 //
 //   node dist/eval.mjs --data <illisis export> [--map gw-bc41437d~2E1] [--surface nauvis]
@@ -166,7 +166,7 @@ const result = {
   metrics,
   notes: [
     journeysJson
-      ? "train samples: the v3 database's stored rows (imported by WP5: re-timed, deduped, handoffs flagged), exported by `measure movers`"
+      ? "train samples: the v3 database's stored rows (imported by import-minimap: re-timed, deduped, handoffs flagged), exported by `measure movers`"
       : "train samples: the illisis movement windows as exported (with the illisis store's clamp re-timing)",
     maskMode === "history"
       ? "rail mask: z0 chart pixels of a track colour (rail 0.55, elevated rail 0.73, rail ramp 0.65, Factorio utility constants) at any time of the history (every snapshot and change record), so rails under parked trains at the end and rails removed before the end count; off-rail = carriage centre more than 1 tile from a rail tile"

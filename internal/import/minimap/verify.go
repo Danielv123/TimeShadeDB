@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"timeshadedb/internal/v3/core"
+	"timeshadedb/internal/core"
 )
 
 // replayArea returns an area's pixels at time t the way illisis's viewer and store

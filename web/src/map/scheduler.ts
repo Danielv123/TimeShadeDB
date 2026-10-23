@@ -1,4 +1,4 @@
-// A global request scheduler (PLAN.md §4.7): at most `maxInFlight` requests at once, lowest
+// A global request scheduler: at most `maxInFlight` requests at once, lowest
 // priority value first, and requests nobody wants any more are dropped (queued) or aborted
 // (in flight). The engine calls want() for everything a frame needs, retain() with the full
 // wanted set, then pump().
