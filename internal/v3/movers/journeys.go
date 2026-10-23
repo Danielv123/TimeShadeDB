@@ -29,7 +29,11 @@ import (
 //     dropped. An adopt of a journey Journeys does not know (the server restarted, as
 //     it does with the Clusterio controller, and the instances' backlogs arrive in any
 //     order) takes the first other source that sends samples from before the cut as
-//     the previous owner.
+//     the previous owner. Known limits: only the last adopt is remembered, so when a
+//     journey returns to its source (A to B to A) before A's late tail and gone of the
+//     first crossing arrive, they are taken as the owner's and the gone ends the
+//     journey there; and a gone that arrives before the adopt keeps its own time, also
+//     when the adopting source's first sample is earlier.
 //     A gone from the owner clears the owner, so the next source to sample the journey
 //     owns it: a train crossing between gridworld instances keeps its id, and the gone
 //     followed by a sample within core.HandoffWindow becomes a handoff in the store.
@@ -327,7 +331,12 @@ func (js *Journeys) late(j *journey, src string, s core.MoverSample, out []core.
 			js.stats.ResolvedGones++
 		}
 		js.change(j)
-		g := core.MoverSample{Surface: j.prevSfc, Meta: j.prevMeta, T: min(s.T, j.cut-1), Tick: s.Tick, Flags: core.FlagGone | s.Flags&core.FlagNoTick}
+		g := core.MoverSample{Surface: j.prevSfc, Meta: j.prevMeta, T: s.T, Tick: s.Tick, Flags: core.FlagGone | s.Flags&core.FlagNoTick}
+		if g.T >= j.cut {
+			// Moved before the cut, its tick no longer matches its time. (A sample of the
+			// previous owner at exactly cut-1 is replaced by it in the store.)
+			g.T, g.Tick, g.Flags = j.cut-1, 0, g.Flags|core.FlagNoTick
+		}
 		j.prev, j.anyPrev = "", false
 		if !j.prevKnown {
 			js.stats.UnknownGones++

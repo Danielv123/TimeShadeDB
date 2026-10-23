@@ -126,13 +126,16 @@ func TestJourneysLateAfterAdopt(t *testing.T) {
 	if g := out[n+1]; g.Flags&core.FlagGone == 0 || g.T != 2899 || g.Meta != meta || g.Surface != sfc {
 		t.Fatalf("late gone = %+v, want at 2899 with the source's meta", g)
 	}
+	if g := out[n+1]; g.Flags&core.FlagNoTick == 0 || g.Tick != 0 {
+		t.Fatalf("late gone moved before the cut kept its tick: %+v", g)
+	}
 	if st := js.Stats(); st.LateKept != 2 || st.OwnerDrops != 1 || js.Owner(meta.ID) != "b" {
 		t.Fatalf("stats %+v, owner %q", st, js.Owner(meta.ID))
 	}
 	// Rolled back (the store refused the batch): the retry meets the same state.
 	js.Rollback()
 	out = js.Move("a", []core.MoverSample{at(2000, 2), gone(2500)}, out[:n])
-	if len(out) != n+2 || out[n+1].T != 2500 {
+	if g := out[n+1]; len(out) != n+2 || g.T != 2500 || g.Tick != 250 || g.Flags&core.FlagNoTick != 0 {
 		t.Fatalf("after rollback: %+v", out[n:])
 	}
 	// The gone ends what a may send: a later sample of it is dropped.
