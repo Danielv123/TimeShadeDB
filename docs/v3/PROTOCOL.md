@@ -21,7 +21,7 @@ the forwarder adds the second group before posting.
 | `instance` | forwarder | int, optional | Clusterio instance id (overlay keys, instance bounds) |
 | `recv_ms` | forwarder | int | wall-clock ms when the line was written or first read (below) |
 | `seq` | forwarder | int, optional | increasing per `src`; echoed by ingest for acknowledgements; ingest skips an envelope whose `seq` and `recv_ms` are both at or below the last applied envelope of its `src` (a retried body) |
-| `caught_up` | forwarder | bool, optional | the forwarder has no older line of this `src` pending: everything it read was sent. Such an envelope may have no messages (`"msgs":[]`); then ingest only notes that the source has caught up to `recv_ms` (API.md 5, "Horizon") and does not use it for the clock anchor or the data clock |
+| `caught_up` | forwarder | bool, optional | the forwarder has no older line of this `src` and `map` pending: everything it read for the map was sent before this envelope. Such an envelope may have no messages (`"msgs":[]`); then ingest only notes that the source has caught up to `recv_ms` (API.md 5, "Horizon") and does not use it for the clock anchor or the data clock |
 | `ended` | forwarder | bool, optional | with `caught_up`: the source stopped (its game exited), so ingest need not wait for more of it until it sends again |
 
 Envelopes without `src`, `map` or `recv_ms` are rejected by ingest (counted, not fatal).
@@ -40,8 +40,9 @@ later than the truth, which the anchor allows.
 Forwarders send `caught_up` envelopes while they have nothing to send: `timeshadedb tail`
 every few seconds once it has posted everything in the directory, and when it stops
 (`ended` when the newest file has not changed for 10 s, so the game is not running); the
-Clusterio instance every few seconds while its queue is empty, and `ended` when the
-instance stops. A forwarder that stops without one (killed, or its host lost) leaves its
+Clusterio instance for each of its maps that had no envelope for 5 s, queued after
+everything that waits (so a map without data is not held back while the instance's other
+map is busy), and `ended` for every map when the instance stops. A forwarder that stops without one (killed, or its host lost) leaves its
 source holding its maps for the server's `--source-hold`, so the lines it still has are
 not late when it comes back.
 
@@ -55,7 +56,9 @@ not late when it comes back.
   encodes with `capture/lua/json.lua`, which gives the same JSON as `helpers.table_to_json`
   (key order aside) at about half the cost. The instance
   plugin parses the line, adds the forwarder fields and sends batches to the controller
-  about once a second; the controller posts them to its sidecar.
+  about once a second, as requests: a batch the controller did not acknowledge stays
+  queued and is sent again (Clusterio drops events it cannot forward without telling the
+  sender); the controller posts them to its sidecar.
 - **Standalone**: the `timeshade_capture` mod appends envelope lines with
   `helpers.write_file("timeshade/<seq>-<tick>.ndjson", lines, true)`, starting a new file
   every 4 MiB or 60 s. `<seq>` is a counter kept in `storage` (raised every 3,600 ticks and

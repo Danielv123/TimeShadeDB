@@ -19,10 +19,15 @@ export const Envelope = Type.Object({
 });
 export type Envelope = Static<typeof Envelope>;
 
-/** Instance to controller, about once a second: the envelopes Lua printed since the last one, split per map. */
-export class EnvelopesEvent {
-	declare ["constructor"]: typeof EnvelopesEvent;
-	static type = "event" as const;
+/**
+ * Instance to controller, about once a second: the envelopes Lua printed since the last one, split per map. A request,
+ * so the instance knows they were delivered: Clusterio drops an event it cannot forward (the controller is away) and
+ * reports nothing to the sender, while a request fails or gets its response. A response means the controller queued
+ * them (ingest.ts).
+ */
+export class EnvelopesRequest {
+	declare ["constructor"]: typeof EnvelopesRequest;
+	static type = "request" as const;
 	static src = "instance" as const;
 	static dst = "controller" as const;
 	static plugin = "timeshade" as const;
@@ -35,7 +40,28 @@ export class EnvelopesEvent {
 		envelopes: Type.Array(Envelope),
 	});
 
-	static fromJSON(json: Static<typeof EnvelopesEvent.jsonSchema>) {
+	static fromJSON(json: Static<typeof EnvelopesRequest.jsonSchema>) {
+		return new this(json.envelopes);
+	}
+}
+
+/**
+ * The same as an event: what waits when the instance stops, whose link then routes no responses back (instance.ts).
+ */
+export class EnvelopesEvent {
+	declare ["constructor"]: typeof EnvelopesEvent;
+	static type = "event" as const;
+	static src = "instance" as const;
+	static dst = "controller" as const;
+	static plugin = "timeshade" as const;
+
+	constructor(
+		public envelopes: Envelope[],
+	) { }
+
+	static jsonSchema = EnvelopesRequest.jsonSchema;
+
+	static fromJSON(json: Static<typeof EnvelopesRequest.jsonSchema>) {
 		return new this(json.envelopes);
 	}
 }

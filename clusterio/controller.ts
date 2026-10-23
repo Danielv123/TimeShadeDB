@@ -15,7 +15,7 @@ import { IngestQueue, type IngestQueueOptions } from "./ingest.js";
 import {
 	edgeLines, mapInfos, mapOf, tileOf, ueApi, type ClusterInstance, type EdgeApiLike, type Quad,
 } from "./integrations.js";
-import { EnvelopesEvent, ViewTokenRequest, ViewTokenResponse } from "./messages.js";
+import { EnvelopesEvent, EnvelopesRequest, ViewTokenRequest, ViewTokenResponse } from "./messages.js";
 import { lifecycle } from "./runtime.js";
 import { Sidecar, type SidecarOptions } from "./sidecar.js";
 
@@ -170,12 +170,15 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 	const mapsTimer = setInterval(publish, options.mapsEveryMs ?? MAPS_EVERY_MS);
 	mapsTimer.unref?.();
 
-	controller.handle(EnvelopesEvent, async (event: EnvelopesEvent, src: lib.Address) => {
+	// The response to a request tells the instance its envelopes are queued (on disk past the memory part).
+	const envelopes = async (message: EnvelopesRequest | EnvelopesEvent, src: lib.Address) => {
 		// The source and instance come from the link, never from the payload.
-		for (const env of event.envelopes) {
+		for (const env of message.envelopes) {
 			queue.push(JSON.stringify({ ...env, src: `clusterio:${src.id}`, instance: src.id }));
 		}
-	});
+	};
+	controller.handle(EnvelopesRequest, envelopes);
+	controller.handle(EnvelopesEvent, envelopes);
 	controller.handle(ViewTokenRequest, async (_request: ViewTokenRequest, src: lib.Address) => {
 		const user = controller.wsServer.controlConnections.get(src.id)?.user;
 		if (!user) {

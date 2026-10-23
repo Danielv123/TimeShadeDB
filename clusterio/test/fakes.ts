@@ -84,8 +84,12 @@ export function fakeUser(name: string, permissions: string[], tokenValidAfter = 
 
 export type FakeInstance = ReturnType<typeof fakeInstanceContext>;
 
-/** An instance with what the plugin touches: its IPC handler, sendTo, sendRcon, four hooks, config and status. */
-export function fakeInstanceContext(id: number, fields: Record<string, unknown> = {}, send?: (event: any) => void) {
+/**
+ * An instance with what the plugin touches: its IPC handler, sendTo, sendRcon, four hooks, config and status. sendTo
+ * resolves (a request's response) once `send` returned or resolved, and rejects when it throws or rejects; `sent` has
+ * every message sent, delivered or not.
+ */
+export function fakeInstanceContext(id: number, fields: Record<string, unknown> = {}, send?: (message: any) => unknown) {
 	const lines: Line[] = [];
 	const sent: any[] = [];
 	const rcon: string[] = [];
@@ -104,12 +108,12 @@ export function fakeInstanceContext(id: number, fields: Record<string, unknown> 
 				ipc = fn;
 			},
 		},
-		sendTo: (dst: string, event: any) => {
+		sendTo: async (dst: string, message: any) => {
 			if (dst !== "controller") {
 				throw new Error(`unexpected destination ${dst}`);
 			}
-			sent.push(event);
-			send?.(event);
+			sent.push(message);
+			await send?.(message);
 		},
 		sendRcon: async (command: string, expectEmpty: boolean, plugin: string) => {
 			if (!expectEmpty || plugin !== "timeshade") {

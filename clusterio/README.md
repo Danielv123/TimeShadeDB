@@ -6,7 +6,7 @@ vehicles, players, chart tags, machine recipes and optional rails, live and thro
 
 | Part | What it does |
 |---|---|
-| Instances (`instance.ts`, `forward.ts`) | The save-patch module `timeshade` (the capture Lua, [capture/](../capture/README.md)) prints envelopes on the IPC channel `timeshade:out`. The plugin stamps each one with `recv_ms` and `seq`, splits it by map, and sends what arrived to the controller about once a second. At every start, on a `gridworld.tile` change, on a capture setting change and on a new controller session it runs `/sc ts_rt.config(...) ts_rt.resync(...)` over RCON. |
+| Instances (`instance.ts`, `forward.ts`) | The save-patch module `timeshade` (the capture Lua, [capture/](../capture/README.md)) prints envelopes on the IPC channel `timeshade:out`. The plugin stamps each one with `recv_ms` and `seq`, splits it by map, and sends what arrived to the controller about once a second, as a request; what the controller did not acknowledge is sent again. At every start, on a `gridworld.tile` change, on a capture setting change and on a new controller session it runs `/sc ts_rt.config(...) ts_rt.resync(...)` over RCON. |
 | Controller (`controller.ts`) | Runs `timeshadedb serve-v3 --listen 127.0.0.1:0` as a sidecar (`sidecar.ts`). It forwards envelopes to the sidecar's `POST /api/v3/ingest` (`ingest.ts`), and publishes the cluster's maps as `map` messages: titles, gridworld instance bounds and Universal Edges lines. |
 | Proxy (`http.ts`) | `/api/timeshade/*` on the controller's web server goes to the sidecar. Viewer files are open. The API (`/api/timeshade/api/v3/*`) needs a Clusterio token of a user with `timeshade.view`. |
 | Web UI (`web/`) | A **Map** page at `/timeshade` that shows the TimeShadeDB viewer in a frame. |
@@ -23,7 +23,8 @@ instance: `surfaces`, `resynced` and `adopt`.
 A train or vehicle that crosses between instances, through Universal Edges or a gridworld
 border, keeps its journey id. The destination sends `adopt`. The sidecar then stores it as one
 journey, with a handoff where the old instance's gone and the new instance's first sample are
-less than 10 s apart.
+less than 10 s apart. The old instance's last samples and gone often reach the sidecar after
+the adopt (each instance sends once a second); they are kept by their time.
 
 ## Install
 
@@ -80,13 +81,18 @@ for every API request through the proxy.
   A 400 or 413 splits the batch, and a single refused line is dropped. Lines the sidecar
   counts as bad are logged (rate-limited). While the sidecar is down the queue holds up to
   `timeshade.queue_mb` in memory and the rest on disk, up to `timeshade.queue_disk_mb`.
-  Instances keep up to 32 MiB in memory while the controller link is down, and the rest on
-  disk (`timeshade-pending/` in the instance directory, up to 4 GiB, also across host
-  restarts). Each line keeps the time it arrived at the instance, so a backlog lands where it
+  Instances send their envelopes as requests, one at a time: Clusterio drops an event it
+  cannot forward (the controller is away or came back with a new session) without telling
+  the sender, while a request fails. What the controller did not acknowledge stays queued,
+  up to 32 MiB in memory and the rest on disk (`timeshade-pending/` in the instance
+  directory, up to 4 GiB, also across host restarts), and is sent again; ingest skips what
+  arrives twice. When the instance stops, what waits goes as events (its link routes no
+  responses any more), or stays on disk for the next start while the controller is away. Each line keeps the time it arrived at the instance, so a backlog lands where it
   belongs (docs/v3/API.md 5, "Horizon").
-- **Caught up.** While an instance has nothing waiting it sends a `caught_up` envelope per map
-  every 5 s, and `ended` ones when it stops, so the map server holds a map's horizon back only
-  for an instance that still has data to send (docs/v3/PROTOCOL.md 1).
+- **Caught up.** An instance sends a `caught_up` envelope for each of its maps that had no
+  envelope for 5 s, after everything that waits, also while its other map is busy, and
+  `ended` ones when it stops, so the map server holds a map's horizon back only for an
+  instance that still has data of that map to send (docs/v3/PROTOCOL.md 1).
 - **Auth.**
   - Tokens are accepted as `X-Access-Token`, `Authorization: Bearer` or `?token=` (the
     viewer's live events use `?token=`).

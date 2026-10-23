@@ -1,5 +1,5 @@
 import type * as lib from "@clusterio/lib";
-import { EnvelopesEvent, ViewTokenRequest } from "./messages.js";
+import { EnvelopesEvent, EnvelopesRequest, ViewTokenRequest } from "./messages.js";
 
 declare module "@clusterio/lib" {
 	export interface ControllerConfigFields {
@@ -94,7 +94,7 @@ export const plugin: lib.PluginDeclaration = {
 			initialValue: "",
 		},
 	},
-	messages: [EnvelopesEvent, ViewTokenRequest],
+	messages: [EnvelopesRequest, EnvelopesEvent, ViewTokenRequest],
 	permissions: [
 		{
 			name: "timeshade.view",
