@@ -136,12 +136,15 @@ export class Sidecar extends EventEmitter {
 		}
 	}
 
-	/** Logs a line of the process's output, at most logLines per 10 s. */
+	/**
+	 * Logs a line of the process's output, at most logLines per 10 s. The count of lines left out is logged at the level
+	 * of the lines (info): a burst, such as the resyncs after an outage, is no warning.
+	 */
 	private output(line: string, stream: "stdout" | "stderr") {
 		const now = Date.now();
 		if (now - this.logged.at >= 10_000) {
 			if (this.logged.skipped > 0) {
-				this.opts.logger.warn(`timeshade sidecar: ${this.logged.skipped} output lines not logged`);
+				this.opts.logger.info(`timeshade sidecar: ${this.logged.skipped} output lines not logged`);
 			}
 			this.logged = { at: now, n: 0, skipped: 0 };
 		}
