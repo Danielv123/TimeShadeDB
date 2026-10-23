@@ -148,34 +148,41 @@ test("the exit sends what waits as events (the link routes no responses any more
 	assert.equal(f.sent.length, 1, "nothing after the exit");
 }));
 
-test("a failed request keeps its envelopes for the next try; a big backlog leaves in requests of about 1 MiB, in order", () => withTimers(async () => {
-	let fail = true;
-	const delivered: any[] = [];
-	const g = fakeInstanceContext(6, {}, (message: any) => {
-		if (fail) {
-			throw new Error("No session");
+test("a failed request keeps its envelopes; tries back off until the link connects; a backlog leaves in requests of about 1 MiB, in order",
+	() => withTimers(async () => {
+		let fail = true;
+		const delivered: any[] = [];
+		const tries: number[] = [];
+		const g = fakeInstanceContext(6, {}, (message: any) => {
+			tries.push(Date.now());
+			if (fail) {
+				throw new Error("No session");
+			}
+			delivered.push(message);
+		});
+		await loadInstancePlugin(g.context);
+		const d = "x".repeat(3000);
+		for (let i = 0; i < 1000; i++) {
+			await g.ipc({ v: 1, tick: i, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: i, y: 0, d }] });
 		}
-		delivered.push(message);
-	});
-	await loadInstancePlugin(g.context);
-	const d = "x".repeat(3000);
-	for (let i = 0; i < 1000; i++) {
-		await g.ipc({ v: 1, tick: i, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: i, y: 0, d }] });
-	}
-	await tick(BATCH_MS);
-	await tick(BATCH_MS);
-	assert.equal(g.sent.length, 2, "one try a second");
-	assert.equal(delivered.length, 0);
-	assert.ok(g.lines.some(l => l.message === "timeshade.forward send failed"));
-	fail = false;
-	await tick(BATCH_MS);
-	assert.ok(delivered.length >= 3, `${delivered.length} requests`);
-	for (const request of delivered) {
-		assert.ok(request instanceof EnvelopesRequest);
-		assert.ok(JSON.stringify(request.envelopes).length <= MAX_EVENT_BYTES + 4096);
-	}
-	assert.deepEqual(delivered.flatMap((e: any) => e.envelopes.map((x: any) => x.tick)), [...Array(1000).keys()], "in order");
-}));
+		for (let i = 0; i < 45; i++) {
+			await tick(BATCH_MS);
+		}
+		// twice as long each time, up to MAX_RETRY_MS (Clusterio's host logs every message it cannot deliver)
+		assert.deepEqual(tries.map(t => (t - 1_000_000) / 1000), [1, 3, 7, 15, 30, 45]);
+		assert.equal(delivered.length, 0);
+		assert.ok(g.lines.some(l => l.message === "timeshade.forward send failed"));
+		fail = false;
+		await g.call("controllerConnectionEvent", "connect");
+		await tick(BATCH_MS);
+		assert.ok(delivered.length >= 3, `${delivered.length} requests`);
+		for (const request of delivered) {
+			assert.ok(request instanceof EnvelopesRequest);
+			assert.ok(JSON.stringify(request.envelopes).length <= MAX_EVENT_BYTES + 4096);
+		}
+		const ticks = delivered.flatMap((e: any) => e.envelopes.filter((x: any) => !x.caught_up).map((x: any) => x.tick));
+		assert.deepEqual(ticks, [...Array(1000).keys()], "in order");
+	}));
 
 test("a controller restart: requests in the lost session fail late and go again; one request at a time", () => withTimers(async () => {
 	// Clusterio keeps messages sent while the link is resuming, and fails them when the controller comes back with a new
@@ -191,8 +198,10 @@ test("a controller restart: requests in the lost session fail late and go again;
 	await g.ipc({ v: 1, tick: 2, msgs: [{ type: "chunk", s: "nauvis", f: "player", x: 2, y: 0, d: "eJzt" }] });
 	await tick(5 * BATCH_MS);
 	assert.equal(open.length, 1, "no second request while one is open");
+	// the controller is back with a new session: the open request fails, and the link connects
 	open.shift()!.reject(new Error("Session Lost"));
 	await tick(0);
+	await g.call("controllerConnectionEvent", "connect");
 	await tick(BATCH_MS);
 	assert.equal(open.length, 1);
 	assert.deepEqual(open[0].message.envelopes.filter((e: any) => !e.caught_up).map((e: any) => e.tick), [1, 2], "the failed envelopes again, first");

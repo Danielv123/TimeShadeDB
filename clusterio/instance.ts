@@ -28,6 +28,8 @@ export const MAX_PENDING_BYTES = 32 << 20;
 export const MAX_PENDING_DISK_BYTES = 4 * 1024 ** 3;
 /** A map without envelopes this long gets a caught_up envelope. */
 export const HEARTBEAT_MS = 5000;
+/** After failed requests the next try waits twice as long each time, up to this; a new or resumed link tries at once. */
+export const MAX_RETRY_MS = 15_000;
 
 export type InstanceOptions = {
 	/** The wall clock stamped as recv_ms (tests). */
@@ -76,6 +78,9 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	let sending = false;
 	let linkUp = true;
 	let closed = false;
+	/** When the next request may go after failures, and the wait after the next failure. */
+	let retryAt = 0;
+	let retryMs = 0;
 
 	/** A trace line from Lua, logged; reserved keys and the fields the cluster logger stamps never come from Lua. */
 	function log(msg: TraceMsg) {
@@ -212,7 +217,8 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	/**
 	 * Sends what waits, one request at a time. A request that fails (the controller is away, or the session it was sent
 	 * in ended) leaves its envelopes queued for the next try, in memory and then on disk; a delivered one may come again
-	 * after a failure that hid its response, which ingest skips (docs/v3/PROTOCOL.md 1, seq).
+	 * after a failure that hid its response, which ingest skips (docs/v3/PROTOCOL.md 1, seq). Tries after failures back
+	 * off up to MAX_RETRY_MS (the host logs each failed message) until the link connects or resumes.
 	 */
 	async function flush() {
 		if (sending || closed) {
@@ -220,6 +226,9 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 		}
 		refill();
 		heartbeat();
+		if (now() < retryAt) {
+			return;
+		}
 		sending = true;
 		try {
 			while (pending.length > 0) {
@@ -229,6 +238,8 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 				} catch (err: any) {
 					if (!closed) {
 						linkUp = false;
+						retryMs = Math.min(Math.max(2 * retryMs, 2 * (options.batchMs ?? BATCH_MS)), MAX_RETRY_MS);
+						retryAt = now() + retryMs;
 						warn("send", "timeshade.forward send failed", { op: "timeshade.forward", phase: "send_failed", error: err?.message });
 					}
 					return;
@@ -237,6 +248,7 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 					return; // the exit hook took over what waits
 				}
 				linkUp = true;
+				retryMs = 0;
 				sent(n, bytes);
 			}
 		} finally {
@@ -318,6 +330,10 @@ export default async function loadInstancePlugin(context: InstancePluginContext,
 	// nothing (Clusterio keeps unacknowledged messages), so only "connect" resyncs.
 	instance.hooks.controllerConnectionEvent.attach(plugin.name, async (event: string) => {
 		linkUp = event === "connect" || event === "resume";
+		if (linkUp) {
+			retryAt = 0;
+			retryMs = 0;
+		}
 		if (event === "connect" && instance.status === "running") {
 			await configure("reconnect");
 		}

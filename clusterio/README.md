@@ -86,7 +86,8 @@ for every API request through the proxy.
   the sender, while a request fails. What the controller did not acknowledge stays queued,
   up to 32 MiB in memory and the rest on disk (`timeshade-pending/` in the instance
   directory, up to 4 GiB, also across host restarts), and is sent again; ingest skips what
-  arrives twice. When the instance stops, what waits goes as events (its link routes no
+  arrives twice. After a failed request the next try waits 2 s, doubling up to 15 s (the host
+  logs every message it cannot deliver), until the controller link connects or resumes. When the instance stops, what waits goes as events (its link routes no
   responses any more), or stays on disk for the next start while the controller is away. Each line keeps the time it arrived at the instance, so a backlog lands where it
   belongs (docs/v3/API.md 5, "Horizon").
 - **Caught up.** An instance sends a `caught_up` envelope for each of its maps that had no
