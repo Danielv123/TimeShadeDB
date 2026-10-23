@@ -28,31 +28,86 @@ active if any step fails. Upgrades require space for another full copy and all
 other writers must be stopped. Previous and interrupted generations remain
 unselected for manual cleanup.
 
+## Moving a v2 chunk database to v3
+
+`timeshadedb migrate-v3` copies every datastore of a v2 chunk database into a v3
+terrain store (see `docs/v3/`), then compares both pixel by pixel at random ticks:
+
+```powershell
+timeshadedb migrate-v3 --from factorio.tshd --db v3db
+timeshadedb migrate-v3 --from factorio.tshd --dry-run --verify 20
+```
+
+v2 stores game ticks and v3 stores map-clock milliseconds. `--epoch auto` (the
+default) puts each savefile's latest tick at the time its `progress.json` was last
+written; pass `--epoch` as RFC 3339 or Unix milliseconds to choose it, and `--ups`
+if the game did not run at 60 UPS. The savefile UUID becomes the v3 map name unless
+`--map` is given. v3 keeps the net change per chunk and terrain window (`--window`,
+default 60s), so states that lasted less than a window are not carried over; at every
+window boundary the copy equals the v2 database. The source is opened read-only.
+`--dry-run` migrates into memory and writes nothing. `--db` writes the v3 terrain
+store and then builds its coarse zoom levels (the pyramid).
+
+## Importing an illisis/minimap export
+
+`timeshadedb import-minimap` reads an illisis/minimap S3 export (the directory that
+holds `maps.json.gz`) and writes terrain, movers, tags and recipes into a v3 database,
+then builds the pyramid and stores the map metadata in `maps.json`:
+
+```powershell
+timeshadedb import-minimap --db v3db --verify D:\minimap-export
+```
+
+Without `--db` it imports into in-memory stores, which only checks the export.
+`--verify` compares the imported state with the export and reads the movers and
+overlays back. An import cannot resume or add to a database: `--db` must be empty
+(or not exist yet), and the command fails if a store dropped any update as late.
+The catalog icons of the export are copied into `v3db/icons`.
+
+## Serving a v3 database
+
+`timeshadedb serve-v3` serves the v3 HTTP API (`docs/v3/API.md`), live events, ingest
+and the embedded viewer (build it first with `npm --prefix web run build`):
+
+```powershell
+timeshadedb serve-v3 --db v3db --listen 127.0.0.1:8080
+```
+
+It listens on loopback by default; any other address needs `--ingest-token`. A standalone
+game with the `timeshade_capture` mod is forwarded with
+`timeshadedb tail --dir <factorio>/script-output/timeshade --map <key> --url http://127.0.0.1:8080`.
+Ingest is not throttled by memory: open windows past their share of `--mem-budget` are
+spilled to disk. A backlog (a recorded capture posted with `tail --once`, or the lines a
+forwarder kept while it, the network or the server was down) keeps the times it was
+captured at and is stored in full, as long as each source sends its data in time order:
+the server holds a map's horizon behind the data of a source that is still catching up
+(docs/v3/API.md section 5). A forwarder may stay away for up to `--source-hold` (default
+1 hour) while the server keeps running; past that its source no longer holds the map and
+the rest of its backlog is late. A server that is down holds nothing back, so the length
+of its downtime is not limited.
+
+## Publishing a static map
+
+`timeshadedb publish` exports a v3 database as static files (the API subset of
+`docs/v3/API.md` section 6 plus the viewer) to a directory or an S3/R2 bucket, storing each
+immutable file once and mutable files only when they change:
+
+```powershell
+timeshadedb publish --db v3db --dir C:\www\map
+timeshadedb publish --from http://127.0.0.1:8080/api/v3/ --every 1m --s3-endpoint https://<account>.r2.cloudflarestorage.com --s3-bucket map --state publish-state
+```
+
+See `internal/v3/publish/README.md` for the flags, the tile versions it exports and the
+durable upload queue.
+
 ## Factorio export
 
-The `timeshadedb_exporter` mod writes Factorio export files under
-`script-output/timeshadedb/`:
-
-```text
-chunk-charted.tsv
-entity-positions.tsv
-```
-
-Import entity movement into VictoriaMetrics with:
+The `timeshadedb_exporter` mod writes charted chunks to
+`script-output/timeshadedb/chunk-charted.tsv`. Send them to `serve` with:
 
 ```powershell
-timeshadedb tail-entity-tsv --input entity-positions.tsv --savefile SAVE_UUID --victoriametrics-url http://127.0.0.1:8428
+timeshadedb tail-chunk-tsv --input chunk-charted.tsv --savefile SAVE_UUID --base-url http://127.0.0.1:8080
 ```
-
-The chunk tailer can watch both files together:
-
-```powershell
-timeshadedb tail-chunk-tsv --input chunk-charted.tsv --entity-input entity-positions.tsv --savefile SAVE_UUID --base-url http://127.0.0.1:8080 --victoriametrics-url http://127.0.0.1:8428
-```
-
-Entity coordinates are stored as `timeshadedb_entity_x` and
-`timeshadedb_entity_y` series labelled by savefile, surface, force, entity type,
-entity id, and path segment. No tile label is written.
 
 ## Factorio mod deployment
 

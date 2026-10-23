@@ -1,0 +1,76 @@
+{
+	"name": "@timeshadedb/clusterio-plugin",
+	"version": "0.1.0",
+	"description": "TimeShadeDB v3 cluster map for Clusterio: captures every instance's chart, trains, vehicles and players into a TimeShadeDB sidecar and shows it in the web UI",
+	"license": "UNLICENSED",
+	"private": true,
+	"type": "module",
+	"main": "dist/node/index.js",
+	"keywords": [
+		"clusterio-plugin",
+		"clusterio",
+		"factorio",
+		"map"
+	],
+	"engines": {
+		"node": ">=22"
+	},
+	"files": [
+		"dist/node/*.js",
+		"dist/node/*.d.ts",
+		"dist/web",
+		"module",
+		"LICENSE-BlueOak-1.0.0.md",
+		"README.md"
+	],
+	"scripts": {
+		"build": "node scripts/build-module.mjs && tsc --build && webpack-cli --mode production",
+		"build:node": "node scripts/build-module.mjs && tsc --build",
+		"build:binary": "node scripts/build-binary.mjs",
+		"test": "node --test \"dist/node/test/*.test.js\"",
+		"build:npm-binaries": "node scripts/build-npm-binaries.mjs"
+	},
+	"peerDependencies": {
+		"@clusterio/controller": "^2.0.2",
+		"@clusterio/host": "^2.0.2",
+		"@clusterio/lib": "^2.0.2"
+	},
+	"peerDependenciesMeta": {
+		"@clusterio/controller": {
+			"optional": true
+		},
+		"@clusterio/host": {
+			"optional": true
+		}
+	},
+	"dependencies": {
+		"@sinclair/typebox": "^0.30.6",
+		"jsonwebtoken": "^9.0.3"
+	},
+	"optionalDependencies": {
+		"@timeshadedb/bin-win32-x64": "0.1.0",
+		"@timeshadedb/bin-linux-x64": "0.1.0",
+		"@timeshadedb/bin-linux-arm64": "0.1.0",
+		"@timeshadedb/bin-darwin-x64": "0.1.0",
+		"@timeshadedb/bin-darwin-arm64": "0.1.0"
+	},
+	"devDependencies": {
+		"@clusterio/controller": "^2.0.2",
+		"@clusterio/host": "^2.0.2",
+		"@clusterio/lib": "^2.0.2",
+		"@clusterio/web_ui": "^2.0.2",
+		"@types/express": "^5.0.6",
+		"@types/jsonwebtoken": "^9.0.10",
+		"@types/node": "^24.19.2",
+		"@types/react": "^18.3.31",
+		"@types/ws": "^8.18.2",
+		"antd": "^5.29.3",
+		"express": "^5.2.1",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1",
+		"typescript": "^5.9.3",
+		"webpack": "^5.112.0",
+		"webpack-cli": "^7.2.3",
+		"webpack-merge": "5.9.0"
+	}
+}

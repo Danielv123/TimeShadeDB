@@ -38,6 +38,10 @@ jobs:
         working-directory: web
         run: npm run build
 
+      - name: Test web contracts
+        working-directory: web
+        run: npm test
+
       - name: Test
         run: go test ./...
 

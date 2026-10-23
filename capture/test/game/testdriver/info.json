@@ -1,0 +1,9 @@
+{
+	"name": "timeshade_capture_testdriver",
+	"version": "0.1.0",
+	"title": "TimeShadeDB capture test driver",
+	"author": "TimeShadeDB",
+	"factorio_version": "2.0",
+	"description": "Headless test scenario for timeshade_capture (capture/test/run_game.mjs). Not for play.",
+	"dependencies": ["base >= 2.0.0", "? timeshade_capture"]
+}

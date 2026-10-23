@@ -614,6 +614,19 @@ On startup:
    snapshot plus deltas.
 4. Resume ingest.
 
+### Behaviour changes from the v2 memory stopgaps (v3 plan, WP1)
+
+- Startup reads the indexes and rebuilds each chunk from its newest snapshot and
+  the deltas after it. It no longer decodes, or checksums, the whole history, and
+  no history is kept in memory (`ds.events` is gone): historical reads decode
+  frames from disk.
+- A chunk tile for an unknown datastore, or with coordinates out of bounds, is a
+  `404` with `Cache-Control: no-store`, where it used to be a cached black PNG. A
+  read error is a `500` with `no-store`, where it used to be a black image. A tile
+  is `immutable` only when it was read successfully at a tick before the
+  datastore's latest tick. Clients that drew the old black tiles see broken-tile
+  placeholders unless they set a fallback (Leaflet `errorTileUrl`).
+
 ## Multithreading Plan
 
 Recommended goroutines:

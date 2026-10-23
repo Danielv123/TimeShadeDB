@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "now": 1791633610000,
+  "static": false,
+  "live_ms": 5000,
+  "maps": [
+    {
+      "key": "gw-demo.1",
+      "title": "Demo gridworld",
+      "tile_size": 512,
+      "instances": [
+        {
+          "id": "248495586",
+          "name": "gridworld_0_0",
+          "bounds": [
+            -256,
+            -256,
+            256,
+            256
+          ]
+        },
+        {
+          "id": "1151964797",
+          "name": "gridworld_1_0",
+          "bounds": [
+            256,
+            -256,
+            768,
+            256
+          ]
+        }
+      ],
+      "surfaces": [
+        {
+          "name": "nauvis",
+          "id": "gw-demo~2E1.nauvis",
+          "edges": [
+            [
+              256,
+              -256,
+              256,
+              256
+            ]
+          ],
+          "datastores": [
+            {
+              "force": "player",
+              "id": "gw-demo~2E1.nauvis.player",
+              "window_ms": 60000,
+              "horizon": 1791630120000,
+              "first": 1791630001000,
+              "last": 1791630125000,
+              "palette_version": 6,
+              "bounds": [
+                0,
+                0,
+                1,
+                0
+              ],
+              "levels": [
+                0,
+                -1
+              ]
+            }
+          ],
+          "movers": {
+            "horizon": 1791633600000,
+            "first": 1791630000500,
+            "last": 1791633605000,
+            "days": [
+              "2026-10-10"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "icons": null
+}

@@ -1,0 +1,52 @@
+{
+  "ds": "gw-demo~2E1.nauvis.player",
+  "x": 0,
+  "y": 0,
+  "version": 5,
+  "intervals": [
+    {
+      "kind": "rail",
+      "key": "248495586/7001",
+      "instance": 248495586,
+      "start": 1791630002000,
+      "end": 0,
+      "x": -99,
+      "y": -175,
+      "name": "straight-rail",
+      "dir": 4
+    },
+    {
+      "kind": "recipe",
+      "key": "248495586/5001",
+      "instance": 248495586,
+      "start": 1791630002000,
+      "end": 0,
+      "x": -60.5,
+      "y": -140.5,
+      "recipe": "iron-gear-wheel",
+      "quality": "normal"
+    },
+    {
+      "kind": "tag",
+      "key": "248495586/1",
+      "instance": 248495586,
+      "start": 1791630001000,
+      "end": 1791630030000,
+      "x": -100,
+      "y": -150,
+      "icon": "item/iron-ore",
+      "text": "21M"
+    },
+    {
+      "kind": "tag",
+      "key": "248495586/1",
+      "instance": 248495586,
+      "start": 1791630030000,
+      "end": 0,
+      "x": -100,
+      "y": -150,
+      "icon": "item/iron-ore",
+      "text": "12M"
+    }
+  ]
+}
