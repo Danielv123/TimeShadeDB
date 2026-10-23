@@ -32,8 +32,11 @@ import (
 //     the previous owner. Known limits: only the last adopt is remembered, so when a
 //     journey returns to its source (A to B to A) before A's late tail and gone of the
 //     first crossing arrive, they are taken as the owner's and the gone ends the
-//     journey there; and a gone that arrives before the adopt keeps its own time, also
-//     when the adopting source's first sample is earlier.
+//     journey there.
+//     Each instance's clock is anchored on its own, so the next owner's first samples
+//     can come a few ms before the gone of the last one. Those up to goneSlack before
+//     it are moved just after it, so the gone stays between the two sources' rows
+//     (Stats.AfterGone).
 //     A gone from the owner clears the owner, so the next source to sample the journey
 //     owns it: a train crossing between gridworld instances keeps its id, and the gone
 //     followed by a sample within core.HandoffWindow becomes a handoff in the store.
@@ -165,6 +168,9 @@ type JourneyStats struct {
 	// LateKept are samples and gones of a journey's previous owner from before another
 	// source adopted it, kept although they arrived after the adopt.
 	LateKept int64
+	// AfterGone are samples of a journey's next owner from just before the last
+	// owner's gone, moved to just after it.
+	AfterGone int64
 }
 
 type journey struct {
@@ -189,7 +195,17 @@ type journey struct {
 	prevSfc   core.SurfaceKey
 	prevMeta  core.MoverMeta
 	cut       core.TimeMs
+	// afterBy sent the gone that ended the last ownership at afterT: another source's
+	// samples up to goneSlack before afterT are moved after it. Cleared by the first
+	// sample kept at its own time and when an adopt takes the journey from an owner.
+	afterBy string
+	afterT  core.TimeMs
 }
+
+// goneSlack is how far a next owner's sample may come before the last owner's gone and
+// still be moved after it. Instance clocks differ by tens of ms at a crossing; a larger
+// overlap is left as it is.
+const goneSlack core.TimeMs = 250
 
 // NewJourneys returns a tracker of at most max journeys (default 100,000 when max <= 0).
 func NewJourneys(max int) *Journeys {
@@ -264,6 +280,7 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			// The owner's gone clears the owner; meta and surface are kept so a resumed
 			// journey carries forward its train details.
 			j.owner, j.goneBy, j.goneT, j.prev, j.anyPrev = "", src, s.T, "", false
+			j.afterBy, j.afterT = src, s.T
 			j.lastT = s.T
 			continue
 		}
@@ -290,6 +307,15 @@ func (js *Journeys) Move(src string, samples []core.MoverSample, out []core.Move
 			}
 			if s.Meta.Color == "" {
 				s.Meta.Color = j.meta.Color
+			}
+		}
+		if j.afterBy != "" {
+			if j.afterBy != src && s.T <= j.afterT && j.afterT-s.T <= goneSlack {
+				s.T = j.afterT + 1
+				j.afterT = s.T // a second such sample goes after this one
+				js.stats.AfterGone++
+			} else {
+				j.afterBy = ""
 			}
 		}
 		if j.owner != src {
@@ -384,9 +410,11 @@ func (js *Journeys) Adopt(src, id string, t core.TimeMs) string {
 	case prev == src:
 	case prev != "" && j.known:
 		j.prev, j.anyPrev, j.prevKnown, j.prevSfc, j.prevMeta, j.cut = prev, false, true, j.sfc, j.meta, t
+		j.afterBy = ""
 	case prev == "" && j.goneBy == "" && !j.known:
 		// unknown: forgotten by the bound, or the server restarted since its last sample
 		j.prev, j.anyPrev, j.prevKnown, j.cut = "", true, false, t
+		j.afterBy = ""
 	default:
 		// the previous owner's gone came first: nothing of it is still to come
 		j.prev, j.anyPrev = "", false

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"timeshadedb/internal/v3/core"
@@ -185,6 +186,54 @@ func TestJourneysAdoptUnknown(t *testing.T) {
 	js.Adopt("b", meta.ID, 3000)
 	if out = js.Move("a", []core.MoverSample{at(2100)}, nil); len(out) != 0 {
 		t.Fatalf("a sample after its own gone was kept: %+v", out)
+	}
+}
+
+// TestJourneysAfterGone: the gone arrives before the adopt, and the next owner's first
+// samples are a few ms earlier (its clock anchored on its own). They are moved just
+// after the gone; a larger overlap is left as it is, and so is the old owner resuming.
+func TestJourneysAfterGone(t *testing.T) {
+	sfc := core.SurfaceKey{Map: "gw", Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "7.1.2", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 3}
+	at := func(t core.TimeMs) core.MoverSample { return core.MoverSample{Surface: sfc, Meta: meta, T: t} }
+	gone := func(t core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: meta.ID}, T: t, Flags: core.FlagGone}
+	}
+	times := func(out []core.MoverSample) []core.TimeMs {
+		var ts []core.TimeMs
+		for _, s := range out {
+			ts = append(ts, s.T)
+		}
+		return ts
+	}
+	js := NewJourneys(0)
+	out := js.Move("a", []core.MoverSample{at(1000), gone(3000)}, nil)
+	js.Adopt("b", meta.ID, 3010)
+	out = js.Move("b", []core.MoverSample{at(2995), at(2998), at(3100), at(3050)}, out)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 3001, 3002, 3100, 3050}) {
+		t.Fatalf("times %v", got)
+	}
+	if st := js.Stats(); st.AfterGone != 2 {
+		t.Fatalf("stats %+v", st)
+	}
+	// Without an adopt (a gridworld crossing), and with an overlap past goneSlack.
+	js = NewJourneys(0)
+	out = js.Move("a", []core.MoverSample{at(1000), gone(3000)}, nil)
+	out = js.Move("b", []core.MoverSample{at(2999)}, out)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 3001}) {
+		t.Fatalf("no adopt: times %v", got)
+	}
+	js = NewJourneys(0)
+	out = js.Move("a", []core.MoverSample{at(1000), gone(3000)}, nil)
+	out = js.Move("b", []core.MoverSample{at(2000), at(2999)}, out)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 2000, 2999}) {
+		t.Fatalf("large overlap: times %v", got)
+	}
+	// The old owner resuming after the handoff window keeps its times.
+	js = NewJourneys(0)
+	out = js.Move("a", []core.MoverSample{at(1000), gone(3000), at(3000 + core.HandoffWindow)}, nil)
+	if got := times(out); !slices.Equal(got, []core.TimeMs{1000, 3000, 3000 + core.HandoffWindow}) {
+		t.Fatalf("resume: times %v", got)
 	}
 }
 
