@@ -727,7 +727,9 @@ function runBench() {
 		const altOut = path.join(root, "build-alt");
 		execFileSync(process.execPath, [path.join(compareDir, "build.mjs"), "--out", altOut, "--test", "--no-zip",
 			"--factorio-version", majorMinor()], { encoding: "utf8" });
-		const altInfo = JSON.parse(fs.readFileSync(path.join(compareDir, "mod", "timeshadedb_exporter", "info.json"), "utf8"));
+		// Checkouts from before the mod was renamed have it as mod/timeshade_capture.
+		const altMod = ["timeshadedb_exporter", "timeshade_capture"].map(n => path.join(compareDir, "mod", n, "info.json")).find(f => fs.existsSync(f));
+		const altInfo = JSON.parse(fs.readFileSync(altMod ?? path.join(compareDir, "mod", "timeshadedb_exporter", "info.json"), "utf8"));
 		const [alt] = boxes("bench-alt", path.join(altOut, `${altInfo.name}_${altInfo.version}`),
 			path.join(altOut, "clusterio_module"), false);
 		alt[1].save = path.join(alt[1].dir, "bench.zip");
