@@ -131,6 +131,9 @@ type Ingester struct {
 	// seg and win are the reusable read state of the body being applied (under mu).
 	seg segment
 	win window
+	// resynced is, per source, the trace of the last resync logged (under mu): the
+	// Clusterio instance sends a resync's "resynced" to each of its maps, logged once.
+	resynced map[string]string
 
 	stats struct {
 		envelopes, bytes, badLines, badMessages, clamped, maps, overloaded atomic.Int64
@@ -1023,7 +1026,13 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		t := b.timeOf(nil)
 		b.holds(t)
 		b.jops = append(b.jops, jop{kind: jopResynced, mapKey: env.Map, src: env.Src, t: t})
-		in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
+		if in.resynced[env.Src] != m.Trace || m.Trace == "" {
+			if in.resynced == nil || len(in.resynced) >= 10_000 {
+				in.resynced = map[string]string{}
+			}
+			in.resynced[env.Src] = m.Trace
+			in.opt.Logf("ingest: %s resynced %q %v", env.Src, m.Trace, m.Counts)
+		}
 	case core.MsgTrace:
 		in.opt.Logf("ingest: %s trace %s %s %s", env.Src, m.Level, m.Op, m.Phase)
 	case core.MsgMap:

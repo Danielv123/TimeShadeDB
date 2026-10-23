@@ -375,6 +375,29 @@ func TestIngestAdoptKeepsSourceTail(t *testing.T) {
 	}
 }
 
+// TestIngestResyncLoggedOnce: the Clusterio instance sends a resync's "resynced" to each
+// of its maps; the log has it once.
+func TestIngestResyncLoggedOnce(t *testing.T) {
+	var logged []string
+	f := newFixture(t, Options{Logf: func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }})
+	done := func(mapKey, trace string, recv int64) string {
+		return line(t, env{V: 1, Tick: 60, Src: "s", Map: mapKey, RecvMs: recv, Msgs: []any{
+			map[string]any{"type": "resynced", "trace": trace, "counts": map[string]int{"movers": 1}},
+		}})
+	}
+	f.ingest(t, done("gw-w", "r1", int64(base))+done("i-1", "r1", int64(base)))
+	f.ingest(t, done("gw-w", "r2", int64(base+1000))+done("i-1", "r2", int64(base+1000)))
+	n := 0
+	for _, l := range logged {
+		if strings.Contains(l, " resynced ") {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("resyncs logged %d times, want 2: %q", n, logged)
+	}
+}
+
 func TestReadLineLimits(t *testing.T) {
 	f := newFixture(t, Options{MaxLine: 100})
 	body := strings.Repeat("x", 70000) + "\n" + line(t, env{V: 1, Tick: 1, Src: "s", Map: "m", RecvMs: int64(base), Msgs: []any{}})
