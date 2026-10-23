@@ -147,6 +147,44 @@ func TestJourneysLateAfterAdopt(t *testing.T) {
 	}
 }
 
+// TestJourneysAdoptUnknown: after a server restart (the Clusterio controller restarts
+// its sidecar) the destination's adopt can come before anything of the journey. The
+// first other source with samples from before the cut is taken as the previous owner;
+// a gone first gets its meta from the store (Lookup).
+func TestJourneysAdoptUnknown(t *testing.T) {
+	sfc := core.SurfaceKey{Map: "gw", Surface: "nauvis"}
+	meta := core.MoverMeta{ID: "7.1.2", Kind: core.KindTrain, Force: "player", Name: "locomotive", Carriages: 3}
+	at := func(t core.TimeMs) core.MoverSample { return core.MoverSample{Surface: sfc, Meta: meta, T: t} }
+	gone := func(t core.TimeMs) core.MoverSample {
+		return core.MoverSample{Surface: sfc, Meta: core.MoverMeta{ID: meta.ID}, T: t, Flags: core.FlagGone}
+	}
+	js := NewJourneys(0)
+	js.Adopt("b", meta.ID, 3000)
+	out := js.Move("a", []core.MoverSample{at(2000), at(2900), gone(2950)}, nil)
+	out = js.Move("c", []core.MoverSample{at(2500)}, out)
+	if len(out) != 3 || out[2].Flags&core.FlagGone == 0 || out[2].Meta != meta || js.Owner(meta.ID) != "b" {
+		t.Fatalf("out %+v, owner %q", out, js.Owner(meta.ID))
+	}
+	if st := js.Stats(); st.LateKept != 3 || st.OwnerDrops != 1 {
+		t.Fatalf("stats %+v", st)
+	}
+	// Only the gone arrives late: its meta from the store.
+	js = NewJourneys(0)
+	js.Lookup = func(k core.SurfaceKey, id string) (core.MoverMeta, bool) { return meta, k == sfc && id == meta.ID }
+	js.Adopt("b", meta.ID, 3000)
+	out = js.Move("a", []core.MoverSample{gone(3500)}, nil)
+	if len(out) != 1 || out[0].T != 2999 || out[0].Meta != meta {
+		t.Fatalf("gone = %+v", out)
+	}
+	// The previous owner's gone came before the adopt: nothing late is taken.
+	js = NewJourneys(0)
+	js.Move("a", []core.MoverSample{at(1000), gone(2000)}, nil)
+	js.Adopt("b", meta.ID, 3000)
+	if out = js.Move("a", []core.MoverSample{at(2100)}, nil); len(out) != 0 {
+		t.Fatalf("a sample after its own gone was kept: %+v", out)
+	}
+}
+
 func TestJourneysResyncAndStopped(t *testing.T) {
 	js := NewJourneys(0)
 	sfc := core.SurfaceKey{Map: "m", Surface: "s"}
