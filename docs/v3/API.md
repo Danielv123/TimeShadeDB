@@ -130,7 +130,8 @@ transparent). Cache: immutable. Static: no.
 
 The catalog icon files (`catalog.icons.png` and `.json` are `icons/<file>` relative to the
 API base). The live server serves exactly the two files named in `<db>/icons/icons.json`
-(FORMAT.md 5); their names are content-hashed. Cache: immutable. Static: yes.
+(FORMAT.md 5), read again when that file changes; their names are content-hashed. Cache:
+immutable. Static: yes.
 
 ### `GET tiledelta/{ds}/{x}/{y}/{from}-{to}.bin`
 

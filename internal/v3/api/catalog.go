@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"timeshadedb/internal/v3/core"
@@ -24,6 +25,41 @@ const LiveMs = 5000
 // metadata (core.CatalogIcons with paths relative to the API base, e.g.
 // "icons/spritesheet.<hash>.png"). docs/v3/FORMAT.md 5.
 const IconsFile = "icons.json"
+
+// iconsCache holds what <icons dir>/icons.json names. The Clusterio plugin replaces the
+// file while the server runs (a new mod-pack export), so get re-reads it when its
+// modification time or size changed: one stat per catalog build or icon request.
+type iconsCache struct {
+	dir    string
+	mu     sync.Mutex
+	loaded bool // icons and stamp are those of the file as it stood at stamp
+	stamp  [2]int64
+	icons  *core.CatalogIcons
+}
+
+// get returns the current icons; nil when there are none or icons.json is invalid. An
+// invalid file is read again on the next call (its named files may not be there yet).
+func (c *iconsCache) get() *core.CatalogIcons {
+	if c.dir == "" {
+		return nil
+	}
+	var stamp [2]int64 // zero: no icons.json
+	if fi, err := os.Stat(filepath.Join(c.dir, IconsFile)); err == nil {
+		stamp = [2]int64{fi.ModTime().UnixNano(), fi.Size()}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loaded && c.stamp == stamp {
+		return c.icons
+	}
+	c.icons = nil
+	if stamp != ([2]int64{}) {
+		c.icons = loadIcons(c.dir)
+	}
+	c.loaded = c.icons != nil || stamp == ([2]int64{})
+	c.stamp = stamp
+	return c.icons
+}
 
 // loadIcons reads <icons dir>/icons.json; nil when absent or invalid.
 func loadIcons(dir string) *core.CatalogIcons {
@@ -116,7 +152,7 @@ func (s *Server) catalogBody(ctx context.Context) ([]byte, string, error) {
 }
 
 func (s *Server) buildCatalog(ctx context.Context) (core.Catalog, error) {
-	cat := core.Catalog{Version: core.APIVersion, LiveMs: LiveMs, Maps: []core.CatalogMap{}, Icons: s.icons}
+	cat := core.Catalog{Version: core.APIVersion, LiveMs: LiveMs, Maps: []core.CatalogMap{}, Icons: s.icons.get()}
 	infos, err := s.cfg.Terrain.Datastores(ctx)
 	if err != nil {
 		return cat, err
@@ -200,11 +236,12 @@ func (s *Server) buildCatalog(ctx context.Context) (core.Catalog, error) {
 
 // GET icons/{file}: the catalog icon files, immutable (content-hashed names).
 func (s *Server) serveIcon(ctx context.Context, w http.ResponseWriter, r *http.Request, tail string) (int, error) {
-	if s.icons == nil || !validIconName(tail) {
+	icons := s.icons.get()
+	if icons == nil || !validIconName(tail) {
 		return 0, notFound("no icon %q", truncate(tail))
 	}
-	if p, _ := cutIconPath(s.icons.PNG); tail != p {
-		if j, _ := cutIconPath(s.icons.JSON); tail != j {
+	if p, _ := cutIconPath(icons.PNG); tail != p {
+		if j, _ := cutIconPath(icons.JSON); tail != j {
 			return 0, notFound("no icon %q", truncate(tail))
 		}
 	}
