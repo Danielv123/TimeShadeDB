@@ -763,7 +763,7 @@ type batch struct {
 	// (Sources.Applied once applied).
 	w     map[srcMap]core.TimeMs
 	marks map[string]seqMark
-	ended map[string]bool
+	ended map[string]uint64
 	// slab holds the pixels of the queued chunk updates (FlushChunks entries; nslab used).
 	slab  *[]core.ChunkPixels
 	nslab int
@@ -933,11 +933,11 @@ func (b *batch) beginLine(l *parsedLine) {
 		if srcs != nil {
 			srcs.Seen(env.Src, env.Map, env.RecvMs)
 		}
-		if env.Ended {
+		if env.Ended && srcs != nil {
 			if b.ended == nil {
-				b.ended = map[string]bool{}
+				b.ended = map[string]uint64{}
 			}
-			b.ended[env.Src] = true
+			b.ended[env.Src] = srcs.HeardCount(env.Src)
 		}
 		b.cur = lineState{ok: true, env: env, maxT: env.RecvMs, hasT: true}
 		return
@@ -1321,7 +1321,7 @@ type applyJob struct {
 	// w, marks and ended go to Sources.Applied once the batch is applied.
 	w     map[srcMap]core.TimeMs
 	marks map[string]seqMark
-	ended map[string]bool
+	ended map[string]uint64
 	// clock is the data clock's seen value when the batch was handed over, published
 	// once the batch is applied.
 	clock core.TimeMs
@@ -1359,8 +1359,8 @@ func (in *Ingester) startApplier(ctx context.Context) *applier {
 				}
 				if in.opt.Sources != nil {
 					in.opt.Sources.Applied(job.w, job.marks)
-					for src := range job.ended {
-						in.opt.Sources.End(src)
+					for src, heard := range job.ended {
+						in.opt.Sources.End(src, heard)
 					}
 				}
 			}

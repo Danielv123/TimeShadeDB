@@ -346,6 +346,16 @@ func TestEndedReleases(t *testing.T) {
 	if _, ok := srcs.Holds()["m"]; !ok {
 		t.Fatal("not held after new data")
 	}
+	// An end followed by the restarted source's data in one body: the end is past once the
+	// body is applied, so the source holds the map.
+	ended2 := `{"v":1,"tick":180,"src":"s","map":"m","recv_ms":` + fmt.Sprint(int64(base+6000)) + `,"seq":4,"caught_up":true,"ended":true,"msgs":[]}` + "\n"
+	restarted := line(t, env{V: 1, Tick: 60, Src: "s", Map: "m", RecvMs: int64(base + 9000), Seq: seq(5), Msgs: []any{moveMsg(trainEntry("1.1.1", 3))}})
+	if _, err := in.Ingest(context.Background(), strings.NewReader(ended2+restarted)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := srcs.Holds()["m"]; !ok {
+		t.Fatal("not held after an end followed by the restarted source's data")
+	}
 }
 
 // TestGoneAfterRestart: the journey rules live in memory, so after a server restart the
@@ -505,7 +515,7 @@ func TestUnknownHolds(t *testing.T) {
 	srcs.Seen("s", "a", base+500) // data: s holds a from its first data on
 	srcs.Seen("t", "b", base+600) // the same for a caught_up envelope
 	srcs.Seen("u", "c", base+700)
-	srcs.End("u")
+	srcs.End("u", srcs.HeardCount("u"))
 	h = srcs.Holds()
 	if h["a"] != base+500 || h["b"] != base+600 {
 		t.Fatalf("holds after the sources sent %v", h)

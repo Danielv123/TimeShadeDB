@@ -63,6 +63,9 @@ type source struct {
 	// SeenMs for a map without an entry).
 	MapSeen map[string]int64 `json:"map_seen_ms,omitempty"`
 	Ended   bool             `json:"ended,omitempty"`
+	// heard counts the envelopes heard from the source (Heard, Seen), so an end applied
+	// after newer data was parsed does not end the source again (End).
+	heard uint64
 }
 
 // mapSeen returns when the source last had data or caught_up for mapKey.
@@ -173,6 +176,7 @@ func (s *Sources) Heard(src string) {
 	e := s.get(src)
 	e.SeenMs = s.wall().UnixMilli()
 	e.Ended = false
+	e.heard++
 	s.dirty = true
 }
 
@@ -187,6 +191,7 @@ func (s *Sources) Seen(src, mapKey string, t core.TimeMs) {
 	e := s.get(src)
 	e.SeenMs = s.wall().UnixMilli()
 	e.Ended = false
+	e.heard++
 	if _, ok := e.Maps[mapKey]; !ok {
 		e.Maps[mapKey] = t
 	}
@@ -243,12 +248,25 @@ func (s *Sources) Applied(w map[srcMap]core.TimeMs, marks map[string]seqMark) {
 	s.dirty = true
 }
 
-// End records that src stopped (an ended envelope, applied): it holds nothing until it
-// sends again.
-func (s *Sources) End(src string) {
+// HeardCount returns how many envelopes were heard from src (Heard, Seen): the generation
+// an ended envelope passes to End.
+func (s *Sources) HeardCount(src string) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e := s.m[src]; e != nil {
+		return e.heard
+	}
+	return 0
+}
+
+// End records that src stopped (an ended envelope, applied): it holds nothing until it
+// sends again. heard is HeardCount when the ended envelope was read: when the source was
+// heard from since (it restarted, and ingest read its newer envelopes before the end was
+// applied), the end is past and ignored.
+func (s *Sources) End(src string, heard uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e := s.m[src]; e != nil && e.heard == heard {
 		e.Ended = true
 		for mk := range e.Maps {
 			delete(s.unknown, mk)
