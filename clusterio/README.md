@@ -26,6 +26,12 @@ journey, with a handoff where the old instance's gone and the new instance's fir
 less than 10 s apart. The old instance's last samples and gone often reach the sidecar after
 the adopt (each instance sends once a second); they are kept by their time.
 
+Who owns a journey lives only in the sidecar's memory. After a sidecar restart, an
+instance's resync also ends the journeys the map still shows live in its gridworld tile (on
+its own map: anywhere) that it did not re-send and that no instance has sampled since the
+restart, such as a train lost when the instance came back from an older save
+([docs/v3/PROTOCOL.md](../docs/v3/PROTOCOL.md) 5, "Resync after a restart").
+
 ## Install
 
 1. Install the plugin next to Clusterio:

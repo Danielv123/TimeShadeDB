@@ -5,8 +5,10 @@
 package movers
 
 import (
+	"cmp"
 	"container/list"
 	"maps"
+	"slices"
 	"strings"
 
 	"timeshadedb/internal/v3/core"
@@ -55,9 +57,14 @@ import (
 //     the old surface at the sample's time (the mover left that surface).
 //   - Train carriage count, kinds and colour are carried forward from the previous
 //     sample when a sample omits them.
-//   - Resync: after Begin(src), Resynced(src, t) emits gones for every journey src owns
-//     that it did not re-send. Stopped(src, t) emits gones for src's players (its
-//     trains and vehicles stay parked).
+//   - Resync: after Begin(src), Resynced(src, t, region) emits gones for every journey
+//     src owns that it did not re-send. Ownership lives only in memory, so after a
+//     server restart it also ends the journeys the store still has live (Live) that
+//     Journeys does not know and src did not re-send, when their newest row lies in
+//     src's region (its gridworld tile, or the whole map of a single source): a game
+//     restarted from an older save no longer has them, and nothing else would end them.
+//     See Resynced for what is left alone. Stopped(src, t) emits gones for src's players
+//     (its trains and vehicles stay parked).
 //
 // Memory is bounded: at most max journeys are tracked; the least recently seen is
 // forgotten first (its next sample starts a new owner).
@@ -69,6 +76,10 @@ type Journeys struct {
 	// Lookup, if set, returns the meta of journey id's last row on surface sfc when the
 	// journey is live there (the store's state), for gones of journeys Journeys forgot.
 	Lookup func(sfc core.SurfaceKey, id string) (core.MoverMeta, bool)
+	// Live, if set, returns the journeys live in the store on this map for which keep
+	// reports true (Store.LiveJourneys), for resyncs. keep must not be called after Live
+	// returns.
+	Live func(keep func(sfc core.SurfaceKey, id string, x, y float64) bool) []LiveJourney
 
 	max   int
 	byID  map[string]*list.Element
@@ -171,6 +182,9 @@ type JourneyStats struct {
 	// AfterGone are samples of a journey's next owner from just before the last
 	// owner's gone, moved to just after it.
 	AfterGone int64
+	// ResyncForgotten are journeys the store had live that Journeys did not know (a
+	// server restart), ended by a resync of the source whose region holds them.
+	ResyncForgotten int64
 }
 
 type journey struct {
@@ -437,16 +451,96 @@ func (js *Journeys) Begin(src string) {
 	js.seen[src] = map[string]bool{}
 }
 
+// Region is the part of a map a source captures, which its resync speaks for
+// (Journeys.Resynced): the whole map (All), a gridworld tile (Bounds: [x1, y1, x2, y2)
+// in tiles, as core.InstanceInfo.Bounds), or nothing (the zero value).
+type Region struct {
+	All    bool
+	Bounds *core.Quad
+}
+
+// Has reports whether position (x, y) lies in r.
+func (r Region) Has(x, y float64) bool {
+	if r.All {
+		return true
+	}
+	b := r.Bounds
+	return b != nil && x >= b[0] && x < b[2] && y >= b[1] && y < b[3]
+}
+
 // Resynced ends a resync of src at t: every journey src owns that it did not sample
 // since Begin gets a gone, appended to out.
-func (js *Journeys) Resynced(src string, t core.TimeMs, out []core.MoverSample) []core.MoverSample {
+//
+// So does every journey the store has live on this map (Live) that src did not sample
+// since Begin and that Journeys does not know (the server restarted since its last
+// sample, or the bound forgot it), when its newest row lies in region and before t;
+// also one src adopted but never sampled, wherever it is. Each such surface gets a gone
+// at t with the newest row's meta (Stats.ResyncForgotten). Left alone are journeys
+// Journeys knows (a sample since the restart: another source's, or ended by a gone
+// already sent), those another source adopted without a sample yet, and those with rows
+// earlier in this batch. A train another source owns whose newest row lies in src's
+// tile (a crossing when both restarted) is ended too, until that source samples it
+// again. The store's state does not change before the batch is stored, so a retried
+// batch ends the same journeys. Journeys it did not know stay untracked, so a resync
+// that ends thousands does not push out the ones it tracks.
+func (js *Journeys) Resynced(src string, t core.TimeMs, region Region, out []core.MoverSample) []core.MoverSample {
 	seen := js.seen[src]
 	if seen == nil {
 		return out
 	}
 	js.changeSeen(src)
 	delete(js.seen, src)
-	return js.endOwned(src, t, out, func(j *journey) bool { return !seen[j.id] })
+	out = js.endOwned(src, t, out, func(j *journey) bool { return !seen[j.id] })
+	if js.Live == nil {
+		return out
+	}
+	type key struct {
+		sfc core.SurfaceKey
+		id  string
+	}
+	var pending map[key]bool
+	n := len(out)
+	stale := js.Live(func(sfc core.SurfaceKey, id string, x, y float64) bool {
+		if seen[id] {
+			return false
+		}
+		owned := false
+		if e := js.byID[id]; e != nil {
+			j := e.Value.(*journey)
+			if j.known || j.owner != "" && j.owner != src {
+				return false
+			}
+			owned = j.owner == src
+		}
+		if !owned && !region.Has(x, y) {
+			return false
+		}
+		if pending == nil {
+			pending = map[key]bool{}
+			for _, s := range out[:n] {
+				pending[key{s.Surface, s.Meta.ID}] = true
+			}
+		}
+		return !pending[key{sfc, id}]
+	})
+	slices.SortFunc(stale, func(a, b LiveJourney) int {
+		return cmp.Or(cmp.Compare(a.Surface.Map, b.Surface.Map), cmp.Compare(a.Surface.Surface, b.Surface.Surface),
+			cmp.Compare(a.Meta.ID, b.Meta.ID))
+	})
+	for _, lj := range stale {
+		if lj.T >= t {
+			continue // a gone at t would not end it
+		}
+		out = append(out, core.MoverSample{Surface: lj.Surface, Meta: lj.Meta, T: t, Flags: core.FlagGone | core.FlagNoTick})
+		if e := js.byID[lj.Meta.ID]; e != nil {
+			j := e.Value.(*journey)
+			js.change(j)
+			j.owner, j.sfc, j.meta, j.known, j.lastT = "", lj.Surface, lj.Meta, true, t
+			j.prev, j.anyPrev, j.goneBy, j.afterBy = "", false, "", ""
+		}
+		js.stats.ResyncForgotten++
+	}
+	return out
 }
 
 // Stopped handles a stopped source at t: its players are gone; its trains and vehicles

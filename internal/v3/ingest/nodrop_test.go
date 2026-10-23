@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -392,6 +393,91 @@ func TestGoneAfterRestart(t *testing.T) {
 	}
 	if len(live.Rows) != 0 {
 		t.Fatalf("live after the gones: %+v", live.Rows)
+	}
+}
+
+// failStoreOnce is the on-disk mover store refusing the next Append once fail is set.
+type failStoreOnce struct {
+	*movers.Store
+	fail atomic.Bool
+}
+
+func (f *failStoreOnce) Append(ctx context.Context, s []core.MoverSample) (core.ApplyResult, error) {
+	if f.fail.Swap(false) {
+		return core.ApplyResult{}, fmt.Errorf("test: %w", core.ErrOverloaded)
+	}
+	return f.Store.Append(ctx, s)
+}
+
+// TestResyncAfterRestart: a gridworld instance came back from an older save without a
+// train, while the server restarted and forgot who owned it. The instance's resync ends
+// the train, which lies in its tile, and leaves the one it re-sent and the neighbour's
+// parked train; on the instance's own map it ends every journey it did not re-send. A
+// batch the store refused ends the same journeys when retried.
+func TestResyncAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	m, err := movers.Open(dir, movers.Options{SyncInterval: -1, MaxAhead: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	mov := &failStoreOnce{Store: m}
+	maps, _ := OpenMaps(t.TempDir())
+	if _, err := maps.Put(core.MapInfo{Key: "gw-w", TileSize: 512, Instances: []core.InstanceInfo{
+		{ID: "1", Name: "a", Bounds: &core.Quad{-256, -256, 256, 256}},
+		{ID: "2", Name: "b", Bounds: &core.Quad{256, -256, 768, 256}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	newIn := func() *Ingester {
+		return New(Stores{Terrain: memstore.NewTerrain(), Movers: mov, Overlays: memstore.NewOverlays(), Maps: maps},
+			Options{Clock: func() core.TimeMs { return base + core.Hour }})
+	}
+	body := line(t, env{V: 1, Tick: 60, Src: "clusterio:1", Map: "gw-w", Inst: 1, RecvMs: int64(base),
+		Msgs: []any{moveMsg(trainEntry("1.1.1", 179.5), trainEntry("1.1.2", 10))}}) +
+		line(t, env{V: 1, Tick: 60, Src: "clusterio:2", Map: "gw-w", Inst: 2, RecvMs: int64(base),
+			Msgs: []any{moveMsg(trainEntry("2.1.3", 300))}}) +
+		line(t, env{V: 1, Tick: 60, Src: "clusterio:1", Map: "i-1", Inst: 1, RecvMs: int64(base),
+			Msgs: []any{moveMsg(trainEntry("1.1.4", 5000))}})
+	if _, err := newIn().Ingest(ctx, strings.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Commit(ctx, base+core.MoverWindowLen*2); err != nil {
+		t.Fatal(err)
+	}
+	// The server restarted; then the instance restarted and resyncs its two maps.
+	in := newIn()
+	resync := func(mapKey string, msgs ...any) string {
+		msgs = append([]any{map[string]any{"type": "surfaces", "list": []any{map[string]any{"name": "nauvis"}}}}, msgs...)
+		msgs = append(msgs, map[string]any{"type": "resynced", "trace": "r", "counts": map[string]int{"movers": 1}})
+		return line(t, env{V: 1, Tick: 600, Src: "clusterio:1", Map: mapKey, Inst: 1, RecvMs: int64(base + 15*core.Minute), Msgs: msgs})
+	}
+	body = resync("gw-w", moveMsg(trainEntry("1.1.2", 10))) + resync("i-1")
+	mov.fail.Store(true)
+	if _, err := in.Ingest(ctx, strings.NewReader(body)); err == nil {
+		t.Fatal("the refused batch did not fail")
+	}
+	resp, err := in.Ingest(ctx, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := in.Stats(); resp.Samples.Accepted != 3 || st.ResyncForgotten != 2 {
+		t.Fatalf("resync: %+v, stats %+v", resp.Samples, st)
+	}
+	if err := m.Commit(ctx, base+core.Hour); err != nil {
+		t.Fatal(err)
+	}
+	all := func(core.SurfaceKey, string, float64, float64) bool { return true }
+	var live []string
+	for _, mapKey := range []string{"gw-w", "i-1"} {
+		for _, lj := range m.LiveJourneys(mapKey, all) {
+			live = append(live, mapKey+" "+lj.Meta.ID)
+		}
+	}
+	slices.Sort(live)
+	if want := []string{"gw-w 1.1.2", "gw-w 2.1.3"}; !slices.Equal(live, want) {
+		t.Fatalf("live after the resync: %v, want %v", live, want)
 	}
 }
 

@@ -155,6 +155,8 @@ func (s *Server) serveMetrics(w http.ResponseWriter) int {
 		val("tsdb_ingest_resolved_gones_total", "", st.ResolvedGones)
 		typ("tsdb_ingest_adopt_late_total", "counter")
 		val("tsdb_ingest_adopt_late_total", "", st.LateKept)
+		typ("tsdb_ingest_resync_forgotten_total", "counter")
+		val("tsdb_ingest_resync_forgotten_total", "", st.ResyncForgotten)
 		for _, x := range []struct {
 			name string
 			r    core.ApplyResult
