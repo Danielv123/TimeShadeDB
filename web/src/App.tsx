@@ -361,14 +361,16 @@ export function App({ boot }: { boot: Promise<Boot> }) {
       </section>
 
       <footer className="timebar" aria-label="Time">
+        {/* Live counts as playing: pausing it holds the moment shown, and playing on from a past time is a timelapse
+            that turns live again when it catches up. */}
         <button
           className="playButton"
           type="button"
-          onClick={() => (state?.playing ? v?.pause() : v?.play())}
+          onClick={() => (state?.live ? v?.setTime(v.displayTime()) : state?.playing ? v?.pause() : v?.play())}
           disabled={!state?.datastore}
-          aria-label={state?.playing ? "Pause timelapse" : "Play timelapse"}
+          aria-label={state?.live ? "Pause" : state?.playing ? "Pause timelapse" : "Play timelapse"}
         >
-          {state?.playing ? "❚❚" : "▶"}
+          {state?.live || state?.playing ? "❚❚" : "▶"}
         </button>
         <select className="speed" value={state?.speed ?? 3_600_000} onChange={e => v?.setSpeed(Number(e.target.value))} aria-label="Timelapse speed">
           {SPEEDS.map(([ms, label]) => (
