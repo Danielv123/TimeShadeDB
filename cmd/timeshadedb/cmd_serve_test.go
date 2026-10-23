@@ -589,3 +589,19 @@ func TestServeDataClockMoversFirst(t *testing.T) {
 		t.Fatalf("samples %+v (errors %v)", ir.Samples, ir.Errors)
 	}
 }
+
+// --pprof serves the profiling routes (they were lost once with the import that registered them).
+func TestPprofMux(t *testing.T) {
+	srv := httptest.NewServer(pprofMux())
+	defer srv.Close()
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/cmdline", "/debug/pprof/heap?gc=1"} {
+		res, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Errorf("%s: HTTP %d", path, res.StatusCode)
+		}
+	}
+}

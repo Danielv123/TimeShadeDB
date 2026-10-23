@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	httppprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -356,7 +357,7 @@ func runServe(ctx context.Context, stdout, stderr io.Writer, args []string) erro
 			return fmt.Errorf("pprof: %w", err)
 		}
 		quietf("pprof on %s", pl.Addr())
-		go func() { _ = http.Serve(pl, http.DefaultServeMux) }()
+		go func() { _ = http.Serve(pl, pprofMux()) }()
 		defer pl.Close()
 	}
 
@@ -410,4 +411,16 @@ func runServe(ctx context.Context, stdout, stderr io.Writer, args []string) erro
 		return errors.Join(err, cerr)
 	}
 	return cerr
+}
+
+// pprofMux serves net/http/pprof's handlers (--pprof), registered here rather than through the package's side
+// effect on http.DefaultServeMux, so they do not depend on an import elsewhere.
+func pprofMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", httppprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	return mux
 }
