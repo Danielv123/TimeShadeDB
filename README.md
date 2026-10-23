@@ -68,7 +68,7 @@ node capture/build.mjs
 
 ## Releasing the mod
 
-Pushing a tag `factorio-v<version>` publishes the mod to the Factorio Mod Portal, where `<version>` matches `capture/mod/timeshadedb_exporter/info.json`. The workflow needs the repository secret `FACTORIO_MOD_PORTAL_API_KEY`, an API key with the `ModPortal: Publish Mods` permission. It can also be run by hand from GitHub Actions.
+Pushing a tag `factorio-v<version>` publishes the mod to the Factorio Mod Portal, where `<version>` matches `capture/mod/timeshadedb_exporter/info.json`. The workflow needs the repository secret `FACTORIO_MOD_PORTAL_API_KEY`, an API key with the `ModPortal: Publish Mods` permission (the first release) and `ModPortal: Upload Mods` (every version after it). It can also be run by hand from GitHub Actions.
 
 ## Documentation
 
