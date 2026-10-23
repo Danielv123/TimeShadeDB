@@ -29,6 +29,7 @@ import {
   placeCarriages,
   placeRailCarriages,
   railGaps,
+  tickRate,
 } from "./track";
 
 /** New data that moves a drawn mover is blended in over at least this long. */
@@ -197,7 +198,7 @@ export class MoverView {
 
   /** Whether a sample of the rail path model (F_RAIL) was added (DelayEstimator.railPrior). */
   sawRail = false;
-  /** Game ticks a millisecond between the last two samples with ticks of a track (NaN: none yet). */
+  /** Game ticks a millisecond between the last two samples of one game of a track (NaN: none yet). */
   tickRate = NaN;
 
   /** Adds one sample; returns false when the track already had this row. */
@@ -222,8 +223,9 @@ export class MoverView {
     const n = tr.s.length;
     if (n >= 2 && tr.s[n - 1] === s) {
       const p = tr.s[n - 2];
-      if (p.tick !== null && s.tick !== null && s.t > p.t && s.tick > p.tick) {
-        this.tickRate = (s.tick - p.tick) / (s.t - p.t);
+      const r = tickRate(p, s);
+      if (!Number.isNaN(r)) {
+        this.tickRate = r / 1000;
       }
       // A rail path stop sample is not a moving mover's: the rail path holds the train there until
       // it starts, so the wait for the start says nothing about readiness. (With few samples a

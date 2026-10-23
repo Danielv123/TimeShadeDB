@@ -452,17 +452,62 @@ function railFrom(rr: RailRuns, k: number): number {
   return rr.run[k] === rr.run[k + 1] ? rr.u[k] : rr.ub[k];
 }
 
-/** Game ticks a second around sample k, from neighbouring samples' ticks (60 when unknown). */
-function ticksPerSecond(tr: Track, k: number): number {
+/** The game ticks a second two samples of one game can show: game speed 0.01 to 100 at up to 60 UPS. */
+const MIN_TPS = 0.5;
+const MAX_TPS = 6000;
+
+/**
+ * Game ticks a second from sample a to b, or NaN when their ticks cannot be of one game: unknown,
+ * not increasing, or at a rate no game runs at. A journey that crossed between instances without a
+ * gone row between (the source's gone lost) has the two instances' ticks side by side, and each
+ * instance counts from its own start.
+ */
+export function tickRate(a: Sample, b: Sample): number {
+  if (a.tick === null || b.tick === null || !(b.tick > a.tick) || !(b.t > a.t)) {
+    return NaN;
+  }
+  const r = ((b.tick - a.tick) * 1000) / (b.t - a.t);
+  return r >= MIN_TPS && r <= MAX_TPS ? r : NaN;
+}
+
+/** Game ticks a second from the first of these sample pairs around k with a rate (NaN: none). */
+function rateNear(tr: Track, k: number, pairs: number[][]): number {
   const s = tr.s;
-  for (const [i, j] of [[k - 1, k], [k, k + 1], [k - 2, k - 1], [k + 1, k + 2]]) {
+  for (const [i, j] of pairs) {
     const a = s[i];
     const b = s[j];
-    if (a && b && a.tick !== null && b.tick !== null && b.tick > a.tick && b.t > a.t && !isGone(a) && !isGone(b)) {
-      return ((b.tick - a.tick) * 1000) / (b.t - a.t);
+    if (a && b && !isGone(a) && !isGone(b)) {
+      const r = tickRate(a, b);
+      if (!Number.isNaN(r)) {
+        return r;
+      }
     }
   }
-  return 60;
+  return NaN;
+}
+
+/** Game ticks a second around sample k, from neighbouring samples' ticks (60 when unknown). */
+function ticksPerSecond(tr: Track, k: number): number {
+  const r = rateNear(tr, k, [[k - 1, k], [k, k + 1], [k - 2, k - 1], [k + 1, k + 2]]);
+  return Number.isNaN(r) ? 60 : r;
+}
+
+/**
+ * The game ticks between rail samples k and k+1 that time the segment: their tick difference when
+ * both ticks are of one game, at a rate within a factor of 4 of the samples' around them; else the
+ * time between them at that rate (60 a second when unknown). Without that, a crossing whose gone was
+ * lost was timed by the difference of two instances' ticks: negative, which put the head at the
+ * destination's first sample at once, or far too large.
+ */
+function railTicks(tr: Track, k: number): number {
+  const a = tr.s[k];
+  const b = tr.s[k + 1];
+  const r = tickRate(a, b);
+  const near = rateNear(tr, k, [[k - 1, k], [k + 1, k + 2], [k - 2, k - 1], [k + 2, k + 3]]);
+  if (!Number.isNaN(r) && (Number.isNaN(near) || (r >= near / 4 && r <= near * 4))) {
+    return b.tick! - a.tick!;
+  }
+  return (Math.max(0, b.t - a.t) * (Number.isNaN(near) ? 60 : near)) / 1000;
 }
 
 const rt = [0, 0];
@@ -473,7 +518,7 @@ function railInterpolate(tr: Track, k: number, t: number, out: Head): void {
   const a = tr.s[k];
   const b = tr.s[k + 1];
   const rr = railRuns(tr);
-  const T = b.tick! - a.tick!;
+  const T = railTicks(tr, k);
   const f = b.t > a.t ? Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t))) : 1;
   const ua = railFrom(rr, k);
   timingU(rr.u[k + 1] - ua, T, a.v, b.v, f * T, rt);
