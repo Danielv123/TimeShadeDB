@@ -574,6 +574,83 @@ t.test("trains: a train destroyed sends gone; a long train's car is capped and e
 		t.expect_eq(storage.timeshade.movers[j], nil, "forgotten")
 	end)
 
+--- A capture with a train cruising at a tile a tick through fake.path_lc's quarter turn for `ticks` ticks, starting 60
+--- tiles before it: with no sample since the turn (the timing model holds). Returns capture, log, train, journey, the
+--- samples so far, the leading carriage's position at each tick and the turn's pieces as `rp` entries.
+local function through_turn(ticks)
+	local capture, world, log = boot()
+	local path = fake.path_lc(300, 12)
+	local tr = fake.train(world.surfaces.nauvis, "LCC", path, path.straight_end - 60)
+	local truth = {}
+	run(capture, 1, ticks, function(tick)
+		tr.speed = 1
+		fake.place(tr, tr.pos + 1)
+		local p = tr.front_stock.position
+		truth[tick] = { x = p.x, y = p.y }
+	end)
+	local j = storage.timeshade.by_train[tr.id]
+	local before = entries(log, j)
+	t.expect_true(truth[before[#before].__tick].x < path.straight_end - 10, "no sample since the turn")
+	local turn = {}
+	for _, r in ipairs(path.rails) do
+		if r.type ~= "straight-rail" then
+			turn[#turn + 1] = { r.position.x, r.position.y, r.direction, r.type == "curved-rail-a" and 1 or 2 }
+		end
+	end
+	return capture, log, tr, j, before, truth, turn
+end
+
+local function destroy(capture, j, tick)
+	storage.timeshade.movers[j].ref.valid = false
+	fire(capture, "on_object_destroyed", { registration_number = storage.timeshade.movers[j].reg })
+	run(capture, tick, tick)
+end
+
+t.test("trains: a gone sends the last read first, with the pieces entered since the last sample", function()
+	local capture, log, _, j, before, truth, turn = through_turn(90)
+	destroy(capture, j, 91)
+	local all = entries(log, j)
+	t.expect_true(all[#all].gone, "gone")
+	local flushed = all[#all - 1]
+	t.expect_true(#all == #before + 2 and not flushed.gone and not flushed.ru, "one sample before the gone")
+	local p = truth[flushed.__tick]
+	t.expect_true(p and math.abs(p.x - flushed.x) < 1e-9 and math.abs(p.y - flushed.y) < 1e-9, "at its read's tick")
+	t.expect_true(90 - flushed.__tick <= capture.core.STEP, "the last read: at most a read step before the end")
+	t.expect_eq(flushed.v, 1, "with its speed")
+	t.expect_same(flushed.rp, turn, "the turn's pieces")
+end)
+
+t.test("trains: a Universal Edges capture sends the train as captured, with the pieces since the last sample; "
+	.. "its gone sends nothing more", function()
+	-- The source's train is destroyed only after the destination adopted the journey; ingest drops what the source
+	-- sends from after the adopt, so the curve on the way into the border box goes with the capture.
+	local capture, log, tr, j, before, truth, turn = through_turn(90)
+	-- after this tick's flush, as when Universal Edges' on_tick runs after the capture's
+	local data = capture.movers.capture(storage.timeshade, { type = "train" }, tr)
+	t.expect_eq(data and data.j, j, "the crossing carries the journey")
+	run(capture, 91, 100, function()
+		fake.place(tr, tr.pos + 1) -- held, it runs on into the box
+	end)
+	local got = entries(log, j)
+	t.expect_eq(#got, #before + 1, "one sample")
+	local at = got[#got]
+	t.expect_true(at.__tick == 90 and at.x == truth[90].x and at.y == truth[90].y, "the train as captured")
+	t.expect_same(at.rp, turn, "the turn's pieces")
+	destroy(capture, j, 101)
+	local all = entries(log, j)
+	t.expect_true(all[#all].gone and #all == #got + 1, "then only the gone")
+	-- given back (refused): its gone sends its last read again
+	local capture2, log2, tr2, j2 = through_turn(90)
+	capture2.movers.capture(storage.timeshade, { type = "train" }, tr2)
+	capture2.movers.restored(storage.timeshade, { type = "train" }, tr2)
+	run(capture2, 91, 100, function()
+		fake.place(tr2, tr2.pos + 1)
+	end)
+	local n = #entries(log2, j2)
+	destroy(capture2, j2, 101)
+	t.expect_eq(#entries(log2, j2), n + 2, "a restored train's gone sends its last read first")
+end)
+
 t.test("trains: with the file transport's limits (core.limits) a long train lists every carriage and kind", function()
 	local capture, world, log = boot()
 	local core = capture.core

@@ -102,21 +102,6 @@ local function mint(st, ref, kind, key, t)
 	return j
 end
 
---- Journey j's gone, if it was ever sampled and the capture is configured, then forget it. Unconfigured (before a
---- Clusterio boot's config, or with the standalone mod turned off) only the storage side runs: a gone queued then would
---- be flushed much later under a wrong envelope tick.
-function movers.gone(st, j)
-	st.fast[j] = nil
-	local m = st.movers[j]
-	if not m then
-		return
-	end
-	if m.s and st.configured then
-		outbox.move(m.s, { j = j, gone = true })
-	end
-	core.forget(st, j)
-end
-
 --- What a train looks like now: its leading carriage (front_stock while running forwards), position, surface, heading:
 --- the leading carriage's own orientation turned to the direction of travel (the rail tangent at its centre,
 --- PROTOCOL.md 3.1), and that orientation unrounded (turns). m must be shaped.
@@ -269,6 +254,60 @@ local function surface_name(m, si)
 		m.s, m.ssi = game.get_surface(si).name, si
 	end
 	return m.s
+end
+
+--- The pieces of train m entered up to a read with piece count np, taken from m.rp; nil for none.
+local function take_pieces(m, np)
+	local rp = m.rp
+	local n = np - (m.rpn - #rp)
+	if n <= 0 then
+		return nil
+	end
+	local sent, rest = {}, {}
+	for i = 1, #rp do
+		if i <= n then
+			sent[#sent + 1] = rp[i]
+		else
+			rest[#rest + 1] = rp[i]
+		end
+	end
+	m.rp = rest
+	return sent
+end
+
+--- Sends journey j's train m's last read since its last sample, if any, as a sample with the pieces entered up to it.
+--- The timing model can hold for up to core.LIVE_GAP ticks, so without it the train's path since its last sample, and
+--- any curve on it, would be lost where the train ends or crosses.
+local function flush(j, m)
+	local rv = m.buf and m.buf[#m.buf]
+	if not rv then
+		return
+	end
+	local s = sample(j, m, nil, rv.x, rv.y, rv.h, rv.fwd)
+	-- its own tick always: a Universal Edges capture runs in that mod's on_tick, possibly after this tick's flush
+	s.v, s.tick = core.round(rv.v, 4), rv.t
+	s.rp = take_pieces(m, rv.np)
+	outbox.move(m.s, s)
+	m.e, m.buf = rv, {}
+end
+
+--- Journey j's gone, if it was ever sampled and the capture is configured, then forget it. Unconfigured (before a
+--- Clusterio boot's config, or with the standalone mod turned off) only the storage side runs: a gone queued then would
+--- be flushed much later under a wrong envelope tick. A train's last read goes first (flush), unless Universal Edges
+--- took the train: what it does after its capture comes after the destination's adopt, which ingest drops.
+function movers.gone(st, j)
+	st.fast[j] = nil
+	local m = st.movers[j]
+	if not m then
+		return
+	end
+	if m.s and st.configured then
+		if m.kind == "t" and not m.handed then
+			flush(j, m)
+		end
+		outbox.move(m.s, { j = j, gone = true })
+	end
+	core.forget(st, j)
 end
 
 --- One poll of journey j. A train reads its leading end, a vehicle its position, a player its physical controller. A
@@ -426,19 +465,7 @@ local function poll(st, j, t, how)
 				started = true
 			else
 				-- the pieces entered up to this read
-				local rp = m.rp
-				local n = rv.np - (m.rpn - #rp)
-				if n > 0 then
-					local sent, rest = {}, {}
-					for i = 1, #rp do
-						if i <= n then
-							sent[#sent + 1] = rp[i]
-						else
-							rest[#rest + 1] = rp[i]
-						end
-					end
-					s.rp, m.rp = sent, rest
-				end
+				s.rp = take_pieces(m, rv.np)
 				if emit.why == "stop" or emit.why == "start" then
 					-- and the pieces under the whole train (this is always the current read): a keyframe or the live payload
 					-- holds only a parked train's stop sample, and the live payload's trail often begins with a start. The
@@ -664,7 +691,10 @@ function movers.on_train_created(st, e)
 	end
 end
 
---- Universal Edges source (ue.transfers.extend's capture): the crossing carries the journey. It reads storage only.
+--- Universal Edges source (ue.transfers.extend's capture): the crossing carries the journey. A train is read now and
+--- that read sent with the pieces entered since its last sample (flush): its way into the border box often runs through
+--- a curve after its last sample, and from here on what it sends comes after the destination's adopt, which ingest
+--- drops. Without it the viewer bridges the corner straight.
 function movers.capture(st, ep, h)
 	if not st then
 		return nil
@@ -672,10 +702,34 @@ function movers.capture(st, ep, h)
 	local j
 	if ep.type == "train" then
 		j = st.by_train[h.id]
+		local m = j and st.movers[j]
+		if m and m.s and st.configured then
+			if m.lt ~= game.tick then
+				poll(st, j, game.tick)
+			end
+			m = st.movers[j]
+			if m then
+				flush(j, m)
+				m.handed = true
+			end
+		end
 	else
 		j = st.by_unit[h.unit_number]
 	end
 	return j and { j = j } or nil
+end
+
+--- Universal Edges source: a captured train given back (the destination refused it, it was too big, the lane closed)
+--- stays this instance's journey.
+function movers.restored(st, ep, h)
+	if not st or ep.type ~= "train" then
+		return
+	end
+	local j = st.by_train[h.id]
+	local m = j and st.movers[j]
+	if m then
+		m.handed = nil
+	end
 end
 
 --- Universal Edges destination (materialized): take the source's journey over any entry, and tell the server, which
