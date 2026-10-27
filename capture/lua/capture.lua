@@ -19,7 +19,7 @@ local overlays = require(P .. "overlays")
 
 local capture = { core = core, outbox = outbox, terrain = terrain, movers = movers, overlays = overlays, events = {} }
 
-capture.VERSION = "0.1.1"
+capture.VERSION = "0.1.2"
 
 local host = {}
 local resync = nil -- the running resync: { trace, chunks, movers, tags, machines, rails?, chunks_done }

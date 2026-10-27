@@ -1,6 +1,6 @@
 {
 	"name": "timeshade",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "TimeShadeDB v3 cluster map for Clusterio: captures every instance's chart, trains, vehicles and players into a TimeShadeDB sidecar and shows it in the web UI",
 	"license": "UNLICENSED",
 	"repository": {

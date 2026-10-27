@@ -3,7 +3,8 @@ name: Release
 # After CI passes on master, publishes each artifact whose version is not released yet: the Factorio mod
 # (capture/mod/timeshadedb_exporter/info.json) to the Mod Portal, and the Clusterio plugin with its binary packages
 # (clusterio/package.json) to npm. Bumping a version is what releases it. Each release is tagged factorio-v<version> or
-# clusterio-v<version>. Run it by hand to retry a release that failed.
+# clusterio-v<version>. Then a GitHub release gets the mod zip and the timeshadedb binaries. Run it by hand to retry a
+# release that failed.
 
 on:
   workflow_run:
@@ -197,9 +198,98 @@ jobs:
 
       - name: Build, test and publish
         working-directory: clusterio
-        run: node scripts/publish.mjs
+        run: node scripts/publish.mjs --assets ../build/binaries
+
+      - name: Upload the binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeshadedb-${{ needs.plan.outputs.npm_version }}
+          path: build/binaries/*
+          if-no-files-found: error
 
       - name: Tag the release
         run: |
           tag="clusterio-v${{ needs.plan.outputs.npm_version }}"
           git tag "$tag" "$SHA" && git push origin "$tag"
+
+  # One GitHub release for the run, on the plugin's tag (the mod's when only the mod was released). It carries the mod
+  # zip and the binaries at their current versions: what this run published, the rest from the latest GitHub release,
+  # which carries them all.
+  github:
+    needs: [plan, mod, npm]
+    if: always() && needs.plan.result == 'success' && (needs.mod.result == 'success' || needs.npm.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      MOD: ${{ needs.mod.result == 'success' }}
+      NPM: ${{ needs.npm.result == 'success' }}
+      MOD_VERSION: ${{ needs.plan.outputs.mod_version }}
+      NPM_VERSION: ${{ needs.plan.outputs.npm_version }}
+    steps:
+      - name: Download the mod zip
+        if: needs.mod.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: timeshadedb_exporter-${{ needs.plan.outputs.mod_version }}
+          path: assets
+
+      - name: Download the binaries
+        if: needs.npm.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: timeshadedb-${{ needs.plan.outputs.npm_version }}
+          path: assets
+
+      - name: Create the GitHub release
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          # the latest release before this one: the start of the generated notes, and where the assets this run did not
+          # publish come from
+          previous="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
+          if [ "${MOD}" = true ]; then mod_version="${MOD_VERSION}"; fi
+          if [ "${NPM}" = true ]; then npm_version="${NPM_VERSION}"; fi
+          if [ -n "${previous}" ] && [ "${MOD}" != true ]; then
+            gh release download "${previous}" -D assets -p 'timeshadedb_exporter_*.zip' || true
+          fi
+          if [ -n "${previous}" ] && [ "${NPM}" != true ]; then
+            gh release download "${previous}" -D assets -p 'timeshadedb-*' || true
+          fi
+          mod_zip="$(ls assets/timeshadedb_exporter_*.zip 2>/dev/null | head -n 1 || true)"
+          if [ -n "${mod_zip}" ] && [ -z "${mod_version:-}" ]; then
+            mod_version="$(basename "${mod_zip}" .zip)"
+            mod_version="${mod_version#timeshadedb_exporter_}"
+          fi
+          binary="$(ls assets/timeshadedb-* 2>/dev/null | head -n 1 || true)"
+          if [ -n "${binary}" ] && [ -z "${npm_version:-}" ]; then
+            npm_version="$(basename "${binary}")"
+            npm_version="${npm_version#timeshadedb-}"
+            npm_version="${npm_version%%-*}"
+          fi
+          [ -n "${mod_zip}" ] || echo "::warning::No mod zip to attach: the mod was not released by this run or the last GitHub release."
+          [ -n "${binary}" ] || echo "::warning::No binaries to attach: the plugin was not released by this run or the last GitHub release."
+          (cd assets && sha256sum * > SHA256SUMS)
+
+          if [ "${NPM}" = true ]; then tag="clusterio-v${NPM_VERSION}"; else tag="factorio-v${MOD_VERSION}"; fi
+          title=""
+          notes=""
+          if [ -n "${npm_version:-}" ]; then
+            title="timeshade ${npm_version}"
+            notes+="- Clusterio plugin: [timeshade ${npm_version}](https://www.npmjs.com/package/timeshade/v/${npm_version}) on npm."$'\n'
+            notes+="- The timeshadedb binaries: \`timeshadedb-${npm_version}-<os>-<arch>\`, the server for a single game and the plugin's sidecar."$'\n'
+          fi
+          if [ -n "${mod_version:-}" ]; then
+            title="${title:+${title}, }timeshadedb_exporter ${mod_version}"
+            notes+="- Factorio mod: [timeshadedb_exporter ${mod_version}](https://mods.factorio.com/mod/timeshadedb_exporter), also attached as \`timeshadedb_exporter_${mod_version}.zip\`."$'\n'
+          fi
+
+          if gh release view "${tag}" > /dev/null 2>&1; then
+            gh release upload "${tag}" assets/* --clobber
+          else
+            start=()
+            if [ -n "${previous}" ]; then start=(--notes-start-tag "${previous}"); fi
+            gh release create "${tag}" assets/* --verify-tag --title "${title}" --notes "${notes}" --generate-notes "${start[@]}"
+          fi

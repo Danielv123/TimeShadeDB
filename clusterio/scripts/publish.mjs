@@ -6,15 +6,16 @@
 // The release workflow (.github/workflows/release.yml) runs it with npm trusted publishing. npm only takes a trusted
 // publisher for a package it already has, so a new package is published once by hand: npm login, then this script.
 //
-//   node scripts/publish.mjs [--check] [--dry-run]
+//   node scripts/publish.mjs [--check] [--dry-run] [--assets <dir>]
 //
+// --assets also copies the binaries to <dir> as timeshadedb-<version>-<goos>-<goarch>(.exe), for the GitHub release.
 // --check only says which packages are not on npm at the version, and writes release=true|false and version to
 // $GITHUB_OUTPUT. In GitHub Actions publishing fails at once for a package that is not on npm at all.
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { packageName, targets } from "./targets.mjs";
+import { binaryName, packageName, targets } from "./targets.mjs";
 
 const plugin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -72,6 +73,16 @@ run("node scripts/build-binary.mjs --web");
 run("node scripts/build-npm-binaries.mjs");
 run("npm run build");
 run("npm test");
+
+const assets = args.includes("--assets") ? path.resolve(args[args.indexOf("--assets") + 1]) : null;
+if (assets) {
+	fs.mkdirSync(assets, { recursive: true });
+	for (const t of targets) {
+		const ext = path.extname(binaryName(t));
+		fs.copyFileSync(path.join(plugin, "npm", packageName(t).replace("/", "__"), "bin", binaryName(t)),
+			path.join(assets, `timeshadedb-${version}-${t.goos}-${t.goarch}${ext}`));
+	}
+}
 
 const publish = dir => run(`npm publish${args.includes("--dry-run") ? " --dry-run" : ""}`, dir);
 for (const name of binaries) {
