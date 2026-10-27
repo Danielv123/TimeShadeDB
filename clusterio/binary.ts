@@ -5,9 +5,9 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 
-/** The npm package that carries the binary for a platform, e.g. @timeshadedb/bin-win32-x64. */
+/** The npm package that carries the binary for a platform, e.g. @danielv123/timeshade-win32-x64. */
 export function binaryPackage(platform: string = process.platform, arch: string = process.arch): string {
-	return `@timeshadedb/bin-${platform}-${arch}`;
+	return `@danielv123/timeshade-${platform}-${arch}`;
 }
 
 export function binaryName(platform: string = process.platform): string {

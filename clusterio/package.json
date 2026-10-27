@@ -1,9 +1,16 @@
 {
-	"name": "@timeshadedb/clusterio-plugin",
-	"version": "0.1.0",
+	"name": "timeshade",
+	"version": "0.1.1",
 	"description": "TimeShadeDB v3 cluster map for Clusterio: captures every instance's chart, trains, vehicles and players into a TimeShadeDB sidecar and shows it in the web UI",
 	"license": "UNLICENSED",
-	"private": true,
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Danielv123/TimeShadeDB.git",
+		"directory": "clusterio"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
 	"type": "module",
 	"main": "dist/node/index.js",
 	"keywords": [
@@ -28,7 +35,8 @@
 		"build:node": "node scripts/build-module.mjs && tsc --build",
 		"build:binary": "node scripts/build-binary.mjs",
 		"test": "node --test \"dist/node/test/*.test.js\"",
-		"build:npm-binaries": "node scripts/build-npm-binaries.mjs"
+		"build:npm-binaries": "node scripts/build-npm-binaries.mjs",
+		"release": "node scripts/publish.mjs"
 	},
 	"peerDependencies": {
 		"@clusterio/controller": "^2.0.2",
@@ -46,13 +54,6 @@
 	"dependencies": {
 		"@sinclair/typebox": "^0.30.6",
 		"jsonwebtoken": "^9.0.3"
-	},
-	"optionalDependencies": {
-		"@timeshadedb/bin-win32-x64": "0.1.0",
-		"@timeshadedb/bin-linux-x64": "0.1.0",
-		"@timeshadedb/bin-linux-arm64": "0.1.0",
-		"@timeshadedb/bin-darwin-x64": "0.1.0",
-		"@timeshadedb/bin-darwin-arm64": "0.1.0"
 	},
 	"devDependencies": {
 		"@clusterio/controller": "^2.0.2",

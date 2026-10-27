@@ -66,9 +66,20 @@ node capture/build.mjs
 
 `timeshadedb help` lists the commands and `timeshadedb <command> -h` their flags.
 
-## Releasing the mod
+## Releasing
 
-Pushing a tag `factorio-v<version>` publishes the mod to the Factorio Mod Portal, where `<version>` matches `capture/mod/timeshadedb_exporter/info.json`. The workflow needs the repository secret `FACTORIO_MOD_PORTAL_API_KEY`, an API key with the `ModPortal: Publish Mods` permission (the first release) and `ModPortal: Upload Mods` (every version after it). It can also be run by hand from GitHub Actions.
+A version bump on master is a release. Once CI passes, the Release workflow publishes each artifact whose version is not out yet, and tags it:
+
+| Artifact | Version in | Published to | Tag |
+|---|---|---|---|
+| The Factorio mod | `capture/mod/timeshadedb_exporter/info.json`, with `capture/clusterio_module/module.json` and `capture.VERSION` in `capture/lua/capture.lua` (the build checks that the three match) | Factorio Mod Portal | `factorio-v<version>` |
+| The Clusterio plugin and its binary packages | `clusterio/package.json` (`npm version patch --no-git-tag-version` in `clusterio/`) | npm | `clusterio-v<version>` |
+
+So the mod and the plugin release on their own. Both carry the capture Lua: the mod for single games, the plugin's save-patch module for Clusterio. A capture fix needs both bumped to reach both. The workflow can also be run by hand from GitHub Actions to retry a release that failed.
+
+The mod needs the secret `FACTORIO_MOD_PORTAL_API_KEY` in the `factorio-mod-portal` environment: an API key with the `ModPortal: Publish Mods` permission (the first release) and `ModPortal: Upload Mods` (every version after it).
+
+npm uses trusted publishing, so there is no token. npm only takes a trusted publisher for a package it already has, so a new package is published once by hand: `npm login`, then `node clusterio/scripts/publish.mjs` (it builds, tests and publishes what npm does not have at the version, and `--dry-run` shows what it would publish). Then add a trusted publisher on npmjs.com to each of `timeshade` and `@danielv123/timeshade-{win32-x64,linux-x64,linux-arm64,darwin-x64,darwin-arm64}`: repository `Danielv123/TimeShadeDB`, workflow `release.yml`, no environment.
 
 ## Documentation
 

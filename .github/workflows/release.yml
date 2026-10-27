@@ -1,0 +1,188 @@
+name: Release
+
+# After CI passes on master, publishes each artifact whose version is not released yet: the Factorio mod
+# (capture/mod/timeshadedb_exporter/info.json) to the Mod Portal, and the Clusterio plugin with its binary packages
+# (clusterio/package.json) to npm. Bumping a version is what releases it. Each release is tagged factorio-v<version> or
+# clusterio-v<version>. Run it by hand to retry a release that failed.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # The commit CI tested, or the branch head when run by hand.
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  plan:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      mod: ${{ steps.mod.outputs.release }}
+      mod_version: ${{ steps.mod.outputs.version }}
+      npm: ${{ steps.npm.outputs.release }}
+      npm_version: ${{ steps.npm.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Factorio mod version on the Mod Portal
+        id: mod
+        run: |
+          set -euo pipefail
+          name="$(jq -r .name capture/mod/timeshadedb_exporter/info.json)"
+          version="$(jq -r .version capture/mod/timeshadedb_exporter/info.json)"
+          # a mod not on the portal yet answers 404 {"message": "Mod not found"}, without releases
+          released="$(curl -sS "https://mods.factorio.com/api/mods/${name}" | jq --arg v "$version" '[.releases[]?.version] | index($v) != null')"
+          echo "${name} ${version} on the Mod Portal: ${released}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release=$([ "$released" = true ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+      - name: Clusterio plugin version on npm
+        id: npm
+        run: node clusterio/scripts/publish.mjs --check
+
+  mod:
+    needs: plan
+    if: needs.plan.outputs.mod == 'true'
+    runs-on: ubuntu-latest
+    environment: factorio-mod-portal
+    permissions:
+      contents: write # the release tag
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            capture/test/package-lock.json
+
+      - name: Test the capture
+        working-directory: capture/test
+        run: npm ci && node run_unit.mjs
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build Factorio mod package
+        shell: pwsh
+        run: ./scripts/build.ps1 -SkipPackage
+
+      - name: Upload Factorio mod package
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeshadedb_exporter-${{ needs.plan.outputs.mod_version }}
+          path: build/packages/timeshadedb_exporter_${{ needs.plan.outputs.mod_version }}.zip
+          if-no-files-found: error
+
+      - name: Publish to Factorio Mod Portal
+        env:
+          FACTORIO_MOD_PORTAL_API_KEY: ${{ secrets.FACTORIO_MOD_PORTAL_API_KEY }}
+          MOD_NAME: timeshadedb_exporter
+          ZIP_PATH: build/packages/timeshadedb_exporter_${{ needs.plan.outputs.mod_version }}.zip
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FACTORIO_MOD_PORTAL_API_KEY}" ]; then
+            echo "::error::Missing FACTORIO_MOD_PORTAL_API_KEY secret."
+            exit 1
+          fi
+
+          # init_publish creates the mod on the portal, init_upload adds a release to it.
+          if curl -fsS -o /dev/null "https://mods.factorio.com/api/mods/${MOD_NAME}"; then
+            init_url="https://mods.factorio.com/api/v2/mods/releases/init_upload"
+          else
+            init_url="https://mods.factorio.com/api/v2/mods/init_publish"
+          fi
+
+          init_response="$(
+            curl -fsS -X POST "${init_url}" -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}" -F "mod=${MOD_NAME}"
+          )"
+
+          upload_url="$(jq -r .upload_url <<< "${init_response}")"
+
+          if [ "${init_url##*/}" = "init_publish" ]; then
+            curl -fsS -X POST "${upload_url}" -F "file=@${ZIP_PATH}" \
+              -F "description=<capture/mod/README.md" -F "source_url=https://github.com/${GITHUB_REPOSITORY}"
+          else
+            curl -fsS -X POST "${upload_url}" -F "file=@${ZIP_PATH}"
+          fi
+
+      - name: Tag the release
+        run: |
+          tag="factorio-v${{ needs.plan.outputs.mod_version }}"
+          git tag "$tag" "$SHA" && git push origin "$tag"
+
+  npm:
+    needs: plan
+    if: needs.plan.outputs.npm == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release tag
+      id-token: write # npm trusted publishing
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SHA }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            clusterio/package-lock.json
+
+      - name: Use an npm with trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - name: Build, test and publish
+        working-directory: clusterio
+        run: node scripts/publish.mjs
+
+      - name: Tag the release
+        run: |
+          tag="clusterio-v${{ needs.plan.outputs.npm_version }}"
+          git tag "$tag" "$SHA" && git push origin "$tag"
