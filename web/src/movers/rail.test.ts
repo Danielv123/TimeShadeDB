@@ -163,6 +163,55 @@ test("rail samples: a crossing without its gone row (two instances' ticks) is ti
   }
 });
 
+test("rail samples: a Universal Edges crossing past a curve follows the curve when the capture sends it", () => {
+  // The source's last regular sample is on the straight before the curve; Universal Edges captures the train in its
+  // border box on the straight after it (tick 110), destroys it 10 ticks later (gone), and the destination's first
+  // sight comes 3 tiles behind where the source's train ended. Its run lists no pieces: the destination's rails under
+  // the train are straight.
+  const crossing = (captured: boolean) => {
+    const tr = new T.Track("j1", meta);
+    tr.insert(sample(0, null, true));
+    if (captured) {
+      tr.insert(sample(110, [A, B]));
+    }
+    tr.insert(T.makeSample(meta, msOf(120), 0, 0, 0, T.F_GONE | T.F_HANDOFF));
+    truthChain.carriage(uAt(120) - 3, out);
+    const o = ((Math.atan2(out[2], -out[3]) / (2 * Math.PI)) % 1 + 1) % 1;
+    tr.insert(T.makeSample(meta, msOf(125), out[0], out[1], o, T.F_RAIL, null, 469_000, vAt(120), null, true));
+    return tr;
+  };
+  /** The head's largest distance from the true path (not from where the truth is at that time) over ticks a to b. */
+  const offPath = (tr: InstanceType<typeof T.Track>, a: number, b: number) => {
+    const h = T.newHead();
+    let worst = 0;
+    for (let t = a; t <= b; t++) {
+      T.headAt(tr, msOf(t), Infinity, h);
+      assert.ok(h.visible, `visible at ${t}`);
+      let best = Infinity;
+      for (let u = uAt(0) - 10; u <= uAt(125) + 5; u += 0.05) {
+        truthChain.carriage(u, out);
+        best = Math.min(best, Math.hypot(h.x - out[0], h.y - out[1]));
+      }
+      worst = Math.max(worst, best);
+    }
+    return worst;
+  };
+  const cut = offPath(crossing(false), 0, 125);
+  assert.ok(cut > 2, `without the capture's sample the bridge cuts the corner (${cut.toFixed(2)} tiles)`);
+  const tr = crossing(true);
+  assert.ok(T.railLinked(tr, 0), "the source's run reaches the captured train on its chain");
+  const h = T.newHead();
+  let worst = 0;
+  for (let t = 0; t <= 110; t++) {
+    T.headAt(tr, msOf(t), Infinity, h);
+    truthChain.carriage(uAt(t), out);
+    worst = Math.max(worst, Math.hypot(h.x - out[0], h.y - out[1]));
+  }
+  assert.ok(worst < 1e-3, `through the curve: head off the truth by ${worst}`);
+  const bridged = offPath(tr, 110, 125);
+  assert.ok(bridged < 0.05, `the bridge stays on the rails (${bridged.toFixed(3)} tiles off)`);
+});
+
 test("tickRate: samples of one game only", () => {
   const s = (t: number, tick: number | null) => T.makeSample(meta, t, 0, 0, 0, T.F_RAIL, null, tick, 0.1);
   assert.equal(T.tickRate(s(0, 100), s(1000, 160)), 60);

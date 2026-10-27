@@ -388,10 +388,16 @@ read), at least every 120 ticks (60 below game speed 0.5; 2 s of real time at sp
 speed 0.2, so a live viewer's next sample is that late at worst; a read is scheduled for
 when that wait ends), on the 600-tick heartbeat, on first sight, stop, start, end switch,
 surface change and a missed piece that the walk back did not find, and when 32 pieces wait.
-The reads kept for the check are at most 16; a full buffer keeps every other one. `car` goes
-with first sight, a changed train, a surface change and resyncs only: the path places every
-carriage, and `car` only tells the viewer the carriages' pitches. Stop and start samples list
-the pieces under the whole train (8.1).
+The last read since the last sample, if any, is also sent before a gone, with its own tick and
+the pieces entered up to it. A train that Universal Edges captures for a crossing is read and
+sent at the capture instead: the destination's adopt comes before the source destroys the
+train, and ingest drops what the source sends after it, so its gone then sends nothing more.
+Without those reads, up to 120 ticks of travel before a crossing, and any curve on the way
+into the border box, would be lost, and the viewer would bridge from the sample before the
+curve to the destination in a straight line. The reads kept for the check are at most 16; a
+full buffer keeps every other one. `car` goes with first sight, a changed train, a surface
+change and resyncs only: the path places every carriage, and `car` only tells the viewer the
+carriages' pitches. Stop and start samples list the pieces under the whole train (8.1).
 
 ### 8.5 Test vectors
 

@@ -88,6 +88,8 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   ramps it enters go with the next sample (`rp`), and a sample is sent when a read lies more
   than 0.1 tile of rail distance off the timing model, at least every 120 ticks while moving,
   on the 600-tick heartbeat, and on first sight, stop, start, end switch and surface change.
+  The last read since the last sample goes out before a gone, or when Universal Edges
+  captures the train for a crossing, so the way into a border box is not lost.
   A parked train is not polled. [RAIL-GEOMETRY.md](../docs/RAIL-GEOMETRY.md) 8 has the
   full rules. Deploy the server and viewer before a capture that sends rail path samples
   (PROTOCOL.md 3.1).

@@ -259,6 +259,8 @@ These are protocol-level requirements. The capture in `capture/lua/` meets them
 - Vehicles and players: emit when off the dead-reckoned position by more than 1 tile or on
   the heartbeat; send `h` for vehicles too.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for
-  every player.
+  every player. A train's last read since its last sample is sent before its gone, or, at a
+  Universal Edges crossing, when the crossing captures the train (before the destination's
+  `adopt`, after which ingest drops the source's samples).
 - Budget: at most 0.3 ms per tick with 100 moving trains and 50,000 charted chunks
   (`node capture/test/run_game.mjs --mode bench` checks it).

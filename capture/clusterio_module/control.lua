@@ -43,6 +43,9 @@ if capture.ue then
 		materialized = function(ep, h, data, meta)
 			capture.movers.materialized(storage.timeshade, ep, h, data, meta)
 		end,
+		restored = function(ep, h)
+			capture.movers.restored(storage.timeshade, ep, h)
+		end,
 	}
 end
 
