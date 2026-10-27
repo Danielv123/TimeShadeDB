@@ -65,13 +65,13 @@ test("findBinary: config, then TIMESHADEDB_BINARY, then the platform package, th
 	const pluginDir = path.resolve("plugin");
 	const pkgDir = path.resolve("node_modules", "@timeshadedb", "bin-linux-x64");
 	const resolve = (request: string) => {
-		if (request !== "@timeshadedb/bin-linux-x64/package.json") {
+		if (request !== "@danielv123/timeshade-linux-x64/package.json") {
 			throw new Error("not found");
 		}
 		return path.join(pkgDir, "package.json");
 	};
 	const base = { pluginDir, platform: "linux", arch: "x64", exists, resolve, env: {} };
-	assert.equal(binaryPackage("linux", "x64"), "@timeshadedb/bin-linux-x64");
+	assert.equal(binaryPackage("linux", "x64"), "@danielv123/timeshade-linux-x64");
 	assert.equal(binaryName("win32"), "timeshadedb.exe");
 	assert.match(String(findBinary(base)), /no timeshadedb binary for linux-x64/);
 	const local = path.join(pluginDir, "bin", "timeshadedb");

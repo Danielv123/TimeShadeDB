@@ -1,6 +1,6 @@
 {
 	"name": "timeshade",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"dependencies": { "clusterio": "*" },
 	"load": ["control.lua"],
 	"require": ["globals.lua"]

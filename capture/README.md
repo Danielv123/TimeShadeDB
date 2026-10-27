@@ -28,7 +28,7 @@ envelopes of [docs/PROTOCOL.md](../docs/PROTOCOL.md). One library serves two hos
 ## Build
 
 ```sh
-node capture/build.mjs                         # dist/timeshadedb_exporter_0.1.0{/,.zip} and dist/clusterio_module/
+node capture/build.mjs                         # dist/timeshadedb_exporter_<version>{/,.zip} and dist/clusterio_module/
 node capture/build.mjs --factorio-version 2.1  # Factorio 2.1 refuses mods that declare 2.0
 ```
 
@@ -37,7 +37,7 @@ node capture/build.mjs --factorio-version 2.1  # Factorio 2.1 refuses mods that 
 
 ## Standalone use
 
-1. Put `dist/timeshadedb_exporter_0.1.0.zip` (or the directory) in the game's `mods` folder.
+1. Put `dist/timeshadedb_exporter_<version>.zip` (or the directory) in the game's `mods` folder.
 2. Run `timeshadedb tail --dir <user data>/script-output/timeshade --url ... --token ...
    --map <key>` next to it (`--src` defaults to `standalone:<map>`). It posts complete files
    and deletes them.

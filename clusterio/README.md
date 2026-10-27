@@ -35,9 +35,9 @@ restart, such as a train lost when the instance came back from an older save
 ## Install
 
 1. Install the plugin next to Clusterio:
-   `npm install @timeshadedb/clusterio-plugin`. Automatic discovery adds it to
+   `npm install timeshade`. Automatic discovery adds it to
    `plugin-list.json`.
-2. The binary: npm installs the `@timeshadedb/bin-<platform>-<arch>` package for the machine as
+2. The binary: npm installs the `@danielv123/timeshade-<platform>-<arch>` package for the machine as
    an optional dependency (win32-x64, linux-x64, linux-arm64, darwin-x64, darwin-arm64). On
    another platform, or to run your own build, set `timeshade.binary_path` or the
    `TIMESHADEDB_BINARY` environment variable, or put a build in `bin/`
@@ -183,8 +183,6 @@ Tests (`node --test`):
 - Universal Edges lines are drawn on the world's map only for edge sides on an instance's
   `tile.surface`. The controller does not know the instance's other tiled surfaces.
 - The plugin does not run `timeshadedb publish` (static export to S3).
-- The `@timeshadedb/bin-*` packages and the plugin are not published. The scope name is a
-  placeholder.
 
 ## Licence
 
