@@ -121,25 +121,40 @@ jobs:
             exit 1
           fi
 
+          # POSTs to a portal endpoint (label, URL, curl's form arguments) and prints its response. On an HTTP error
+          # it prints the portal's error and message (never the URL: an upload URL carries a token) and fails.
+          post() {
+            local label="$1" url="$2" out code
+            shift 2
+            out="$(curl -sS -w '\n%{http_code}' -X POST "${url}" "$@")"
+            code="${out##*$'\n'}"
+            out="${out%$'\n'*}"
+            if [ "${code}" -ge 400 ]; then
+              echo "::error::${label}: HTTP ${code}: ${out}" >&2
+              return 1
+            fi
+            printf '%s' "${out}"
+          }
+
           # init_publish creates the mod on the portal, init_upload adds a release to it.
           if curl -fsS -o /dev/null "https://mods.factorio.com/api/mods/${MOD_NAME}"; then
+            init=init_upload
             init_url="https://mods.factorio.com/api/v2/mods/releases/init_upload"
           else
+            init=init_publish
             init_url="https://mods.factorio.com/api/v2/mods/init_publish"
           fi
 
-          init_response="$(
-            curl -fsS -X POST "${init_url}" -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}" -F "mod=${MOD_NAME}"
-          )"
-
+          init_response="$(post "${init}" "${init_url}" -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}" -F "mod=${MOD_NAME}")"
           upload_url="$(jq -r .upload_url <<< "${init_response}")"
 
-          if [ "${init_url##*/}" = "init_publish" ]; then
-            curl -fsS -X POST "${upload_url}" -F "file=@${ZIP_PATH}" \
+          if [ "${init}" = init_publish ]; then
+            post finish_upload "${upload_url}" -F "file=@${ZIP_PATH}" \
               -F "description=<capture/mod/README.md" -F "source_url=https://github.com/${GITHUB_REPOSITORY}"
           else
-            curl -fsS -X POST "${upload_url}" -F "file=@${ZIP_PATH}"
+            post finish_upload "${upload_url}" -F "file=@${ZIP_PATH}"
           fi
+          echo
 
       - name: Tag the release
         run: |
