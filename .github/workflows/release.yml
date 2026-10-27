@@ -116,7 +116,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${FACTORIO_MOD_PORTAL_API_KEY}" ]; then
+          # a key pasted into the secret with a trailing newline would break the Authorization header
+          key="$(printf '%s' "${FACTORIO_MOD_PORTAL_API_KEY}" | tr -d '[:space:]')"
+          if [ -z "${key}" ]; then
             echo "::error::Missing FACTORIO_MOD_PORTAL_API_KEY secret."
             exit 1
           fi
@@ -145,7 +147,7 @@ jobs:
             init_url="https://mods.factorio.com/api/v2/mods/init_publish"
           fi
 
-          init_response="$(post "${init}" "${init_url}" -H "Authorization: Bearer ${FACTORIO_MOD_PORTAL_API_KEY}" -F "mod=${MOD_NAME}")"
+          init_response="$(post "${init}" "${init_url}" -H "Authorization: Bearer ${key}" -F "mod=${MOD_NAME}")"
           upload_url="$(jq -r .upload_url <<< "${init_response}")"
 
           if [ "${init}" = init_publish ]; then
