@@ -35,12 +35,13 @@ restart, such as a train lost when the instance came back from an older save
 ## Install
 
 1. Install the plugin next to Clusterio:
-   `npm install @timeshadedb/clusterio-plugin` (not published yet, use the tarball from
-   `npm pack`). Automatic discovery adds it to `plugin-list.json`.
+   `npm install @timeshadedb/clusterio-plugin`. Automatic discovery adds it to
+   `plugin-list.json`.
 2. The binary: npm installs the `@timeshadedb/bin-<platform>-<arch>` package for the machine as
-   an optional dependency. These packages are built by `npm run build:npm-binaries` and are not
-   published yet. Until then, set `timeshade.binary_path` or the `TIMESHADEDB_BINARY`
-   environment variable, or put a build in `bin/` (`npm run build:binary -- --web`).
+   an optional dependency (win32-x64, linux-x64, linux-arm64, darwin-x64, darwin-arm64). On
+   another platform, or to run your own build, set `timeshade.binary_path` or the
+   `TIMESHADEDB_BINARY` environment variable, or put a build in `bin/`
+   (`npm run build:binary -- --web`).
 3. Restart the controller and the hosts. Instances get the module at their next start (save
    patching).
 4. For icons (machine recipes and chart-tag icons), run
