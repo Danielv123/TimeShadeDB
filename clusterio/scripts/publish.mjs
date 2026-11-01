@@ -11,6 +11,9 @@
 // --assets also copies the binaries to <dir> as timeshadedb-<version>-<goos>-<goarch>(.exe), for the GitHub release.
 // --check only says which packages are not on npm at the version, and writes release=true|false and version to
 // $GITHUB_OUTPUT. In GitHub Actions publishing fails at once for a package that is not on npm at all.
+//
+// Nothing is published while npm has no Clusterio in the plugin's peer range, as while the plugin builds against
+// Clusterio master for a release that is not out yet: --check writes release=false, and publishing fails.
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -24,10 +27,13 @@ const version = pkg.version;
 
 const run = (cmd, cwd = plugin) => execSync(cmd, { cwd, stdio: "inherit" });
 
-/** The versions npm has of package name, or null when it has no such package. */
-function versions(name) {
+/**
+ * npm view <spec> <field> as an array: the versions npm has of a package ("versions"), or those in a range
+ * ("name@range", "version"). Null when npm has no such package, or (npm 12) nothing in the range.
+ */
+function view(spec, field) {
 	try {
-		const out = execSync(`npm view ${name} versions --json`, { cwd: plugin, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+		const out = execSync(`npm view "${spec}" ${field} --json`, { cwd: plugin, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 		const v = JSON.parse(out || "[]");
 		return Array.isArray(v) ? v : [v];
 	} catch (err) {
@@ -42,7 +48,7 @@ const binaries = targets.map(packageName);
 const pending = [];
 const missing = [];
 for (const name of [...binaries, pkg.name]) {
-	const v = versions(name);
+	const v = view(name, "versions");
 	if (v === null) {
 		missing.push(name);
 	}
@@ -52,14 +58,24 @@ for (const name of [...binaries, pkg.name]) {
 }
 console.log(pending.length > 0 ? `not on npm at ${version}: ${pending.join(", ")}` : `every package is on npm at ${version}`);
 
+const clusterio = `@clusterio/lib@${pkg.peerDependencies["@clusterio/lib"]}`;
+const noClusterio = pending.length > 0 && !view(clusterio, "version")?.length;
+if (noClusterio) {
+	console.log(`::warning::npm has no ${clusterio} yet, so ${version} is not released. Until it is out the plugin ` +
+		"builds against Clusterio master (clusterio/README.md, Development).");
+}
+
 if (args.includes("--check")) {
 	if (process.env.GITHUB_OUTPUT) {
-		fs.appendFileSync(process.env.GITHUB_OUTPUT, `release=${pending.length > 0}\nversion=${version}\n`);
+		fs.appendFileSync(process.env.GITHUB_OUTPUT, `release=${pending.length > 0 && !noClusterio}\nversion=${version}\n`);
 	}
 	process.exit(0);
 }
 if (pending.length === 0) {
 	process.exit(0);
+}
+if (noClusterio) {
+	process.exit(1);
 }
 if (missing.length > 0 && process.env.GITHUB_ACTIONS) {
 	console.log(`::error::${missing.join(", ")} not on npm: trusted publishing cannot create a package. Publish it once ` +
