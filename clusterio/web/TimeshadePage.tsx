@@ -1,8 +1,8 @@
 import React, { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Alert, Button, Space, Spin } from "antd";
 import { ControlContext, PageHeader, PageLayout } from "@clusterio/web_ui";
-import { ViewTokenRequest } from "../messages";
-import { refreshDelay, viewerUrl } from "./viewer_url";
+import { ViewTokenRequest } from "../messages.js";
+import { refreshDelay, viewerUrl } from "./viewer_url.js";
 
 type State = { url: string; running: boolean } | { error: string } | undefined;
 
