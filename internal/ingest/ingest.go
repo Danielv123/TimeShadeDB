@@ -636,7 +636,7 @@ func (m *moveEntries) UnmarshalJSON(b []byte) error {
 
 func knownType(t string) bool {
 	switch t {
-	case core.MsgChunk, core.MsgMove, core.MsgAdopt, core.MsgTag, core.MsgRecipe, core.MsgRail,
+	case core.MsgChunk, core.MsgMove, core.MsgAdopt, core.MsgTag, core.MsgPanel, core.MsgRecipe, core.MsgRail,
 		core.MsgSurfaces, core.MsgResynced, core.MsgTrace, core.MsgMap:
 		return true
 	}
@@ -1020,7 +1020,7 @@ func (b *batch) applyMsg(i int, m *wireMsg) {
 		} else {
 			b.jops = append(b.jops, jop{kind: jopAdopt, mapKey: env.Map, src: env.Src, id: m.J, t: b.timeOf(nil)})
 		}
-	case core.MsgTag, core.MsgRecipe, core.MsgRail:
+	case core.MsgTag, core.MsgPanel, core.MsgRecipe, core.MsgRail:
 		err = b.overlay(env, m, b.timeOf(nil))
 	case core.MsgSurfaces:
 		if !m.Created {
@@ -1235,6 +1235,13 @@ func (b *batch) overlay(env *envHeader, m *wireMsg, t core.TimeMs) error {
 	switch m.Type {
 	case core.MsgTag:
 		iv.Kind, iv.Key = core.OverlayTag, inst+"/"+strconv.FormatInt(m.N, 10)
+		if open {
+			iv.Icon, iv.Text = m.Icon, m.Text
+		}
+	case core.MsgPanel:
+		// A display panel's map tag is drawn as a chart tag; "p" keeps its unit number
+		// apart from tag numbers.
+		iv.Kind, iv.Key = core.OverlayTag, inst+"/p"+strconv.FormatInt(m.U, 10)
 		if open {
 			iv.Icon, iv.Text = m.Icon, m.Text
 		}

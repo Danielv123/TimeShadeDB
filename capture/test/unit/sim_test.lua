@@ -784,6 +784,157 @@ t.test("overlays: tags and recipes; removal through mined events; the rail layer
 	t.expect_eq(#of_type(log2, "rail"), 0, "rails off by default")
 end)
 
+--- The panel messages for unit u (or all).
+local function panel_msgs(log, u)
+	local out = {}
+	for _, m in ipairs(of_type(log, "panel")) do
+		if u == nil or m.u == u then
+			out[#out + 1] = m
+		end
+	end
+	return out
+end
+
+t.test("overlays: a display panel on the map sends its icon and text, at most once per PANEL_GAP, and its last state",
+	function()
+		local capture, world, log = boot()
+		local core = capture.core
+		local s = world.surfaces.nauvis
+		local p = fake.panel(s, 10.5, 20.5, { show = true, text = "hello", icon = { type = "virtual", name = "signal-A" } })
+		local quiet = fake.panel(s, 12.5, 20.5, { text = "not on the map" })
+		local enemy = fake.panel(s, 14.5, 20.5, { show = true, text = "theirs", force = fake.force("enemy") })
+		game.tick = 1 -- built on the tick that flushes them
+		for _, e in ipairs({ p, quiet, enemy }) do
+			fire(capture, "on_built_entity", { entity = e })
+		end
+		run(capture, 1, 1)
+		local got = panel_msgs(log)
+		t.expect_eq(#got, 1, "only the captured panel shown on the map")
+		t.expect_same({ got[1].u, got[1].s, got[1].f, got[1].x, got[1].y, got[1].icon, got[1].text },
+			{ p.unit_number, "nauvis", "player", 10.5, 20.5, "virtual/signal-A", "hello" })
+		t.expect_eq(capture.overlays.panels(), 2, "both captured panels are read from now on")
+		-- a circuit changes the text every tick: one state per PANEL_GAP, then the one it settles on
+		local T = 3000
+		run(capture, 2, T, function(tick)
+			p.display_panel_text = "n" .. tick
+		end)
+		got = panel_msgs(log, p.unit_number)
+		t.expect_true(#got >= T / core.PANEL_GAP and #got <= 1 + math.ceil(T / core.PANEL_GAP),
+			"one state per gap: " .. #got)
+		for i = 2, #got do
+			t.expect_true(got[i].__tick - got[i - 1].__tick >= core.PANEL_GAP, "sent " .. got[i].__tick)
+			t.expect_eq(got[i].text, "n" .. got[i].__tick, "the state at the read")
+		end
+		run(capture, T + 1, T + core.PANEL_GAP + core.PANEL_POLL)
+		got = panel_msgs(log, p.unit_number)
+		t.expect_eq(got[#got].text, "n" .. T, "the state it settled on")
+		-- an icon without text still shows; no icon and no text (a circuit panel whose conditions fail) closes
+		T = T + core.PANEL_GAP + core.PANEL_POLL
+		p.display_panel_text = ""
+		run(capture, T + 1, T + core.PANEL_GAP + core.PANEL_POLL)
+		got = panel_msgs(log, p.unit_number)
+		t.expect_same({ got[#got].icon, got[#got].text }, { "virtual/signal-A", "" }, "the icon alone")
+		T = T + core.PANEL_GAP + core.PANEL_POLL
+		p.display_panel_icon = nil
+		run(capture, T + 1, T + core.PANEL_GAP + core.PANEL_POLL)
+		got = panel_msgs(log, p.unit_number)
+		t.expect_true(got[#got].x == nil and got[#got].u == p.unit_number, "nothing to show: closed")
+		local n = #got
+		-- chart display off: nothing more while it stays off
+		T = T + core.PANEL_GAP + core.PANEL_POLL
+		p.display_panel_show_in_chart, p.display_panel_text = false, "hidden"
+		run(capture, T + 1, T + 3 * core.PANEL_GAP)
+		t.expect_eq(#panel_msgs(log, p.unit_number), n, "hidden and already closed: nothing")
+		-- the quiet panel turned on in its GUI: sent when the GUI closes
+		T = T + 3 * core.PANEL_GAP
+		quiet.display_panel_show_in_chart = true
+		game.tick = T + 1
+		fire(capture, "on_gui_closed", { entity = quiet })
+		run(capture, T + 1, T + 1)
+		got = panel_msgs(log, quiet.unit_number)
+		t.expect_same({ #got, got[1].text, got[1].__tick }, { 1, "not on the map", T + 1 }, "sent at the GUI's close")
+		-- mined: closes at once, past the gap; a panel with nothing open sends nothing
+		fire(capture, "on_player_mined_entity", { entity = quiet })
+		quiet.valid = false
+		fire(capture, "on_robot_mined_entity", { entity = p })
+		p.valid = false
+		run(capture, T + 2, T + 2)
+		got = panel_msgs(log, quiet.unit_number)
+		t.expect_true(#got == 2 and got[2].x == nil and got[2].__tick == T + 2, "mined: closed at once")
+		t.expect_eq(#panel_msgs(log, p.unit_number), n, "nothing open: nothing sent")
+		t.expect_eq(capture.overlays.panels(), 0, "neither is read any more")
+		t.expect_eq(#panel_msgs(log, enemy.unit_number), 0, "a force not captured: never sent")
+	end)
+
+t.test("overlays: display panels together send at most PANEL_RATE states a minute, and each its last state", function()
+	local capture, world, log = boot()
+	local core = capture.core
+	local s = world.surfaces.nauvis
+	local list = {}
+	for i = 1, 300 do
+		list[i] = fake.panel(s, i + 0.5, 0.5, { show = true, text = "0" })
+		fire(capture, "on_built_entity", { entity = list[i] })
+	end
+	local T = 7200
+	run(capture, 1, T, function(tick)
+		if tick % 30 == 0 then
+			for _, e in ipairs(list) do
+				e.display_panel_text = tostring(tick)
+			end
+		end
+	end)
+	local n = #panel_msgs(log)
+	t.expect_true(n <= core.PANEL_RATE * (1 + T / 3600) + 1, "at most a minute's worth at once, then the rate: " .. n)
+	t.expect_true(n >= core.PANEL_RATE * (T / 3600), "and the rate is used: " .. n)
+	-- once the circuits settle, every panel gets to its last state
+	local settle = math.ceil(#list / core.PANEL_RATE * 3600) + core.PANEL_GAP + core.PANEL_POLL
+	run(capture, T + 1, T + settle)
+	local last = {}
+	for _, m in ipairs(panel_msgs(log)) do
+		last[m.u] = m.text
+	end
+	local behind = 0
+	for _, e in ipairs(list) do
+		if last[e.unit_number] ~= tostring(T) then
+			behind = behind + 1
+		end
+	end
+	t.expect_eq(behind, 0, "panels not at their last state")
+end)
+
+t.test("overlays: a resync sends every display panel of its chunks (hidden ones close) and writes no storage",
+	function()
+		local capture, world, log = boot()
+		local s, f = world.surfaces.nauvis, game.forces.player
+		fake.chart(s, f, 0, 0, chart(1))
+		local shown = fake.panel(s, 3.5, 4.5, { show = true, icon = { name = "iron-plate" } })
+		local hidden = fake.panel(s, 5.5, 4.5, { text = "x" })
+		local far = fake.panel(s, 100.5, 4.5, { show = true, text = "uncharted chunk" })
+		local before = fake.snapshot(storage)
+		capture.resync("p")
+		local r = capture.resyncing()
+		for tick = 1, 50 do
+			game.tick = tick
+			capture.terrain.walk(storage.timeshade, r)
+			capture.terrain.step(storage.timeshade, tick, r)
+			capture.overlays.step(tick)
+			capture.overlays.poll(tick)
+			capture.outbox.flush(tick)
+		end
+		t.expect_eq(fake.snapshot(storage), before, "the resync and the reads wrote no storage")
+		local a, b = panel_msgs(log, shown.unit_number), panel_msgs(log, hidden.unit_number)
+		t.expect_same({ #a, a[1].icon, a[1].text }, { 1, "item/iron-plate", "" }, "shown: icon (a SignalID without type)")
+		t.expect_true(#b == 1 and b[1].x == nil, "hidden: closed, in case the server still holds it")
+		t.expect_eq(#panel_msgs(log, far.unit_number), 0, "not in a charted chunk")
+		run(capture, 51, 51)
+		t.expect_eq(of_type(log, "resynced")[1].counts.panels, 2)
+		-- read from then on
+		shown.display_panel_text = "now"
+		run(capture, 52, 52 + capture.core.PANEL_POLL)
+		a = panel_msgs(log, shown.unit_number)
+		t.expect_eq(a[#a].text, "now", "a change after the resync")
+	end)
+
 t.test("resync: the walk keeps pace with the reads; the queue stays short with 10,000 charted chunks", function()
 	local capture, world, log = boot()
 	local s, f = world.surfaces.nauvis, game.forces.player

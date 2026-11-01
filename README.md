@@ -5,7 +5,7 @@
 
 # TimeShadeDB
 
-TimeShadeDB records a Factorio map over time and lets you scroll back through its history in the browser. It stores the map chart, trains, vehicles, players, chart tags, machine recipes and optionally rails. Trains are drawn on the rails, also between samples.
+TimeShadeDB records a Factorio map over time and lets you scroll back through its history in the browser. It stores the map chart, trains, vehicles, players, chart tags (also those display panels show on the map), machine recipes and optionally rails. Trains are drawn on the rails, also between samples.
 
 It is one Go binary that stores the data, serves the HTTP API and embeds a WebGL viewer. It runs next to a single game, or as a [Clusterio plugin](clusterio/README.md) for a whole cluster.
 

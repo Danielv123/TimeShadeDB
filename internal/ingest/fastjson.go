@@ -460,8 +460,8 @@ func parseEnvelopeFast(line []byte, env *envHeader, in *interner) (msgs []byte, 
 
 var msgFields = []string{"type", "s", "f", "x", "y", "d", "tick", "m", "j", "trace", "n", "u", "icon", "text", "r", "q", "name", "dir"}
 
-// decodeMsgFast decodes a message of the hot types (chunk, move, adopt, tag, recipe,
-// rail) into m. A chunk's chart is left as text in m.dRaw (m.D stays nil). ok=false:
+// decodeMsgFast decodes a message of the hot types (chunk, move, adopt, tag, panel,
+// recipe, rail) into m. A chunk's chart is left as text in m.dRaw (m.D stays nil). ok=false:
 // decode raw with encoding/json instead (m is then garbage).
 func decodeMsgFast(raw []byte, m *wireMsg, in *interner) bool {
 	l := lexer{b: raw}

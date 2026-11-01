@@ -2,7 +2,8 @@
 
 A Clusterio 2 plugin (`timeshade`) that records every instance's map into a TimeShadeDB server
 and shows it in the Clusterio web UI. It records terrain from the game's own chart, trains,
-vehicles, players, chart tags, machine recipes and optional rails, live and through time.
+vehicles, players, chart tags (also display panels shown on the map), machine recipes and
+optional rails, live and through time.
 
 | Part | What it does |
 |---|---|

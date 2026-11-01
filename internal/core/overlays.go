@@ -7,7 +7,8 @@ type IntervalKind string
 
 // Overlay interval kinds.
 const (
-	// OverlayTag is a chart tag (icon and text).
+	// OverlayTag is a chart tag (icon and text), or what a display panel shows on the
+	// map, which looks the same.
 	OverlayTag IntervalKind = "tag"
 	// OverlayRecipe is an assembling machine's or furnace's recipe and quality.
 	OverlayRecipe IntervalKind = "recipe"
@@ -25,14 +26,15 @@ func (k IntervalKind) Valid() bool {
 type Interval struct {
 	Kind IntervalKind `json:"kind"`
 	// Key identifies the object within (datastore, kind): "<instance>/<tag number>" for
-	// tags, "<instance>/<unit number>" for recipes and rails. Standalone sources use
-	// instance 0.
+	// chart tags, "<instance>/p<unit number>" for display panels (kind tag),
+	// "<instance>/<unit number>" for recipes and rails. Standalone sources use instance 0.
 	Key string `json:"key"`
 	// Instance is the Clusterio instance id that reported the object (0 standalone).
 	Instance int64  `json:"instance"`
 	Start    TimeMs `json:"start"`
 	End      TimeMs `json:"end"`
-	// X, Y is the object position in tiles (machine or rail centre, tag position).
+	// X, Y is the object position in tiles (machine, rail or display panel centre, tag
+	// position).
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
 	// Tag fields: Icon is "<signal type>/<name>" or "", Text the tag text.

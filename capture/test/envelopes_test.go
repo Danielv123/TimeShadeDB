@@ -3,7 +3,7 @@
 //
 // fixtures/game_envelopes.ndjson holds real lines from a headless Factorio run of the
 // standalone mod (capture/test/run_game.mjs --mode test --keep): chunks, trains with car,
-// stop, es and read ticks, a gone, a car, recipes, rails, surfaces and resynced.
+// stop, es and read ticks, a gone, a car, display panels, recipes, rails, surfaces and resynced.
 package capturetest
 
 import (
@@ -132,6 +132,9 @@ func TestGameEnvelopesDecode(t *testing.T) {
 			case core.MsgTag:
 				var m core.TagMsg
 				strict(t, raw, &m)
+			case core.MsgPanel:
+				var m core.PanelMsg
+				strict(t, raw, &m)
 			case core.MsgSurfaces:
 				var m core.SurfacesMsg
 				strict(t, raw, &m)
@@ -154,8 +157,8 @@ func TestGameEnvelopesDecode(t *testing.T) {
 	if err := sc.Err(); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{core.MsgChunk, core.MsgMove, core.MsgRecipe, core.MsgRail, core.MsgSurfaces,
-		core.MsgResynced} {
+	for _, want := range []string{core.MsgChunk, core.MsgMove, core.MsgPanel, core.MsgRecipe, core.MsgRail,
+		core.MsgSurfaces, core.MsgResynced} {
 		if counts[want] == 0 {
 			t.Errorf("no %s message in the fixture", want)
 		}

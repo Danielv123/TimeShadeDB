@@ -426,6 +426,25 @@ async function checkScenario(label, msgs, results, truthText, { journeyPrefix })
 	check(built.length === 3 && rails.some(r => r.u === results.removed_rail && r.name === undefined),
 		`${label}: rail layer: 3 built, 1 removed (${built.length} built at y = -101 of ${rails.length} rail messages)`);
 	note(`${label}: rail layer: ${rails.length} rail messages (the resync sends the rails of each charted chunk)`);
+	// display panels on the map: set by script, changed every tick (the gap holds it back), set by a circuit, removed
+	const pc = results.checks.panel ?? {};
+	check(pc.ok === true, `${label}: display panels set up (${JSON.stringify(pc)})`);
+	const panels = msgs.filter(m => m.type === "panel");
+	const p1 = panels.filter(m => m.u === pc.p1), p2 = panels.filter(m => m.u === pc.p2);
+	check(p1.some(m => m.text === "hello" && m.icon === "item/iron-plate" && m.x === 40.5 && m.y === 40.5),
+		`${label}: display panel set by script sent (${JSON.stringify(p1)})`);
+	const fast = p1.filter(m => m.__tick >= 1200 && m.__tick < 1800);
+	check(fast.length === 1, `${label}: a panel changing every tick for 300 ticks sent once in `
+		+ `the gap (${fast.length})`);
+	check(p1.some(m => m.text === "n1500"), `${label}: its last state sent once the gap was over`);
+	check(p1.at(-1)?.x === undefined && p1.at(-1)?.__tick >= 2000, `${label}: the destroyed panel closed`);
+	check(pc.circuit_on === "circuit on", `${label}: display_panel_text reads the circuit's message (${pc.circuit_on})`);
+	check(p2.some(m => m.text === "circuit on" && m.icon === "virtual/signal-A"),
+		`${label}: the circuit panel's message sent (${JSON.stringify(p2)})`);
+	const final2 = msgs.find(m => m.type === "resynced" && m.trace === "final");
+	check(final2?.counts.panels === 2, `${label}: the final resync sent both panels (${JSON.stringify(final2?.counts)})`);
+	note(`${label}: display panels: ${p1.length} + ${p2.length} messages; circuit panel through ${pc.api}; with its `
+		+ `condition false it reads ${JSON.stringify(pc.circuit_off)} and sent ${JSON.stringify(p2.filter(m => m.__tick > 900))}`);
 	// the 2.0 API checks the driver made
 	const c = results.checks;
 	check(c.loop_closed, `${label}: the loop built through get_rail_extensions closed`);

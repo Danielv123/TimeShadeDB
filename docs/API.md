@@ -180,6 +180,9 @@ grace; the open part of the last 60 s comes from `live.bin` or live events.
 intervals change. Cache: short, with `ETag: "<version>"`. Static: yes, without query
 parameters (the whole history of the tile; `max-age=60`).
 
+What a display panel shows on the map comes as a `tag` interval too, keyed
+`<instance>/p<unit number>` where a chart tag is keyed `<instance>/<tag number>`.
+
 Rail intervals (`kind: "rail"`) carry the rail prototype `name` and `dir`. The viewer draws
 them as an optional debug layer (`web/src/overlays/layers.ts`).
 

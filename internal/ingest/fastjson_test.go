@@ -71,6 +71,7 @@ var fastMsgCases = []struct {
 	{`{"type":"move","s":"nauvis","m":[{"j":"1","car":[]}]}`, true},
 	{`{"type":"move","s":"nauvis","m":[{"j":"1","es":false,"stop":null,"h":null}]}`, true},
 	{`{"type":"tag","s":"nauvis","f":"player","n":3,"x":1,"y":2,"icon":"item/iron-plate","text":"hi"}`, true},
+	{`{"type":"panel","s":"nauvis","f":"player","u":42,"x":1.5,"y":2.5,"icon":"virtual/signal-A","text":"low"}`, true},
 	{`{"type":"recipe","s":"nauvis","f":"player","u":99,"x":1,"y":2,"r":"gear","q":"normal"}`, true},
 	{`{"type":"rail","s":"nauvis","f":"player","u":5,"x":1,"y":2,"name":"straight-rail","dir":4}`, true},
 	{`{"type":"adopt","j":"5.1.7","trace":"t"}`, true},

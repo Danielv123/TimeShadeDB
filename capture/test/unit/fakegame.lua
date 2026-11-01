@@ -56,7 +56,8 @@ function fake.install()
 	}
 	prototypes = {
 		entity = { ["straight-rail"] = { type = "straight-rail" }, ["curved-rail-a"] = { type = "curved-rail-a" },
-			car = { type = "car" }, spidertron = { type = "spider-vehicle" }, locomotive = { type = "locomotive" } },
+			car = { type = "car" }, spidertron = { type = "spider-vehicle" }, locomotive = { type = "locomotive" },
+			["display-panel"] = { type = "display-panel" } },
 		get_entity_filtered = function()
 			return { car = prototypes.entity.car, spidertron = prototypes.entity.spidertron }
 		end,
@@ -240,6 +241,19 @@ local function rail_entity(type, dir, x, y, s0, len, fwd, ends)
 	next_unit = next_unit + 1
 	return object("LuaEntity", { type = type, name = type, direction = dir, position = { x = x, y = y },
 		unit_number = next_unit, s0 = s0, len = len, fwd = fwd, ends = ends })
+end
+
+--- A display panel at (x, y) on surface s, in world.entities (so find_entities_filtered finds it). o: { show, text,
+--- icon, force } become display_panel_show_in_chart, display_panel_text, display_panel_icon (a SignalID) and its force
+--- (default player); tests change them by hand, as a circuit or a GUI would.
+function fake.panel(s, x, y, o)
+	o = o or {}
+	next_unit = next_unit + 1
+	local e = object("LuaEntity", { type = "display-panel", name = "display-panel", surface = s, surface_index = s.index,
+		force = o.force or game.forces.player, position = { x = x, y = y }, unit_number = next_unit,
+		display_panel_show_in_chart = o.show or false, display_panel_text = o.text or "", display_panel_icon = o.icon })
+	fake.world.entities[#fake.world.entities + 1] = e
+	return e
 end
 
 --- A rail path: straight east along y = 1 from x = -2000 to x = L (2-tile straight-rail pieces), a right turn of

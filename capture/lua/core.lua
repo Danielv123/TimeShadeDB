@@ -25,6 +25,12 @@ core.RESYNC_CHARTS = 4 -- chart reads a tick while a resync runs (50,000 chunks 
 core.MACHINES = 8 -- resync machines and rails sent a tick
 core.RAW_QUEUE = 256 -- a chunk re-queued behind this many reads drops its raw chart (see core.debounce)
 
+-- Display panels shown on the map (overlays.lua).
+core.PANELS = 8 -- display panels read a tick at most
+core.PANEL_POLL = 60 -- ticks at least from one read of a display panel to its next
+core.PANEL_GAP = 600 -- ticks at least from one display panel's sent state to its next (a fast circuit sends no more)
+core.PANEL_RATE = 120 -- display panel states all panels together send a minute at most (a minute's worth at once)
+
 -- Movers.
 core.WALK = 8 -- movers polled a tick
 core.SCAN = 30 -- ticks at least from one scan to the next
@@ -43,6 +49,24 @@ core.RAMP_READS = 3 -- on a straight a train's read looks at the rail under its 
 core.SEEN_MAX = 12 -- rails a turning train's read walks back over a straight to find a piece the reads between missed
 core.LIVE_GAP = 120 -- ticks at game speed 1 a moving train goes without a sample at most, so live viewers stay ~2 s behind
 core.CAR_MAX = 100 -- carriages listed in `car`; with 200 kinds and a 200-byte name a sample stays under a line
+
+--- Take one of `rate` tokens a minute from bucket b ({ tokens, tick }) at tick, refilled at rate / 3600 a tick and
+--- holding at most rate: true when one was there.
+function core.token(b, tick, rate)
+	local tokens = b.tokens
+	if tokens == nil then
+		tokens = rate
+	else
+		tokens = math.min(rate, tokens + math.max(0, tick - b.tick) * rate / 3600)
+	end
+	b.tick = tick
+	if tokens < 1 then
+		b.tokens = tokens
+		return false
+	end
+	b.tokens = tokens - 1
+	return true
+end
 
 -- Transport. The defaults keep lines short; each host raises them with core.limits (the Clusterio module to 64 KiB
 -- lines, the standalone mod's files to 200,000 bytes), so long trains are not cut short.
