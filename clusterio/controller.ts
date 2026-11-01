@@ -208,9 +208,9 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 	controller.handle(EnvelopesRequest, async (request: EnvelopesRequest, src: lib.Address) => {
 		// Clusterio runs the shutdown hook before it closes the links, so a request can arrive after the queue closed.
 		// It fails, and the instance keeps the batch and sends it again after the reconnect (the map server skips
-		// what it has by seq).
+		// what it has by seq). A registered error class, so the link does not log it as unexpected.
 		if (queue.isClosed) {
-			throw new lib.RequestError("timeshade: the controller is shutting down");
+			throw new lib.UnavailableError("timeshade: the controller is shutting down");
 		}
 		await envelopes(request, src);
 	});
@@ -218,7 +218,7 @@ export default async function loadControllerPlugin(context: ControllerPluginCont
 	controller.handle(ViewTokenRequest, async (_request: ViewTokenRequest, src: lib.Address) => {
 		const user = controller.wsServer.controlConnections.get(src.id)?.user;
 		if (!user) {
-			throw new lib.RequestError("view tokens are only given to user connections");
+			throw new lib.ForbiddenError("view tokens are only given to user connections");
 		}
 		const { token, expiresMs } = mintViewToken(user.name, controller.authSecret);
 		return new ViewTokenResponse(token, expiresMs, sidecar.state === "running");

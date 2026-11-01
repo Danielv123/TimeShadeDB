@@ -59,7 +59,7 @@ export function fakeConfig(fields: Record<string, unknown>) {
 		fields,
 		get(name: string) {
 			if (!(name in fields)) {
-				throw new lib.InvalidField(`No field named '${name}'`);
+				throw new lib.InvalidFieldError(`No field named '${name}'`);
 			}
 			return fields[name];
 		},
