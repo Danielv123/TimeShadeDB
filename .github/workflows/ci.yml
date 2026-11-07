@@ -62,3 +62,64 @@ jobs:
           name: timeshadedb-exporter-factorio-mod
           path: build/packages/timeshadedb_exporter_*.zip
           if-no-files-found: error
+
+  # The Clusterio plugin builds against Clusterio master: 2.1, which it needs, is not on npm yet. Master's packages are
+  # linked over the 2.0 ones npm ci installs (clusterio/README.md, Development). Once 2.1 is out, require ^2.1.0 in
+  # devDependencies and drop the Clusterio checkout and the link.
+  clusterio-plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check out Clusterio master
+        uses: actions/checkout@v4
+        with:
+          repository: clusterio/clusterio
+          ref: master
+          path: clusterio-master
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: clusterio-master/package.json
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            clusterio/package-lock.json
+            web/package-lock.json
+
+      - name: Build Clusterio master
+        working-directory: clusterio-master
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm build
+
+      - name: Install the plugin's dependencies, with Clusterio master's packages
+        working-directory: clusterio
+        run: |
+          npm ci
+          npm install --no-save --ignore-scripts ../clusterio-master/packages/{lib,controller,host,web_ui}
+
+      # The binary with the viewer, for the end to end test.
+      - name: Build
+        working-directory: clusterio
+        run: |
+          node scripts/build-binary.mjs --web
+          npm run build
+
+      - name: Test
+        working-directory: clusterio
+        run: npm test

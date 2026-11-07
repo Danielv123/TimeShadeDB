@@ -77,6 +77,8 @@ A version bump on master is a release. Once CI passes, the Release workflow publ
 
 So the mod and the plugin release on their own. Both carry the capture Lua: the mod for single games, the plugin's save-patch module for Clusterio. A capture fix needs both bumped to reach both. The workflow can also be run by hand from GitHub Actions to retry a release that failed.
 
+The plugin is not released while npm has no Clusterio in its peer range. It needs Clusterio 2.1, which is not out yet, so until then a plugin version bump releases nothing and the run warns about it.
+
 Each run that releases something also makes a GitHub release, on the plugin's tag, or on the mod's when only the mod was released. It carries the mod zip, the timeshadedb binaries (`timeshadedb-<version>-<os>-<arch>`, the same ones as the npm binary packages) and `SHA256SUMS`. What the run did not release comes from the previous GitHub release, so the latest one always has both.
 
 The mod needs the secret `FACTORIO_MOD_PORTAL_API_KEY` in the `factorio-mod-portal` environment: an API key with the `ModPortal: Publish Mods` permission (the first release) and `ModPortal: Upload Mods` (every version after it).

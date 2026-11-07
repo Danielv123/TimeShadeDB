@@ -85,8 +85,9 @@ async function setup(opts: { upstream?: boolean } = {}) {
 		res.end(body);
 	});
 	const app = express();
-	const require = createRequire(import.meta.url);
-	app.use(require("compression")());
+	// From the controller's own dependencies: npm hoists it next to the plugin, a linked Clusterio checkout does not.
+	const controller = createRequire(import.meta.url).resolve("@clusterio/controller/package.json");
+	app.use(createRequire(controller)("compression")());
 	addRoutes(app, {
 		upstream: () => (opts.upstream === false ? undefined : { url: up.url, readToken: "sidecar-read" }),
 		secret: () => secret,

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
+import * as lib from "@clusterio/lib";
 import loadControllerPlugin from "../controller.js";
 import { EnvelopesEvent, EnvelopesRequest, ViewTokenRequest } from "../messages.js";
 import { fakeControllerContext, fakeUser, until } from "./fakes.js";
@@ -85,7 +86,7 @@ test("after the shutdown hook closed the queue, a request fails (the instance ke
 		assert.ok(plugin.queue.isClosed);
 		await assert.rejects(
 			c.deliver(EnvelopesRequest, new EnvelopesRequest([env(7)]), { type: "instance", id: 1 }),
-			/shutting down/,
+			(err: Error) => err instanceof lib.UnavailableError && /shutting down/.test(err.message),
 		);
 		await c.deliver(EnvelopesEvent, new EnvelopesEvent([env(8)]), { type: "instance", id: 1 });
 	} finally {
@@ -105,7 +106,10 @@ test("view tokens: given to user connections over the link, accepted by the prox
 		assert.equal(ok.status, 200);
 		assert.deepEqual(await ok.json(), { path: "/api/v3/catalog", query: "" }, "the fake sidecar saw its read token");
 		assert.equal((await fetch(`${c.web.url}/api/timeshade/api/v3/catalog`)).status, 401);
-		await assert.rejects(c.deliver(ViewTokenRequest, new ViewTokenRequest(), { type: "control", id: 8 }), /user connections/);
+		await assert.rejects(
+			c.deliver(ViewTokenRequest, new ViewTokenRequest(), { type: "control", id: 8 }),
+			(err: Error) => err instanceof lib.ForbiddenError && /user connections/.test(err.message),
+		);
 	} finally {
 		await c.call("shutdown");
 		await c.web.close();

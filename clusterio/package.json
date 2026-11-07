@@ -31,7 +31,7 @@
 		"README.md"
 	],
 	"scripts": {
-		"build": "node scripts/build-module.mjs && tsc --build && webpack-cli --mode production",
+		"build": "node scripts/build-module.mjs && tsc --build && vite build",
 		"build:node": "node scripts/build-module.mjs && tsc --build",
 		"build:binary": "node scripts/build-binary.mjs",
 		"test": "node --test \"dist/node/test/*.test.js\"",
@@ -39,9 +39,9 @@
 		"release": "node scripts/publish.mjs"
 	},
 	"peerDependencies": {
-		"@clusterio/controller": "^2.0.2",
-		"@clusterio/host": "^2.0.2",
-		"@clusterio/lib": "^2.0.2"
+		"@clusterio/controller": "^2.1.0",
+		"@clusterio/host": "^2.1.0",
+		"@clusterio/lib": "^2.1.0"
 	},
 	"peerDependenciesMeta": {
 		"@clusterio/controller": {
@@ -52,14 +52,14 @@
 		}
 	},
 	"dependencies": {
-		"@sinclair/typebox": "^0.30.6",
+		"@sinclair/typebox": "^0.34.52",
 		"jsonwebtoken": "^9.0.3"
 	},
 	"devDependencies": {
-		"@clusterio/controller": "^2.0.2",
-		"@clusterio/host": "^2.0.2",
-		"@clusterio/lib": "^2.0.2",
-		"@clusterio/web_ui": "^2.0.2",
+		"@clusterio/controller": "^2.0.3",
+		"@clusterio/host": "^2.0.3",
+		"@clusterio/lib": "^2.0.3",
+		"@clusterio/web_ui": "^2.0.3",
 		"@types/express": "^5.0.6",
 		"@types/jsonwebtoken": "^9.0.10",
 		"@types/node": "^24.19.2",
@@ -70,8 +70,6 @@
 		"react": "^18.3.1",
 		"react-dom": "^18.3.1",
 		"typescript": "^5.9.3",
-		"webpack": "^5.112.0",
-		"webpack-cli": "^7.2.3",
-		"webpack-merge": "5.9.0"
+		"vite": "^8.3.4"
 	}
 }

@@ -1,9 +1,13 @@
 # TimeShadeDB map for Clusterio
 
-A Clusterio 2 plugin (`timeshade`) that records every instance's map into a TimeShadeDB server
+A Clusterio 2.1 plugin (`timeshade`) that records every instance's map into a TimeShadeDB server
 and shows it in the Clusterio web UI. It records terrain from the game's own chart, trains,
 vehicles, players, chart tags (also display panels shown on the map), machine recipes and
 optional rails, live and through time.
+
+Clusterio 2.1 is not released yet, so this version builds against Clusterio master (see
+[Development](#development)) and is not on npm until 2.1 is. It does not load on Clusterio 2.0:
+use 0.1.1 from npm there.
 
 | Part | What it does |
 |---|---|
@@ -158,9 +162,14 @@ same URL.
 
 ## Development
 
+Until Clusterio 2.1 is on npm, build a checkout of Clusterio master (`pnpm install` and
+`pnpm build` in it) and link its packages over the 2.0 ones npm installs. `npm install` and
+`npm ci` remove the link, so link again after each. CI does the same.
+
 ```sh
 cd clusterio
 npm install
+npm install --no-save --ignore-scripts <clusterio>/packages/{lib,controller,host,web_ui}
 npm run build              # module/ (from ../capture), dist/node, dist/web
 npm run build:binary -- --web   # bin/timeshadedb(.exe) with the viewer built for sub-paths
 npm test
