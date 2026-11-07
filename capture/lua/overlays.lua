@@ -158,13 +158,16 @@ end
 -- changes (a circuit network picks the message), so the known panels are read in turn: each at most every
 -- core.PANEL_POLL ticks, core.PANELS a tick. A panel sends its state at most every core.PANEL_GAP ticks, and all panels
 -- together at most core.PANEL_RATE a minute, so a panel driven by a fast circuit cannot flood the database. A change
--- held back goes out at a later read, so the last state sent is the one the panel ends up showing.
+-- held back by the gap goes out at a later read; one held back by the rate waits in line for a token, so the tokens go
+-- out in the order the changes came and busy panels cannot keep one that settled from ever sending. Either way the last
+-- state sent is the one the panel ends up showing.
 --
 -- A panel is known from its build (or a closed GUI, a paste) and from the resync's chunks, which run at every load.
--- panels: unit number -> { e, u, s, f, x, y, icon, text, next, due, gone }, where icon and text are what was sent last
--- (icon nil: nothing open, or nothing sent), next the tick the next send may go and due the tick of the next read. ring
--- holds them in order of due (every push is due core.PANEL_POLL ticks later); gone ones are dropped as they come up.
-local panels, panel_count, ring, bucket = {}, 0, core.queue(64), {}
+-- panels: unit number -> { e, u, s, f, x, y, icon, text, next, due, waits, gone }, where icon and text are what was
+-- sent last (icon nil: nothing open, or nothing sent), next the tick the next send may go, due the tick of the next
+-- read and waits true while in line. ring holds them in order of due (every push is due core.PANEL_POLL ticks later),
+-- line the ones waiting for a token, oldest first; gone ones are dropped as they come up.
+local panels, panel_count, ring, line, bucket = {}, 0, core.queue(64), core.queue(64), {}
 
 --- What panel e shows on the map: its icon ("<signal type>/<name>", or "" without one) and text, or nil when it shows
 --- nothing there (chart display off, or no icon and no text, as a circuit panel whose conditions all fail).
@@ -219,19 +222,25 @@ local function track(e, tick)
 	return r
 end
 
---- Read panel record r; send its state when it changed and both limits allow.
-local function check(r, tick)
+--- Read panel record r; send its state when it changed and both limits allow. A change the rate holds back joins the
+--- line; `turn` is the read at its turn there.
+local function check(r, tick, turn)
 	local e = r.e
 	if not e.valid then
 		forget(r, true) -- gone without a mined event (its surface deleted, destroyed by a script without raising)
 		return
 	end
-	local icon, text = panel_state(e)
-	if icon == r.icon and text == r.text then
-		return
+	if r.waits and not turn then
+		return -- read at its turn
 	end
-	if tick < r.next or not core.token(bucket, tick, core.PANEL_RATE) then
+	local icon, text = panel_state(e)
+	if (icon == r.icon and text == r.text) or tick < r.next then
 		return -- the next read sends it, if it still differs
+	end
+	if (core.size(line) > 0 and not turn) or not core.token(bucket, tick, core.PANEL_RATE) then
+		r.waits = true
+		core.push(line, r)
+		return
 	end
 	send_panel(r, icon, text)
 	r.next = tick + core.PANEL_GAP
@@ -244,8 +253,20 @@ local function resend_panel(e, tick)
 	send_panel(r, icon, text)
 end
 
---- The per-tick read: the panels that are due, at most core.PANELS.
+--- The per-tick read: while there are tokens, the line's first panels; then the panels that are due. At most
+--- core.PANELS of each.
 function overlays.poll(tick)
+	for _ = 1, core.PANELS do
+		local r = core.peek(line)
+		if not (r and core.token(bucket, tick, core.PANEL_RATE, true)) then
+			break
+		end
+		core.pop(line)
+		r.waits = nil
+		if not r.gone then
+			check(r, tick, true)
+		end
+	end
 	for _ = 1, core.PANELS do
 		local r = core.peek(ring)
 		if not r or r.due > tick then
@@ -369,7 +390,7 @@ end
 
 function overlays.reset()
 	queue = core.queue()
-	panels, panel_count, ring, bucket = {}, 0, core.queue(64), {}
+	panels, panel_count, ring, line, bucket = {}, 0, core.queue(64), core.queue(64), {}
 end
 
 return overlays

@@ -104,7 +104,8 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   every 60 ticks, 8 a tick). A panel sends a change at most every 600 ticks, and all panels
   together at most 120 a minute (a minute's worth at once). A change held back is sent at a
   later read, so a panel a circuit flips every tick sends its state every 10 s and ends on the
-  state it settles on. Panels are found when built, at a closed GUI or a paste, and in each
+  state it settles on. Changes the shared limit holds back are sent in the order they came, so
+  busy panels cannot keep a settled one waiting for good. Panels are found when built, at a closed GUI or a paste, and in each
   charted chunk a resync walks (one at every load), so a panel in a chunk charted after the
   last resync is missed until it is touched or the next resync. The Clusterio module uses the
   default limits.

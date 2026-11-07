@@ -51,8 +51,8 @@ core.LIVE_GAP = 120 -- ticks at game speed 1 a moving train goes without a sampl
 core.CAR_MAX = 100 -- carriages listed in `car`; with 200 kinds and a 200-byte name a sample stays under a line
 
 --- Take one of `rate` tokens a minute from bucket b ({ tokens, tick }) at tick, refilled at rate / 3600 a tick and
---- holding at most rate: true when one was there.
-function core.token(b, tick, rate)
+--- holding at most rate: true when one was there. With keep it only tells, taking none.
+function core.token(b, tick, rate, keep)
 	local tokens = b.tokens
 	if tokens == nil then
 		tokens = rate
@@ -60,9 +60,9 @@ function core.token(b, tick, rate)
 		tokens = math.min(rate, tokens + math.max(0, tick - b.tick) * rate / 3600)
 	end
 	b.tick = tick
-	if tokens < 1 then
+	if tokens < 1 or keep then
 		b.tokens = tokens
-		return false
+		return tokens >= 1
 	end
 	b.tokens = tokens - 1
 	return true

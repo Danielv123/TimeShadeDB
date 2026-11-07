@@ -267,8 +267,9 @@ These are protocol-level requirements. The capture in `capture/lua/` meets them
   its message), so read the panels in turn: each at most every 60 ticks, 8 a tick. Send a
   panel's state at most once per 600 ticks, and at most 120 states a minute for all panels
   together (up to a minute's worth at once), so a fast circuit cannot flood the database. A
-  change held back goes out at a later read, so the last state sent is the one the panel
-  shows. A removal (mined, died) closes at once. The standalone mod's map settings set both
+  change the per-panel limit holds back goes out at a later read. One the shared limit holds
+  back waits in line, oldest first, so busy panels cannot keep a settled one from sending.
+  Either way the last state sent is the one the panel shows. A removal (mined, died) closes at once. The standalone mod's map settings set both
   limits.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for
   every player. A train's last read since its last sample is sent before its gone, or, at a

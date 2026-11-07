@@ -902,6 +902,39 @@ t.test("overlays: display panels together send at most PANEL_RATE states a minut
 	t.expect_eq(behind, 0, "panels not at their last state")
 end)
 
+t.test("overlays: with the rate used up by busy panels, one that settles still gets to its last state", function()
+	local capture, world, log = boot()
+	local core = capture.core
+	local s = world.surfaces.nauvis
+	-- three times the panels the rate keeps up with, one in the middle changing once
+	local busy, settled = {}, nil
+	for i = 1, 3 * core.PANEL_RATE * core.PANEL_GAP / 3600 do
+		local e = fake.panel(s, i + 0.5, 0.5, { show = true, text = "0" })
+		fire(capture, "on_built_entity", { entity = e })
+		busy[#busy + 1] = e
+		if i == core.PANEL_RATE * core.PANEL_GAP / 3600 then
+			settled = fake.panel(s, i + 0.5, 1.5, { show = true, text = "first" })
+			fire(capture, "on_built_entity", { entity = settled })
+		end
+	end
+	local change, T = 3 * 3600, 20 * 3600
+	run(capture, 1, T, function(tick)
+		if tick % 30 == 0 then
+			for _, e in ipairs(busy) do
+				e.display_panel_text = tostring(tick)
+			end
+		end
+		if tick == change then
+			settled.display_panel_text = "last"
+		end
+	end)
+	local got = panel_msgs(log, settled.unit_number)
+	t.expect_eq(got[#got].text, "last", "the settled panel's last state")
+	t.expect_true(got[#got].__tick < change + 3600, "within a minute: " .. got[#got].__tick)
+	local n = #panel_msgs(log)
+	t.expect_true(n <= core.PANEL_RATE * (1 + T / 3600) + 1, "still the rate: " .. n)
+end)
+
 t.test("overlays: a resync sends every display panel of its chunks (hidden ones close) and writes no storage",
 	function()
 		local capture, world, log = boot()
