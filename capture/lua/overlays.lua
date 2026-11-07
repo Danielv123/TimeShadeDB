@@ -1,11 +1,13 @@
 -- SPDX-License-Identifier: BlueOak-1.0.0
 -- Ported from illisis/minimap module/overlays.lua (Blue Oak Model License 1.0.0, see capture/README.md).
 --
--- Overlays (docs/PROTOCOL.md section 3): chart tags, machine recipes and, when enabled, rail entities. Each change
--- sends the new state; the server closes the old one. Removal is seen through the mined and died events, so nothing is
--- registered with script.register_on_object_destroyed and the resync can stay read-only.
+-- Overlays (docs/PROTOCOL.md section 3): chart tags, display panels shown on the map, machine recipes and, when
+-- enabled, rail entities. Each change sends the new state; the server closes the old one. Removal is seen through the
+-- mined and died events, so nothing is registered with script.register_on_object_destroyed and the resync can stay
+-- read-only.
 --
--- The resync's queue of machines and rails is a file-local: it only feeds printed lines.
+-- The resync's queue of machines, rails and panels, and the display panels read in turn, are file-locals: they only
+-- feed printed lines.
 local name = ...
 local P = type(name) == "string" and name:match("^(.*[./])[^./]*$") or ""
 local core = require(P .. "core")
@@ -32,23 +34,43 @@ overlays.RAIL = {
 	["rail-ramp"] = true,
 }
 
-local rail_types
---- The rail types this game has (a type missing from the prototypes would make find_entities_filtered fail).
-local function rail_list()
-	if not rail_types then
-		rail_types = {}
-		local present = {}
+overlays.PANEL = "display-panel"
+
+local present
+--- The entity types of `set` this game has, sorted (a type missing from the prototypes would make
+--- find_entities_filtered fail).
+local function types_of(set)
+	if not present then
+		present = {}
 		for _, p in pairs(prototypes.entity) do
 			present[p.type] = true
 		end
-		for t in pairs(overlays.RAIL) do
-			if present[t] then
-				rail_types[#rail_types + 1] = t
-			end
+	end
+	local list = {}
+	for t in pairs(set) do
+		if present[t] then
+			list[#list + 1] = t
 		end
-		table.sort(rail_types)
+	end
+	table.sort(list)
+	return list
+end
+
+local rail_types, panel_types
+--- The rail types this game has.
+local function rail_list()
+	if not rail_types then
+		rail_types = types_of(overlays.RAIL)
 	end
 	return rail_types
+end
+
+--- The display panel type, if this game has it: { "display-panel" } or {}.
+local function panel_list()
+	if not panel_types then
+		panel_types = types_of{ [overlays.PANEL] = true }
+	end
+	return panel_types
 end
 
 local queue = core.queue()
@@ -132,11 +154,151 @@ local function wanted(st, entity)
 	return st and st.configured and st.forces[entity.force.index] and captured(st, entity.surface, entity.position)
 end
 
+-- Display panels with "show in chart" put their icon and text on the map, as a chart tag does. Nothing tells when that
+-- changes (a circuit network picks the message), so the known panels are read in turn: each at most every
+-- core.PANEL_POLL ticks, core.PANELS a tick. A panel sends its state at most every core.PANEL_GAP ticks, and all panels
+-- together at most core.PANEL_RATE a minute, so a panel driven by a fast circuit cannot flood the database. A change
+-- held back by the gap goes out at a later read; one held back by the rate waits in line for a token, so the tokens go
+-- out in the order the changes came and busy panels cannot keep one that settled from ever sending. Either way the last
+-- state sent is the one the panel ends up showing.
+--
+-- A panel is known from its build (or a closed GUI, a paste) and from the resync's chunks, which run at every load.
+-- panels: unit number -> { e, u, s, f, x, y, icon, text, next, due, waits, gone }, where icon and text are what was
+-- sent last (icon nil: nothing open, or nothing sent), next the tick the next send may go, due the tick of the next
+-- read and waits true while in line. ring holds them in order of due (every push is due core.PANEL_POLL ticks later),
+-- line the ones waiting for a token, oldest first; gone ones are dropped as they come up.
+local panels, panel_count, ring, line, bucket = {}, 0, core.queue(64), core.queue(64), {}
+
+--- What panel e shows on the map: its icon ("<signal type>/<name>", or "" without one) and text, or nil when it shows
+--- nothing there (chart display off, or no icon and no text, as a circuit panel whose conditions all fail).
+local function panel_state(e)
+	if not e.display_panel_show_in_chart then
+		return nil
+	end
+	local icon, text = e.display_panel_icon, e.display_panel_text or ""
+	icon = icon and icon.name and ((icon.type or "item") .. "/" .. icon.name) or ""
+	if icon == "" and text == "" then
+		return nil
+	end
+	return icon, text
+end
+
+--- Send panel record r's state: icon and text, or (icon nil) a removal.
+local function send_panel(r, icon, text)
+	local msg = { type = "panel", s = r.s, f = r.f, u = r.u }
+	if icon then
+		msg.x, msg.y, msg.icon, msg.text = r.x, r.y, icon, text
+	end
+	outbox.send(msg)
+	r.icon, r.text = icon, text
+end
+
+--- Stop reading panel record r. With `close` (it was removed) its state closes unless nothing was sent for it.
+local function forget(r, close)
+	if r.gone then
+		return
+	end
+	r.gone = true
+	panels[r.u] = nil
+	panel_count = panel_count - 1
+	if close and r.icon then
+		send_panel(r, nil)
+	end
+end
+
+--- The record of panel e, made (and queued for reads) when new.
+local function track(e, tick)
+	local u = e.unit_number
+	local r = panels[u]
+	if r then
+		r.e = e
+		return r
+	end
+	local p = e.position
+	r = { e = e, u = u, s = e.surface.name, f = e.force.name, x = p.x, y = p.y, next = 0, due = tick + core.PANEL_POLL }
+	panels[u] = r
+	panel_count = panel_count + 1
+	core.push(ring, r)
+	return r
+end
+
+--- Read panel record r; send its state when it changed and both limits allow. A change the rate holds back joins the
+--- line; `turn` is the read at its turn there.
+local function check(r, tick, turn)
+	local e = r.e
+	if not e.valid then
+		forget(r, true) -- gone without a mined event (its surface deleted, destroyed by a script without raising)
+		return
+	end
+	if r.waits and not turn then
+		return -- read at its turn
+	end
+	local icon, text = panel_state(e)
+	if (icon == r.icon and text == r.text) or tick < r.next then
+		return -- the next read sends it, if it still differs
+	end
+	if (core.size(line) > 0 and not turn) or not core.token(bucket, tick, core.PANEL_RATE) then
+		r.waits = true
+		core.push(line, r)
+		return
+	end
+	send_panel(r, icon, text)
+	r.next = tick + core.PANEL_GAP
+end
+
+--- A resync's panel: its state now, past both limits (a removal too, so the server closes what it no longer shows).
+local function resend_panel(e, tick)
+	local r = track(e, tick)
+	local icon, text = panel_state(e)
+	send_panel(r, icon, text)
+end
+
+--- The per-tick read: while there are tokens, the line's first panels; then the panels that are due. At most
+--- core.PANELS of each.
+function overlays.poll(tick)
+	for _ = 1, core.PANELS do
+		local r = core.peek(line)
+		if not (r and core.token(bucket, tick, core.PANEL_RATE, true)) then
+			break
+		end
+		core.pop(line)
+		r.waits = nil
+		if not r.gone then
+			check(r, tick, true)
+		end
+	end
+	for _ = 1, core.PANELS do
+		local r = core.peek(ring)
+		if not r or r.due > tick then
+			return
+		end
+		core.pop(ring)
+		if not r.gone then
+			check(r, tick)
+			if not r.gone then
+				r.due = tick + core.PANEL_POLL
+				core.push(ring, r)
+			end
+		end
+	end
+end
+
+--- Display panels being read.
+function overlays.panels()
+	return panel_count
+end
+
 --- A build's entity, a paste's destination, a closed GUI's entity: machines send their recipe, rails (when enabled)
---- their state.
+--- their state, display panels theirs (within the limits) and are read from then on.
 function overlays.on_entity(st, e)
 	local entity = e.entity or e.destination
 	if not (entity and entity.valid) then
+		return
+	end
+	if entity.type == overlays.PANEL then
+		if wanted(st, entity) then
+			check(track(entity, game.tick), game.tick)
+		end
 		return
 	end
 	local machine = MACHINE[entity.type]
@@ -152,10 +314,21 @@ function overlays.on_entity(st, e)
 	end
 end
 
---- A mined or destroyed entity: a machine's recipe or a rail closes.
+--- A mined or destroyed entity: a machine's recipe, a rail or a display panel's map tag closes (a panel's at once,
+--- whatever the limits: it happens once).
 function overlays.on_removed(st, e)
 	local entity = e.entity
 	if not (entity and entity.valid) then
+		return
+	end
+	if entity.type == overlays.PANEL then
+		local r = panels[entity.unit_number]
+		if r then
+			forget(r, true)
+		elseif wanted(st, entity) then
+			-- not read yet (built before a load whose resync has not reached it): whatever the server holds closes
+			outbox.send{ type = "panel", s = entity.surface.name, f = entity.force.name, u = entity.unit_number }
+		end
 		return
 	end
 	local machine = MACHINE[entity.type]
@@ -167,14 +340,20 @@ function overlays.on_removed(st, e)
 		u = entity.unit_number }
 end
 
---- A resync's forced chunk: its machines (and rails) join the resync's queue. An entity across two chunks is sent twice;
---- the server drops the repeat.
+--- A resync's forced chunk: its machines, display panels (and rails) join the resync's queue. An entity across two
+--- chunks is sent twice; the server drops the repeat.
 function overlays.chunk_resync(st, surface, force, pos, r)
 	local x, y = pos.x * 32, pos.y * 32
 	local area = { { x, y }, { x + 32, y + 32 } }
 	for _, e in pairs(surface.find_entities_filtered{ area = area, type = MACHINE_TYPES, force = force }) do
 		core.push(queue, e)
 		r.machines = r.machines + 1
+	end
+	if #panel_list() > 0 then
+		for _, e in pairs(surface.find_entities_filtered{ area = area, type = panel_list(), force = force }) do
+			core.push(queue, e)
+			r.panels = (r.panels or 0) + 1
+		end
 	end
 	if st.rails then
 		for _, e in pairs(surface.find_entities_filtered{ area = area, type = rail_list(), force = force }) do
@@ -185,7 +364,8 @@ function overlays.chunk_resync(st, surface, force, pos, r)
 end
 
 --- The per-tick step: at most core.MACHINES of the resync's queue.
-function overlays.step()
+function overlays.step(tick)
+	tick = tick or game.tick
 	for _ = 1, core.MACHINES do
 		local e = core.pop(queue)
 		if not e then
@@ -194,6 +374,8 @@ function overlays.step()
 		if e.valid then
 			if MACHINE[e.type] then
 				overlays.send_machine(e)
+			elseif e.type == overlays.PANEL then
+				resend_panel(e, tick)
 			else
 				overlays.send_rail(e)
 			end
@@ -208,6 +390,7 @@ end
 
 function overlays.reset()
 	queue = core.queue()
+	panels, panel_count, ring, line, bucket = {}, 0, core.queue(64), core.queue(64), {}
 end
 
 return overlays

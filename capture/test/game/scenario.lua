@@ -165,6 +165,39 @@ function T.init(cfg)
 	out("init done: loop closed " .. tostring(closed) .. ", rails " .. serpent.line(used))
 end
 
+--- Two display panels in charted chunk (1, 1): one set by script, and one a circuit sets, its message shown while a
+--- constant combinator sends signal-A (LuaDisplayPanelControlBehavior: add_record in 2.1, messages in 2.0).
+local function panels(s)
+	local p1 = s.create_entity{ name = "display-panel", position = { 40.5, 40.5 }, force = "player", raise_built = true }
+	p1.display_panel_text = "hello"
+	p1.display_panel_icon = { type = "item", name = "iron-plate" }
+	p1.display_panel_show_in_chart = true
+	local p2 = s.create_entity{ name = "display-panel", position = { 40.5, 44.5 }, force = "player", raise_built = true }
+	local cc = s.create_entity{ name = "constant-combinator", position = { 42.5, 44.5 }, force = "player" }
+	local res = {}
+	local ok, err = pcall(function()
+		local ccb = cc.get_or_create_control_behavior()
+		local section = ccb.sections_count > 0 and ccb.get_section(1) or ccb.add_section()
+		section.set_slot(1, { value = { type = "virtual", name = "signal-A", quality = "normal" }, min = 1 })
+		local red = defines.wire_connector_id.circuit_red
+		assert(cc.get_wire_connector(red, true).connect_to(p2.get_wire_connector(red, true)), "the wire did not connect")
+		local msg = { text = "circuit on", icon = { type = "virtual", name = "signal-A" },
+			condition = { first_signal = { type = "virtual", name = "signal-A" }, comparator = ">", constant = 0 } }
+		local dcb = p2.get_or_create_control_behavior()
+		if dcb.add_record then
+			dcb.add_record(msg)
+			res.api = "add_record"
+		else
+			dcb.messages = { msg }
+			res.api = "messages"
+		end
+		p2.display_panel_show_in_chart = true
+	end)
+	res.ok = ok or tostring(err)
+	res.p1, res.p2 = p1.unit_number, p2.unit_number
+	return p1, cc, res
+end
+
 --- The straight rail centred at (x, y) on the lab surface.
 local function s_rail(x, y)
 	return game.get_surface(SURFACE).find_entities_filtered{ name = "straight-rail", position = { x, y }, radius = 1 }[1]
@@ -246,6 +279,10 @@ function T.tick(api, cfg, t)
 		end
 		speed(g.b, (not g.b_phase and 0.4) or (g.b_phase == "rest" and t > g.b_at and 0.3) or 0)
 	end
+	-- display panel 1's text changes every tick, as a fast circuit would make it: the capture sends it once a gap
+	if t >= 1200 and t <= 1500 and g.panel then
+		g.panel.display_panel_text = "n" .. t
+	end
 	if t >= 100 and t <= 400 and g.car.valid then
 		g.car.speed = 0.2
 	end
@@ -298,10 +335,20 @@ function T.tick(api, cfg, t)
 		local asm2 = s.create_entity{ name = "assembling-machine-1", position = { 20.5, -60.5 }, force = "player",
 			recipe = "copper-cable", raise_built = true }
 		g.asm2 = asm2.unit_number
+		g.panel, g.panel_cc, g.checks.panel = panels(s)
+	elseif t == 900 and g.panel then
+		g.checks.panel.circuit_on = g.panel_cc.surface.find_entities_filtered{ name = "display-panel",
+			position = { 40.5, 44.5 } }[1].display_panel_text
+		g.panel_cc.get_control_behavior().enabled = false
+	elseif t == 1100 and g.panel then
+		local p2 = g.panel_cc.surface.find_entities_filtered{ name = "display-panel", position = { 40.5, 44.5 } }[1]
+		g.checks.panel.circuit_off = { text = p2.display_panel_text, icon = p2.display_panel_icon }
 	elseif t == 1900 then
 		g.asm.destroy{ raise_destroy = true }
 	elseif t == 1950 and api.resync then
 		api.resync("final")
+	elseif t == 2000 and g.panel then
+		g.panel.destroy{ raise_destroy = true }
 	elseif t == 2050 and g.b.valid then
 		-- every carriage: destroying one only leaves a shorter train, which keeps the journey
 		g.b_gone_id = g.b.id

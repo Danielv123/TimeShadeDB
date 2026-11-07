@@ -102,6 +102,7 @@ func TestIngestMapsMessages(t *testing.T) {
 			map[string]any{"j": "p:bob", "k": "p", "f": "player", "name": "bob", "x": 4, "y": 4, "tick": 590},
 		}},
 		map[string]any{"type": "tag", "s": "nauvis", "f": "player", "n": 3, "x": x, "y": y, "icon": "item/iron-plate", "text": "hi"},
+		map[string]any{"type": "panel", "s": "nauvis", "f": "player", "u": 3, "x": x + 1, "y": y, "icon": "virtual/signal-A", "text": "low"},
 		map[string]any{"type": "recipe", "s": "nauvis", "f": "player", "u": 99, "x": x, "y": y, "r": "gear", "q": "normal"},
 		map[string]any{"type": "map", "info": map[string]any{"key": "gw-a.1", "title": "A", "instances": []any{}}},
 		map[string]any{"type": "unknown-future-type", "x": 1},
@@ -110,12 +111,13 @@ func TestIngestMapsMessages(t *testing.T) {
 	body += line(t, env{V: 1, Tick: 660, Src: "clusterio:5", Map: "gw-a.1", Inst: 5, RecvMs: int64(base + 1000), Seq: &seq2, Msgs: []any{
 		map[string]any{"type": "move", "s": "nauvis", "m": []any{map[string]any{"j": "5.1.7", "gone": true}}},
 		map[string]any{"type": "tag", "s": "nauvis", "f": "player", "n": 3},
+		map[string]any{"type": "panel", "s": "nauvis", "f": "player", "u": 3, "x": x + 1, "y": y, "text": "high"},
 	}})
 	resp := f.ingest(t, body)
 	if resp.Envelopes != 2 || resp.BadLines != 0 || len(resp.Errors) != 0 {
 		t.Fatalf("resp %+v", resp)
 	}
-	if resp.Chunks.Accepted != 2 || resp.Samples.Accepted != 3 || resp.Overlays.Accepted != 3 {
+	if resp.Chunks.Accepted != 2 || resp.Samples.Accepted != 3 || resp.Overlays.Accepted != 5 {
 		t.Fatalf("counts %+v", resp)
 	}
 	if resp.Seq == nil || *resp.Seq != 8 {
@@ -161,19 +163,29 @@ func TestIngestMapsMessages(t *testing.T) {
 	if len(pl) != 1 || pl[0].T != base-167 || pl[0].Flags&core.FlagNoHeading == 0 {
 		t.Fatalf("player rows %+v", pl)
 	}
-	// Overlays: the tag was opened and closed, keyed by instance.
+	// Overlays: the tag was opened and closed, keyed by instance. The display panel with
+	// the same number is a tag of its own, whose new state ended the first.
 	ivs, err := f.ovl.Query(ctx, ds, core.OverlayQuery{Tile: core.TileAt(x, y, 0), T0: 0, T1: base + core.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var tag *core.Interval
+	var panel []core.Interval
 	for i := range ivs {
-		if ivs[i].Kind == core.OverlayTag {
+		switch {
+		case ivs[i].Kind == core.OverlayTag && ivs[i].Key == "5/3":
 			tag = &ivs[i]
+		case ivs[i].Kind == core.OverlayTag:
+			panel = append(panel, ivs[i])
 		}
 	}
 	if tag == nil || tag.Key != "5/3" || tag.Instance != 5 || tag.End != base+1000 || tag.Icon != "item/iron-plate" {
 		t.Fatalf("tag %+v (all %+v)", tag, ivs)
+	}
+	if len(panel) != 2 || panel[0].Key != "5/p3" || panel[0].X != x+1 || panel[0].Icon != "virtual/signal-A" ||
+		panel[0].Text != "low" || panel[0].End != base+1000 || panel[1].Key != "5/p3" || panel[1].Start != base+1000 ||
+		!panel[1].Open() || panel[1].Icon != "" || panel[1].Text != "high" {
+		t.Fatalf("panel %+v (all %+v)", panel, ivs)
 	}
 	// Maps: stored in maps.json.
 	b, err := os.ReadFile(filepath.Join(filepath.Dir(f.maps.path), "maps.json"))

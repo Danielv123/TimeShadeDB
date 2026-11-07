@@ -48,6 +48,7 @@ const (
 	MsgMove     = "move"
 	MsgAdopt    = "adopt"
 	MsgTag      = "tag"
+	MsgPanel    = "panel"
 	MsgRecipe   = "recipe"
 	MsgRail     = "rail"
 	MsgSurfaces = "surfaces"
@@ -124,6 +125,19 @@ type TagMsg struct {
 	S    string   `json:"s"`
 	F    string   `json:"f"`
 	N    int64    `json:"n"`
+	X    *float64 `json:"x,omitempty"`
+	Y    *float64 `json:"y,omitempty"`
+	Icon string   `json:"icon,omitempty"`
+	Text string   `json:"text,omitempty"`
+}
+
+// PanelMsg is what a display panel shows on the map, as a chart tag; no X means it
+// shows nothing there (chart display off, no icon and no text, or the panel gone).
+type PanelMsg struct {
+	Type string   `json:"type"`
+	S    string   `json:"s"`
+	F    string   `json:"f"`
+	U    int64    `json:"u"`
 	X    *float64 `json:"x,omitempty"`
 	Y    *float64 `json:"y,omitempty"`
 	Icon string   `json:"icon,omitempty"`

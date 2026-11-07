@@ -22,10 +22,11 @@ local capture = { core = core, outbox = outbox, terrain = terrain, movers = move
 capture.VERSION = "0.1.2"
 
 local host = {}
-local resync = nil -- the running resync: { trace, chunks, movers, tags, machines, rails?, chunks_done }
+local resync = nil -- the running resync: { trace, chunks, movers, tags, machines, panels?, rails?, chunks_done }
 
 -- Tunables a config may set. Only output-side ones: the mover rules stay fixed, so every peer runs the same ones.
-local TUNABLES = { debounce = "DEBOUNCE", charts = "CHARTS", cache = "CACHE", resync_charts = "RESYNC_CHARTS" }
+local TUNABLES = { debounce = "DEBOUNCE", charts = "CHARTS", cache = "CACHE", resync_charts = "RESYNC_CHARTS",
+	panel_gap = "PANEL_GAP", panel_rate = "PANEL_RATE" }
 
 local DEFAULTS = {}
 for _, const in pairs(TUNABLES) do
@@ -93,8 +94,8 @@ local function names(v)
 	return true
 end
 
---- Configure the capture and start it. c: { tile?, rails?, forces?, debounce?, charts?, cache?, resync_charts? }.
---- tile is gridworld's
+--- Configure the capture and start it. c: { tile?, rails?, forces?, debounce?, charts?, cache?, resync_charts?,
+--- panel_gap?, panel_rate? }. tile is gridworld's
 --- { world, x, y, size, surface, exclude? }; forces names forces captured without a player; rails turns on the rail
 --- layer. Every field read is checked; a bad one raises. Writes storage: run it on every peer.
 function capture.config(c)
@@ -110,7 +111,8 @@ function capture.config(c)
 		extra[n] = true
 	end
 	st.extra_forces = extra
-	st.cfg = { debounce = c.debounce, charts = c.charts, cache = c.cache, resync_charts = c.resync_charts }
+	st.cfg = { debounce = c.debounce, charts = c.charts, cache = c.cache, resync_charts = c.resync_charts,
+		panel_gap = c.panel_gap, panel_rate = c.panel_rate }
 	st.rails = c.rails and true or false
 	apply(st.cfg)
 	terrain.refresh_forces(st)
@@ -134,8 +136,8 @@ function capture.on_load()
 	apply(st and st.cfg)
 end
 
---- Resync: the surfaces, every mover with its carriages, every tag, then every charted captured chunk (and its machines
---- and rails) over the next ticks, forced past the compare and the cap; a resynced message follows the last of them.
+--- Resync: the surfaces, every mover with its carriages, every tag, then every charted captured chunk (and its machines,
+--- display panels and rails) over the next ticks, forced past the compare and the cap; a resynced message follows the last of them.
 --- A newer resync replaces one still running. It writes no storage.
 function capture.resync(trace)
 	assert(type(trace) == "string", "timeshade resync: the trace must be a string")
@@ -162,13 +164,13 @@ local function finish()
 	if r and r.chunks_done and overlays.waiting() == 0 then
 		local d = terrain.state().debounce
 		outbox.send{ type = "resynced", trace = r.trace, counts = { chunks = r.chunks, movers = r.movers, tags = r.tags,
-			machines = r.machines, rails = r.rails or 0, drops = d.drops + outbox.oversize() } }
+			machines = r.machines, panels = r.panels or 0, rails = r.rails or 0, drops = d.drops + outbox.oversize() } }
 		resync = nil
 	end
 end
 
 --- The per-tick steps: nothing before the config; then the host's step, the resync walk, chart reads, the resync's
---- machines, movers, the resync's end, and the flush.
+--- machines, display panel reads, movers, the resync's end, and the flush.
 function capture.on_tick(e)
 	local st = storage.timeshade
 	if not (st and st.configured) then
@@ -180,7 +182,8 @@ function capture.on_tick(e)
 	end
 	terrain.walk(st, resync)
 	terrain.step(st, e.tick, resync)
-	overlays.step()
+	overlays.step(e.tick)
+	overlays.poll(e.tick)
 	movers.step(st, e.tick)
 	finish()
 	outbox.flush(e.tick, game.speed)
@@ -238,7 +241,7 @@ function capture.build_events()
 	on({ "on_chart_tag_added", "on_chart_tag_modified", "on_chart_tag_removed" }, function(e)
 		overlays.on_tag(storage.timeshade, e)
 	end)
-	-- circuit-set recipes and a furnace's own switch are missed (as in illisis)
+	-- circuit-set recipes and a furnace's own switch are missed (as in illisis); display panels are also read in turn
 	on({ "on_built_entity", "on_robot_built_entity", "on_space_platform_built_entity", "script_raised_built",
 		"script_raised_revive", "on_entity_settings_pasted", "on_gui_closed" }, function(e)
 		overlays.on_entity(storage.timeshade, e)
@@ -267,6 +270,7 @@ function capture.stats()
 		forced = core.size(t.debounce.forced),
 		drops = t.debounce.drops,
 		cached = core.cache_count(t.cache), lines = lines, bytes = bytes, oversize = outbox.oversize(), movers = nm,
+		panels = overlays.panels(),
 		resyncing = resync and resync.trace or nil }
 end
 

@@ -33,7 +33,8 @@ end
 
 local function config()
 	capture.config{ forces = forces(), rails = setting("rails"), debounce = setting("debounce"),
-		charts = setting("chart-reads"), cache = setting("cache") }
+		charts = setting("chart-reads"), cache = setting("cache"), panel_gap = setting("panel-gap"),
+		panel_rate = setting("panel-rate") }
 	local st = capture.state()
 	if not setting("enabled") then
 		st.configured = false

@@ -1,7 +1,8 @@
 # TimeShadeDB capture
 
 The Lua that records a Factorio game for TimeShadeDB: the map chart, trains, vehicles,
-players, chart tags, machine recipes and (optionally) rail entities. It writes the capture
+players, chart tags, display panels shown on the map, machine recipes and (optionally) rail
+entities. It writes the capture
 envelopes of [docs/PROTOCOL.md](../docs/PROTOCOL.md). One library serves two hosts:
 
 | Host | Directory | Output | Forwarder |
@@ -18,7 +19,7 @@ envelopes of [docs/PROTOCOL.md](../docs/PROTOCOL.md). One library serves two hos
 | `lua/json.lua` | The JSON encoder (cheaper than `helpers.table_to_json`) |
 | `lua/terrain.lua` | `on_chunk_charted` through the debounce, chart reads and compare, surfaces, the resync walk |
 | `lua/movers.lua` | Scan, read wheel, train/vehicle/player samples, joins and splits, Universal Edges hand-off |
-| `lua/overlays.lua` | Chart tags, recipes, rails |
+| `lua/overlays.lua` | Chart tags, display panels, recipes, rails |
 | `lua/capture.lua` | Entry points: `setup`, `config`, `resync`, `on_tick`, the event table |
 | `mod/timeshadedb_exporter/` | The standalone mod (settings, file rotation, `/timeshade` command, remote interface). `mod/README.md` is its mod portal description |
 | `clusterio_module/` | The module's `control.lua` and `globals.lua` (`ts_rt` RCON entry point) |
@@ -44,7 +45,8 @@ node capture/build.mjs --factorio-version 2.1  # Factorio 2.1 refuses mods that 
 
 Map settings (runtime, per save): capture on or off, chart debounce (600 ticks), chart reads
 per tick (1), sent-chart cache size (16,384 chunks), rail layer (off), extra forces to
-capture (forces with a player are always captured). `/timeshade stats` prints counters,
+capture (forces with a player are always captured), and the display panel limits: ticks
+between two changes of one panel (600) and changes a minute for all panels (120). `/timeshade stats` prints counters,
 `/timeshade resync` resends everything. Remote interface `timeshadedb_exporter`: `resync`,
 `stats`.
 
@@ -97,6 +99,16 @@ and `ts_rt.seam.charted` stand in for charting on headless servers.
   are more than 1 tile off the prediction.
 - Recipe and rail removals come from the mined and died events, so nothing new is registered
   for them.
+- Display panels with "show in chart" are drawn as chart tags. Nothing tells when a circuit
+  changes a panel's message, so the capture reads every known panel in turn (each at most
+  every 60 ticks, 8 a tick). A panel sends a change at most every 600 ticks, and all panels
+  together at most 120 a minute (a minute's worth at once). A change held back is sent at a
+  later read, so a panel a circuit flips every tick sends its state every 10 s and ends on the
+  state it settles on. Changes the shared limit holds back are sent in the order they came, so
+  busy panels cannot keep a settled one waiting for good. Panels are found when built, at a closed GUI or a paste, and in each
+  charted chunk a resync walks (one at every load), so a panel in a chunk charted after the
+  last resync is missed until it is touched or the next resync. The Clusterio module uses the
+  default limits.
 - The resync never writes `storage`, so a single peer may run it (the standalone mod resyncs
   after every load). The walk of charted chunks keeps pace with the reads.
 
@@ -142,6 +154,9 @@ loads it, with a stub Clusterio API) and check:
 - a third train under a schedule, whose samples follow its `LuaTrain.path`;
 - a car's heading and kind, recipes opening and closing, and three built rails and one
   removal on the rail layer;
+- two display panels: one set by script and changed every tick for 300 ticks (sent once
+  within the gap, then its last state), one whose message a constant combinator picks
+  (`display_panel_text` reads the circuit's message), the resync's panels and a removal;
 - the 2.0 API the capture uses (`LuaTrain.front_end`/`back_end`, `path`, `get_rails`,
   carriage `orientation`, the rail prototype types, `helpers.write_file`,
   `helpers.encode_string`).

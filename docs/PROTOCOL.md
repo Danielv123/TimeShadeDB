@@ -88,6 +88,7 @@ Every message has `type`. Ingest ignores unknown types and unknown fields.
 | `move` | `s`, `m`: array of samples or gones | mover samples on surface `s` |
 | `adopt` | `j`, `trace` | a Universal Edges destination took journey `j` |
 | `tag` | `s`, `f`, `n` tag number, `x`?, `y`?, `icon`?, `text`? | chart tag state; no `x`: removed. `icon` is `<signal type>/<name>` |
+| `panel` | `s`, `f`, `u` unit number, `x`?, `y`?, `icon`?, `text`? | what a display panel with "show in chart" shows on the map, as `tag`; no `x`: it shows nothing there (chart display off, no icon and no text, or the panel removed) |
 | `recipe` | `s`, `f`, `u` unit number, `x`?, `y`?, `r`?, `q`? | machine recipe and quality; no `r`: removed (no recipe or machine gone) |
 | `rail` | `s`, `f`, `u`, `name`?, `x`?, `y`?, `dir`? | rail entity (optional layer); no `name`: removed |
 | `surfaces` | `list`: `[{name, tile}]`, `created`? | the game's surfaces and whether each is in the capture clip |
@@ -97,6 +98,9 @@ Every message has `type`. Ingest ignores unknown types and unknown fields.
 
 `tick` on a message overrides the envelope tick for that message (a chunk read on an
 earlier tick than the flush, for example).
+
+A server older than `panel` ignores it as an unknown type, so a capture updated before its
+server only loses display panel tags until the server is updated.
 
 ### 3.1 Move entries
 
@@ -181,6 +185,7 @@ Ingest (`internal/ingest`) turns messages into core values:
 | `move` sample | `MoverSample{Surface: {map, s}, Meta: {j, k, f, name, n, o, c}, T, Tick, X, Y, Orientation: h, Flags, Carriages: car}` with `FlagStop` for `stop`, `FlagEndSwitch` for `es`, `FlagNoHeading` when `h` is absent; a train sample with `v` and `h` also gets `FlagRail`, `Speed: v`, `Rail: rp`, `RailStart: ru` (a piece with an unknown kind or direction drops `rp` and sets `RailStart`) |
 | `move` gone | `MoverSample{..., Flags: FlagGone}` with the journey's last known meta and surface (ingest keeps them per journey in a bounded map; a journey it forgot, after a restart: the mover store's newest row of the journey on the gone's surface; a gone of a journey neither knows, or that already ended, is dropped) |
 | `tag` | `OverlayEvent{DS: {map, s, f}, T, Interval: {Kind: tag, Key: "<instance>/<n>", Instance, X, Y, Icon, Text}}`; no `x`: `Close` |
+| `panel` | the same as `tag`, with `Key: "<instance>/p<u>"`: the viewer draws it as a chart tag |
 | `recipe` | `OverlayEvent{Kind: recipe, Key: "<instance>/<u>", Recipe: r, Quality: q}`; no `r`: `Close` |
 | `rail` | `OverlayEvent{Kind: rail, Key: "<instance>/<u>", Name, Direction: dir}`; no `name`: `Close` |
 | `map` | stored in `<db>/maps.json`, shown in the catalog |
@@ -242,9 +247,9 @@ These are protocol-level requirements. The capture in `capture/lua/` meets them
   charts deflated in a capped cache (bounded memory on any surface size; the capture uses
   two generations of 8,192 charts, an approximate LRU).
 - Resync on start and reconnect: every charted chunk in the clip, every live mover with
-  `car`, every tag and recipe. The walk of charted chunks keeps pace with the chart reads
-  (4 a tick while a resync runs, one of them kept for chart events while any wait), so
-  50,000 chunks take 3.5 to 4.6 minutes.
+  `car`, every tag, display panel and recipe. The walk of charted chunks keeps pace with
+  the chart reads (4 a tick while a resync runs, one of them kept for chart events while any
+  wait), so 50,000 chunks take 3.5 to 4.6 minutes.
 - Trains (rail path samples, RAIL-GEOMETRY.md 8): send `v`, `rp` and `ru` with every train
   sample. Emit when a read since the last sample lies more than 0.1 tile of rail distance off
   the timing model between that sample and the current read, at least every 120 ticks while
@@ -258,6 +263,14 @@ These are protocol-level requirements. The capture in `capture/lua/` meets them
   payload whose trail begins at a start.
 - Vehicles and players: emit when off the dead-reckoned position by more than 1 tile or on
   the heartbeat; send `h` for vehicles too.
+- Display panels: no event tells when a panel's map tag changes (a circuit network picks
+  its message), so read the panels in turn: each at most every 60 ticks, 8 a tick. Send a
+  panel's state at most once per 600 ticks, and at most 120 states a minute for all panels
+  together (up to a minute's worth at once), so a fast circuit cannot flood the database. A
+  change the per-panel limit holds back goes out at a later read. One the shared limit holds
+  back waits in line, oldest first, so busy panels cannot keep a settled one from sending.
+  Either way the last state sent is the one the panel shows. A removal (mined, died) closes at once. The standalone mod's map settings set both
+  limits.
 - Gone: on leaving the surface, the instance (crossing) or the game; on instance stop for
   every player. A train's last read since its last sample is sent before its gone, or, at a
   Universal Edges crossing, when the crossing captures the train (before the destination's
