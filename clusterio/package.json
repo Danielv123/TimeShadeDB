@@ -56,10 +56,10 @@
 		"jsonwebtoken": "^9.0.3"
 	},
 	"devDependencies": {
-		"@clusterio/controller": "^2.0.3",
-		"@clusterio/host": "^2.0.3",
-		"@clusterio/lib": "^2.0.3",
-		"@clusterio/web_ui": "^2.0.3",
+		"@clusterio/controller": "^2.1.0",
+		"@clusterio/host": "^2.1.0",
+		"@clusterio/lib": "^2.1.0",
+		"@clusterio/web_ui": "^2.1.0",
 		"@types/express": "^5.0.6",
 		"@types/jsonwebtoken": "^9.0.10",
 		"@types/node": "^24.19.2",
