@@ -12,8 +12,8 @@
 // --check only says which packages are not on npm at the version, and writes release=true|false and version to
 // $GITHUB_OUTPUT. In GitHub Actions publishing fails at once for a package that is not on npm at all.
 //
-// Nothing is published while npm has no Clusterio in the plugin's peer range, as while the plugin builds against
-// Clusterio master for a release that is not out yet: --check writes release=false, and publishing fails.
+// Nothing is published while npm has no Clusterio in the plugin's peer range (a peer range naming a Clusterio release
+// that is not out yet): --check writes release=false, and publishing fails.
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -61,8 +61,7 @@ console.log(pending.length > 0 ? `not on npm at ${version}: ${pending.join(", ")
 const clusterio = `@clusterio/lib@${pkg.peerDependencies["@clusterio/lib"]}`;
 const noClusterio = pending.length > 0 && !view(clusterio, "version")?.length;
 if (noClusterio) {
-	console.log(`::warning::npm has no ${clusterio} yet, so ${version} is not released. Until it is out the plugin ` +
-		"builds against Clusterio master (clusterio/README.md, Development).");
+	console.log(`::warning::npm has no ${clusterio} yet, so ${version} is not released.`);
 }
 
 if (args.includes("--check")) {
